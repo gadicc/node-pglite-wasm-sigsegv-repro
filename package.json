@@ -1,0 +1,19 @@
+{
+  "name": "node-pglite-wasm-sigsegv-repro",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Framework-free reproduction for intermittent Node.js SIGSEGVs during concurrent PGlite initialization",
+  "type": "module",
+  "scripts": {
+    "repro": "node repro.mjs",
+    "repro:long": "node repro.mjs 16 100",
+    "repro:sequential": "node repro.mjs 1 50",
+    "check:deno": "deno check deno-repro.ts"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "0.5.4"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
