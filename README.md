@@ -43,8 +43,8 @@ npm run repro:sequential
 
 ## Docker
 
-The Dockerfile uses the official `node:26-bookworm` image and the checked-in
-npm lockfile:
+The Dockerfile pins the tested official `node:26-bookworm` image digest and
+uses the checked-in npm lockfile:
 
 ```sh
 docker build -t pglite-node-sigsegv-repro .
@@ -76,13 +76,20 @@ One Node 25.2.1 run failed 4 of 20 waves, with five children receiving
 
 Official `node:<major>-bookworm` images on the same host:
 
-| Node | Default-mode result |
+| Node | Default Node flags (no V8 CLI overrides) |
 | --- | --- |
 | 26 | Two clean runs failed at waves 13 and 8; the final Docker build failed at wave 8 |
 | 25 | 1/20 waves failed |
 | 24 | 4/45 waves failed; the final locked Docker build failed at wave 15 |
 | 22 | 1/10 waves failed |
 | 20 | 0/40 waves failed |
+
+The Node 20 result is a non-reproduction in 40 intermittent waves, not evidence
+that Node 20 is unaffected. The relevant exposed defaults are the same in the
+official Node 20, 22, 24, and 26 images: Liftoff, lazy compilation, dynamic
+tiering, and WASM tier-up are enabled, with up to 128 compilation tasks. Node
+20 did reproduce when `--no-liftoff` forced the optimizing compiler, so the
+underlying crash is not established as a post-20 regression.
 
 The newest available official Node V8-canary was also tested after verifying
 its published SHA-256 checksum:
@@ -161,9 +168,11 @@ the official Node canary still fails. Plausible locations therefore include:
 - a concurrency/resource interaction specific to Node processes executing a
   large WASM module.
 
-A standalone `d8` reproduction would be needed to establish that the same bug
-exists in V8 independently of Node. The recommended initial report target is
-Node, with maintainers routing or cross-linking it to V8 if appropriate.
+`d8` is V8's standalone JavaScript shell. A reproduction that loads and runs
+the relevant WASM directly in `d8`, without Node or its APIs, would establish
+that the same bug exists in V8 independently of Node. The recommended initial
+report target is Node, with maintainers routing or cross-linking it to V8 if
+appropriate.
 
 ## Related reports
 
