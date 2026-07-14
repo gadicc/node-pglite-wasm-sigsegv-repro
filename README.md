@@ -7,6 +7,11 @@ Each child creates an in-memory PGlite 0.5.4 client, runs `SELECT 1`, awaits
 `client.close()`, and exits. There is no Vitest, Vite, test runner, native
 addon, application code, or database persistence.
 
+## Filed reports
+
+- [nodejs/node#64500](https://github.com/nodejs/node/issues/64500)
+- [electric-sql/pglite#1053](https://github.com/electric-sql/pglite/issues/1053)
+
 ## Reproduce
 
 > [!CAUTION]
