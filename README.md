@@ -153,6 +153,30 @@ Deno's Node-compatible `child_process.fork()` could not provide an exact IPC
 control because its compatibility layer failed before spawning with
 `fd is not from BiPipe`.
 
+## PGlite debug-build control
+
+The exact PGlite 0.5.4 tag (source commit
+`25d0a55e1f1e4c59f26d9e125150dda88a33fd00`) was also built with the official
+`pnpm build:all:debug` workflow. The PostgreSQL WASM build used `-g`,
+`-gsource-map`, and `--no-wasm-opt`. Its 50,321,851-byte `pglite.wasm`
+contained 1,322 DWARF compilation units and passed LLVM's DWARF verifier.
+
+Using Node 25.2.1 and the same harness:
+
+| Debug-build mode | Result |
+| --- | --- |
+| Sequential, one child | 5/5 waves passed |
+| Eight concurrent children | 5/5 waves passed |
+| Sixteen concurrent children | Wave 1 passed; child 9 received `SIGSEGV` in wave 2 |
+
+After resetting the test scope's cgroup counter, the 16-child run peaked at
+67,306,729,472 bytes (62.7 GiB). The cgroup recorded `oom=0` and `oom_kill=0`.
+The debug build therefore preserves the concurrency-dependent crash despite
+Emscripten's `--no-wasm-opt` build setting and the inclusion of source-level
+debug information. V8's runtime compilation tiers were not disabled by that
+setting. The debug build also requires much more memory than the release-build
+reproduction.
+
 ## Node versus V8 attribution
 
 The exact ownership is not yet proven.
