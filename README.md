@@ -146,6 +146,64 @@ Two consequences:
   handling on the main thread, with cross-process machine load as the
   likely timing perturber.
 
+## Root-cause investigation (2026-07-30): platform-level address corruption
+
+A full native investigation on the affected machine found that the crashes
+are not caused by Node, V8, or PGlite. The evidence points to sporadic
+single-bit corruption of faulting linear addresses in the CPU's address
+path under heavy concurrent load.
+
+### The fault-address signature
+
+Children were run under `gdb --batch` with `handle SIGSEGV stop nopass`,
+capturing the pristine fault context before Node's trap handler runs. Every
+captured fault had the same shape: the faulting instruction is an ordinary
+register-relative memory access whose architecturally intended address is
+valid and mapped, but the kernel-reported fault address (`si_addr`/CR2)
+equals the intended address with an extra high bit set.
+
+| Capture | Faulting instruction | Intended address | `si_addr` | Intended address mapped? |
+| --- | --- | --- | --- | --- |
+| Node 25.2.1, gdb | `addl $1, 0x1c0(%r13)`, `r13=0x6720080` | `0x6720240` | `0x40006720240` | yes, inside `[heap]` (rw) |
+| Node 25.2.1, gdb | `mov %rbp, 0xb0(%r13)`, `r13=0x6720080` | `0x6720130` | `0x40006720130` | yes, inside `[heap]` (rw) |
+| Node 25.2.1, strace | `mov %rbp, 0xb0(%r13)` (wasm entry) | `0x44905130` | `0x40044905130` | — |
+
+`strace -e %memory` showed the faulting address was never mapped, unmapped,
+or protected by the process at any point. The register state at each fault
+is clean and self-consistent. No x86-64 mechanism (segment bases, LAM,
+canonicalization) adds 2^42 to a plain register-relative access, and
+page-table or TLB-shootdown bugs cannot change the linear address reported
+in CR2. A software bug can only corrupt architectural state, which would be
+visible in the register dump. The varying crash sites seen earlier (Liftoff
+code emission, wasm entry, GC marking barrier) are explained by the anomaly
+striking whatever memory access is in flight.
+
+### Cross-checks
+
+- Deno 2.9.3 (V8 14.9.207.2) crashes under the same gdb harness with a
+  flipped-high-bit fault address (`si_addr=0x167f20915dad` versus live
+  pointer `rbx=0x127f20915c71`, approximately bit 34). The earlier "Deno
+  clean" control was insufficient sampling.
+- A second PC (i9-10885H, Comet Lake) passed 100/100 waves (1,600
+  child-runs). On the affected machine a crash occurs roughly every 40-80
+  child-runs; the clean run is conclusive to better than 1e-14.
+- Reproduced on kernels 6.18 (CachyOS) and 7.1.5 (Arch).
+- The affected machine's journal shows other applications (Chromium, and
+  Electron/Signal V8 `int3` aborts) crashing with anomalous fault addresses
+  over the same period.
+
+### Conclusion
+
+The affected machine (Core Ultra 9 285HX, stepping 2, microcode 0x122)
+exhibits sporadic single-high-bit corruption of faulting linear addresses
+under heavy concurrent load. The CPU reports 42-bit physical addressing,
+so the flipped bit is — intriguingly but unproven — exactly the MAXPHYADDR
+boundary. Node+PGlite is an unusually effective trigger but not the cause.
+Observed crashes are the subset where the corrupted address is unmapped; a
+corrupted store address landing on a mapped page would silently corrupt
+memory. Next steps are firmware updates and stock BIOS settings on the
+affected machine and, if the behavior persists, an erratum report to Intel.
+
 ## Native crash evidence
 
 A reproduction was run under `env -i` with only `HOME`, `PATH`, `LANG`, and
@@ -215,6 +273,11 @@ setting. The debug build also requires much more memory than the release-build
 reproduction.
 
 ## Node versus V8 attribution
+
+> **Superseded (2026-07-30):** see "Root-cause investigation: platform-level
+> address corruption" above. The evidence now points to a hardware/platform
+> anomaly on the affected machine, with Node as the trigger rather than the
+> cause. This section is retained for historical context.
 
 The exact ownership is not yet proven.
 
