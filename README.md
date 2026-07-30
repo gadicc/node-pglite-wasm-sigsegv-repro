@@ -178,6 +178,12 @@ visible in the register dump. The varying crash sites seen earlier (Liftoff
 code emission, wasm entry, GC marking barrier) are explained by the anomaly
 striking whatever memory access is in flight.
 
+Bit 42 sits inside the PML4 index field of a 48-bit linear address, so the
+corrupted fault address names a different top-level page-table slot than
+the intended access. This is consistent with a glitch in the CPU's
+address-generation/TLB path rather than RAM data corruption, which cannot
+change CR2 (a linear address) at all.
+
 ### Cross-checks
 
 - Deno 2.9.3 (V8 14.9.207.2) crashes under the same gdb harness with a
@@ -191,6 +197,17 @@ striking whatever memory access is in flight.
 - The affected machine's journal shows other applications (Chromium, and
   Electron/Signal V8 `int3` aborts) crashing with anomalous fault addresses
   over the same period.
+- A generic non-V8 stress test (24 threads of dense computed-address
+  stores, 10 minutes) did not reproduce. The anomaly appears to require the
+  specific concurrent V8 WASM-compilation workload, not merely memory load.
+
+### Forensic notes
+
+Post-mortem siginfo from systemd-coredump cores is misleading for this
+crash: the core records the fatal `SI_TKILL` re-raise, so `$_siginfo`
+decodes to the sender's pid/uid rather than the original fault address.
+Trustworthy fault addresses require a live gdb stop
+(`handle SIGSEGV stop nopass`) or a signal-capturing strace.
 
 ### Conclusion
 
