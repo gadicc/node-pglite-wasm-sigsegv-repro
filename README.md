@@ -114,6 +114,38 @@ The canary results show that neither IPC nor optimized WASM compilation is
 universally required. Concurrency is the stable trigger in the measured Node
 configurations.
 
+## Post-report flag and version sweep
+
+After filing, the host (Linux x64, 24 cores, Node v25.2.1, V8
+14.1.146.11-node.14) reproduced the crash far more aggressively than the
+Docker matrix: every run failed between waves 1 and 5. A systematic sweep
+found no V8 flag and no released Node version that prevents the crash.
+Each row used 16 children for up to 100 waves and stopped at the first
+failed wave:
+
+| Configuration | Result |
+| --- | --- |
+| Node v25.2.1, default | SIGSEGV at wave 5 |
+| `--no-wasm-tier-up` | SIGSEGV at wave 4 |
+| `--no-wasm-lazy-compilation` | no SIGSEGV, but unusable: even a single child deterministically exits 13 with an unsettled top-level await in `client.query` |
+| `--liftoff-only` | SIGSEGV at wave 3 (two children) |
+| `--no-concurrent-marking` | SIGSEGV at wave 1 |
+| `--single-threaded-gc` | SIGSEGV at wave 2 (two children) |
+| Node v25.9.0 (V8 14.1.146.11-node.25), default | SIGSEGV at wave 1 |
+| Node v26.5.1 (V8 14.6.202.34-node.24), default | SIGSEGV at wave 1 |
+
+Two consequences:
+
+- The Node report's observation that `--no-wasm-tier-up` passed 100/100
+  waves did not reproduce and was luck; a single clean run is not evidence
+  of mitigation for this intermittent crash.
+- The crash survives `--liftoff-only`, `--no-wasm-tier-up`,
+  `--no-concurrent-marking`, and `--single-threaded-gc`, so background
+  optimizing compilation and concurrent GC threads are not required. The
+  remaining shared paths are lazy Liftoff compilation and the WASM trap
+  handling on the main thread, with cross-process machine load as the
+  likely timing perturber.
+
 ## Native crash evidence
 
 A reproduction was run under `env -i` with only `HOME`, `PATH`, `LANG`, and
