@@ -333,6 +333,60 @@ improvement given the previously observed rate drift. The remaining hardware
 candidates are internal platform power delivery and the CPU itself; both are
 replaced together by a system-board replacement on this model.
 
+## Temporary workarounds
+
+These mitigate the observed trigger but are not substitutes for hardware
+replacement: the failure can potentially become silent memory corruption when
+the corrupted address happens to be mapped.
+
+The most conservative frequency workaround tested so far is to disable turbo
+globally. Core 19 passed 20/20 runs with the resulting 2.1 GHz ceiling:
+
+```bash
+echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo
+```
+
+Writing `0` restores turbo. This sysfs setting is not persistent across a
+reboot.
+
+A more targeted workaround is to prevent the scheduler from using the known
+affected logical CPUs on this machine (11, 19, and 21):
+
+```bash
+for cpu in 11 19 21; do
+  echo 0 | sudo tee "/sys/devices/system/cpu/cpu${cpu}/online"
+done
+```
+
+Writing `1` to the same files brings them back online. These CPU numbers are
+specific to this machine and should be revalidated after a firmware or
+system-board change. Verdicts for the other cores also remain statistical,
+rather than a guarantee of hardware correctness.
+
+For an application-only workaround, affinity can keep the complete process,
+including its threads, on the extensively tested P-cores:
+
+```bash
+taskset -c 0-7 node app.mjs
+```
+
+Finally, `scaling_max_freq` can cap only CPUs 11, 19, and 21 while preserving
+turbo elsewhere. A 2.1 GHz ceiling is a conservative starting point suggested
+by the successful no-turbo test, but this exact per-CPU configuration has not
+yet been independently validated and the earlier intel_pstate/HWP cap did not
+strictly match the observed effective clock. Confirm the actual frequency
+under load and run a much longer validation before relying on it:
+
+```bash
+for cpu in 11 19 21; do
+  echo 2100000 | sudo tee \
+    "/sys/devices/system/cpu/cpu${cpu}/cpufreq/scaling_max_freq"
+done
+```
+
+Node/V8 flags are not workarounds: the repro survives `--no-wasm-tier-up`,
+`--liftoff-only`, `--no-liftoff`, and the other flag combinations tested above.
+
 ## Native crash evidence
 
 A reproduction was run under `env -i` with only `HOME`, `PATH`, `LANG`, and
