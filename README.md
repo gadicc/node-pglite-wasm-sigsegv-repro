@@ -315,8 +315,23 @@ boost and pass when downclocked, consistent with marginal voltage at boost
 - firmware/BIOS voltage configuration, platform power delivery, or
 out-of-spec silicon. Disabling SaGV did not change the result (9/20), so
 system-agent voltage/frequency scaling is not required. The highest-value
-remaining controls are direct OEM power with no dock, followed by a full
-stock-BIOS retest, ahead of any erratum report.
+remaining control is a full stock-BIOS retest, ahead of any erratum report.
+
+Power-source controls on core 19, all with turbo enabled, reproduced the
+fault through either USB-C port and with the machine running on battery:
+
+| Power condition | Result |
+| --- | --- |
+| USB-C port nearer the front | 1/20 runs SIGSEGV |
+| USB-C port nearer the rear | 2/20 runs SIGSEGV |
+| Battery only | 2/20 runs SIGSEGV |
+
+The battery-only failures show that the dock, USB-C input path, external
+adapter, household mains, and unstable external supply are not required for
+the defect. The lower counts in these small batches are not evidence of an
+improvement given the previously observed rate drift. The remaining hardware
+candidates are internal platform power delivery and the CPU itself; both are
+replaced together by a system-board replacement on this model.
 
 ## Native crash evidence
 
