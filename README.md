@@ -175,6 +175,7 @@ equals the intended address with an extra high bit set.
 | --- | --- | --- | --- | --- |
 | Node 25.2.1, gdb | `addl $1, 0x1c0(%r13)`, `r13=0x6720080` | `0x6720240` | `0x40006720240` | yes, inside `[heap]` (rw) |
 | Node 25.2.1, gdb | `mov %rbp, 0xb0(%r13)`, `r13=0x6720080` | `0x6720130` | `0x40006720130` | yes, inside `[heap]` (rw) |
+| Node 25.2.1, gdb, CPU 19 with TME disabled | `mov %rbp, 0xb0(%r13)`, `r13=0x6720080` | `0x6720130` | `0x40006720130` | yes, inside `[heap]` (rw) |
 | Node 25.2.1, strace | `mov %rbp, 0xb0(%r13)` (wasm entry) | `0x44905130` | `0x40044905130` | — |
 
 `strace -e %memory` showed the faulting address was never mapped, unmapped,
@@ -222,13 +223,18 @@ Trustworthy fault addresses require a live gdb stop
 
 The affected machine (Core Ultra 9 285HX, stepping 2, microcode 0x122)
 exhibits sporadic single-high-bit corruption of faulting linear addresses
-under heavy concurrent load. The CPU reports 42-bit physical addressing,
-so the flipped bit is — intriguingly but unproven — exactly the MAXPHYADDR
-boundary. Node+PGlite is an unusually effective trigger but not the cause.
-Observed crashes are the subset where the corrupted address is unmapped; a
-corrupted store address landing on a mapped page would silently corrupt
-memory. Next steps are firmware updates and stock BIOS settings on the
-affected machine and, if the behavior persists, an erratum report to Intel.
+under heavy concurrent load. In the initial TME-enabled configuration the
+CPU reported 42-bit physical addressing, so the flipped bit appeared to be
+exactly the MAXPHYADDR boundary. A controlled cold-boot test with TME disabled
+restored 46-bit physical addressing, but CPU 19 still failed 9/20 runs and a
+pristine gdb capture retained the exact `intended_address + 2^42` signature.
+TME/MKTME is therefore not required for the failure, and the earlier
+MAXPHYADDR correspondence was incidental. Node+PGlite is an unusually
+effective trigger but not the cause. Observed crashes are the subset where
+the corrupted address is unmapped; a corrupted store address landing on a
+mapped page would silently corrupt memory. Next steps are firmware updates
+and stock BIOS settings on the affected machine and, if the behavior
+persists, an erratum report to Intel.
 
 ### Update (2026-07-31): isolated to three physical cores
 
