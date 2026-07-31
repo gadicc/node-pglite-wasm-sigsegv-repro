@@ -1,0 +1,216 @@
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.archlinux.org>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/libthread_db.so.1".
+[New Thread 0x7ffff75ff6c0 (LWP 2690786)]
+[New Thread 0x7ffff6dfe6c0 (LWP 2690787)]
+[New Thread 0x7ffff65fd6c0 (LWP 2690788)]
+[New Thread 0x7ffff5dfc6c0 (LWP 2690789)]
+[New Thread 0x7ffff55fb6c0 (LWP 2690790)]
+[New Thread 0x7ffff7d3f6c0 (LWP 2690791)]
+[New Thread 0x7ffff4dfa6c0 (LWP 2690792)]
+[New Thread 0x7ffda7fff6c0 (LWP 2690793)]
+[New Thread 0x7ffda77fe6c0 (LWP 2690794)]
+[New Thread 0x7ffda6ffd6c0 (LWP 2690795)]
+
+Thread 1 "MainThread" received signal SIGSEGV, Segmentation fault.
+0x00007fffd7dcfc74 in ?? ()
+#0  0x00007fffd7dcfc74 in ?? ()
+#1  0x00007fffffffd2f8 in ?? ()
+#2  0x00007fffffffd330 in ?? ()
+#3  0x0000000000000000 in ?? ()
+rax            0x7fffffffd330      140737488343856
+rbx            0x2d22750ea431      49626016031793
+rcx            0x0                 0
+rdx            0x1743df0           24395248
+rsi            0x94c6eb05cd9       10223879216345
+rdi            0x7fffffffd2c0      140737488343744
+rbp            0x7fffffffd2e8      0x7fffffffd2e8
+rsp            0x7fffffffd2c0      0x7fffffffd2c0
+r8             0x921               2337
+r9             0x0                 0
+r10            0x7c45a800011       8539913322513
+r11            0xd65fe900011       14731713708049
+r12            0x6792458           108602456
+r13            0x6720080           108134528
+r14            0x7ff               2047
+r15            0x67943e0           108610528
+rip            0x7fffd7dcfc74      0x7fffd7dcfc74
+eflags         0x10206             [ PF IF RF ]
+cs             0x33                51
+ss             0x2b                43
+ds             0x0                 0
+es             0x0                 0
+fs             0x0                 0
+gs             0x0                 0
+pl3_ssp        <unavailable>
+fs_base        0x7ffff7e192c0      140737352143552
+gs_base        0x0                 0
+=> 0x7fffd7dcfc74:	addl   $0x1,0x1c0(%r13)
+   0x7fffd7dcfc7c:	call   *%rdx
+$1 = 0x40006720240
+  Id   Target Id                                             Frame 
+* 1    Thread 0x7ffff7e192c0 (LWP 2690782) "MainThread"      0x00007fffd7dcfc74 in ?? ()
+  2    Thread 0x7ffff75ff6c0 (LWP 2690786) "DelayedTaskSche" 0x00007ffff76b5882 in ?? () from /usr/lib/libc.so.6
+  3    Thread 0x7ffff6dfe6c0 (LWP 2690787) "V8Worker"        0x00007ffff76b5882 in ?? () from /usr/lib/libc.so.6
+  4    Thread 0x7ffff65fd6c0 (LWP 2690788) "V8Worker"        0x00007ffff76b5882 in ?? () from /usr/lib/libc.so.6
+  5    Thread 0x7ffff5dfc6c0 (LWP 2690789) "V8Worker"        0x00007ffff76b5882 in ?? () from /usr/lib/libc.so.6
+  6    Thread 0x7ffff55fb6c0 (LWP 2690790) "V8Worker"        0x00007ffff76b5882 in ?? () from /usr/lib/libc.so.6
+  7    Thread 0x7ffff7d3f6c0 (LWP 2690791) "SignalInspector" 0x00007ffff76b5882 in ?? () from /usr/lib/libc.so.6
+  8    Thread 0x7ffff4dfa6c0 (LWP 2690792) "libuv-worker"    0x00007ffff76b5882 in ?? () from /usr/lib/libc.so.6
+  9    Thread 0x7ffda7fff6c0 (LWP 2690793) "libuv-worker"    0x00007ffff76b5882 in ?? () from /usr/lib/libc.so.6
+  10   Thread 0x7ffda77fe6c0 (LWP 2690794) "libuv-worker"    0x00007ffff76b5882 in ?? () from /usr/lib/libc.so.6
+  11   Thread 0x7ffda6ffd6c0 (LWP 2690795) "libuv-worker"    0x00007ffff76b5882 in ?? () from /usr/lib/libc.so.6
+process 2690782
+Mapped address spaces:
+
+Start Addr         End Addr           Size               Offset             Perms File 
+0x0000000000400000 0x000000000078f000 0x38f000           0x0                r--p  /home/dragon/.nvm/versions/node/v25.2.1/bin/node 
+0x000000000078f000 0x0000000002d13000 0x2584000          0x38f000           r-xp  /home/dragon/.nvm/versions/node/v25.2.1/bin/node 
+0x0000000002e00000 0x0000000002e01000 0x1000             0x2a00000          r-xp  /home/dragon/.nvm/versions/node/v25.2.1/bin/node 
+0x0000000002e01000 0x00000000065f1000 0x37f0000          0x2a01000          r--p  /home/dragon/.nvm/versions/node/v25.2.1/bin/node 
+0x00000000065f1000 0x00000000065f3000 0x2000             0x61f1000          r--p  /home/dragon/.nvm/versions/node/v25.2.1/bin/node 
+0x00000000065f3000 0x000000000661f000 0x2c000            0x61f3000          rw-p  /home/dragon/.nvm/versions/node/v25.2.1/bin/node 
+0x000000000661f000 0x0000000006658000 0x39000            0x0                rw-p   
+0x0000000006658000 0x0000000006b29000 0x4d1000           0x0                rw-p  [heap] 
+0x000000f01d280000 0x000000f01d2c0000 0x40000            0x0                rw-p   
+0x000001592a6c0000 0x000001592a700000 0x40000            0x0                rw-p   
+0x000001a9de140000 0x000001a9de180000 0x40000            0x0                rw-p   
+0x000002d04e500000 0x000002d04e540000 0x40000            0x0                rw-p   
+0x00000448e2540000 0x00000448e2580000 0x40000            0x0                rw-p   
+0x000004aaa7c80000 0x000004aaa7cc0000 0x40000            0x0                rw-p   
+0x0000061dc2200000 0x0000061dc2240000 0x40000            0x0                rw-p   
+0x0000072784980000 0x00000727849c0000 0x40000            0x0                rw-p   
+0x000007c45a800000 0x000007c45a81f000 0x1f000            0x0                r--p   
+0x0000083088080000 0x00000830880a1000 0x21000            0x0                rw-p   
+0x0000094c6eb00000 0x0000094c6eb40000 0x40000            0x0                rw-p   
+0x00000aa5b1540000 0x00000aa5b1580000 0x40000            0x0                rw-p   
+0x00000c9a15500000 0x00000c9a15540000 0x40000            0x0                rw-p   
+0x00000d65fe900000 0x00000d65fe93a000 0x3a000            0x0                rw-p   
+0x00000df9393c0000 0x00000df939400000 0x40000            0x0                rw-p   
+0x00000f6c4f9c0000 0x00000f6c4fa00000 0x40000            0x0                rw-p   
+0x000012edbc8c0000 0x000012edbc900000 0x40000            0x0                rw-p   
+0x000013b6fb640000 0x000013b6fb680000 0x40000            0x0                rw-p   
+0x00001450c1700000 0x00001450c1740000 0x40000            0x0                rw-p   
+0x0000156750000000 0x0000156750040000 0x40000            0x0                rw-p   
+0x000016802ab80000 0x000016802abc0000 0x40000            0x0                rw-p   
+0x000016a4dba00000 0x000016a4dba40000 0x40000            0x0                rw-p   
+0x0000172e42f00000 0x0000172e42f40000 0x40000            0x0                rw-p   
+0x0000173358dc0000 0x0000173358e00000 0x40000            0x0                rw-p   
+0x00001b255d600000 0x00001b255d640000 0x40000            0x0                rw-p   
+0x00001f87af475000 0x00001f87b0821000 0x13ac000          0x0                rwxp   
+0x00002249ac980000 0x00002249ac9c0000 0x40000            0x0                rw-p   
+0x0000233fd56c0000 0x0000233fd5700000 0x40000            0x0                rw-p   
+0x0000241a80380000 0x0000241a803c0000 0x40000            0x0                rw-p   
+0x0000253355080000 0x00002533550c0000 0x40000            0x0                rw-p   
+0x0000261713d40000 0x0000261713d80000 0x40000            0x0                rw-p   
+0x00002651f0040000 0x00002651f0080000 0x40000            0x0                rw-p   
+0x000026fa51d80000 0x000026fa51dc0000 0x40000            0x0                rw-p   
+0x00002861af340000 0x00002861af380000 0x40000            0x0                rw-p   
+0x000029067da80000 0x000029067dac0000 0x40000            0x0                rw-p   
+0x00002970c7c00000 0x00002970c7c40000 0x40000            0x0                rw-p   
+0x00002aac45200000 0x00002aac45240000 0x40000            0x0                rw-p   
+0x00002bb672880000 0x00002bb6728c0000 0x40000            0x0                rw-p   
+0x00002bfd2dec0000 0x00002bfd2df01000 0x41000            0x0                rw-p   
+0x00002d22750c0000 0x00002d2275100000 0x40000            0x0                rw-p   
+0x00002f9fbfc80000 0x00002f9fbfcf2000 0x72000            0x0                rw-p   
+0x000031b75b600000 0x000031b75b640000 0x40000            0x0                rw-p   
+0x0000335bd8a40000 0x0000335bd8a80000 0x40000            0x0                rw-p   
+0x000035b8e1dc0000 0x000035b8e1e00000 0x40000            0x0                rw-p   
+0x00003739b4080000 0x00003739b40c0000 0x40000            0x0                rw-p   
+0x00003782e8600000 0x00003782e8640000 0x40000            0x0                rw-p   
+0x000037b861e00000 0x000037b861e40000 0x40000            0x0                rw-p   
+0x000038b3ff0c0000 0x000038b3ff100000 0x40000            0x0                rw-p   
+0x000038cc25d00000 0x000038cc25d40000 0x40000            0x0                rw-p   
+0x00003adac9dc0000 0x00003adac9e00000 0x40000            0x0                rw-p   
+0x00003bd61c240000 0x00003bd61c261000 0x21000            0x0                rw-p   
+0x00003fbb92140000 0x00003fbb92180000 0x40000            0x0                rw-p   
+0x00003ff328380000 0x00003ff3283c0000 0x40000            0x0                rw-p   
+0x00007ffda4ebe000 0x00007ffda67fd000 0x193f000          0x0                rw-p   
+0x00007ffda67fd000 0x00007ffda8000000 0x1803000          0x0                rw-p   
+0x00007ffda8000000 0x00007ffdb0000000 0x8000000          0x0                rw-p   
+0x00007ffdb0000000 0x00007fffa8000000 0x1f8000000        0x0                ---p   
+0x00007fffa8000000 0x00007fffa808c000 0x8c000            0x0                rw-p   
+0x00007fffa808c000 0x00007fffac000000 0x3f74000          0x0                ---p   
+0x00007fffac000000 0x00007fffac08e000 0x8e000            0x0                rw-p   
+0x00007fffac08e000 0x00007fffb0000000 0x3f72000          0x0                ---p   
+0x00007fffb0000000 0x00007fffb00a2000 0xa2000            0x0                rw-p   
+0x00007fffb00a2000 0x00007fffb4000000 0x3f5e000          0x0                ---p   
+0x00007fffb4000000 0x00007fffb4081000 0x81000            0x0                rw-p   
+0x00007fffb4081000 0x00007fffb8000000 0x3f7f000          0x0                ---p   
+0x00007fffb8000000 0x00007fffd7dc0000 0x1fdc0000         0x0                rwxp   
+0x00007fffd7dc0000 0x00007fffd7fc7000 0x207000           0x0                r-xp   
+0x00007fffd7fc7000 0x00007fffd8000000 0x39000            0x0                rwxp   
+0x00007fffd8000000 0x00007fffd8020000 0x20000            0x0                rw-p   
+0x00007fffd8020000 0x00007fffe0000000 0x7fe0000          0x0                ---p   
+0x00007fffe0000000 0x00007fffe0010000 0x10000            0x0                r--p   
+0x00007fffe0010000 0x00007fffe0050000 0x40000            0x0                rw-p   
+0x00007fffe0050000 0x00007ffff0000000 0xffb0000          0x0                ---p   
+0x00007ffff0000000 0x00007ffff0021000 0x21000            0x0                rw-p   
+0x00007ffff0021000 0x00007ffff4000000 0x3fdf000          0x0                ---p   
+0x00007ffff45fa000 0x00007ffff7600000 0x3006000          0x0                rw-p   
+0x00007ffff7600000 0x00007ffff7624000 0x24000            0x0                r--p  /usr/lib/libc.so.6 
+0x00007ffff7624000 0x00007ffff77d1000 0x1ad000           0x24000            r-xp  /usr/lib/libc.so.6 
+0x00007ffff77d1000 0x00007ffff7849000 0x78000            0x1d1000           r--p  /usr/lib/libc.so.6 
+0x00007ffff7849000 0x00007ffff784d000 0x4000             0x248000           r--p  /usr/lib/libc.so.6 
+0x00007ffff784d000 0x00007ffff784f000 0x2000             0x24c000           rw-p  /usr/lib/libc.so.6 
+0x00007ffff784f000 0x00007ffff7857000 0x8000             0x0                rw-p   
+0x00007ffff7880000 0x00007ffff7a00000 0x180000           0x0                rw-p   
+0x00007ffff7a00000 0x00007ffff7a9a000 0x9a000            0x0                r--p  /usr/lib/libstdc++.so.6.0.35 
+0x00007ffff7a9a000 0x00007ffff7c77000 0x1dd000           0x9a000            r-xp  /usr/lib/libstdc++.so.6.0.35 
+0x00007ffff7c77000 0x00007ffff7d16000 0x9f000            0x277000           r--p  /usr/lib/libstdc++.so.6.0.35 
+0x00007ffff7d16000 0x00007ffff7d27000 0x11000            0x316000           r--p  /usr/lib/libstdc++.so.6.0.35 
+0x00007ffff7d27000 0x00007ffff7d28000 0x1000             0x327000           rw-p  /usr/lib/libstdc++.so.6.0.35 
+0x00007ffff7d28000 0x00007ffff7d2c000 0x4000             0x0                rw-p   
+0x00007ffff7d37000 0x00007ffff7d40000 0x9000             0x0                rw-p   
+0x00007ffff7d61000 0x00007ffff7d65000 0x4000             0x10000000         rw-s  anon_inode:[io_uring] 
+0x00007ffff7d65000 0x00007ffff7d68000 0x3000             0x0                rw-s  anon_inode:[io_uring] 
+0x00007ffff7d68000 0x00007ffff7d6c000 0x4000             0x0                rw-p   
+0x00007ffff7d6c000 0x00007ffff7de8000 0x7c000            0x0                ---p   
+0x00007ffff7de8000 0x00007ffff7dec000 0x4000             0x10000000         rw-s  anon_inode:[io_uring] 
+0x00007ffff7dec000 0x00007ffff7def000 0x3000             0x0                rw-s  anon_inode:[io_uring] 
+0x00007ffff7def000 0x00007ffff7df3000 0x4000             0x10000000         rw-s  anon_inode:[io_uring] 
+0x00007ffff7df3000 0x00007ffff7df6000 0x3000             0x0                rw-s  anon_inode:[io_uring] 
+0x00007ffff7df6000 0x00007ffff7e1c000 0x26000            0x0                rw-p   
+0x00007ffff7e1c000 0x00007ffff7e1d000 0x1000             0x0                r--p  /usr/lib/libpthread.so.0 
+0x00007ffff7e1d000 0x00007ffff7e1e000 0x1000             0x1000             r-xp  /usr/lib/libpthread.so.0 
+0x00007ffff7e1e000 0x00007ffff7e1f000 0x1000             0x2000             r--p  /usr/lib/libpthread.so.0 
+0x00007ffff7e1f000 0x00007ffff7e20000 0x1000             0x2000             r--p  /usr/lib/libpthread.so.0 
+0x00007ffff7e20000 0x00007ffff7e21000 0x1000             0x3000             rw-p  /usr/lib/libpthread.so.0 
+0x00007ffff7e21000 0x00007ffff7e25000 0x4000             0x0                r--p  /usr/lib/libgcc_s.so.1 
+0x00007ffff7e25000 0x00007ffff7e51000 0x2c000            0x4000             r-xp  /usr/lib/libgcc_s.so.1 
+0x00007ffff7e51000 0x00007ffff7e55000 0x4000             0x30000            r--p  /usr/lib/libgcc_s.so.1 
+0x00007ffff7e55000 0x00007ffff7e56000 0x1000             0x34000            r--p  /usr/lib/libgcc_s.so.1 
+0x00007ffff7e56000 0x00007ffff7e57000 0x1000             0x35000            rw-p  /usr/lib/libgcc_s.so.1 
+0x00007ffff7e57000 0x00007ffff7e67000 0x10000            0x0                r--p  /usr/lib/libm.so.6 
+0x00007ffff7e67000 0x00007ffff7efd000 0x96000            0x10000            r-xp  /usr/lib/libm.so.6 
+0x00007ffff7efd000 0x00007ffff7f5d000 0x60000            0xa6000            r--p  /usr/lib/libm.so.6 
+0x00007ffff7f5d000 0x00007ffff7f5e000 0x1000             0x105000           r--p  /usr/lib/libm.so.6 
+0x00007ffff7f5e000 0x00007ffff7f5f000 0x1000             0x106000           rw-p  /usr/lib/libm.so.6 
+0x00007ffff7f5f000 0x00007ffff7f60000 0x1000             0x0                r--p  /usr/lib/libdl.so.2 
+0x00007ffff7f60000 0x00007ffff7f61000 0x1000             0x1000             r-xp  /usr/lib/libdl.so.2 
+0x00007ffff7f61000 0x00007ffff7f62000 0x1000             0x2000             r--p  /usr/lib/libdl.so.2 
+0x00007ffff7f62000 0x00007ffff7f63000 0x1000             0x2000             r--p  /usr/lib/libdl.so.2 
+0x00007ffff7f63000 0x00007ffff7f64000 0x1000             0x3000             rw-p  /usr/lib/libdl.so.2 
+0x00007ffff7f64000 0x00007ffff7f66000 0x2000             0x0                r--p  /usr/lib/libatomic.so.1.2.0 
+0x00007ffff7f66000 0x00007ffff7f6a000 0x4000             0x2000             r-xp  /usr/lib/libatomic.so.1.2.0 
+0x00007ffff7f6a000 0x00007ffff7f6c000 0x2000             0x6000             r--p  /usr/lib/libatomic.so.1.2.0 
+0x00007ffff7f6c000 0x00007ffff7f6d000 0x1000             0x7000             r--p  /usr/lib/libatomic.so.1.2.0 
+0x00007ffff7f6d000 0x00007ffff7f6e000 0x1000             0x8000             rw-p  /usr/lib/libatomic.so.1.2.0 
+0x00007ffff7f6e000 0x00007ffff7f71000 0x3000             0x0                rw-p   
+0x00007ffff7f71000 0x00007ffff7fb1000 0x40000            0x0                r--p  /etc/ld.so.cache 
+0x00007ffff7fb1000 0x00007ffff7fb5000 0x4000             0x0                r--p  [vvar] 
+0x00007ffff7fb5000 0x00007ffff7fb7000 0x2000             0x0                r--p  [vvar_vclock] 
+0x00007ffff7fb7000 0x00007ffff7fb9000 0x2000             0x0                r-xp  [vdso] 
+0x00007ffff7fb9000 0x00007ffff7fba000 0x1000             0x0                r--p  /usr/lib/ld-linux-x86-64.so.2 
+0x00007ffff7fba000 0x00007ffff7feb000 0x31000            0x1000             r-xp  /usr/lib/ld-linux-x86-64.so.2 
+0x00007ffff7feb000 0x00007ffff7ffb000 0x10000            0x32000            r--p  /usr/lib/ld-linux-x86-64.so.2 
+0x00007ffff7ffb000 0x00007ffff7ffd000 0x2000             0x41000            r--p  /usr/lib/ld-linux-x86-64.so.2 
+0x00007ffff7ffd000 0x00007ffff7ffe000 0x1000             0x43000            rw-p  /usr/lib/ld-linux-x86-64.so.2 
+0x00007ffff7ffe000 0x00007ffff7fff000 0x1000             0x0                rw-p   
+0x00007ffffffde000 0x00007ffffffff000 0x21000            0x0                rw-p  [stack] 
+0xffffffffff600000 0xffffffffff601000 0x1000             0x0                --xp  [vsyscall] 

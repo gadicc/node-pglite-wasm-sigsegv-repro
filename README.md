@@ -114,6 +114,11 @@ The canary results show that neither IPC nor optimized WASM compilation is
 universally required. Concurrency is the stable trigger in the measured Node
 configurations.
 
+> **Update (2026-07-31):** "Concurrency is the stable trigger" is superseded.
+> A single process pinned to a defective core reproduces the crash with no
+> other load; concurrency only ensured scheduler exposure to the defective
+> cores. See "Update (2026-07-31): isolated to three physical cores" below.
+
 ## Post-report flag and version sweep
 
 After filing, the host (Linux x64, 24 cores, Node v25.2.1, V8
@@ -145,6 +150,10 @@ Two consequences:
   remaining shared paths are lazy Liftoff compilation and the WASM trap
   handling on the main thread, with cross-process machine load as the
   likely timing perturber.
+
+> **Update (2026-07-31):** the "likely timing perturber" framing is also
+> superseded — no cross-process load is required. See "Update (2026-07-31):
+> isolated to three physical cores" below.
 
 ## Root-cause investigation (2026-07-30): platform-level address corruption
 
@@ -220,6 +229,61 @@ Observed crashes are the subset where the corrupted address is unmapped; a
 corrupted store address landing on a mapped page would silently corrupt
 memory. Next steps are firmware updates and stock BIOS settings on the
 affected machine and, if the behavior persists, an erratum report to Intel.
+
+### Update (2026-07-31): isolated to three physical cores
+
+`taskset` isolation on the affected machine localized the defect to
+individual cores. CPUs 0-7 are P-cores; 8-23 are E-cores in four clusters
+of four sharing one L2 (sysfs cluster ids: 16 = cpus 8-11, 24 = cpus 12-15,
+64 = cpus 16-19, 72 = cpus 20-23).
+
+| CPU set | Topology | Result |
+| --- | --- | --- |
+| 0-7 | P-cores | clean: 16 and 8 children x 50 waves (1,200 child-runs) |
+| 8-11 | E-cluster 16 | SIGSEGV at wave 1 (4 children) |
+| 12-15 | E-cluster 24 | clean: 2 x (4 children x 50 waves) = 400 child-runs |
+| 16-19 | E-cluster 64 | SIGSEGV at wave 1 in both runs (3 + 3 of 8 child-runs) |
+| 20-23 | E-cluster 72 | SIGSEGV at wave 1 in both runs (1 + 2 of 8 child-runs) |
+
+Single-child pinning (one child per run, 50 waves per core) refined this to
+exactly one defective core per affected cluster:
+
+| CPU | Result |
+| --- | --- |
+| 8, 9, 10, 16, 17, 18, 20, 22, 23 | 50/50 waves clean, each |
+| 11 | SIGSEGV at waves 7 and 14 |
+| 19 | SIGSEGV at waves 2, 10, and 3 across three runs |
+| 21 | SIGSEGV at wave 22 (single observation) |
+
+The defective cores are 11, 19, and 21: one in each of three E-core
+clusters, none in cluster 24, none on a P-core (the P-core runs above gave
+every P-core full thread exposure across 1,200 clean child-runs). The
+defect is per-core, not cluster-shared logic such as the common L2.
+
+Running one child under the same gdb harness pinned to core 19
+(`capture-fault.sh`; transcripts `captures/cpu19-run{1,5,6}.txt`) captured
+three faults in six runs. Each is identical to the original capture above:
+`addl $1, 0x1c0(%r13)` with `r13=0x6720080`, intended address `0x6720240`
+(inside `[heap]`, rw), `si_addr=0x40006720240` = intended + 2^42, with clean
+self-consistent registers. The faulting CPU is core 19 by construction:
+taskset confined every thread of the process to it.
+
+Consequences:
+
+- Concurrency is not required, superseding "concurrency is the stable
+  trigger" and "cross-process machine load as the likely timing perturber"
+  above. A single process pinned to a defective core faults while its V8
+  background threads sit idle. The earlier concurrency dependence, and the
+  unpinned rate of one crash per 40-80 child-runs, were scheduler exposure
+  to three defective cores among 24.
+- "Good core" verdicts are provisional at low rates: 50 clean single-child
+  runs exclude per-run crash rates only above roughly 5%, and core 21's
+  observed rate (1 in 22) sits at that boundary. Cluster 24's 400 fully
+  exposed child-runs remain conclusive even against a weak-core rate.
+- The minimal trigger no longer needs the wave harness:
+  `while taskset -c 19 node child.mjs; do :; done` faults within a few
+  runs in a single ~1.2 GiB process. This is a cheap oracle for firmware
+  A/B tests and, if it comes to it, an Intel erratum report.
 
 ## Native crash evidence
 
