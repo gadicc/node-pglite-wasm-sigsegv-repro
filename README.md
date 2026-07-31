@@ -229,12 +229,13 @@ exactly the MAXPHYADDR boundary. A controlled cold-boot test with TME disabled
 restored 46-bit physical addressing, but CPU 19 still failed 9/20 runs and a
 pristine gdb capture retained the exact `intended_address + 2^42` signature.
 TME/MKTME is therefore not required for the failure, and the earlier
-MAXPHYADDR correspondence was incidental. Node+PGlite is an unusually
-effective trigger but not the cause. Observed crashes are the subset where
-the corrupted address is unmapped; a corrupted store address landing on a
-mapped page would silently corrupt memory. Next steps are firmware updates
-and stock BIOS settings on the affected machine and, if the behavior
-persists, an erratum report to Intel.
+MAXPHYADDR correspondence was incidental. Disabling Intel System Agent
+Geyserville (SaGV) also had no effect: CPU 19 still failed 9/20 runs.
+Node+PGlite is an unusually effective trigger but not the cause. Observed
+crashes are the subset where the corrupted address is unmapped; a corrupted
+store address landing on a mapped page would silently corrupt memory. Next
+steps are firmware updates and stock BIOS settings on the affected machine
+and, if the behavior persists, an erratum report to Intel.
 
 ### Update (2026-07-31): isolated to three physical cores
 
@@ -299,18 +300,23 @@ session) shows the defect tracks the clock:
 | Baseline | 4.7 GHz | ~4.7 GHz boost | 6/20 runs SIGSEGV |
 | Capped | 800 MHz | ~1.3-2.8 GHz observed | 0/20 runs SIGSEGV |
 | Restored | 4.7 GHz | ~4.7 GHz boost | 9/20 runs SIGSEGV |
+| Turbo disabled (`intel_pstate/no_turbo=1`) | 2.1 GHz | non-turbo | 0/20 runs SIGSEGV |
 
 Against the combined stock rate of 15/40, the binomial probability of the
-capped 0/20 is ~8e-5. Two caveats: the 800 MHz policy cap did not fully
-clamp (`scaling_cur_freq` still sampled 1.3-2.8 GHz under load, a
-per-cluster clock-domain or intel_pstate quirk), so the precise claim is
-"suppressed at roughly half boost"; and the stock per-run rate itself
-drifts between batches (30% then 45%). The suppression is nonetheless
-decisive: this is a frequency/voltage margin, not hard logic. The
-defective cores fail at high boost and pass when downclocked, consistent
-with marginal voltage at boost - firmware/BIOS voltage configuration or
-out-of-spec silicon. That makes the stock-BIOS / "Intel Default Settings"
-retest the highest-value next step, ahead of any erratum report.
+capped 0/20 is ~8e-5. The independent no-turbo control also passed 20/20;
+with turbo disabled, sysfs reported a 2.1 GHz ceiling for CPU 19. Two
+caveats: the 800 MHz policy cap did not fully clamp (`scaling_cur_freq`
+still sampled 1.3-2.8 GHz under load, an intel_pstate/HWP behavior that
+prevents assigning an exact threshold from that test), and the stock
+per-run rate itself drifts between batches (30% then 45%). The two clean
+lower-frequency controls are nonetheless decisive: this is a
+frequency/voltage margin, not hard logic. The defective cores fail at high
+boost and pass when downclocked, consistent with marginal voltage at boost
+- firmware/BIOS voltage configuration, platform power delivery, or
+out-of-spec silicon. Disabling SaGV did not change the result (9/20), so
+system-agent voltage/frequency scaling is not required. The highest-value
+remaining controls are direct OEM power with no dock, followed by a full
+stock-BIOS retest, ahead of any erratum report.
 
 ## Native crash evidence
 
