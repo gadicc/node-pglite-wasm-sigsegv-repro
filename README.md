@@ -285,6 +285,27 @@ Consequences:
   runs in a single ~1.2 GiB process. This is a cheap oracle for firmware
   A/B tests and, if it comes to it, an Intel erratum report.
 
+A frequency A/B/A test on core 19 (single-child runs, back-to-back in one
+session) shows the defect tracks the clock:
+
+| Condition | scaling_max_freq | Effective clock under load | Result |
+| --- | --- | --- | --- |
+| Baseline | 4.7 GHz | ~4.7 GHz boost | 6/20 runs SIGSEGV |
+| Capped | 800 MHz | ~1.3-2.8 GHz observed | 0/20 runs SIGSEGV |
+| Restored | 4.7 GHz | ~4.7 GHz boost | 9/20 runs SIGSEGV |
+
+Against the combined stock rate of 15/40, the binomial probability of the
+capped 0/20 is ~8e-5. Two caveats: the 800 MHz policy cap did not fully
+clamp (`scaling_cur_freq` still sampled 1.3-2.8 GHz under load, a
+per-cluster clock-domain or intel_pstate quirk), so the precise claim is
+"suppressed at roughly half boost"; and the stock per-run rate itself
+drifts between batches (30% then 45%). The suppression is nonetheless
+decisive: this is a frequency/voltage margin, not hard logic. The
+defective cores fail at high boost and pass when downclocked, consistent
+with marginal voltage at boost - firmware/BIOS voltage configuration or
+out-of-spec silicon. That makes the stock-BIOS / "Intel Default Settings"
+retest the highest-value next step, ahead of any erratum report.
+
 ## Native crash evidence
 
 A reproduction was run under `env -i` with only `HOME`, `PATH`, `LANG`, and
