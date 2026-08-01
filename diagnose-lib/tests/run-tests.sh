@@ -173,6 +173,24 @@ printf 'existing evidence\n' > "$TMP/nonempty-output/results.json"
 nonempty_output_rc=$?
 check_eq "new run rejects a nonempty output directory" "1" "$([[ $nonempty_output_rc -ne 0 ]] && echo 1 || echo 0)"
 
+echo "== effective resume configuration =="
+printf 'MODE=quick\nINDIVIDUAL_RUNS=20\nCOMPLETED_PHASES=baseline\n' > "$RB/results/meta.env"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  META_FILE="$RB/results/meta.env"
+  MODE=quick
+  BASELINE_CHILDREN=8
+  BASELINE_WAVES=10
+  GROUP_WAVES=10
+  INDIVIDUAL_RUNS=50
+  GDB_MAX_RUNS=6
+  SKIP_GDB=0
+  persist_effective_config
+)
+check_eq "resume persists overridden individual run count" "50" "$(sed -n 's/^INDIVIDUAL_RUNS=//p' "$RB/results/meta.env")"
+check_eq "persisting overrides retains completion metadata" "baseline" "$(sed -n 's/^COMPLETED_PHASES=//p' "$RB/results/meta.env")"
+
 echo "== node unit tests (stats, parsers) =="
 if (cd "$LIB" && node --test 'tests/*.test.mjs') > "$TMP/node-tests.log" 2>&1; then
   ok "node --test stats+parsers"

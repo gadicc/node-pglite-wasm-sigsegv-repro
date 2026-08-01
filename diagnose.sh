@@ -230,6 +230,16 @@ sync_meta_completed() {
   meta_set COMPLETED_PHASES "$list"
 }
 
+persist_effective_config() {
+  meta_set MODE "$MODE"
+  meta_set BASELINE_CHILDREN "$BASELINE_CHILDREN"
+  meta_set BASELINE_WAVES "$BASELINE_WAVES"
+  meta_set GROUP_WAVES "$GROUP_WAVES"
+  meta_set INDIVIDUAL_RUNS "$INDIVIDUAL_RUNS"
+  meta_set GDB_MAX_RUNS "$GDB_MAX_RUNS"
+  meta_set SKIP_GDB "$SKIP_GDB"
+}
+
 # Move a phase's data aside (never delete) and clear its done marker so the
 # phase re-runs from scratch on this resume. Used by --redo when a phase
 # should be repeated in a single contiguous session rather than topped up.
@@ -938,6 +948,9 @@ main() {
       printf 'INTERRUPTED=0\n'
     } > "$META_FILE"
   fi
+  # Stored configuration seeds resume defaults, but explicit CLI overrides
+  # describe the run that is about to execute and must be reflected in JSON.
+  persist_effective_config
 
   if [[ -n "$REDO_PHASES" ]]; then
     local -a redo_list=()
