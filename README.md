@@ -46,6 +46,140 @@ The sequential control runs the same workload one child at a time:
 npm run repro:sequential
 ```
 
+## Diagnostic runner (`diagnose.sh`)
+
+`diagnose.sh` automates the full investigation this repository documents:
+environment collection, baseline reproduction, CPU-group isolation,
+per-CPU isolation, GDB fault-signature capture, and a statistically honest
+Markdown report. It is meant to take a machine "from zero" to a shareable
+evidence bundle with one command, and every conclusion in the generated
+report is derived from that run's own measurements — nothing is assumed
+from prior results.
+
+> [!CAUTION]
+> The workload is memory-intensive (~1.2 GiB per child process; the default
+> baseline needs ~20 GiB), intentionally triggers SIGSEGV crashes, and a
+> full run can take one to several hours. System core dumps are disabled
+> for the test processes; GDB captures are collected separately.
+
+### Dependencies
+
+Required: `bash`, `node` (with `npm ci` done here), `taskset`, `awk`, and
+standard coreutils. Optional (recorded in the report when missing, never
+fatal): `gdb` (phase 6), `turbostat` (preferred load-frequency sampling),
+`lscpu`, `journalctl`/`systemctl`, `intel-undervolt`, and Dell `cctk`.
+The runner never requires root and never elevates privileges itself.
+
+Preflight collects distribution/kernel/Node/V8 versions, CPU model,
+stepping, microcode, address sizes, topology (P/E cores, clusters, shared
+L2, cpufreq policies), cpufreq state, `intel_pstate/no_turbo`, power
+source, and relevant kernel warnings (MCE/EDAC/thermal/TME/microcode) from
+unprivileged sources. Service tags, serial numbers, UUIDs, MAC addresses,
+and BIOS passwords are never collected.
+
+### Privileged companion scripts (manual, reviewable)
+
+Everything that needs root is kept out of `diagnose.sh` in two small
+standalone scripts, meant to be read before being run:
+
+```sh
+sudo ./root-checks.sh diagnostics/<bundle>       # read-only evidence
+sudo ./frequency-ab.sh 19 20 diagnostics/<bundle> # the A/B/A experiment
+./diagnose.sh --resume diagnostics/<bundle> --yes # regenerate the report
+```
+
+- `root-checks.sh` performs only *reads*: a `dmesg` excerpt
+  (MCE/EDAC/thermal/TME/microcode), `intel-undervolt read` plus its
+  service state, a 5-second `turbostat` sample, and an explicit allowlist
+  of read-only `cctk` BIOS settings (`--TurboMode`, `--IntelTME`,
+  `--IntelSagv`, `--Speedstep`, `--CStatesCtrl`, `--AdaptiveCStates`,
+  `--ThermalManagement`, `--SpeedShift`). It never writes BIOS settings,
+  never takes a password, and never produces a full `cctk` export.
+- `frequency-ab.sh` is the only script that changes anything; see below.
+
+### Frequency A/B/A (`frequency-ab.sh`)
+
+The turbo A/B/A experiment temporarily changes a runtime setting, so it is
+deliberately a separate manual step run as root. It saves the original
+`intel_pstate/no_turbo` value first, then runs single-child tests on the
+CPU you give it (use the highest-failure CPU from phase 4) as **A**
+(original state) → **B** (turbo disabled) → **A** (original state
+restored). Every setting is restored on normal exit, failure, SIGINT, or
+SIGTERM, and the restore is verified and recorded in the bundle. Workload
+legs run as the invoking user via `runuser` when possible. Requested *and*
+measured frequencies (turbostat preferred, `scaling_cur_freq` fallback)
+are reported per leg; never trust `scaling_max_freq` alone on
+intel_pstate/HWP. A separate, clearly labelled per-CPU cap experiment is
+available via `--cap KHZ`. BIOS settings are never changed.
+
+### Quick and full examples
+
+```sh
+npm ci
+./diagnose.sh --quick --yes      # ~10 minutes: small baseline, 10 group
+                                 # waves, 5 runs per CPU, 6 gdb runs
+./diagnose.sh --yes              # default: 16x50 baseline, 50 group waves,
+                                 # 50 runs per CPU, 12 gdb runs
+./diagnose.sh --full --yes       # hours: 16x100 baseline, 100 group waves,
+                                 # 100 runs on every online CPU, 24 gdb runs
+./diagnose.sh --dry-run          # print the resolved plan and exit
+```
+
+`--yes` accepts the safety warning (required when not interactive).
+Useful overrides: `--individual-runs N`, `--group-waves N`,
+`--gdb-max-runs N`, `--skip-gdb`, `--out-dir DIR`, `--cpu N`.
+
+### Output layout and resumability
+
+Everything lands in a timestamped bundle, `diagnostics/<UTC timestamp>/`
+(override with `--out-dir`):
+
+- `report.md` — the human report (see below)
+- `results.json` — machine-readable results
+- `commands.log`, `run.log` — exact command log and progress log
+- `env/` — sanitized system-information files (`env/root/` if
+  `root-checks.sh` was run)
+- `logs/` — raw stdout/stderr per phase
+- `freq/` — frequency samples per phase
+- `gdb/` — capture transcripts
+- `manifest.txt` — file names and SHA-256 checksums
+
+Phases mark completion under `state/`; an interrupted run (SIGINT/SIGTERM
+writes a partial report first) can be resumed without discarding finished
+work — including partially completed per-CPU tables:
+
+```sh
+./diagnose.sh --resume diagnostics/2026-08-01T084335Z --yes
+```
+
+### Interpreting the report
+
+Rates are reported with Wilson 95% confidence intervals; groups/CPUs are
+compared with Fisher's exact test; the frequency legs get an exact
+comparison plus, separately labelled, the binomial probability of the
+clean leg *under an assumed fixed baseline rate*. Wave failures are kept
+distinct from individual child-process failures. The conclusions section
+states only what this run supports: whether the problem reproduced,
+whether it localized to particular CPUs or topology groups, whether lower
+frequency suppressed it, whether the GDB fault matches the documented
+`intended + 2^42` signature, which hypotheses the collected configuration
+rules out, and what remains uncertain.
+
+**Clean-run statistics are one-sided.** Zero failures in `n` runs never
+prove a zero rate; the report shows the exact 95% upper bound
+`1 - 0.05^(1/n)` (approximately `3/n`). A CPU with 50 clean runs is only
+cleared of per-run rates above ~5.8%, and observed rates can drift between
+batches, so treat "clean" verdicts as exclusions of high rates, not proof
+of correct hardware.
+
+### Testing the tooling
+
+`bash diagnose-lib/tests/run-tests.sh` runs the offline test suite:
+CPU-list parsing, settings-restore-on-signal simulation, argument and
+exit-code checks, statistics and parser unit tests with fixtures, and an
+end-to-end collect+report pass on a synthetic bundle. It does not run the
+crash workload.
+
 ## Docker
 
 The Dockerfile pins the tested official `node:26-bookworm` image digest and

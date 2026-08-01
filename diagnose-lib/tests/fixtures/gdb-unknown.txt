@@ -1,0 +1,38 @@
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/libthread_db.so.1".
+
+Thread 1 "MainThread" received signal SIGSEGV, Segmentation fault.
+0x00007fffd7dcfc74 in ?? ()
+#0  0x00007fffd7dcfc74 in ?? ()
+#1  0x000035c773d40b49 in ?? ()
+rax            0x1                 1
+rbx            0x1000000          16777216
+rcx            0x0                 0
+rdx            0x1743af0           24394480
+rsi            0x3fbec3585cd9      70088553684185
+rdi            0x7fffffff8f38      140737488326456
+rbp            0x7fffffff8f60      0x7fffffff8f60
+rsp            0x7fffffff8f30      0x7fffffff8f30
+r8             0x196fa35853f1      27967272539121
+r9             0x196fa359b611      27967272629777
+r10            0x35c773d40011      59130758037521
+r11            0x3fbec35a4ce9      70088553811177
+r12            0x6792450           108602448
+r13            0x6720080           108134528
+r14            0x1a93              6803
+r15            0x67943e0           108610528
+rip            0x7fffd7dcfc74      0x7fffd7dcfc74
+eflags         0x10206             [ PF IF RF ]
+=> 0x7fffd7dcfc74:	mov    %rax,0x10(%rbx)
+   0x7fffd7dcfc7c:	call   *%rdx
+SI_ADDR=0x1000010
+  Id   Target Id                                             Frame
+* 1    Thread 0x7ffff7e192c0 (LWP 100) "MainThread"      0x00007fffd7dcfc74 in ?? ()
+  2    Thread 0x7ffff75ff6c0 (LWP 101) "V8Worker"        0x00007ffff76b5882 in ?? () from /usr/lib/libc.so.6
+process 100
+Mapped address spaces:
+
+Start Addr         End Addr           Size               Offset             Perms File
+0x0000000000400000 0x000000000078f000 0x38f000           0x0                r--p  /usr/bin/node
+0x0000000006658000 0x0000000007129000 0xad1000           0x0                rw-p  [heap]
+0x00007ffffffde000 0x00007ffffffff000 0x21000            0x0                rw-p  [stack]

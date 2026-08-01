@@ -1,0 +1,4 @@
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/libthread_db.so.1".
+[New Thread 0x7ffff75ff6c0 (LWP 2689860)]
+[Inferior 1 (process 2689857) exited normally]
