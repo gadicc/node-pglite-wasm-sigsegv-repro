@@ -638,6 +638,30 @@ repro_result_is_complete() {
 }
 
 # ------------------------------------------------------------------
+# Sanitization helpers. The bundle is meant to be shareable, so identifying
+# values are redacted before they reach the env/ files.
+
+# Replace UUID-shaped values (root=UUID=..., rd.luks.uuid=..., ...) and
+# PARTUUID= values with a fixed placeholder. Detection tokens such as
+# tme=off do not match these patterns and must survive untouched.
+diag_redact_cmdline() {
+  sed -E \
+    -e 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/<redacted>/g' \
+    -e 's/(PARTUUID=)[^ ]+/\1<redacted>/g'
+}
+
+# Substitute a leading $HOME prefix so paths under the user's home directory
+# do not leak the account name (e.g. version-manager node installs).
+diag_redact_home_prefix() {
+  local path="$1"
+  if [[ -n "${HOME:-}" && "$path" == "$HOME/"* ]]; then
+    printf '~/%s\n' "${path#"$HOME"/}"
+  else
+    printf '%s\n' "$path"
+  fi
+}
+
+# ------------------------------------------------------------------
 phase_preflight() {
   local env_dir="$OUT_DIR/env"
   mkdir -p "$env_dir"
@@ -648,13 +672,15 @@ phase_preflight() {
   } > "$env_dir/date.txt"
 
   grep -h . /etc/os-release > "$env_dir/os-release.txt" 2> /dev/null || true
-  uname -a > "$env_dir/uname.txt"
-  diag_log_cmd uname -a
+  # Kernel identity without the nodename field (the hostname identifies
+  # the machine and is deliberately not collected).
+  uname -srmv > "$env_dir/uname.txt"
+  diag_log_cmd uname -srmv
 
   {
     printf 'node=%s\n' "$(node --version 2>&1)"
     printf 'v8=%s\n' "$(node -p 'process.versions.v8' 2>&1)"
-    printf 'node_path=%s\n' "$(command -v node)"
+    printf 'node_path=%s\n' "$(diag_redact_home_prefix "$(command -v node)")"
     printf 'pglite=%s\n' "$(node -e 'console.log(JSON.parse(require("fs").readFileSync("node_modules/@electric-sql/pglite/package.json","utf8")).version)' 2>&1 || echo unknown)"
   } > "$env_dir/node.txt"
 
@@ -681,7 +707,10 @@ phase_preflight() {
     fi
   done
 
-  diag_run cat /proc/cmdline > "$env_dir/cmdline.txt"
+  # Kernel command line, redacted: it commonly carries root=/resume= UUIDs,
+  # rd.luks.uuid= LUKS UUIDs and PARTUUID= values. The tme=off detection
+  # below reads tokens this redaction does not touch.
+  diag_run cat /proc/cmdline | diag_redact_cmdline > "$env_dir/cmdline.txt"
   diag_run cat /sys/devices/system/cpu/online > "$env_dir/online.txt" 2> /dev/null || true
 
   # Per-CPU topology table.

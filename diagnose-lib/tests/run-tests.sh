@@ -582,6 +582,31 @@ check_eq "completed individual override is accepted with redo" "0" "$?"
 completed_gdb_override_rc=$?
 check_eq "completed gdb evidence rejects changed attempt count without redo" "1" "$([[ $completed_gdb_override_rc -ne 0 ]] && echo 1 || echo 0)"
 
+echo "== environment redaction =="
+fake_cmdline='BOOT_IMAGE=/vmlinuz-linux root=UUID=550e8400-e29b-41d4-a716-446655440000 rd.luks.uuid=luks-550e8400-e29b-41d4-a716-446655440000 root=PARTUUID=1234abcd-01 tme=off quiet'
+redacted_cmdline="$(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  printf '%s\n' "$fake_cmdline" | diag_redact_cmdline
+)"
+check_eq "cmdline root UUID is redacted" "0" "$([[ "$redacted_cmdline" == *550e8400-e29b-41d4-a716-446655440000* ]] && echo 1 || echo 0)"
+check_eq "cmdline PARTUUID is redacted" "0" "$([[ "$redacted_cmdline" == *1234abcd-01* ]] && echo 1 || echo 0)"
+check_eq "tme=off survives cmdline redaction" "1" "$([[ "$redacted_cmdline" == *'tme=off'* ]] && echo 1 || echo 0)"
+printf '%s\n' "$redacted_cmdline" | grep -qiE '(^| )tme=off( |$)'
+check_eq "tme=off detection still matches the redacted cmdline" "0" "$?"
+redacted_node_path="$(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  diag_redact_home_prefix "$HOME/.nvm/versions/node/v25.2.1/bin/node"
+)"
+check_eq "node_path under \$HOME is redacted" "~/.nvm/versions/node/v25.2.1/bin/node" "$redacted_node_path"
+system_node_path="$(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  diag_redact_home_prefix /usr/bin/node
+)"
+check_eq "node_path outside \$HOME is unchanged" "/usr/bin/node" "$system_node_path"
+
 echo "== node unit tests (stats, parsers) =="
 if (cd "$LIB" && node --test 'tests/*.test.mjs') > "$TMP/node-tests.log" 2>&1; then
   ok "node --test stats+parsers"
