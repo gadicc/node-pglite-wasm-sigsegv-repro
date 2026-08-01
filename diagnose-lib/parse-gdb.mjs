@@ -155,16 +155,17 @@ export function parseGdbCapture(text) {
   }
   out.classification = "manual";
 
-  // Locate si_addr relative to mappings.
+  // Locate si_addr relative to mappings. No mapping rows means "unknown"
+  // (null), which is distinct from "not among the parsed mappings" (false).
+  const hasMappings = out.mappings.length > 0;
   const findMapping = (addrBig) =>
     out.mappings.find(
       (mp) => BigInt(mp.start) <= addrBig && addrBig < BigInt(mp.end),
     );
 
-  if (out.siAddr !== null) {
+  if (out.siAddr !== null && hasMappings) {
     const si = BigInt(out.siAddr);
-    const siMap = findMapping(si);
-    out.siAddrMapped = Boolean(siMap);
+    out.siAddrMapped = Boolean(findMapping(si));
   }
 
   // Intended address for the exact known instructions only.
@@ -180,10 +181,12 @@ export function parseGdbCapture(text) {
       const intended = BigInt(baseHex) + known.displacement;
       out.intendedAddr = `0x${intended.toString(16)}`;
       const intendedMap = findMapping(intended);
-      out.intendedMapped = Boolean(intendedMap);
-      out.intendedWritable = intendedMap
-        ? intendedMap.perms.includes("w")
-        : false;
+      if (hasMappings) {
+        out.intendedMapped = Boolean(intendedMap);
+        out.intendedWritable = intendedMap
+          ? intendedMap.perms.includes("w")
+          : false;
+      }
       if (intendedMap) out.intendedMappingFile = intendedMap.file;
 
       if (out.siAddr !== null) {
@@ -196,8 +199,24 @@ export function parseGdbCapture(text) {
           if ((xor >> bit) & 1n) out.diffBits.push(Number(bit));
         }
         if (diff === BIT42 && out.diffBits.length === 1 && out.diffBits[0] === 42) {
+          // matchesKnownSignature is the pure arithmetic flag. The
+          // "known-signature" classification additionally requires mapping
+          // evidence that the intended address was a valid (mapped and
+          // writable) target; arithmetic alone is not enough.
           out.matchesKnownSignature = true;
-          out.classification = "known-signature";
+          if (out.intendedMapped === true && out.intendedWritable === true) {
+            out.classification = "known-signature";
+          } else {
+            out.classification = "bit-flip-unverified";
+            const reason = !hasMappings
+              ? "no mapping data in transcript; intended address validity unknown"
+              : out.intendedMapped === false
+                ? "intended address not found in process mappings"
+                : "intended mapping is not writable";
+            out.notes.push(
+              `si_addr matches the +2^42 single-bit-42 arithmetic, but the intended address is not verified as valid: ${reason}`,
+            );
+          }
         } else {
           out.notes.push(
             `si_addr differs from intended address by ${out.addrDiffHex} (bits ${out.diffBits.join(",")}), not the documented +2^42 signature`,

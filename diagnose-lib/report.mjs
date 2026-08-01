@@ -387,14 +387,33 @@ function renderConclusions(r) {
 
   // 4. GDB signature
   if (r.gdb && !r.gdb.skipped && r.gdb.captures.length > 0) {
+    // Only "known-signature" captures are verified: the +2^42 arithmetic
+    // matched AND the intended address was evidenced as mapped+writable.
     const known = r.gdb.captures.filter((c) => c.classification === "known-signature");
-    const manual = r.gdb.captures.filter((c) => c.classification !== "known-signature");
+    const unverified = r.gdb.captures.filter((c) => c.classification === "bit-flip-unverified");
+    const manual = r.gdb.captures.filter(
+      (c) => c.classification !== "known-signature" && c.classification !== "bit-flip-unverified",
+    );
     if (known.length === r.gdb.captures.length) {
       C.push(`- **Fault signature matches the documented pattern**: ${known.length} capture(s), each an intended valid address reported by the kernel as intended + 2^42 (single differing bit 42).`);
-    } else if (known.length > 0) {
-      C.push(`- Fault signature: ${known.length} capture(s) match the documented +2^42 pattern, but ${manual.length} capture(s) need manual classification (see phase 6).`);
     } else {
-      C.push(`- **Fault signature does NOT match** the documented +2^42 pattern; ${manual.length} capture(s) preserved for manual classification. Do not assume the previously reported root cause.`);
+      const parts = [];
+      if (known.length > 0) {
+        parts.push(`${known.length} capture(s) match the documented pattern: an intended valid (mapped and writable) address reported by the kernel as intended + 2^42`);
+      }
+      if (unverified.length > 0) {
+        parts.push(`${unverified.length} capture(s) match the +2^42 arithmetic but their intended addresses could not be verified as mapped and writable (see phase 6), so they are NOT confirmed signature matches`);
+      }
+      if (manual.length > 0) {
+        parts.push(`${manual.length} capture(s) need manual classification (see phase 6)`);
+      }
+      if (known.length > 0) {
+        C.push(`- Fault signature: ${parts.join("; ")}.`);
+      } else if (unverified.length > 0) {
+        C.push(`- **Fault signature NOT confirmed**: ${parts.join("; ")}. Matching bit-flip arithmetic without address-validity evidence is not the documented signature; do not assume the previously reported root cause.`);
+      } else {
+        C.push(`- **Fault signature does NOT match** the documented +2^42 pattern; ${manual.length} capture(s) preserved for manual classification. Do not assume the previously reported root cause.`);
+      }
     }
   } else if (r.gdb && !r.gdb.skipped) {
     C.push("- GDB phase ran but captured no fault within the run limit.");
