@@ -158,10 +158,36 @@ load_stored_config() {
 }
 
 parse_args() {
+  local -a argv=("$@")
+  local mode_count=0
+  # Resolve the preset first so explicit numeric overrides have the same
+  # precedence regardless of where the mode flag appears.
   while (($#)); do
     case "$1" in
-      --quick) MODE="quick"; apply_mode_preset; shift ;;
-      --full) MODE="full"; apply_mode_preset; shift ;;
+      --quick)
+        MODE="quick"
+        mode_count=$((mode_count + 1))
+        shift
+        ;;
+      --full)
+        MODE="full"
+        mode_count=$((mode_count + 1))
+        shift
+        ;;
+      --resume | --out-dir | --redo | --individual-runs | --group-waves | --gdb-max-runs | --cpu)
+        (($# >= 2)) || diag_die "$1 needs a value"
+        shift 2
+        ;;
+      *) shift ;;
+    esac
+  done
+  ((mode_count <= 1)) || diag_die "pick at most one mode (--quick or --full)"
+  ((mode_count == 0)) || apply_mode_preset
+
+  set -- "${argv[@]}"
+  while (($#)); do
+    case "$1" in
+      --quick | --full) shift ;;
       --resume) RESUME_DIR="${2:?}"; shift 2 ;;
       --out-dir) OUT_DIR="${2:?}"; OUT_DIR_EXPLICIT=1; shift 2 ;;
       --skip-gdb) SKIP_GDB=1; shift ;;
@@ -190,8 +216,8 @@ validate_config() {
   diag_require_uint "baseline waves" "$BASELINE_WAVES"
   [[ "$SKIP_GDB" == "0" || "$SKIP_GDB" == "1" ]] ||
     diag_die "stored SKIP_GDB must be 0 or 1, got '$SKIP_GDB'"
-  ((INDIVIDUAL_RUNS >= 1 && GROUP_WAVES >= 1 && BASELINE_CHILDREN >= 1 && BASELINE_WAVES >= 1)) ||
-    diag_die "runs/waves/children must all be >= 1"
+  ((INDIVIDUAL_RUNS >= 1 && GROUP_WAVES >= 1 && GDB_MAX_RUNS >= 1 && BASELINE_CHILDREN >= 1 && BASELINE_WAVES >= 1)) ||
+    diag_die "runs, waves, children, and gdb attempts must all be >= 1"
   if [[ -n "$WORST_CPU_OVERRIDE" ]]; then
     diag_require_uint "--cpu" "$WORST_CPU_OVERRIDE"
   fi

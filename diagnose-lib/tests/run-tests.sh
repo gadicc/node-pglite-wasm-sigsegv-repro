@@ -394,6 +394,16 @@ check_eq "new run rejects a nonempty output directory" "1" "$([[ $nonempty_outpu
 relative_out_plan="$(cd "$TMP" && "$REPO_ROOT/diagnose.sh" --out-dir relative-output --dry-run --yes 2>&1)"
 check_eq "relative output directory is resolved from caller cwd" "1" "$([[ "$relative_out_plan" == *"out dir            $TMP/relative-output"* ]] && echo 1 || echo 0)"
 
+quick_override_before="$($REPO_ROOT/diagnose.sh --individual-runs 7 --quick --dry-run --yes 2>&1)"
+quick_override_after="$($REPO_ROOT/diagnose.sh --quick --individual-runs 7 --dry-run --yes 2>&1)"
+check_eq "mode flag order does not override explicit run count" "1" "$([[ "$quick_override_before" == *"individual runs    7 per CPU"* && "$quick_override_after" == *"individual runs    7 per CPU"* ]] && echo 1 || echo 0)"
+"$REPO_ROOT/diagnose.sh" --quick --full --dry-run --yes > /dev/null 2>&1
+mode_conflict_rc=$?
+check_eq "conflicting mode flags are rejected" "1" "$([[ $mode_conflict_rc -ne 0 ]] && echo 1 || echo 0)"
+"$REPO_ROOT/diagnose.sh" --gdb-max-runs 0 --dry-run --yes > /dev/null 2>&1
+zero_gdb_rc=$?
+check_eq "zero gdb attempts are rejected" "1" "$([[ $zero_gdb_rc -ne 0 ]] && echo 1 || echo 0)"
+
 echo "== effective resume configuration =="
 printf 'MODE=quick\nINDIVIDUAL_RUNS=20\nCOMPLETED_PHASES=baseline\n' > "$RB/results/meta.env"
 (
