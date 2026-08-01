@@ -274,6 +274,26 @@ grep -q '^+ original command$' "$COMMAND_LOG" &&
   grep -q '^# resumed ' "$COMMAND_LOG" && command_log_ok=1
 check_eq "resume preserves command history" "1" "$command_log_ok"
 
+END_META="$TMP/end-meta.env"
+printf 'END_EPOCH=123\nEND_ISO=old\n' > "$END_META"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  META_FILE="$END_META"
+  SESSION_DID_WORK=0
+  persist_session_end
+)
+check_eq "report-only resume preserves end time" "123" "$(sed -n 's/^END_EPOCH=//p' "$END_META")"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  META_FILE="$END_META"
+  SESSION_DID_WORK=1
+  persist_session_end
+)
+end_after_work="$(sed -n 's/^END_EPOCH=//p' "$END_META")"
+check_eq "resume with phase work updates end time" "1" "$([[ "$end_after_work" =~ ^[0-9]+$ && "$end_after_work" != 123 ]] && echo 1 || echo 0)"
+
 echo "== resumed metadata validation =="
 INJECTION_SENTINEL="$TMP/arithmetic-injection-ran"
 (

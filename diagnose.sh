@@ -47,6 +47,7 @@ ASSUME_YES=0
 REDO_PHASES=""
 declare -a REDO_PLAN=()
 WORST_CPU_OVERRIDE=""
+SESSION_DID_WORK=0
 
 usage() {
   cat << 'EOF'
@@ -213,6 +214,7 @@ meta_set() {
 
 mark_done() {
   touch "$STATE_DIR/phase-$1.done"
+  SESSION_DID_WORK=1
   sync_meta_completed
 }
 
@@ -900,9 +902,17 @@ write_manifest() {
   diag_log "manifest written: $OUT_DIR/manifest.txt"
 }
 
+persist_session_end() {
+  # Re-rendering an already-complete bundle is not a new experiment. Preserve
+  # its original end time so downtime between runs is not counted as duration.
+  if ((SESSION_DID_WORK == 1)) || ! grep -q '^END_EPOCH=' "$META_FILE" 2> /dev/null; then
+    meta_set END_EPOCH "$(date +%s)"
+    meta_set END_ISO "$(date -Is)"
+  fi
+}
+
 finalize_report() {
-  meta_set END_EPOCH "$(date +%s)"
-  meta_set END_ISO "$(date -Is)"
+  persist_session_end
   sync_meta_completed
   node "$LIB/collect.mjs" "$OUT_DIR" || diag_warn "collect.mjs failed"
   node "$LIB/report.mjs" "$OUT_DIR" || diag_warn "report.mjs failed"
