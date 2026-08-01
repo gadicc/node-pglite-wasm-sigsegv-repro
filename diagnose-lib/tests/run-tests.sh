@@ -52,7 +52,7 @@ fi
 
 echo "== settings restore on simulated interruption =="
 run_restore_case() {
-  # run_restore_case <signal|EXIT>; echoes value|rc|ready|ledger-empty|seconds
+  # run_restore_case <signal|EXIT>; echoes value|rc|ready|ledger-empty|seconds|sampler-gone
   local sig="$1"
   local dir
   dir="$(mktemp -d "$TMP/restore.XXXXXX")"
@@ -76,16 +76,18 @@ run_restore_case() {
     kill -s "$sig" "$pid" 2> /dev/null
   fi
   wait "$pid" 2> /dev/null
-  local rc=$? ledger_empty=0
+  local rc=$? ledger_empty=0 sampler_gone=0 sampler_pid=""
   [[ ! -s "$dir/restore.tsv" ]] && ledger_empty=1
-  printf '%s|%s|%s|%s|%s\n' "$(cat "$dir/no_turbo")" "$rc" "$ready" "$ledger_empty" "$((SECONDS - start))"
+  sampler_pid="$(cat "$dir/ready" 2> /dev/null || true)"
+  [[ -n "$sampler_pid" ]] && ! kill -0 "$sampler_pid" 2> /dev/null && sampler_gone=1
+  printf '%s|%s|%s|%s|%s|%s\n' "$(cat "$dir/no_turbo")" "$rc" "$ready" "$ledger_empty" "$((SECONDS - start))" "$sampler_gone"
 }
 term_restore="$(run_restore_case TERM)"
 int_restore="$(run_restore_case INT)"
 exit_restore="$(run_restore_case EXIT)"
-check_eq "SIGTERM restores promptly with rc=143" "1" "$([[ "$term_restore" =~ ^0\|143\|1\|1\|([0-4])$ ]] && echo 1 || echo 0)"
-check_eq "SIGINT restores promptly with rc=130" "1" "$([[ "$int_restore" =~ ^0\|130\|1\|1\|([0-4])$ ]] && echo 1 || echo 0)"
-check_eq "normal exit restores no_turbo" "1" "$([[ "$exit_restore" =~ ^0\|0\|1\|1\|([0-4])$ ]] && echo 1 || echo 0)"
+check_eq "SIGTERM restores promptly with rc=143 and reaps sampler" "1" "$([[ "$term_restore" =~ ^0\|143\|1\|1\|([0-4])\|1$ ]] && echo 1 || echo 0)"
+check_eq "SIGINT restores promptly with rc=130 and reaps sampler" "1" "$([[ "$int_restore" =~ ^0\|130\|1\|1\|([0-4])\|1$ ]] && echo 1 || echo 0)"
+check_eq "normal exit restores and reaps sampler" "1" "$([[ "$exit_restore" =~ ^0\|0\|1\|1\|([0-4])\|1$ ]] && echo 1 || echo 0)"
 
 echo "== fail-closed settings restore =="
 RESTORE_FAIL_DIR="$TMP/restore-fail"

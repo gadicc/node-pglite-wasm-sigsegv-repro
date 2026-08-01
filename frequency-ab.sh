@@ -89,9 +89,7 @@ DIAG_RESTORE_FILE="$BUNDLE/state/restore-frequency-ab.tsv"
 DIAG_FREQ_DIR="$BUNDLE/freq"
 DIAG_COMMANDS_LOG="$BUNDLE/commands.log"
 
-trap 'diag_restore_now' EXIT
-trap 'diag_warn "interrupted (SIGINT)"; exit 130' INT
-trap 'diag_warn "terminated (SIGTERM)"; exit 143' TERM
+diag_register_cleanup_traps
 
 # SIGKILL cannot run a trap. Recover any durable ledger left by a previous
 # killed invocation before replacing output files or saving new state.

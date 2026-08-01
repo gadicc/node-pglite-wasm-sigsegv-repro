@@ -253,10 +253,42 @@ diag_recover_pending_restore() {
   diag_log "pending settings restore completed and verified"
 }
 
+diag_cleanup_now() {
+  # A sampler may still be reading a setting we are about to restore. Stop and
+  # reap it first, then perform the verified restore.
+  diag_freq_sampler_stop
+  diag_restore_now
+}
+
+diag_cleanup_exit() {
+  local rc="$1" cleanup_rc=0
+  trap - EXIT INT TERM
+  if diag_cleanup_now; then
+    :
+  else
+    cleanup_rc=$?
+  fi
+  ((rc == 0 && cleanup_rc != 0)) && rc=1
+  exit "$rc"
+}
+
+diag_cleanup_signal() {
+  local name="$1" rc="$2"
+  trap - EXIT INT TERM
+  diag_warn "received $name"
+  diag_cleanup_now || true
+  exit "$rc"
+}
+
+diag_register_cleanup_traps() {
+  trap 'diag_cleanup_exit $?' EXIT
+  trap 'diag_cleanup_signal SIGINT 130' INT
+  trap 'diag_cleanup_signal SIGTERM 143' TERM
+}
+
 diag_register_restore_trap() {
-  trap 'diag_restore_now' EXIT
-  trap 'diag_warn "interrupted (SIGINT)"; exit 130' INT
-  trap 'diag_warn "terminated (SIGTERM)"; exit 143' TERM
+  # Backward-compatible name for callers/tests that only save restore state.
+  diag_register_cleanup_traps
 }
 
 # ---------------------------------------------------------------------------

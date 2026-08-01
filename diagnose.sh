@@ -923,8 +923,7 @@ on_interrupt() {
   local sig="$1"
   diag_warn "received $sig - restoring settings and writing a partial report"
   meta_set INTERRUPTED 1 2> /dev/null || true
-  diag_freq_sampler_stop 2> /dev/null || true
-  diag_restore_now 2> /dev/null || true
+  diag_cleanup_now 2> /dev/null || true
   finalize_report 2> /dev/null || true
   if [[ "$sig" == "SIGINT" ]]; then exit 130; else exit 143; fi
 }
@@ -1038,7 +1037,7 @@ main() {
   DIAG_COMMANDS_LOG="$OUT_DIR/commands.log"
   prepare_commands_log
 
-  trap 'diag_restore_now' EXIT
+  trap 'diag_cleanup_exit $?' EXIT
   trap 'on_interrupt SIGINT' INT
   trap 'on_interrupt SIGTERM' TERM
 

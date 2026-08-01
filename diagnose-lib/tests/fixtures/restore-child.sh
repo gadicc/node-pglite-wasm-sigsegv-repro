@@ -22,7 +22,10 @@ diag_restore_save "$fake_file"
 diag_register_restore_trap
 diag_sysfs_write "$fake_file" 1
 
-: > "$ready_file"
+# Exercise cleanup ordering and reaping as well as the restore itself.
+sleep 300 &
+DIAG_SAMPLER_PID=$!
+printf '%s\n' "$DIAG_SAMPLER_PID" > "$ready_file"
 if [[ -n "$exit_now" ]]; then
   exit 0
 fi
