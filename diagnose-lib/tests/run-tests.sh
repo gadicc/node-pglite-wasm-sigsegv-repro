@@ -148,6 +148,18 @@ check_eq "--redo rejects unknown phase" "0" "$?"
 [[ $? -ne 0 ]]
 check_eq "--redo without --resume is rejected" "0" "$?"
 
+echo "== resumed metadata validation =="
+INJECTION_SENTINEL="$TMP/arithmetic-injection-ran"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  SKIP_GDB='probe[$(touch '"$INJECTION_SENTINEL"')]'
+  validate_config
+) > /dev/null 2>&1
+injection_rc=$?
+check_eq "crafted SKIP_GDB metadata is rejected" "1" "$([[ $injection_rc -ne 0 ]] && echo 1 || echo 0)"
+check_eq "crafted SKIP_GDB metadata is not evaluated" "0" "$([[ -e "$INJECTION_SENTINEL" ]] && echo 1 || echo 0)"
+
 echo "== node unit tests (stats, parsers) =="
 if (cd "$LIB" && node --test 'tests/*.test.mjs') > "$TMP/node-tests.log" 2>&1; then
   ok "node --test stats+parsers"

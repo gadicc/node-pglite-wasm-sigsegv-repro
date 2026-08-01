@@ -180,6 +180,8 @@ validate_config() {
   diag_require_uint "--gdb-max-runs" "$GDB_MAX_RUNS"
   diag_require_uint "baseline children" "$BASELINE_CHILDREN"
   diag_require_uint "baseline waves" "$BASELINE_WAVES"
+  [[ "$SKIP_GDB" == "0" || "$SKIP_GDB" == "1" ]] ||
+    diag_die "stored SKIP_GDB must be 0 or 1, got '$SKIP_GDB'"
   ((INDIVIDUAL_RUNS >= 1 && GROUP_WAVES >= 1 && BASELINE_CHILDREN >= 1 && BASELINE_WAVES >= 1)) ||
     diag_die "runs/waves/children must all be >= 1"
   if [[ -n "$WORST_CPU_OVERRIDE" ]]; then
@@ -822,7 +824,7 @@ Resolved configuration:
   groups             ${#GROUP_NAME[@]} group(s) x $GROUP_WAVES waves
   individual runs    $INDIVIDUAL_RUNS per CPU (failing groups' CPUs, or all $ncpus_online online CPUs)
   frequency A/B/A    manual step (sudo ./frequency-ab.sh; never automatic)
-  gdb capture        $( ((SKIP_GDB == 1)) && printf 'skipped' || printf 'up to %s runs on the worst CPU' "$GDB_MAX_RUNS" )
+  gdb capture        $( [[ "$SKIP_GDB" == "1" ]] && printf 'skipped' || printf 'up to %s runs on the worst CPU' "$GDB_MAX_RUNS" )
 
 Discovered topology:
   online CPUs        $ONLINE_CPUS
@@ -987,7 +989,7 @@ main() {
   # ---- phase 6 ----
   if phase_is_done gdb; then
     diag_log "phase 6/7 gdb: already done, skipping (resume)"
-  elif ((SKIP_GDB == 1)); then
+  elif [[ "$SKIP_GDB" == "1" ]]; then
     diag_log "phase 6/7: skipped (--skip-gdb)"
     printf 'SKIPPED=1\nSKIP_REASON=--skip-gdb\n' > "$OUT_DIR/results/gdb.meta"
     mark_done gdb
