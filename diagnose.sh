@@ -1129,9 +1129,9 @@ persist_session_end() {
 finalize_report() {
   persist_session_end
   sync_meta_completed
-  node "$LIB/collect.mjs" "$OUT_DIR" || diag_warn "collect.mjs failed"
-  node "$LIB/report.mjs" "$OUT_DIR" || diag_warn "report.mjs failed"
-  write_manifest || diag_warn "manifest generation failed"
+  node "$LIB/collect.mjs" "$OUT_DIR" || diag_die "collect.mjs failed; results.json may be stale"
+  node "$LIB/report.mjs" "$OUT_DIR" || diag_die "report.mjs failed; report.md may be stale"
+  write_manifest || diag_die "manifest generation failed"
 }
 
 on_interrupt() {
@@ -1139,7 +1139,9 @@ on_interrupt() {
   diag_warn "received $sig - restoring settings and writing a partial report"
   meta_set INTERRUPTED 1 2> /dev/null || true
   diag_cleanup_now 2> /dev/null || true
-  finalize_report 2> /dev/null || true
+  # Best effort: a failed partial report must not mask the interrupt, so
+  # the subshell contains diag_die's exit and the failure is swallowed.
+  ( finalize_report ) 2> /dev/null || true
   if [[ "$sig" == "SIGINT" ]]; then exit 130; else exit 143; fi
 }
 

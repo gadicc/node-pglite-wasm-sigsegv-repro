@@ -785,6 +785,36 @@ check_eq "report contains privileged-reads section" "0" "$?"
 grep -q "IntelTME=Disabled" "$B/report.md"
 check_eq "report includes cctk allowlist data" "0" "$?"
 
+echo "== finalization failure handling =="
+# collect.mjs cannot write results.json into a missing bundle directory.
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$TMP/finalize-missing-bundle"
+  META_FILE="$TMP/finalize-fail.meta"
+  STATE_DIR="$TMP/finalize-fail-state"
+  mkdir -p "$STATE_DIR"
+  finalize_report
+) > /dev/null 2>&1
+finalize_fail_rc=$?
+check_eq "finalization aborts nonzero when collect.mjs fails" "1" "$([[ $finalize_fail_rc -ne 0 ]] && echo 1 || echo 0)"
+
+# The happy path on the synthetic bundle above still succeeds, and the
+# manifest it leaves behind verifies (all log lines precede the hash pass).
+touch "$B/state"/phase-{preflight,baseline,groups,individual,frequency,gdb}.done
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$B"
+  META_FILE="$B/results/meta.env"
+  STATE_DIR="$B/state"
+  DIAG_LOG_FILE="$B/run.log"
+  finalize_report
+) > /dev/null 2>&1
+check_eq "finalization succeeds on a complete bundle" "0" "$?"
+(cd "$B" && sha256sum -c manifest.txt) > /dev/null 2>&1
+check_eq "end-to-end bundle manifest verifies" "0" "$?"
+
 echo
 printf 'passed=%d failed=%d\n' "$pass" "$fail"
 ((fail == 0))
