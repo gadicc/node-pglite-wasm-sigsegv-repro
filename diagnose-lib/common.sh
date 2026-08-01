@@ -242,6 +242,17 @@ diag_restore_now() {
   DIAG_RESTORE_ARMED=0
 }
 
+diag_recover_pending_restore() {
+  [[ -n "$DIAG_RESTORE_FILE" && -s "$DIAG_RESTORE_FILE" ]] || return 0
+  DIAG_RESTORE_ARMED=1
+  diag_warn "pending settings restore detected; recovering it before starting new work"
+  if ! diag_restore_now; then
+    diag_warn "pending settings restore could not be completed; ledger retained at $DIAG_RESTORE_FILE"
+    return 1
+  fi
+  diag_log "pending settings restore completed and verified"
+}
+
 diag_register_restore_trap() {
   trap 'diag_restore_now' EXIT
   trap 'diag_warn "interrupted (SIGINT)"; exit 130' INT

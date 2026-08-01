@@ -88,11 +88,15 @@ mkdir -p "$BUNDLE/results" "$BUNDLE/freq" "$BUNDLE/state"
 DIAG_RESTORE_FILE="$BUNDLE/state/restore-frequency-ab.tsv"
 DIAG_FREQ_DIR="$BUNDLE/freq"
 DIAG_COMMANDS_LOG="$BUNDLE/commands.log"
-: > "$DIAG_RESTORE_FILE"
 
 trap 'diag_restore_now' EXIT
 trap 'diag_warn "interrupted (SIGINT)"; exit 130' INT
 trap 'diag_warn "terminated (SIGTERM)"; exit 143' TERM
+
+# SIGKILL cannot run a trap. Recover any durable ledger left by a previous
+# killed invocation before replacing output files or saving new state.
+diag_recover_pending_restore ||
+  diag_die "refusing to start while a previous settings restore is pending"
 
 # Run workload legs as the invoking user when we can.
 declare -a AS_USER=()

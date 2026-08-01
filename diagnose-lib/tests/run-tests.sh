@@ -113,6 +113,20 @@ restore_verify_rc=$?
 check_eq "restore readback mismatch returns nonzero" "1" "$([[ $restore_verify_rc -ne 0 ]] && echo 1 || echo 0)"
 check_eq "restore readback mismatch retains ledger" "1" "$([[ -s "$RESTORE_FAIL_DIR/restore.tsv" ]] && echo 1 || echo 0)"
 
+RECOVER_DIR="$TMP/recover-pending"
+mkdir -p "$RECOVER_DIR"
+printf 'changed\n' > "$RECOVER_DIR/value"
+printf '%s\toriginal\n' "$RECOVER_DIR/value" > "$RECOVER_DIR/restore.tsv"
+(
+  DIAG_RESTORE_FILE="$RECOVER_DIR/restore.tsv"
+  DIAG_RESTORE_ARMED=0
+  DIAG_SUDO=""
+  diag_recover_pending_restore
+) > /dev/null 2>&1
+recover_rc=$?
+check_eq "pending SIGKILL ledger is recovered before new work" "1" "$([[ $recover_rc -eq 0 && "$(cat "$RECOVER_DIR/value")" == original ]] && echo 1 || echo 0)"
+check_eq "successful pending recovery clears ledger" "1" "$([[ ! -s "$RECOVER_DIR/restore.tsv" ]] && echo 1 || echo 0)"
+
 echo "== single.sh validation =="
 bash "$REPO_ROOT/single.sh" abc > /dev/null 2>&1
 check_eq "single.sh rejects non-numeric cpu (rc=2)" "2" "$?"
