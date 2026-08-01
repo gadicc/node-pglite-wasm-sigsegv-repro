@@ -271,7 +271,10 @@ redo_phase() {
   local phase="$1"
   local -a paths=()
   case "$phase" in
-    baseline) paths=(results/baseline.meta logs/baseline) ;;
+    baseline)
+      paths=(results/baseline.meta logs/baseline
+        freq/baseline.samples freq/baseline.method)
+      ;;
     groups) paths=(results/groups.tsv logs/groups) ;;
     individual) paths=(results/individual.tsv logs/individual) ;;
     gdb) paths=(results/gdb.meta gdb logs/gdb) ;;
@@ -283,6 +286,16 @@ redo_phase() {
       diag_die "--redo: unknown or unsupported phase '$phase' (supported: baseline,groups,individual,gdb,frequency)"
       ;;
   esac
+  local artifact
+  if [[ "$phase" == "groups" ]]; then
+    for artifact in "$OUT_DIR"/freq/group-*; do
+      [[ -e "$artifact" ]] && paths+=("${artifact#"$OUT_DIR"/}")
+    done
+  elif [[ "$phase" == "frequency" ]]; then
+    for artifact in "$OUT_DIR"/freq/freq-ab-*; do
+      [[ -e "$artifact" ]] && paths+=("${artifact#"$OUT_DIR"/}")
+    done
+  fi
   local -a existing=()
   local p
   for p in "${paths[@]}"; do

@@ -151,6 +151,31 @@ gdb_redo_ok=0
   [[ -f "$gdb_stash/logs/gdb/runner.log" ]] &&
   [[ ! -f "$GB/state/phase-gdb.done" ]] && gdb_redo_ok=1
 check_eq "--redo gdb preserves distinct capture and runner paths" "1" "$gdb_redo_ok"
+
+FB="$TMP/redo-frequency-bundle"
+mkdir -p "$FB"/{results,state,freq}
+printf 'A1\t1\t0\t2\n' > "$FB/results/frequency-ab.tsv"
+printf 'CPU=19\n' > "$FB/results/frequency-ab.meta"
+printf 'old samples\n' > "$FB/freq/freq-ab-A1.samples"
+printf 'scaling_cur_freq\n' > "$FB/freq/freq-ab-A1.method"
+touch "$FB/state/phase-frequency.done"
+printf 'COMPLETED_PHASES=frequency\n' > "$FB/results/meta.env"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$FB"
+  STATE_DIR="$FB/state"
+  META_FILE="$FB/results/meta.env"
+  redo_phase frequency
+) > /dev/null 2>&1
+frequency_stash="$(find "$FB/state/superseded" -mindepth 1 -maxdepth 1 -type d -name 'frequency-*' -print -quit)"
+frequency_redo_ok=0
+[[ -f "$frequency_stash/results/frequency-ab.tsv" ]] &&
+  [[ -f "$frequency_stash/results/frequency-ab.meta" ]] &&
+  [[ "$(cat "$frequency_stash/freq/freq-ab-A1.samples")" == "old samples" ]] &&
+  [[ -f "$frequency_stash/freq/freq-ab-A1.method" ]] &&
+  [[ ! -e "$FB/freq/freq-ab-A1.samples" ]] && frequency_redo_ok=1
+check_eq "--redo frequency preserves raw sampler evidence" "1" "$frequency_redo_ok"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
