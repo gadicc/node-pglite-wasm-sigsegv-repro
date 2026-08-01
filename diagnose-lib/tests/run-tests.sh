@@ -366,6 +366,14 @@ INJECTION_SENTINEL="$TMP/arithmetic-injection-ran"
 injection_rc=$?
 check_eq "crafted SKIP_GDB metadata is rejected" "1" "$([[ $injection_rc -ne 0 ]] && echo 1 || echo 0)"
 check_eq "crafted SKIP_GDB metadata is not evaluated" "0" "$([[ -e "$INJECTION_SENTINEL" ]] && echo 1 || echo 0)"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  MODE=unexpected
+  validate_config
+) > /dev/null 2>&1
+invalid_mode_rc=$?
+check_eq "unknown stored mode is rejected" "1" "$([[ $invalid_mode_rc -ne 0 ]] && echo 1 || echo 0)"
 
 echo "== resume bundle identity =="
 resume_plan="$(cd "$TMP" && "$REPO_ROOT/diagnose.sh" --resume redo-bundle --dry-run --yes 2>&1)"
@@ -374,6 +382,10 @@ mkdir -p "$TMP/different-bundle"
 (cd "$TMP" && "$REPO_ROOT/diagnose.sh" --resume redo-bundle --out-dir different-bundle --dry-run --yes) > /dev/null 2>&1
 resume_conflict_rc=$?
 check_eq "resume rejects a different --out-dir" "1" "$([[ $resume_conflict_rc -ne 0 ]] && echo 1 || echo 0)"
+mkdir -p "$TMP/not-a-bundle"
+"$REPO_ROOT/diagnose.sh" --resume "$TMP/not-a-bundle" --dry-run --yes > /dev/null 2>&1
+not_bundle_rc=$?
+check_eq "resume requires diagnostic bundle metadata" "1" "$([[ $not_bundle_rc -ne 0 ]] && echo 1 || echo 0)"
 mkdir -p "$TMP/nonempty-output"
 printf 'existing evidence\n' > "$TMP/nonempty-output/results.json"
 "$REPO_ROOT/diagnose.sh" --out-dir "$TMP/nonempty-output" --dry-run --yes > /dev/null 2>&1

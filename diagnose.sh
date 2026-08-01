@@ -179,6 +179,10 @@ parse_args() {
 }
 
 validate_config() {
+  case "$MODE" in
+    default | quick | full) ;;
+    *) diag_die "stored mode must be default, quick, or full, got '$MODE'" ;;
+  esac
   diag_require_uint "--individual-runs" "$INDIVIDUAL_RUNS"
   diag_require_uint "--group-waves" "$GROUP_WAVES"
   diag_require_uint "--gdb-max-runs" "$GDB_MAX_RUNS"
@@ -984,6 +988,8 @@ main() {
     fi
     RESUME_DIR="$resume_abs"
     OUT_DIR="$resume_abs"
+    [[ -f "$OUT_DIR/results/meta.env" ]] ||
+      diag_die "resume directory '$OUT_DIR' is not a diagnostic bundle (missing results/meta.env)"
     load_stored_config "$OUT_DIR"
     # Stored values are already concrete; do not re-apply the mode preset.
   fi
