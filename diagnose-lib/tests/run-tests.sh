@@ -215,7 +215,50 @@ invalid_redo_rc=$?
 check_eq "mixed invalid redo list is rejected" "1" "$([[ $invalid_redo_rc -ne 0 ]] && echo 1 || echo 0)"
 check_eq "invalid redo list leaves phase data in place" "1" "$([[ -f "$INVALID_RB/results/individual.tsv" && -f "$INVALID_RB/state/phase-individual.done" ]] && echo 1 || echo 0)"
 redo_plan="$($REPO_ROOT/diagnose.sh --resume "$INVALID_RB" --redo individual --dry-run --yes 2>&1)"
-check_eq "dry run shows the validated redo plan" "1" "$([[ "$redo_plan" == *"redo phases        individual"* ]] && echo 1 || echo 0)"
+check_eq "dry run shows the dependent redo plan" "1" "$([[ "$redo_plan" == *"redo phases        individual frequency gdb"* ]] && echo 1 || echo 0)"
+
+DEPENDENT_RB="$TMP/redo-dependent-bundle"
+mkdir -p "$DEPENDENT_RB"/{results,state,logs/groups,logs/individual,gdb,logs/gdb,freq}
+printf 'groups\n' > "$DEPENDENT_RB/results/groups.tsv"
+printf 'individual\n' > "$DEPENDENT_RB/results/individual.tsv"
+printf 'frequency\n' > "$DEPENDENT_RB/results/frequency-ab.tsv"
+printf 'gdb\n' > "$DEPENDENT_RB/results/gdb.meta"
+printf 'group log\n' > "$DEPENDENT_RB/logs/groups/ecores.log"
+printf 'individual log\n' > "$DEPENDENT_RB/logs/individual/cpu-19.log"
+printf 'capture\n' > "$DEPENDENT_RB/gdb/cpu19-run1.txt"
+printf 'runner\n' > "$DEPENDENT_RB/logs/gdb/runner.log"
+printf 'sample\n' > "$DEPENDENT_RB/freq/group-ecores.samples"
+printf '{}\n' > "$DEPENDENT_RB/results.json"
+printf 'old report\n' > "$DEPENDENT_RB/report.md"
+printf 'old manifest\n' > "$DEPENDENT_RB/manifest.txt"
+touch "$DEPENDENT_RB/state/phase-"{baseline,groups,individual,frequency,gdb}.done
+printf 'COMPLETED_PHASES=baseline,groups,individual,frequency,gdb\n' > "$DEPENDENT_RB/results/meta.env"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$DEPENDENT_RB"
+  STATE_DIR="$DEPENDENT_RB/state"
+  META_FILE="$DEPENDENT_RB/results/meta.env"
+  REDO_PHASES=groups
+  build_redo_plan
+  apply_redo_plan
+) > /dev/null 2>&1
+dependent_redo_ok=0
+[[ -f "$DEPENDENT_RB/state/phase-baseline.done" ]] &&
+  [[ ! -e "$DEPENDENT_RB/state/phase-groups.done" ]] &&
+  [[ ! -e "$DEPENDENT_RB/state/phase-individual.done" ]] &&
+  [[ ! -e "$DEPENDENT_RB/state/phase-frequency.done" ]] &&
+  [[ ! -e "$DEPENDENT_RB/state/phase-gdb.done" ]] &&
+  [[ ! -e "$DEPENDENT_RB/results.json" ]] &&
+  [[ ! -e "$DEPENDENT_RB/report.md" ]] &&
+  [[ ! -e "$DEPENDENT_RB/manifest.txt" ]] &&
+  compgen -G "$DEPENDENT_RB/state/superseded/groups-*/results/groups.tsv" > /dev/null &&
+  compgen -G "$DEPENDENT_RB/state/superseded/individual-*/results/individual.tsv" > /dev/null &&
+  compgen -G "$DEPENDENT_RB/state/superseded/frequency-*/results/frequency-ab.tsv" > /dev/null &&
+  compgen -G "$DEPENDENT_RB/state/superseded/gdb-*/results/gdb.meta" > /dev/null &&
+  compgen -G "$DEPENDENT_RB/state/superseded/derived-*/results.json" > /dev/null &&
+  grep -q '^COMPLETED_PHASES=baseline$' "$DEPENDENT_RB/results/meta.env" && dependent_redo_ok=1
+check_eq "redoing groups invalidates dependent phases and reports" "1" "$dependent_redo_ok"
 
 echo "== resumed metadata validation =="
 INJECTION_SENTINEL="$TMP/arithmetic-injection-ran"

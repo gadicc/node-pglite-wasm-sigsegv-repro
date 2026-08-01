@@ -249,7 +249,7 @@ build_redo_plan() {
     diag_die "--redo contains an empty phase name"
   local -a requested=()
   local phase
-  declare -A seen=()
+  declare -A seen=() wanted=()
   IFS=',' read -ra requested <<< "$REDO_PHASES"
   for phase in "${requested[@]}"; do
     case "$phase" in
@@ -260,7 +260,52 @@ build_redo_plan() {
     esac
     [[ -z "${seen[$phase]:-}" ]] || diag_die "--redo phase '$phase' was listed more than once"
     seen[$phase]=1
-    REDO_PLAN+=("$phase")
+    wanted[$phase]=1
+  done
+
+  # Group results choose the CPUs tested individually; individual results in
+  # turn choose the CPU used by the manual frequency and GDB phases. Repeating
+  # an upstream phase therefore invalidates every completed dependent phase.
+  if [[ -n "${wanted[groups]:-}" ]]; then
+    wanted[individual]=1
+  fi
+  if [[ -n "${wanted[individual]:-}" ]]; then
+    wanted[frequency]=1
+    wanted[gdb]=1
+  fi
+
+  # Always execute the closure in dependency order, independent of the order
+  # used on the command line.
+  for phase in baseline groups individual frequency gdb; do
+    [[ -n "${wanted[$phase]:-}" ]] && REDO_PLAN+=("$phase")
+  done
+}
+
+archive_derived_outputs() {
+  local -a paths=(results.json report.md manifest.txt)
+  local -a existing=()
+  local p
+  for p in "${paths[@]}"; do
+    [[ -e "$OUT_DIR/$p" ]] && existing+=("$p")
+  done
+  ((${#existing[@]} > 0)) || return 0
+
+  mkdir -p "$STATE_DIR/superseded"
+  local stash
+  stash="$(mktemp -d "$STATE_DIR/superseded/derived-$(date +%Y%m%dT%H%M%S)-XXXXXX")"
+  for p in "${existing[@]}"; do
+    mkdir -p "$stash/$(dirname "$p")"
+    mv "$OUT_DIR/$p" "$stash/$p"
+  done
+  diag_log "--redo: generated report data preserved under ${stash#"$OUT_DIR"/}"
+}
+
+apply_redo_plan() {
+  ((${#REDO_PLAN[@]} > 0)) || return 0
+  archive_derived_outputs
+  local phase
+  for phase in "${REDO_PLAN[@]}"; do
+    redo_phase "$phase"
   done
 }
 
@@ -997,12 +1042,7 @@ main() {
   # describe the run that is about to execute and must be reflected in JSON.
   persist_effective_config
 
-  if ((${#REDO_PLAN[@]} > 0)); then
-    local rp
-    for rp in "${REDO_PLAN[@]}"; do
-      redo_phase "$rp"
-    done
-  fi
+  apply_redo_plan
 
   safety_gate
   print_plan
