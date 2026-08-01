@@ -39,6 +39,7 @@ INDIVIDUAL_RUNS=50
 GDB_MAX_RUNS=12
 GDB_MAX_CAPTURES=3
 OUT_DIR=""
+OUT_DIR_EXPLICIT=0
 RESUME_DIR=""
 SKIP_GDB=0
 DRY_RUN=0
@@ -108,6 +109,7 @@ pre_pass() {
         ;;
       --out-dir)
         OUT_DIR="${2:?--out-dir needs a directory}"
+        OUT_DIR_EXPLICIT=1
         shift 2
         ;;
       *) shift ;;
@@ -159,7 +161,7 @@ parse_args() {
       --quick) MODE="quick"; apply_mode_preset; shift ;;
       --full) MODE="full"; apply_mode_preset; shift ;;
       --resume) RESUME_DIR="${2:?}"; shift 2 ;;
-      --out-dir) OUT_DIR="${2:?}"; shift 2 ;;
+      --out-dir) OUT_DIR="${2:?}"; OUT_DIR_EXPLICIT=1; shift 2 ;;
       --skip-gdb) SKIP_GDB=1; shift ;;
       --redo) REDO_PHASES="${2:?--redo needs a phase list}"; shift 2 ;;
       --individual-runs) INDIVIDUAL_RUNS="${2:?}"; shift 2 ;;
@@ -851,14 +853,31 @@ EOF
 main() {
   pre_pass "$@"
 
+  local resume_abs=""
   if [[ -n "$RESUME_DIR" ]]; then
     [[ -d "$RESUME_DIR" ]] || diag_die "resume directory '$RESUME_DIR' does not exist"
-    OUT_DIR="$RESUME_DIR"
+    resume_abs="$(cd "$RESUME_DIR" && pwd -P)"
+    if ((OUT_DIR_EXPLICIT == 1)); then
+      [[ -d "$OUT_DIR" ]] ||
+        diag_die "--out-dir with --resume must name the same existing bundle"
+      local explicit_out_abs
+      explicit_out_abs="$(cd "$OUT_DIR" && pwd -P)"
+      [[ "$explicit_out_abs" == "$resume_abs" ]] ||
+        diag_die "--out-dir and --resume refer to different bundles"
+    fi
+    RESUME_DIR="$resume_abs"
+    OUT_DIR="$resume_abs"
     load_stored_config "$OUT_DIR"
     # Stored values are already concrete; do not re-apply the mode preset.
   fi
 
   parse_args "$@"
+  # parse_args sees the original relative spellings again. Keep the canonical
+  # bundle identity resolved above so the later cd cannot retarget a resume.
+  if [[ -n "$resume_abs" ]]; then
+    RESUME_DIR="$resume_abs"
+    OUT_DIR="$resume_abs"
+  fi
   validate_config
 
   # Work from the repository root regardless of the caller's CWD.
