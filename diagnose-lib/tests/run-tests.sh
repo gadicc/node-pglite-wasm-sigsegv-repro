@@ -389,6 +389,25 @@ check_eq "unknown stored mode is rejected" "1" "$([[ $invalid_mode_rc -ne 0 ]] &
 missing_required_rc=$?
 check_eq "missing required command aborts preflight" "1" "$([[ $missing_required_rc -ne 0 ]] && echo 1 || echo 0)"
 
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  repro_result_is_complete "$FIX/repro-clean.log" 3 0
+)
+check_eq "complete repro footer is accepted" "0" "$?"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  repro_result_is_complete "$FIX/repro-clean.log" 4 0
+) > /dev/null 2>&1
+check_eq "truncated repro output is not phase-complete" "1" "$([[ $? -ne 0 ]] && echo 1 || echo 0)"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  repro_result_is_complete "$FIX/repro-clean.log" 3 2
+) > /dev/null 2>&1
+check_eq "unexpected repro exit is not phase-complete" "1" "$([[ $? -ne 0 ]] && echo 1 || echo 0)"
+
 echo "== resume bundle identity =="
 resume_plan="$(cd "$TMP" && "$REPO_ROOT/diagnose.sh" --resume redo-bundle --dry-run --yes 2>&1)"
 check_eq "relative resume keeps its caller-resolved bundle" "1" "$([[ "$resume_plan" == *"out dir            $RB (resume)"* ]] && echo 1 || echo 0)"
