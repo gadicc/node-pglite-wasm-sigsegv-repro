@@ -1041,14 +1041,22 @@ phase_gdb() {
   local rc=${PIPESTATUS[0]}
   set -e
   printf 'EXIT_CODE=%s\n' "$rc" >> "$meta"
+  if ! gdb_result_is_complete "$rc"; then
+    case "$rc" in
+      4) diag_die "gdb capture lost a required dependency; phase remains resumable" ;;
+      5) diag_die "gdb runner failed (see logs/gdb/runner.log); phase remains resumable" ;;
+      *) diag_die "gdb runner returned unexpected exit code $rc; phase remains resumable" ;;
+    esac
+  fi
   case "$rc" in
     0) diag_log "gdb: fault captured" ;;
     3) diag_log "gdb: no fault within $GDB_MAX_RUNS runs" ;;
-    4) diag_warn "gdb: missing dependency" ;;
-    5) diag_warn "gdb: runner failure (see logs/gdb/runner.log)" ;;
-    *) diag_warn "gdb: unexpected exit code $rc" ;;
   esac
   mark_done gdb
+}
+
+gdb_result_is_complete() {
+  [[ "$1" == "0" || "$1" == "3" ]]
 }
 
 # ------------------------------------------------------------------
