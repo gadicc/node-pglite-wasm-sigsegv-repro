@@ -1137,6 +1137,11 @@ main() {
   [[ -d node_modules/@electric-sql/pglite ]] ||
     diag_die "dependencies not installed; run 'npm ci' first"
 
+  # Consent must precede every bundle mutation, especially redo archival and
+  # metadata rewrites on an existing bundle.
+  safety_gate
+  print_plan
+
   mkdir -p "$OUT_DIR"/{results,logs/individual,state,env,freq,gdb}
   OUT_DIR="$(cd "$OUT_DIR" && pwd)"
   META_FILE="$OUT_DIR/results/meta.env"
@@ -1170,9 +1175,6 @@ main() {
   persist_effective_config
 
   apply_redo_plan
-
-  safety_gate
-  print_plan
 
   # ---- phase 1 ----
   if phase_is_done preflight; then

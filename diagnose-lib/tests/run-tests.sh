@@ -352,6 +352,33 @@ dependent_redo_ok=0
   grep -q '^COMPLETED_PHASES=baseline$' "$DEPENDENT_RB/results/meta.env" && dependent_redo_ok=1
 check_eq "redoing groups invalidates dependent phases and reports" "1" "$dependent_redo_ok"
 
+CONSENT_RB="$TMP/redo-consent-bundle"
+mkdir -p "$CONSENT_RB"/{results,state,logs/individual}
+printf '19\t1\t139\t2\n' > "$CONSENT_RB/results/individual.tsv"
+printf 'old command log\n' > "$CONSENT_RB/commands.log"
+touch "$CONSENT_RB/state/phase-individual.done"
+cat > "$CONSENT_RB/results/meta.env" << EOF
+MODE=quick
+BASELINE_CHILDREN=8
+BASELINE_WAVES=10
+GROUP_WAVES=10
+INDIVIDUAL_RUNS=5
+GDB_MAX_RUNS=6
+SKIP_GDB=0
+COMPLETED_PHASES=individual
+EOF
+cp "$CONSENT_RB/results/meta.env" "$CONSENT_RB/meta.before"
+"$REPO_ROOT/diagnose.sh" --resume "$CONSENT_RB" --redo individual > /dev/null 2>&1
+consent_rc=$?
+consent_redo_ok=0
+[[ $consent_rc -ne 0 ]] &&
+  [[ -f "$CONSENT_RB/results/individual.tsv" ]] &&
+  [[ -f "$CONSENT_RB/state/phase-individual.done" ]] &&
+  [[ ! -e "$CONSENT_RB/state/superseded" ]] &&
+  cmp -s "$CONSENT_RB/meta.before" "$CONSENT_RB/results/meta.env" &&
+  [[ "$(cat "$CONSENT_RB/commands.log")" == "old command log" ]] && consent_redo_ok=1
+check_eq "redo does not mutate bundle before consent" "1" "$consent_redo_ok"
+
 COMMAND_LOG="$TMP/commands.log"
 printf '+ original command\n' > "$COMMAND_LOG"
 (
