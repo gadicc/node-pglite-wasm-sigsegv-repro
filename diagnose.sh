@@ -1105,13 +1105,16 @@ gdb_result_is_complete() {
 
 # ------------------------------------------------------------------
 write_manifest() {
+  # The hash pass must be the last filesystem write into the bundle: emit
+  # the log line first, because diag_log appends to run.log, which is
+  # itself hashed below.
+  diag_log "writing manifest: $OUT_DIR/manifest.txt"
   (
     cd "$OUT_DIR"
     find . -type f ! -name manifest.txt -print0 |
       sort -z |
       xargs -0 sha256sum > manifest.txt
   )
-  diag_log "manifest written: $OUT_DIR/manifest.txt"
 }
 
 persist_session_end() {
@@ -1383,10 +1386,11 @@ main() {
   # A run that reaches here completed fully; clear any interrupted flag
   # left over from a previous, interrupted attempt on this bundle.
   meta_set INTERRUPTED 0
-  finalize_report
-
+  # Log the closing pointers before finalizing: the manifest hashes
+  # run.log, so nothing may be logged into the bundle after write_manifest.
   diag_log "done. Bundle: $OUT_DIR"
   diag_log "report: $OUT_DIR/report.md"
+  finalize_report
 }
 
 # Allow tests to source this file for individual functions without running.

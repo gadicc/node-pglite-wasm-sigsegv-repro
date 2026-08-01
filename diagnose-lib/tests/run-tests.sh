@@ -607,6 +607,23 @@ system_node_path="$(
 )"
 check_eq "node_path outside \$HOME is unchanged" "/usr/bin/node" "$system_node_path"
 
+echo "== manifest covers the final log lines =="
+MB="$TMP/manifest-bundle"
+mkdir -p "$MB"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$MB"
+  DIAG_LOG_FILE="$MB/run.log"
+  # Reproduce the real ordering: every log line precedes the hash pass.
+  diag_log "done. Bundle: $OUT_DIR"
+  diag_log "report: $OUT_DIR/report.md"
+  write_manifest
+) > /dev/null 2>&1
+check_eq "write_manifest succeeds after the final log lines" "0" "$?"
+(cd "$MB" && sha256sum -c manifest.txt) > /dev/null 2>&1
+check_eq "manifest verifies immediately after the run" "0" "$?"
+
 echo "== node unit tests (stats, parsers) =="
 if (cd "$LIB" && node --test 'tests/*.test.mjs') > "$TMP/node-tests.log" 2>&1; then
   ok "node --test stats+parsers"
