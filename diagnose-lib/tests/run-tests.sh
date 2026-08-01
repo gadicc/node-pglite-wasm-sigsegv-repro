@@ -260,6 +260,20 @@ dependent_redo_ok=0
   grep -q '^COMPLETED_PHASES=baseline$' "$DEPENDENT_RB/results/meta.env" && dependent_redo_ok=1
 check_eq "redoing groups invalidates dependent phases and reports" "1" "$dependent_redo_ok"
 
+COMMAND_LOG="$TMP/commands.log"
+printf '+ original command\n' > "$COMMAND_LOG"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  RESUME_DIR="$TMP/existing-bundle"
+  DIAG_COMMANDS_LOG="$COMMAND_LOG"
+  prepare_commands_log
+)
+command_log_ok=0
+grep -q '^+ original command$' "$COMMAND_LOG" &&
+  grep -q '^# resumed ' "$COMMAND_LOG" && command_log_ok=1
+check_eq "resume preserves command history" "1" "$command_log_ok"
+
 echo "== resumed metadata validation =="
 INJECTION_SENTINEL="$TMP/arithmetic-injection-ran"
 (

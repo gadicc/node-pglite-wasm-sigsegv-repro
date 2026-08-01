@@ -242,6 +242,14 @@ persist_effective_config() {
   meta_set SKIP_GDB "$SKIP_GDB"
 }
 
+prepare_commands_log() {
+  if [[ -n "$RESUME_DIR" && -f "$DIAG_COMMANDS_LOG" ]]; then
+    printf '\n# resumed %s\n' "$(date -Is)" >> "$DIAG_COMMANDS_LOG"
+  else
+    : > "$DIAG_COMMANDS_LOG"
+  fi
+}
+
 build_redo_plan() {
   REDO_PLAN=()
   [[ -n "$REDO_PHASES" ]] || return 0
@@ -1018,7 +1026,7 @@ main() {
   DIAG_FREQ_DIR="$OUT_DIR/freq"
   DIAG_LOG_FILE="$OUT_DIR/run.log"
   DIAG_COMMANDS_LOG="$OUT_DIR/commands.log"
-  : > "$DIAG_COMMANDS_LOG"
+  prepare_commands_log
 
   trap 'diag_restore_now' EXIT
   trap 'on_interrupt SIGINT' INT
