@@ -408,6 +408,28 @@ check_eq "truncated repro output is not phase-complete" "1" "$([[ $? -ne 0 ]] &&
 ) > /dev/null 2>&1
 check_eq "unexpected repro exit is not phase-complete" "1" "$([[ $? -ne 0 ]] && echo 1 || echo 0)"
 
+INDIVIDUAL_VALID="$TMP/individual-valid.tsv"
+printf '19\t1\t0\t2\n19\t2\t139\t2\n' > "$INDIVIDUAL_VALID"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  individual_cpu_result_is_complete "$INDIVIDUAL_VALID" 19 0 2 1
+)
+check_eq "complete clean/SIGSEGV individual result is accepted" "0" "$?"
+printf '19\t2\t1\t0\n' >> "$INDIVIDUAL_VALID"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  individual_cpu_result_is_complete "$INDIVIDUAL_VALID" 19 0 3 1
+) > /dev/null 2>&1
+check_eq "launcher exit is rejected as individual evidence" "1" "$([[ $? -ne 0 ]] && echo 1 || echo 0)"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  individual_cpu_result_is_complete "$INDIVIDUAL_VALID" 19 0 4 1
+) > /dev/null 2>&1
+check_eq "individual row deficit is rejected" "1" "$([[ $? -ne 0 ]] && echo 1 || echo 0)"
+
 echo "== resume bundle identity =="
 resume_plan="$(cd "$TMP" && "$REPO_ROOT/diagnose.sh" --resume redo-bundle --dry-run --yes 2>&1)"
 check_eq "relative resume keeps its caller-resolved bundle" "1" "$([[ "$resume_plan" == *"out dir            $RB (resume)"* ]] && echo 1 || echo 0)"

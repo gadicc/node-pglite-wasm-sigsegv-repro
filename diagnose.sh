@@ -874,7 +874,7 @@ phase_individual() {
   touch "$tsv"
   local -a cpus=()
   mapfile -t cpus < <(cpu_list_sorted "$INDIVIDUAL_TARGET_CPUS")
-  local total=${#cpus[@]} idx=0 cpu existing deficit
+  local total=${#cpus[@]} idx=0 cpu existing deficit wrapper_rc
   for cpu in "${cpus[@]}"; do
     idx=$((idx + 1))
     # Intra-phase resume: skip CPUs already fully recorded; top up CPUs
@@ -893,10 +893,29 @@ phase_individual() {
     set +e
     diag_log_cmd bash single.sh "$cpu" "$deficit" "$tsv"
     bash single.sh "$cpu" "$deficit" "$tsv" 2>&1 |
-      tee "$OUT_DIR/logs/individual/cpu-${cpu}.log" | tail -1
+      tee -a "$OUT_DIR/logs/individual/cpu-${cpu}.log" | tail -1
+    wrapper_rc=${PIPESTATUS[0]}
     set -e
+    individual_cpu_result_is_complete "$tsv" "$cpu" "$existing" "$INDIVIDUAL_RUNS" "$wrapper_rc" ||
+      diag_die "cpu $cpu did not produce $deficit valid clean/SIGSEGV result(s) (wrapper rc=$wrapper_rc); phase remains resumable"
   done
   mark_done individual
+}
+
+individual_cpu_result_is_complete() {
+  local tsv="$1" cpu="$2" before="$3" expected_total="$4" wrapper_rc="$5"
+  [[ "$wrapper_rc" == "0" || "$wrapper_rc" == "1" ]] || return 1
+  awk -F'\t' -v cpu="$cpu" -v before="$before" -v expected="$expected_total" -v wrapper="$wrapper_rc" '
+    $1 == cpu {
+      count++
+      if ($3 != 0 && $3 != 139) invalid++
+      if (count > before && $3 == 139) new_sigsegv++
+    }
+    END {
+      wrapper_ok = (wrapper == 0 && new_sigsegv == 0) || (wrapper == 1 && new_sigsegv > 0)
+      exit (count == expected && invalid == 0 && wrapper_ok) ? 0 : 1
+    }
+  ' "$tsv"
 }
 
 # ------------------------------------------------------------------
