@@ -148,6 +148,27 @@ check_eq "--redo rejects unknown phase" "0" "$?"
 [[ $? -ne 0 ]]
 check_eq "--redo without --resume is rejected" "0" "$?"
 
+INVALID_RB="$TMP/redo-invalid-bundle"
+mkdir -p "$INVALID_RB"/{results,state,logs/individual}
+printf '19\t1\t139\t2\n' > "$INVALID_RB/results/individual.tsv"
+touch "$INVALID_RB/state/phase-individual.done"
+cat > "$INVALID_RB/results/meta.env" << EOF
+MODE=quick
+BASELINE_CHILDREN=8
+BASELINE_WAVES=10
+GROUP_WAVES=10
+INDIVIDUAL_RUNS=20
+GDB_MAX_RUNS=6
+SKIP_GDB=0
+COMPLETED_PHASES=individual
+EOF
+"$REPO_ROOT/diagnose.sh" --resume "$INVALID_RB" --redo individual,bogus --dry-run --yes > /dev/null 2>&1
+invalid_redo_rc=$?
+check_eq "mixed invalid redo list is rejected" "1" "$([[ $invalid_redo_rc -ne 0 ]] && echo 1 || echo 0)"
+check_eq "invalid redo list leaves phase data in place" "1" "$([[ -f "$INVALID_RB/results/individual.tsv" && -f "$INVALID_RB/state/phase-individual.done" ]] && echo 1 || echo 0)"
+redo_plan="$($REPO_ROOT/diagnose.sh --resume "$INVALID_RB" --redo individual --dry-run --yes 2>&1)"
+check_eq "dry run shows the validated redo plan" "1" "$([[ "$redo_plan" == *"redo phases        individual"* ]] && echo 1 || echo 0)"
+
 echo "== resumed metadata validation =="
 INJECTION_SENTINEL="$TMP/arithmetic-injection-ran"
 (

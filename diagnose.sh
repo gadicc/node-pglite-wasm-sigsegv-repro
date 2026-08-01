@@ -45,6 +45,7 @@ SKIP_GDB=0
 DRY_RUN=0
 ASSUME_YES=0
 REDO_PHASES=""
+declare -a REDO_PLAN=()
 WORST_CPU_OVERRIDE=""
 
 usage() {
@@ -192,6 +193,7 @@ validate_config() {
   if [[ -n "$REDO_PHASES" && -z "$RESUME_DIR" ]]; then
     diag_die "--redo requires --resume DIR (it re-runs phases of an existing bundle)"
   fi
+  build_redo_plan
 }
 
 # ---------------------------------------------------------------------------
@@ -238,6 +240,28 @@ persist_effective_config() {
   meta_set INDIVIDUAL_RUNS "$INDIVIDUAL_RUNS"
   meta_set GDB_MAX_RUNS "$GDB_MAX_RUNS"
   meta_set SKIP_GDB "$SKIP_GDB"
+}
+
+build_redo_plan() {
+  REDO_PLAN=()
+  [[ -n "$REDO_PHASES" ]] || return 0
+  [[ ! "$REDO_PHASES" =~ (^,|,$|,,) ]] ||
+    diag_die "--redo contains an empty phase name"
+  local -a requested=()
+  local phase
+  declare -A seen=()
+  IFS=',' read -ra requested <<< "$REDO_PHASES"
+  for phase in "${requested[@]}"; do
+    case "$phase" in
+      baseline | groups | individual | gdb | frequency) ;;
+      *)
+        diag_die "--redo: unknown or unsupported phase '$phase' (supported: baseline,groups,individual,gdb,frequency)"
+        ;;
+    esac
+    [[ -z "${seen[$phase]:-}" ]] || diag_die "--redo phase '$phase' was listed more than once"
+    seen[$phase]=1
+    REDO_PLAN+=("$phase")
+  done
 }
 
 # Move a phase's data aside (never delete) and clear its done marker so the
@@ -835,6 +859,7 @@ Resolved configuration:
   baseline           $BASELINE_CHILDREN children x $BASELINE_WAVES waves (~$((BASELINE_CHILDREN * BASELINE_WAVES)) child runs)
   groups             ${#GROUP_NAME[@]} group(s) x $GROUP_WAVES waves
   individual runs    $INDIVIDUAL_RUNS per CPU (failing groups' CPUs, or all $ncpus_online online CPUs)
+  redo phases        ${REDO_PLAN[*]:-none}
   frequency A/B/A    manual step (sudo ./frequency-ab.sh; never automatic)
   gdb capture        $( [[ "$SKIP_GDB" == "1" ]] && printf 'skipped' || printf 'up to %s runs on the worst CPU' "$GDB_MAX_RUNS" )
 
@@ -952,11 +977,9 @@ main() {
   # describe the run that is about to execute and must be reflected in JSON.
   persist_effective_config
 
-  if [[ -n "$REDO_PHASES" ]]; then
-    local -a redo_list=()
+  if ((${#REDO_PLAN[@]} > 0)); then
     local rp
-    IFS=',' read -ra redo_list <<< "$REDO_PHASES"
-    for rp in "${redo_list[@]}"; do
+    for rp in "${REDO_PLAN[@]}"; do
       redo_phase "$rp"
     done
   fi
