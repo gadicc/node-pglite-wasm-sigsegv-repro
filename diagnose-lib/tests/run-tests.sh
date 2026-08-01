@@ -50,28 +50,40 @@ fi
 
 echo "== settings restore on simulated interruption =="
 run_restore_case() {
-  # run_restore_case <signal|EXIT> ; echoes final fake-file content
+  # run_restore_case <signal|EXIT>; echoes value|rc|ready|ledger-empty|seconds
   local sig="$1"
   local dir
   dir="$(mktemp -d "$TMP/restore.XXXXXX")"
   printf '0\n' > "$dir/no_turbo"
+  # Job control prevents Bash from starting the background child with SIGINT
+  # ignored, which would make an INT test incapable of exercising its trap.
+  set -m
   bash "$FIX/restore-child.sh" "$REPO_ROOT" "$dir/restore.tsv" "$dir/no_turbo" "$dir/ready" \
     $([[ "$sig" == "EXIT" ]] && printf 'exit-now') > /dev/null 2>&1 &
   local pid=$!
-  local i
+  set +m
+  local i ready=0 start=$SECONDS
   for ((i = 0; i < 50; i++)); do
-    [[ -f "$dir/ready" ]] && break
+    if [[ -f "$dir/ready" ]]; then
+      ready=1
+      break
+    fi
     sleep 0.1
   done
-  if [[ "$sig" != "EXIT" ]]; then
+  if ((ready == 1)) && [[ "$sig" != "EXIT" ]]; then
     kill -s "$sig" "$pid" 2> /dev/null
   fi
   wait "$pid" 2> /dev/null
-  cat "$dir/no_turbo"
+  local rc=$? ledger_empty=0
+  [[ ! -s "$dir/restore.tsv" ]] && ledger_empty=1
+  printf '%s|%s|%s|%s|%s\n' "$(cat "$dir/no_turbo")" "$rc" "$ready" "$ledger_empty" "$((SECONDS - start))"
 }
-check_eq "SIGTERM restores no_turbo" "0" "$(run_restore_case TERM)"
-check_eq "SIGINT restores no_turbo" "0" "$(run_restore_case INT)"
-check_eq "normal exit restores no_turbo" "0" "$(run_restore_case EXIT)"
+term_restore="$(run_restore_case TERM)"
+int_restore="$(run_restore_case INT)"
+exit_restore="$(run_restore_case EXIT)"
+check_eq "SIGTERM restores promptly with rc=143" "1" "$([[ "$term_restore" =~ ^0\|143\|1\|1\|([0-4])$ ]] && echo 1 || echo 0)"
+check_eq "SIGINT restores promptly with rc=130" "1" "$([[ "$int_restore" =~ ^0\|130\|1\|1\|([0-4])$ ]] && echo 1 || echo 0)"
+check_eq "normal exit restores no_turbo" "1" "$([[ "$exit_restore" =~ ^0\|0\|1\|1\|([0-4])$ ]] && echo 1 || echo 0)"
 
 echo "== single.sh validation =="
 bash "$REPO_ROOT/single.sh" abc > /dev/null 2>&1
@@ -100,12 +112,17 @@ fi
 echo "== privileged companion script guards =="
 bash "$REPO_ROOT/frequency-ab.sh" > /dev/null 2>&1
 check_eq "frequency-ab.sh usage error (rc=2)" "2" "$?"
-(cd "$REPO_ROOT" && bash ./frequency-ab.sh 19 1 "$TMP") > /dev/null 2>&1
-check_eq "frequency-ab.sh refuses non-root (rc=4)" "4" "$?"
 bash "$REPO_ROOT/root-checks.sh" > /dev/null 2>&1
 check_eq "root-checks.sh usage error (rc=2)" "2" "$?"
-bash "$REPO_ROOT/root-checks.sh" "$TMP" > /dev/null 2>&1
-check_eq "root-checks.sh refuses non-root (rc=4)" "4" "$?"
+if ((EUID != 0)); then
+  (cd "$REPO_ROOT" && bash ./frequency-ab.sh 19 1 "$TMP") > /dev/null 2>&1
+  check_eq "frequency-ab.sh refuses non-root (rc=4)" "4" "$?"
+  bash "$REPO_ROOT/root-checks.sh" "$TMP" > /dev/null 2>&1
+  check_eq "root-checks.sh refuses non-root (rc=4)" "4" "$?"
+else
+  ok "frequency-ab.sh non-root guard [skipped while tests run as root]"
+  ok "root-checks.sh non-root guard [skipped while tests run as root]"
+fi
 
 echo "== --redo phase handling =="
 RB="$TMP/redo-bundle"

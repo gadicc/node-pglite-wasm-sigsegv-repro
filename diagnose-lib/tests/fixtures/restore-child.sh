@@ -4,7 +4,7 @@
 #
 # Saves the current value of the fake sysfs file, arms the restore traps,
 # writes 1 into it (simulating "turbo disabled"), signals readiness, then
-# sleeps until a signal arrives (or exits immediately when exit-now is set,
+# blocks in a shell builtin until a signal arrives (or exits immediately when exit-now is set,
 # exercising the EXIT trap path).
 set -u
 
@@ -26,4 +26,12 @@ diag_sysfs_write "$fake_file" 1
 if [[ -n "$exit_now" ]]; then
   exit 0
 fi
-sleep 60
+
+# A foreground external `sleep` makes non-interactive Bash defer traps until
+# the child exits. A read/write FIFO has no writer process to clean up and lets
+# the shell handle INT/TERM immediately while blocked in `read`.
+fifo="$ready_file.fifo"
+mkfifo "$fifo"
+exec {signal_fd}<> "$fifo"
+rm -f "$fifo"
+read -r -u "$signal_fd" _
