@@ -67,6 +67,7 @@ if [[ -n "$CAP_KHZ" ]]; then
   ((CAP_KHZ >= 100000)) || diag_die "--cap must be >= 100000 kHz"
 fi
 [[ -d "$BUNDLE" ]] || diag_die "bundle directory '$BUNDLE' does not exist"
+BUNDLE="$(diag_canonical_dir "$BUNDLE")"
 [[ -f child.mjs ]] || diag_die "child.mjs not found; run from the repository checkout"
 
 if ((EUID != 0)); then

@@ -62,6 +62,11 @@ diag_require_uint() {
   diag_is_uint "$value" || diag_die "$name must be a non-negative integer, got '$value'"
 }
 
+diag_canonical_dir() {
+  local dir="$1"
+  (cd -- "$dir" && pwd -P)
+}
+
 # ---------------------------------------------------------------------------
 # CPU list handling ("0-3,8,10-11" <-> individual ids)
 # ---------------------------------------------------------------------------
