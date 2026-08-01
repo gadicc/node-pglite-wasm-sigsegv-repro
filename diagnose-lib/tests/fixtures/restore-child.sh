@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # restore-child.sh - helper for the restore-on-signal tests.
-# Usage: restore-child.sh <repo-root> <restore-file> <fake-sysfs-file> <ready-file> [exit-now]
+# Usage: restore-child.sh <repo-root> <restore-file> <fake-sysfs-file> <ready-file> [exit-now|signal:INT|signal:TERM]
 #
 # Saves the current value of the fake sysfs file, arms the restore traps,
 # writes 1 into it (simulating "turbo disabled"), signals readiness, then
@@ -12,7 +12,7 @@ repo_root="$1"
 export DIAG_RESTORE_FILE="$2"
 fake_file="$3"
 ready_file="$4"
-exit_now="${5:-}"
+action="${5:-}"
 
 export DIAG_SUDO=""
 # shellcheck source=../../common.sh
@@ -26,8 +26,12 @@ diag_sysfs_write "$fake_file" 1
 sleep 300 &
 DIAG_SAMPLER_PID=$!
 printf '%s\n' "$DIAG_SAMPLER_PID" > "$ready_file"
-if [[ -n "$exit_now" ]]; then
+if [[ "$action" == "exit-now" ]]; then
   exit 0
+fi
+if [[ "$action" == signal:* ]]; then
+  signal="${action#signal:}"
+  (sleep 0.05; kill -s "$signal" "$$") &
 fi
 
 # A foreground external `sleep` makes non-interactive Bash defer traps until

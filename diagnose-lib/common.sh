@@ -359,6 +359,16 @@ diag_freq_sampler_start() {
 diag_freq_sampler_stop() {
   if [[ -n "$DIAG_SAMPLER_PID" ]]; then
     kill "$DIAG_SAMPLER_PID" 2> /dev/null || true
+    local i
+    for ((i = 0; i < 20; i++)); do
+      kill -0 "$DIAG_SAMPLER_PID" 2> /dev/null || break
+      sleep 0.05
+    done
+    # Do not let an uncooperative sampler indefinitely block restoration.
+    if kill -0 "$DIAG_SAMPLER_PID" 2> /dev/null; then
+      diag_warn "frequency sampler did not stop after SIGTERM; sending SIGKILL"
+      kill -KILL "$DIAG_SAMPLER_PID" 2> /dev/null || true
+    fi
     wait "$DIAG_SAMPLER_PID" 2> /dev/null || true
     DIAG_SAMPLER_PID=""
   fi

@@ -63,26 +63,21 @@ run_restore_case() {
   local dir
   dir="$(mktemp -d "$TMP/restore.XXXXXX")"
   printf '0\n' > "$dir/no_turbo"
-  # Job control prevents Bash from starting the background child with SIGINT
-  # ignored, which would make an INT test incapable of exercising its trap.
-  set -m
-  bash "$FIX/restore-child.sh" "$REPO_ROOT" "$dir/restore.tsv" "$dir/no_turbo" "$dir/ready" \
-    $([[ "$sig" == "EXIT" ]] && printf 'exit-now') > /dev/null 2>&1 &
-  local pid=$!
-  set +m
-  local i ready=0 start=$SECONDS
-  for ((i = 0; i < 50; i++)); do
-    if [[ -f "$dir/ready" ]]; then
-      ready=1
-      break
-    fi
-    sleep 0.1
-  done
-  if ((ready == 1)) && [[ "$sig" != "EXIT" ]]; then
-    kill -s "$sig" "$pid" 2> /dev/null
+  local ready=0 start=$SECONDS rc
+  if [[ "$sig" == "EXIT" ]]; then
+    bash "$FIX/restore-child.sh" "$REPO_ROOT" "$dir/restore.tsv" "$dir/no_turbo" "$dir/ready" exit-now \
+      > /dev/null 2>&1
+    rc=$?
+  else
+    # The foreground fixture schedules its own signal after it has armed the
+    # traps and published readiness. This avoids asynchronous-job signal
+    # dispositions and parent/exec races in the test harness.
+    bash "$FIX/restore-child.sh" "$REPO_ROOT" "$dir/restore.tsv" "$dir/no_turbo" "$dir/ready" "signal:$sig" \
+      > /dev/null 2>&1
+    rc=$?
   fi
-  wait "$pid" 2> /dev/null
-  local rc=$? ledger_empty=0 sampler_gone=0 sampler_pid=""
+  [[ -f "$dir/ready" ]] && ready=1
+  local ledger_empty=0 sampler_gone=0 sampler_pid=""
   [[ ! -s "$dir/restore.tsv" ]] && ledger_empty=1
   sampler_pid="$(cat "$dir/ready" 2> /dev/null || true)"
   [[ -n "$sampler_pid" ]] && ! kill -0 "$sampler_pid" 2> /dev/null && sampler_gone=1
