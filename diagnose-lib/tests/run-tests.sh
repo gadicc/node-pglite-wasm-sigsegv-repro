@@ -44,6 +44,12 @@ check_eq "canonical directory survives later cwd changes" "$TMP/canonical/base/b
 check_eq "compress" "0-3,8,10-11" "$(diag_cpulist_expand '0-3,8,10-11' | sort -n | diag_cpulist_compress)"
 check_eq "compress single" "5" "$(printf '5\n' | diag_cpulist_compress)"
 check_eq "count" "24" "$(diag_cpulist_count '0-23')"
+check_eq "intersect CPU lists" "2-3" "$(diag_cpulist_intersect '0-7' '2-3,8')"
+if diag_cpulist_contains '2-3,8' 8 && ! diag_cpulist_contains '2-3,8' 7; then
+  ok "CPU-list membership"
+else
+  bad "CPU-list membership"
+fi
 if (diag_cpulist_expand 'bogus') 2> /dev/null; then
   bad "expand rejects garbage"
 else
@@ -403,6 +409,9 @@ check_eq "conflicting mode flags are rejected" "1" "$([[ $mode_conflict_rc -ne 0
 "$REPO_ROOT/diagnose.sh" --gdb-max-runs 0 --dry-run --yes > /dev/null 2>&1
 zero_gdb_rc=$?
 check_eq "zero gdb attempts are rejected" "1" "$([[ $zero_gdb_rc -ne 0 ]] && echo 1 || echo 0)"
+"$REPO_ROOT/diagnose.sh" --cpu 999999 --dry-run --yes > /dev/null 2>&1
+unusable_cpu_rc=$?
+check_eq "unusable CPU override is rejected" "1" "$([[ $unusable_cpu_rc -ne 0 ]] && echo 1 || echo 0)"
 
 echo "== effective resume configuration =="
 printf 'MODE=quick\nINDIVIDUAL_RUNS=20\nCOMPLETED_PHASES=baseline\n' > "$RB/results/meta.env"

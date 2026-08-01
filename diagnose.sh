@@ -410,6 +410,8 @@ redo_phase() {
 # Topology discovery (sysfs only; nothing hardcoded to this machine)
 # ---------------------------------------------------------------------------
 ONLINE_CPUS=""
+KERNEL_ONLINE_CPUS=""
+ALLOWED_CPUS=""
 P_CORES=""
 E_CORES=""
 declare -a GROUP_NAME=()
@@ -430,11 +432,20 @@ cpu_list_sorted() {
 }
 
 discover_topology() {
-  ONLINE_CPUS="$(cat /sys/devices/system/cpu/online 2> /dev/null || echo "")"
-  [[ -n "$ONLINE_CPUS" ]] || ONLINE_CPUS="0-$(( $(nproc) - 1 ))"
+  KERNEL_ONLINE_CPUS="$(cat /sys/devices/system/cpu/online 2> /dev/null || echo "")"
+  [[ -n "$KERNEL_ONLINE_CPUS" ]] || KERNEL_ONLINE_CPUS="0-$(( $(nproc) - 1 ))"
+  ALLOWED_CPUS="$(sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' /proc/self/status 2> /dev/null)"
+  [[ -n "$ALLOWED_CPUS" ]] || ALLOWED_CPUS="$KERNEL_ONLINE_CPUS"
+  ONLINE_CPUS="$(diag_cpulist_intersect "$KERNEL_ONLINE_CPUS" "$ALLOWED_CPUS")"
+  [[ -n "$ONLINE_CPUS" ]] ||
+    diag_die "no usable CPU is both online and allowed by this process's affinity/cpuset"
 
-  [[ -r /sys/devices/cpu_core/cpus ]] && P_CORES="$(cat /sys/devices/cpu_core/cpus)"
-  [[ -r /sys/devices/cpu_atom/cpus ]] && E_CORES="$(cat /sys/devices/cpu_atom/cpus)"
+  if [[ -r /sys/devices/cpu_core/cpus ]]; then
+    P_CORES="$(diag_cpulist_intersect "$(cat /sys/devices/cpu_core/cpus)" "$ONLINE_CPUS")"
+  fi
+  if [[ -r /sys/devices/cpu_atom/cpus ]]; then
+    E_CORES="$(diag_cpulist_intersect "$(cat /sys/devices/cpu_atom/cpus)" "$ONLINE_CPUS")"
+  fi
 
   if [[ -n "$P_CORES" ]]; then
     add_group "pcores" "pcore" "$P_CORES" "-"
@@ -733,6 +744,8 @@ phase_preflight() {
     printf 'CPU_ADDRESS_SIZES=%s\n' "$(lscpu_field 'Address sizes')"
     printf 'CPU_LOGICAL=%s\n' "$(nproc)"
     printf 'ONLINE_CPUS=%s\n' "$ONLINE_CPUS"
+    printf 'KERNEL_ONLINE_CPUS=%s\n' "$KERNEL_ONLINE_CPUS"
+    printf 'ALLOWED_CPUS=%s\n' "$ALLOWED_CPUS"
     printf 'P_CORES=%s\n' "${P_CORES:-none-detected}"
     printf 'E_CORES=%s\n' "${E_CORES:-none-detected}"
     printf 'DMI_PRODUCT=%s\n' "$(sed -n 's/^product_name=//p' "$env_dir/dmi.txt")"
@@ -1052,6 +1065,10 @@ main() {
   command -v node > /dev/null 2>&1 || diag_die "node is required but not found in PATH"
 
   discover_topology
+
+  if [[ -n "$WORST_CPU_OVERRIDE" ]] && ! diag_cpulist_contains "$ONLINE_CPUS" "$WORST_CPU_OVERRIDE"; then
+    diag_die "--cpu $WORST_CPU_OVERRIDE is not in the usable CPU set ($ONLINE_CPUS)"
+  fi
 
   if [[ -z "$OUT_DIR" ]]; then
     OUT_DIR="diagnostics/$(date -u +%Y-%m-%dT%H%M%SZ)"

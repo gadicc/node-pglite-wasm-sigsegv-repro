@@ -131,6 +131,27 @@ diag_cpulist_count() {
   diag_cpulist_expand "$1" | wc -l
 }
 
+diag_cpulist_intersect() {
+  local left="$1" right="$2" cpu
+  declare -A permitted=()
+  while read -r cpu; do
+    [[ -n "$cpu" ]] && permitted[$cpu]=1
+  done < <(diag_cpulist_expand "$right")
+  local -a overlap=()
+  while read -r cpu; do
+    [[ -n "${permitted[$cpu]:-}" ]] && overlap+=("$cpu")
+  done < <(diag_cpulist_expand "$left")
+  printf '%s\n' "${overlap[@]}" | sort -n -u | diag_cpulist_compress
+}
+
+diag_cpulist_contains() {
+  local list="$1" wanted="$2" cpu
+  while read -r cpu; do
+    [[ "$cpu" == "$wanted" ]] && return 0
+  done < <(diag_cpulist_expand "$list")
+  return 1
+}
+
 # ---------------------------------------------------------------------------
 # Privilege handling
 # ---------------------------------------------------------------------------
