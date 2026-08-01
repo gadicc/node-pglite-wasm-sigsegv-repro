@@ -43,6 +43,7 @@ RESUME_DIR=""
 SKIP_GDB=0
 DRY_RUN=0
 ASSUME_YES=0
+REDO_PHASES=""
 WORST_CPU_OVERRIDE=""
 
 usage() {
@@ -62,6 +63,10 @@ Options:
   --resume DIR          resume an interrupted run, skipping completed phases
                         (also regenerates the report, e.g. after running
                         root-checks.sh or frequency-ab.sh manually)
+  --redo PHASES         with --resume: re-run phase(s) from scratch
+                        (comma-separated: baseline,groups,individual,gdb,
+                        frequency). Old data is preserved under
+                        state/superseded/, never deleted.
   --out-dir DIR         output directory (default: diagnostics/<UTC timestamp>)
   --skip-gdb            skip the GDB capture phase
   --individual-runs N   runs per CPU (overrides mode default)
@@ -156,6 +161,7 @@ parse_args() {
       --resume) RESUME_DIR="${2:?}"; shift 2 ;;
       --out-dir) OUT_DIR="${2:?}"; shift 2 ;;
       --skip-gdb) SKIP_GDB=1; shift ;;
+      --redo) REDO_PHASES="${2:?--redo needs a phase list}"; shift 2 ;;
       --individual-runs) INDIVIDUAL_RUNS="${2:?}"; shift 2 ;;
       --group-waves) GROUP_WAVES="${2:?}"; shift 2 ;;
       --gdb-max-runs) GDB_MAX_RUNS="${2:?}"; shift 2 ;;
@@ -178,6 +184,9 @@ validate_config() {
     diag_die "runs/waves/children must all be >= 1"
   if [[ -n "$WORST_CPU_OVERRIDE" ]]; then
     diag_require_uint "--cpu" "$WORST_CPU_OVERRIDE"
+  fi
+  if [[ -n "$REDO_PHASES" && -z "$RESUME_DIR" ]]; then
+    diag_die "--redo requires --resume DIR (it re-runs phases of an existing bundle)"
   fi
 }
 
@@ -215,6 +224,43 @@ sync_meta_completed() {
     list="${list:+$list,}$f"
   done
   meta_set COMPLETED_PHASES "$list"
+}
+
+# Move a phase's data aside (never delete) and clear its done marker so the
+# phase re-runs from scratch on this resume. Used by --redo when a phase
+# should be repeated in a single contiguous session rather than topped up.
+redo_phase() {
+  local phase="$1"
+  local stash="$STATE_DIR/superseded/${phase}-$(date +%Y%m%dT%H%M%S)"
+  local -a paths=()
+  case "$phase" in
+    baseline) paths=(results/baseline.meta logs/baseline) ;;
+    groups) paths=(results/groups.tsv logs/groups) ;;
+    individual) paths=(results/individual.tsv logs/individual) ;;
+    gdb) paths=(results/gdb.meta gdb logs/gdb) ;;
+    frequency)
+      paths=(results/frequency-ab.tsv results/frequency-ab.meta
+        results/frequency-cap.tsv results/frequency-cap.meta)
+      ;;
+    *)
+      diag_die "--redo: unknown or unsupported phase '$phase' (supported: baseline,groups,individual,gdb,frequency)"
+      ;;
+  esac
+  local p moved=0
+  for p in "${paths[@]}"; do
+    if [[ -e "$OUT_DIR/$p" ]]; then
+      mkdir -p "$stash"
+      mv "$OUT_DIR/$p" "$stash/"
+      moved=1
+    fi
+  done
+  rm -f "$STATE_DIR/phase-$phase.done"
+  sync_meta_completed
+  if ((moved == 1)); then
+    diag_log "--redo $phase: previous data preserved under ${stash#"$OUT_DIR"/}"
+  else
+    diag_log "--redo $phase: no previous data; phase will run fresh"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -641,6 +687,7 @@ compute_individual_targets() {
 
 phase_individual() {
   local tsv="$OUT_DIR/results/individual.tsv"
+  mkdir -p "$OUT_DIR/logs/individual"
   touch "$tsv"
   local -a cpus=()
   mapfile -t cpus < <(cpu_list_sorted "$INDIVIDUAL_TARGET_CPUS")
@@ -867,6 +914,15 @@ main() {
     } > "$META_FILE"
   fi
 
+  if [[ -n "$REDO_PHASES" ]]; then
+    local -a redo_list=()
+    local rp
+    IFS=',' read -ra redo_list <<< "$REDO_PHASES"
+    for rp in "${redo_list[@]}"; do
+      redo_phase "$rp"
+    done
+  fi
+
   safety_gate
   print_plan
 
@@ -959,4 +1015,7 @@ main() {
   diag_log "report: $OUT_DIR/report.md"
 }
 
-main "$@"
+# Allow tests to source this file for individual functions without running.
+if [[ "${DIAG_SOURCE_ONLY:-}" != "1" ]]; then
+  main "$@"
+fi

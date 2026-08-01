@@ -107,6 +107,47 @@ check_eq "root-checks.sh usage error (rc=2)" "2" "$?"
 bash "$REPO_ROOT/root-checks.sh" "$TMP" > /dev/null 2>&1
 check_eq "root-checks.sh refuses non-root (rc=4)" "4" "$?"
 
+echo "== --redo phase handling =="
+RB="$TMP/redo-bundle"
+mkdir -p "$RB"/{results,state,logs/individual}
+printf '19\t1\t139\t2\n19\t2\t0\t2\n' > "$RB/results/individual.tsv"
+touch "$RB/state/phase-individual.done" "$RB/state/phase-baseline.done"
+printf 'MODE=quick\nINDIVIDUAL_RUNS=20\nCOMPLETED_PHASES=baseline,individual\n' > "$RB/results/meta.env"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  # Set these after sourcing: diagnose.sh top-level initialises its own.
+  OUT_DIR="$RB"
+  STATE_DIR="$RB/state"
+  META_FILE="$RB/results/meta.env"
+  redo_phase individual
+) > /dev/null 2>&1
+redo_ok=0
+[[ ! -f "$RB/results/individual.tsv" ]] &&
+  [[ ! -f "$RB/state/phase-individual.done" ]] &&
+  compgen -G "$RB/state/superseded/individual-*/individual.tsv" > /dev/null &&
+  grep -q '^COMPLETED_PHASES=baseline$' "$RB/results/meta.env" && redo_ok=1
+check_eq "--redo individual stashes data, clears marker" "1" "$redo_ok"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$RB"
+  STATE_DIR="$RB/state"
+  META_FILE="$RB/results/meta.env"
+  redo_phase bogus-phase
+) > /dev/null 2>&1
+[[ $? -ne 0 ]]
+check_eq "--redo rejects unknown phase" "0" "$?"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  REDO_PHASES=individual
+  RESUME_DIR=""
+  validate_config
+) > /dev/null 2>&1
+[[ $? -ne 0 ]]
+check_eq "--redo without --resume is rejected" "0" "$?"
+
 echo "== node unit tests (stats, parsers) =="
 if (cd "$LIB" && node --test 'tests/*.test.mjs') > "$TMP/node-tests.log" 2>&1; then
   ok "node --test stats+parsers"

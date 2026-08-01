@@ -146,10 +146,21 @@ Everything lands in a timestamped bundle, `diagnostics/<UTC timestamp>/`
 
 Phases mark completion under `state/`; an interrupted run (SIGINT/SIGTERM
 writes a partial report first) can be resumed without discarding finished
-work — including partially completed per-CPU tables:
+work — including partially completed per-CPU tables, which are topped up
+by running only the missing runs:
 
 ```sh
 ./diagnose.sh --resume diagnostics/2026-08-01T084335Z --yes
+```
+
+To instead *repeat* a phase from scratch in one contiguous session (for
+example the per-CPU tests, so all runs share one turbo/load regime), use
+`--redo`. The previous data is moved to `state/superseded/`, never
+deleted:
+
+```sh
+./diagnose.sh --resume diagnostics/2026-08-01T084335Z \
+  --redo individual --individual-runs 50 --yes
 ```
 
 ### Interpreting the report
