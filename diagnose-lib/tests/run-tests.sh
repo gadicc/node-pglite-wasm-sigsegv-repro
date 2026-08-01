@@ -488,6 +488,26 @@ check_eq "individual row deficit is rejected" "1" "$([[ $? -ne 0 ]] && echo 1 ||
 )
 check_eq "only captured/no-fault gdb outcomes are phase-complete" "0" "$?"
 
+FREQUENCY_COMPLETE="$TMP/frequency-complete"
+mkdir -p "$FREQUENCY_COMPLETE/results"
+printf 'A1\t1\t139\t2\nB\t1\t0\t3\nA2\t1\t0\t2\n' > "$FREQUENCY_COMPLETE/results/frequency-ab.tsv"
+printf 'RUNS_PER_LEG=1\nRESTORED=1\nCOMPLETED=1\n' > "$FREQUENCY_COMPLETE/results/frequency-ab.meta"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$FREQUENCY_COMPLETE"
+  frequency_result_is_complete
+)
+check_eq "complete restored frequency A/B/A evidence is accepted" "0" "$?"
+sed -i '/^A2/d' "$FREQUENCY_COMPLETE/results/frequency-ab.tsv"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$FREQUENCY_COMPLETE"
+  frequency_result_is_complete
+) > /dev/null 2>&1
+check_eq "partial frequency A/B/A evidence is not phase-complete" "1" "$([[ $? -ne 0 ]] && echo 1 || echo 0)"
+
 echo "== resume bundle identity =="
 resume_plan="$(cd "$TMP" && "$REPO_ROOT/diagnose.sh" --resume redo-bundle --dry-run --yes 2>&1)"
 check_eq "relative resume keeps its caller-resolved bundle" "1" "$([[ "$resume_plan" == *"out dir            $RB (resume)"* ]] && echo 1 || echo 0)"
@@ -657,6 +677,7 @@ LEG_B_SCALING_MAX_KHZ=5500000
 LEG_A2_NO_TURBO=0
 LEG_A2_SCALING_MAX_KHZ=5500000
 RESTORED=1
+COMPLETED=1
 EOF
 for leg in A1 B A2; do
   printf 'scaling_cur_freq\n' > "$B/freq/freq-ab-${leg}.method"

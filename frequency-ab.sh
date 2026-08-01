@@ -192,6 +192,10 @@ if [[ -n "$CAP_KHZ" && -n "$POLICY" ]]; then
   [[ "$now" == "$saved_smax" ]] || diag_warn "scaling_max_freq restore verification FAILED"
 fi
 
+diag_frequency_rows_are_complete "$TSV" "$RUNS" ||
+  diag_die "frequency A/B/A output is incomplete or contains non-SIGSEGV operational failures"
+printf 'COMPLETED=1\n' >> "$META"
+
 # Hand ownership back to the invoking user.
 if [[ -n "${SUDO_USER:-}" ]]; then
   chown -R "$SUDO_USER":"$(id -gn "$SUDO_USER")" \

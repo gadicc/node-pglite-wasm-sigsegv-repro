@@ -1011,10 +1011,13 @@ worst_cpu() {
 # print the exact manual command.
 phase_frequency() {
   local cpu="$1"
-  if [[ -s "$OUT_DIR/results/frequency-ab.tsv" ]]; then
+  if frequency_result_is_complete; then
     diag_log "phase 5/7: frequency-ab.tsv present (manual frequency-ab.sh run); incorporating"
     mark_done frequency
     return 0
+  fi
+  if [[ -e "$OUT_DIR/results/frequency-ab.tsv" || -e "$OUT_DIR/results/frequency-ab.meta" ]]; then
+    diag_warn "phase 5/7: incomplete manual frequency results found; phase remains resumable"
   fi
   diag_warn "phase 5/7: frequency A/B/A not run by this script (it changes a runtime setting)."
   if [[ -n "$cpu" ]]; then
@@ -1023,6 +1026,18 @@ phase_frequency() {
   else
     diag_warn "  no failing CPU identified; nothing to test."
   fi
+}
+
+frequency_result_is_complete() {
+  local tsv="$OUT_DIR/results/frequency-ab.tsv"
+  local meta="$OUT_DIR/results/frequency-ab.meta"
+  [[ -f "$meta" ]] || return 1
+  local runs restored completed
+  runs="$(metadata_value "$meta" RUNS_PER_LEG)"
+  restored="$(metadata_value "$meta" RESTORED)"
+  completed="$(metadata_value "$meta" COMPLETED)"
+  [[ "$restored" == "1" && "$completed" == "1" ]] || return 1
+  diag_frequency_rows_are_complete "$tsv" "$runs"
 }
 
 # ------------------------------------------------------------------
@@ -1304,7 +1319,7 @@ main() {
   # ---- phase 5 (manual; see frequency-ab.sh) ----
   if phase_is_done frequency; then
     diag_log "phase 5/7 frequency: already done, skipping (resume)"
-  elif [[ -s "$OUT_DIR/results/frequency-ab.tsv" ]]; then
+  elif frequency_result_is_complete; then
     diag_log "phase 5/7: results from a manual frequency-ab.sh run found; incorporating"
     mark_done frequency
   elif [[ -z "$target_cpu" ]]; then

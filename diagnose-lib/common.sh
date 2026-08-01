@@ -434,3 +434,26 @@ diag_run_single_runs() {
   done
   diag_freq_sampler_stop
 }
+
+diag_frequency_rows_are_complete() {
+  local tsv="$1" runs="$2"
+  diag_is_uint "$runs" && ((runs >= 1)) || return 1
+  [[ -f "$tsv" ]] || return 1
+  awk -F'\t' -v runs="$runs" '
+    BEGIN { valid=1 }
+    {
+      if (NF != 4 || ($1 != "A1" && $1 != "B" && $1 != "A2") ||
+          $2 !~ /^[0-9]+$/ || $2 < 1 || $2 > runs ||
+          ($3 != 0 && $3 != 139) || $4 !~ /^[0-9]+$/) {
+        valid=0
+        next
+      }
+      key=$1 SUBSEP $2
+      if (seen[key]++) valid=0
+      count[$1]++
+    }
+    END {
+      exit (valid && count["A1"] == runs && count["B"] == runs && count["A2"] == runs) ? 0 : 1
+    }
+  ' "$tsv"
+}
