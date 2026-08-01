@@ -889,10 +889,17 @@ main() {
 
   discover_topology
 
-  if ((DRY_RUN == 1)); then
-    if [[ -z "$OUT_DIR" ]]; then
-      OUT_DIR="diagnostics/$(date -u +%Y-%m-%dT%H%M%SZ)"
+  if [[ -z "$OUT_DIR" ]]; then
+    OUT_DIR="diagnostics/$(date -u +%Y-%m-%dT%H%M%SZ)"
+  fi
+  if [[ -z "$RESUME_DIR" && -e "$OUT_DIR" ]]; then
+    [[ -d "$OUT_DIR" ]] || diag_die "output path '$OUT_DIR' exists and is not a directory"
+    if find "$OUT_DIR" -mindepth 1 -print -quit | grep -q .; then
+      diag_die "output directory '$OUT_DIR' is not empty; use --resume to continue that bundle"
     fi
+  fi
+
+  if ((DRY_RUN == 1)); then
     print_plan
     if [[ ! -d node_modules/@electric-sql/pglite ]]; then
       diag_warn "node_modules/@electric-sql/pglite missing; run 'npm ci' first"
@@ -903,9 +910,6 @@ main() {
   [[ -d node_modules/@electric-sql/pglite ]] ||
     diag_die "dependencies not installed; run 'npm ci' first"
 
-  if [[ -z "$OUT_DIR" ]]; then
-    OUT_DIR="diagnostics/$(date -u +%Y-%m-%dT%H%M%SZ)"
-  fi
   mkdir -p "$OUT_DIR"/{results,logs/individual,state,env,freq,gdb}
   OUT_DIR="$(cd "$OUT_DIR" && pwd)"
   META_FILE="$OUT_DIR/results/meta.env"
