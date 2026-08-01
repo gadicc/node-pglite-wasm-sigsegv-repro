@@ -391,6 +391,8 @@ printf 'existing evidence\n' > "$TMP/nonempty-output/results.json"
 "$REPO_ROOT/diagnose.sh" --out-dir "$TMP/nonempty-output" --dry-run --yes > /dev/null 2>&1
 nonempty_output_rc=$?
 check_eq "new run rejects a nonempty output directory" "1" "$([[ $nonempty_output_rc -ne 0 ]] && echo 1 || echo 0)"
+relative_out_plan="$(cd "$TMP" && "$REPO_ROOT/diagnose.sh" --out-dir relative-output --dry-run --yes 2>&1)"
+check_eq "relative output directory is resolved from caller cwd" "1" "$([[ "$relative_out_plan" == *"out dir            $TMP/relative-output"* ]] && echo 1 || echo 0)"
 
 echo "== effective resume configuration =="
 printf 'MODE=quick\nINDIVIDUAL_RUNS=20\nCOMPLETED_PHASES=baseline\n' > "$RB/results/meta.env"

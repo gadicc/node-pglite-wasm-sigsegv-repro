@@ -972,7 +972,19 @@ EOF
 
 # ---------------------------------------------------------------------------
 main() {
+  local caller_dir
+  caller_dir="$(pwd -P)"
   pre_pass "$@"
+
+  local requested_out=""
+  if ((OUT_DIR_EXPLICIT == 1)); then
+    if [[ "$OUT_DIR" == /* ]]; then
+      requested_out="$OUT_DIR"
+    else
+      requested_out="$caller_dir/$OUT_DIR"
+    fi
+    OUT_DIR="$requested_out"
+  fi
 
   local resume_abs=""
   if [[ -n "$RESUME_DIR" ]]; then
@@ -995,6 +1007,9 @@ main() {
   fi
 
   parse_args "$@"
+  if ((OUT_DIR_EXPLICIT == 1)); then
+    OUT_DIR="$requested_out"
+  fi
   # parse_args sees the original relative spellings again. Keep the canonical
   # bundle identity resolved above so the later cd cannot retarget a resume.
   if [[ -n "$resume_abs" ]]; then
