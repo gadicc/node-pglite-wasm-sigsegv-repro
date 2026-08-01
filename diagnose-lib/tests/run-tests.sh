@@ -125,9 +125,32 @@ printf 'MODE=quick\nINDIVIDUAL_RUNS=20\nCOMPLETED_PHASES=baseline,individual\n' 
 redo_ok=0
 [[ ! -f "$RB/results/individual.tsv" ]] &&
   [[ ! -f "$RB/state/phase-individual.done" ]] &&
-  compgen -G "$RB/state/superseded/individual-*/individual.tsv" > /dev/null &&
+  compgen -G "$RB/state/superseded/individual-*/results/individual.tsv" > /dev/null &&
   grep -q '^COMPLETED_PHASES=baseline$' "$RB/results/meta.env" && redo_ok=1
 check_eq "--redo individual stashes data, clears marker" "1" "$redo_ok"
+
+GB="$TMP/redo-gdb-bundle"
+mkdir -p "$GB"/{results,state,gdb,logs/gdb}
+printf 'CPU=19\n' > "$GB/results/gdb.meta"
+printf 'capture\n' > "$GB/gdb/cpu19-run1.txt"
+printf 'runner\n' > "$GB/logs/gdb/runner.log"
+touch "$GB/state/phase-gdb.done"
+printf 'COMPLETED_PHASES=gdb\n' > "$GB/results/meta.env"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$GB"
+  STATE_DIR="$GB/state"
+  META_FILE="$GB/results/meta.env"
+  redo_phase gdb
+) > /dev/null 2>&1
+gdb_stash="$(find "$GB/state/superseded" -mindepth 1 -maxdepth 1 -type d -name 'gdb-*' -print -quit)"
+gdb_redo_ok=0
+[[ -f "$gdb_stash/results/gdb.meta" ]] &&
+  [[ -f "$gdb_stash/gdb/cpu19-run1.txt" ]] &&
+  [[ -f "$gdb_stash/logs/gdb/runner.log" ]] &&
+  [[ ! -f "$GB/state/phase-gdb.done" ]] && gdb_redo_ok=1
+check_eq "--redo gdb preserves distinct capture and runner paths" "1" "$gdb_redo_ok"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"

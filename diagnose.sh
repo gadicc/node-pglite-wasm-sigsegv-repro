@@ -269,7 +269,6 @@ build_redo_plan() {
 # should be repeated in a single contiguous session rather than topped up.
 redo_phase() {
   local phase="$1"
-  local stash="$STATE_DIR/superseded/${phase}-$(date +%Y%m%dT%H%M%S)"
   local -a paths=()
   case "$phase" in
     baseline) paths=(results/baseline.meta logs/baseline) ;;
@@ -284,17 +283,25 @@ redo_phase() {
       diag_die "--redo: unknown or unsupported phase '$phase' (supported: baseline,groups,individual,gdb,frequency)"
       ;;
   esac
-  local p moved=0
+  local -a existing=()
+  local p
   for p in "${paths[@]}"; do
     if [[ -e "$OUT_DIR/$p" ]]; then
-      mkdir -p "$stash"
-      mv "$OUT_DIR/$p" "$stash/"
-      moved=1
+      existing+=("$p")
     fi
   done
+  local stash=""
+  if ((${#existing[@]} > 0)); then
+    mkdir -p "$STATE_DIR/superseded"
+    stash="$(mktemp -d "$STATE_DIR/superseded/${phase}-$(date +%Y%m%dT%H%M%S)-XXXXXX")"
+    for p in "${existing[@]}"; do
+      mkdir -p "$stash/$(dirname "$p")"
+      mv "$OUT_DIR/$p" "$stash/$p"
+    done
+  fi
   rm -f "$STATE_DIR/phase-$phase.done"
   sync_meta_completed
-  if ((moved == 1)); then
+  if [[ -n "$stash" ]]; then
     diag_log "--redo $phase: previous data preserved under ${stash#"$OUT_DIR"/}"
   else
     diag_log "--redo $phase: no previous data; phase will run fresh"
