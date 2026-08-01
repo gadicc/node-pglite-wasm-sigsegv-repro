@@ -274,6 +274,40 @@ diag_recover_pending_restore() {
   diag_log "pending settings restore completed and verified"
 }
 
+diag_restore_ledger_is_valid() {
+  # usage: diag_restore_ledger_is_valid <ledger> <allowed-path> <value-regex> ...
+  local ledger="$1"
+  shift
+  (($# > 0 && $# % 2 == 0)) || return 1
+  [[ -f "$ledger" && ! -L "$ledger" ]] || return 1
+
+  local path value extra allowed pattern matched
+  declare -A seen=()
+  while IFS=$'\t' read -r path value extra; do
+    [[ -n "$path" && -n "$value" && -z "$extra" && -z "${seen[$path]:-}" ]] || return 1
+    seen[$path]=1
+    matched=0
+    local -a rules=("$@")
+    local i
+    for ((i = 0; i < ${#rules[@]}; i += 2)); do
+      allowed="${rules[$i]}"
+      pattern="${rules[$((i + 1))]}"
+      if [[ "$path" == "$allowed" && "$value" =~ $pattern ]]; then
+        matched=1
+        break
+      fi
+    done
+    ((matched == 1)) || return 1
+  done < "$ledger"
+}
+
+diag_require_not_symlink() {
+  local path
+  for path in "$@"; do
+    [[ ! -L "$path" ]] || diag_die "refusing privileged write through symlink: $path"
+  done
+}
+
 diag_cleanup_now() {
   # A sampler may still be reading a setting we are about to restore. Stop and
   # reap it first, then perform the verified restore.

@@ -84,6 +84,20 @@ fi
 POLICY="$(readlink -f "/sys/devices/system/cpu/cpu${CPU}/cpufreq" 2> /dev/null || echo "")"
 [[ -n "$POLICY" ]] || diag_warn "no cpufreq policy found for cpu $CPU"
 
+declare -a protected_bundle_paths=(
+  "$BUNDLE/results" "$BUNDLE/freq" "$BUNDLE/state" "$BUNDLE/commands.log"
+  "$BUNDLE/results/frequency-ab.tsv" "$BUNDLE/results/frequency-ab.meta"
+  "$BUNDLE/results/frequency-cap.tsv" "$BUNDLE/results/frequency-cap.meta"
+  "$BUNDLE/state/restore-frequency-ab.tsv"
+)
+for tag in A1 B A2 cap; do
+  protected_bundle_paths+=(
+    "$BUNDLE/freq/freq-ab-${tag}.samples"
+    "$BUNDLE/freq/freq-ab-${tag}.method"
+  )
+done
+diag_require_not_symlink "${protected_bundle_paths[@]}"
+
 mkdir -p "$BUNDLE/results" "$BUNDLE/freq" "$BUNDLE/state"
 DIAG_RESTORE_FILE="$BUNDLE/state/restore-frequency-ab.tsv"
 DIAG_FREQ_DIR="$BUNDLE/freq"
@@ -93,6 +107,14 @@ diag_register_cleanup_traps
 
 # SIGKILL cannot run a trap. Recover any durable ledger left by a previous
 # killed invocation before replacing output files or saving new state.
+if [[ -s "$DIAG_RESTORE_FILE" ]]; then
+  declare -a restore_rules=("$NO_TURBO_PATH" '^[01]$')
+  if [[ -n "$POLICY" ]]; then
+    restore_rules+=("$POLICY/scaling_max_freq" '^[0-9]+$')
+  fi
+  diag_restore_ledger_is_valid "$DIAG_RESTORE_FILE" "${restore_rules[@]}" ||
+    diag_die "pending restore ledger is malformed or names a non-allowlisted setting; refusing privileged recovery"
+fi
 diag_recover_pending_restore ||
   diag_die "refusing to start while a previous settings restore is pending"
 

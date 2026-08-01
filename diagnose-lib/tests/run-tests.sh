@@ -130,6 +130,36 @@ recover_rc=$?
 check_eq "pending SIGKILL ledger is recovered before new work" "1" "$([[ $recover_rc -eq 0 && "$(cat "$RECOVER_DIR/value")" == original ]] && echo 1 || echo 0)"
 check_eq "successful pending recovery clears ledger" "1" "$([[ ! -s "$RECOVER_DIR/restore.tsv" ]] && echo 1 || echo 0)"
 
+LEDGER_GUARD_DIR="$TMP/ledger-guard"
+mkdir -p "$LEDGER_GUARD_DIR"
+printf 'safe\n' > "$LEDGER_GUARD_DIR/victim"
+printf '%s\tpwned\n' "$LEDGER_GUARD_DIR/victim" > "$LEDGER_GUARD_DIR/restore.tsv"
+if diag_restore_ledger_is_valid "$LEDGER_GUARD_DIR/restore.tsv" /sys/allowed '^[01]$'; then
+  ledger_guard_rc=0
+else
+  ledger_guard_rc=$?
+fi
+check_eq "restore ledger rejects arbitrary paths" "1" "$([[ $ledger_guard_rc -ne 0 && "$(cat "$LEDGER_GUARD_DIR/victim")" == safe ]] && echo 1 || echo 0)"
+printf '/sys/allowed\t1\textra\n' > "$LEDGER_GUARD_DIR/restore.tsv"
+if diag_restore_ledger_is_valid "$LEDGER_GUARD_DIR/restore.tsv" /sys/allowed '^[01]$'; then
+  malformed_ledger_rc=0
+else
+  malformed_ledger_rc=$?
+fi
+check_eq "restore ledger rejects malformed rows" "1" "$([[ $malformed_ledger_rc -ne 0 ]] && echo 1 || echo 0)"
+printf '/sys/allowed\t1\n' > "$LEDGER_GUARD_DIR/real-ledger"
+ln -s "$LEDGER_GUARD_DIR/real-ledger" "$LEDGER_GUARD_DIR/restore.tsv.symlink"
+if diag_restore_ledger_is_valid "$LEDGER_GUARD_DIR/restore.tsv.symlink" /sys/allowed '^[01]$'; then
+  symlink_ledger_rc=0
+else
+  symlink_ledger_rc=$?
+fi
+check_eq "restore ledger rejects symlinks" "1" "$([[ $symlink_ledger_rc -ne 0 ]] && echo 1 || echo 0)"
+(
+  diag_require_not_symlink "$LEDGER_GUARD_DIR/restore.tsv.symlink"
+) > /dev/null 2>&1
+check_eq "privileged output guard rejects symlinks" "1" "$([[ $? -ne 0 ]] && echo 1 || echo 0)"
+
 echo "== single.sh validation =="
 bash "$REPO_ROOT/single.sh" abc > /dev/null 2>&1
 check_eq "single.sh rejects non-numeric cpu (rc=2)" "2" "$?"
