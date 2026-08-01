@@ -45,11 +45,53 @@ function num(v) {
   return Number.isFinite(n) ? n : null;
 }
 
-// Summarize a frequency sample file written by the sysfs sampler
-// ("epoch cpu khz" lines). Returns null when the file is missing or uses
-// a different method. Only CPUs in cpuFilter (Set of numbers) count when
-// the filter is provided.
-function summarizeFreqSamples(outDir, tag, cpuFilter = null) {
+// Parse per-CPU turbostat output (default rows, i.e. no --Summary): find the
+// header ("Core CPU Avg_MHz Busy% Bzy_MHz ..."), then read Bzy_MHz -- the
+// average clock while the CPU was busy -- from each per-CPU row. Headers
+// repeat every interval and are re-detected; rows with a non-numeric CPU id
+// (the "-" whole-system row) or a non-numeric Bzy_MHz ("-" for offline CPUs)
+// are skipped. Only CPUs in cpuFilter (Set of numbers) count when the filter
+// is provided. Returns null when no per-CPU header is present (e.g. an old
+// `turbostat --Summary` capture).
+function summarizeTurbostatPerCpu(text, cpuFilter) {
+  const mhz = [];
+  let sawHeader = false;
+  let cpuCol = -1;
+  let bzyCol = -1;
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const cells = trimmed.split(/\s+/);
+    const cpuIdx = cells.indexOf("CPU");
+    const bzyIdx = cells.indexOf("Bzy_MHz");
+    if (cpuIdx !== -1 && bzyIdx !== -1) {
+      sawHeader = true;
+      cpuCol = cpuIdx;
+      bzyCol = bzyIdx;
+      continue;
+    }
+    if (!sawHeader) continue;
+    if (cells.length <= Math.max(cpuCol, bzyCol)) continue;
+    const cpu = Number(cells[cpuCol]);
+    if (!Number.isInteger(cpu)) continue; // "-" whole-system summary row
+    if (cpuFilter && !cpuFilter.has(cpu)) continue;
+    const busy = Number(cells[bzyCol]);
+    if (!Number.isFinite(busy)) continue; // "-" for offline CPUs
+    mhz.push(busy);
+  }
+  if (!sawHeader) return null;
+  const out = { note: "turbostat per-CPU Bzy_MHz (busy-only average clock)", samples: mhz.length };
+  if (mhz.length > 0) {
+    out.avgMHz = Math.round((mhz.reduce((a, b) => a + b, 0) / mhz.length) * 100) / 100;
+    out.maxMHz = Math.max(...mhz);
+  }
+  return out;
+}
+
+// Summarize a frequency sample file: "epoch cpu khz" lines (sysfs sampler)
+// or raw turbostat output (parsed per method). Only CPUs in cpuFilter (Set
+// of numbers) count when the filter is provided; null spans all CPUs.
+export function summarizeFreqSamples(outDir, tag, cpuFilter = null) {
   const file = path.join(outDir, "freq", `${tag}.samples`);
   const methodFile = path.join(outDir, "freq", `${tag}.method`);
   const method = existsSync(methodFile)
@@ -84,17 +126,25 @@ function summarizeFreqSamples(outDir, tag, cpuFilter = null) {
       summary.samples = 0;
     }
   } else if (method === "turbostat") {
-    // Best effort: average the Avg_MHz column of turbostat --Summary rows.
-    const mhz = [];
-    for (const line of text.split("\n")) {
-      const m = line.match(/^\s*(\d+(?:\.\d+)?)\s/);
-      if (m) mhz.push(Number(m[1]));
-    }
-    summary.note = "turbostat raw output retained; Avg_MHz parsed best-effort";
-    if (mhz.length > 0) {
-      summary.avgMHz = Math.round((mhz.reduce((a, b) => a + b, 0) / mhz.length) * 100) / 100;
-      summary.maxMHz = Math.max(...mhz);
-      summary.samples = mhz.length;
+    const perCpu = summarizeTurbostatPerCpu(text, cpuFilter);
+    if (perCpu) {
+      Object.assign(summary, perCpu);
+    } else {
+      // Legacy capture from `turbostat --Summary`: no per-CPU header, so all
+      // that is available is the first-column whole-system Avg_MHz, which
+      // averages every CPU over the interval including idle time.
+      const mhz = [];
+      for (const line of text.split("\n")) {
+        const m = line.match(/^\s*(\d+(?:\.\d+)?)\s/);
+        if (m) mhz.push(Number(m[1]));
+      }
+      summary.note =
+        "turbostat --Summary capture; Avg_MHz is a whole-system summary average (includes idle time), not the pinned CPU";
+      if (mhz.length > 0) {
+        summary.avgMHz = Math.round((mhz.reduce((a, b) => a + b, 0) / mhz.length) * 100) / 100;
+        summary.maxMHz = Math.max(...mhz);
+        summary.samples = mhz.length;
+      }
     }
   }
   return summary;

@@ -351,7 +351,8 @@ diag_register_restore_trap() {
 # ---------------------------------------------------------------------------
 # Prefers turbostat when available and permitted; falls back to per-CPU
 # scaling_cur_freq polling. Samples are appended as "epoch cpu khz" lines
-# (sysfs) or kept raw (turbostat) under $DIAG_FREQ_DIR/<tag>.samples.
+# (sysfs) or kept raw (turbostat per-CPU rows) under
+# $DIAG_FREQ_DIR/<tag>.samples.
 # Sample method is recorded in $DIAG_FREQ_DIR/<tag>.method.
 
 : "${DIAG_FREQ_DIR:=.}"
@@ -370,7 +371,7 @@ diag_freq_sampler_start() {
   : > "$samples"
   if diag_turbostat_usable; then
     printf 'turbostat\n' > "$DIAG_FREQ_DIR/${tag}.method"
-    turbostat --Summary --quiet --interval 1 >> "$samples" 2> /dev/null &
+    turbostat --quiet --interval 1 >> "$samples" 2> /dev/null &
     DIAG_SAMPLER_PID=$!
   else
     printf 'scaling_cur_freq\n' > "$DIAG_FREQ_DIR/${tag}.method"
