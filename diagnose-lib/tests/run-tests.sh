@@ -380,6 +380,14 @@ check_eq "crafted SKIP_GDB metadata is not evaluated" "0" "$([[ -e "$INJECTION_S
 ) > /dev/null 2>&1
 invalid_mode_rc=$?
 check_eq "unknown stored mode is rejected" "1" "$([[ $invalid_mode_rc -ne 0 ]] && echo 1 || echo 0)"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  REQUIRED_COMMANDS=(codex-test-command-that-does-not-exist)
+  require_dependencies
+) > /dev/null 2>&1
+missing_required_rc=$?
+check_eq "missing required command aborts preflight" "1" "$([[ $missing_required_rc -ne 0 ]] && echo 1 || echo 0)"
 
 echo "== resume bundle identity =="
 resume_plan="$(cd "$TMP" && "$REPO_ROOT/diagnose.sh" --resume redo-bundle --dry-run --yes 2>&1)"

@@ -48,6 +48,11 @@ REDO_PHASES=""
 declare -a REDO_PLAN=()
 WORST_CPU_OVERRIDE=""
 SESSION_DID_WORK=0
+REQUIRED_COMMANDS=(
+  awk basename bash cat cut date dirname find grep head mkdir mktemp mv node
+  nproc paste readlink rm sed sha256sum sleep sort sync tail taskset tee timeout
+  touch tr uniq wc xargs
+)
 
 usage() {
   cat << 'EOF'
@@ -225,6 +230,16 @@ validate_config() {
     diag_die "--redo requires --resume DIR (it re-runs phases of an existing bundle)"
   fi
   build_redo_plan
+}
+
+require_dependencies() {
+  local -a missing=()
+  local command_name
+  for command_name in "${REQUIRED_COMMANDS[@]}"; do
+    command -v "$command_name" > /dev/null 2>&1 || missing+=("$command_name")
+  done
+  ((${#missing[@]} == 0)) ||
+    diag_die "required commands missing from PATH: ${missing[*]}"
 }
 
 # ---------------------------------------------------------------------------
@@ -686,12 +701,11 @@ phase_preflight() {
   } > "$env_dir/cctk.txt" 2>&1
 
   # Dependency inventory.
-  local req=(bash node taskset awk grep sed timeout sha256sum date find xargs sort)
   local opt=(gdb turbostat lscpu sudo journalctl systemctl intel-undervolt cctk tac)
   local missing_opt=() c
   {
     printf '# required\n'
-    for c in "${req[@]}"; do
+    for c in "${REQUIRED_COMMANDS[@]}"; do
       printf '%-18s %s\n' "$c" "$(command -v "$c" 2> /dev/null || echo MISSING)"
     done
     printf '# optional\n'
@@ -1062,7 +1076,7 @@ main() {
   [[ -f repro.mjs && -f child.mjs ]] ||
     diag_die "repro.mjs/child.mjs not found; run from the repository checkout"
 
-  command -v node > /dev/null 2>&1 || diag_die "node is required but not found in PATH"
+  require_dependencies
 
   discover_topology
 
