@@ -85,6 +85,32 @@ check_eq "SIGTERM restores promptly with rc=143" "1" "$([[ "$term_restore" =~ ^0
 check_eq "SIGINT restores promptly with rc=130" "1" "$([[ "$int_restore" =~ ^0\|130\|1\|1\|([0-4])$ ]] && echo 1 || echo 0)"
 check_eq "normal exit restores no_turbo" "1" "$([[ "$exit_restore" =~ ^0\|0\|1\|1\|([0-4])$ ]] && echo 1 || echo 0)"
 
+echo "== fail-closed settings restore =="
+RESTORE_FAIL_DIR="$TMP/restore-fail"
+mkdir -p "$RESTORE_FAIL_DIR"
+printf 'original\n' > "$RESTORE_FAIL_DIR/value"
+printf '%s\toriginal\n' "$RESTORE_FAIL_DIR/value" > "$RESTORE_FAIL_DIR/restore.tsv"
+(
+  DIAG_RESTORE_FILE="$RESTORE_FAIL_DIR/restore.tsv"
+  DIAG_RESTORE_ARMED=1
+  diag_sysfs_write() { return 1; }
+  diag_restore_now
+) > /dev/null 2>&1
+restore_write_rc=$?
+check_eq "restore write failure returns nonzero" "1" "$([[ $restore_write_rc -ne 0 ]] && echo 1 || echo 0)"
+check_eq "restore write failure retains ledger" "1" "$([[ -s "$RESTORE_FAIL_DIR/restore.tsv" ]] && echo 1 || echo 0)"
+
+printf 'changed\n' > "$RESTORE_FAIL_DIR/value"
+(
+  DIAG_RESTORE_FILE="$RESTORE_FAIL_DIR/restore.tsv"
+  DIAG_RESTORE_ARMED=1
+  diag_sysfs_write() { return 0; }
+  diag_restore_now
+) > /dev/null 2>&1
+restore_verify_rc=$?
+check_eq "restore readback mismatch returns nonzero" "1" "$([[ $restore_verify_rc -ne 0 ]] && echo 1 || echo 0)"
+check_eq "restore readback mismatch retains ledger" "1" "$([[ -s "$RESTORE_FAIL_DIR/restore.tsv" ]] && echo 1 || echo 0)"
+
 echo "== single.sh validation =="
 bash "$REPO_ROOT/single.sh" abc > /dev/null 2>&1
 check_eq "single.sh rejects non-numeric cpu (rc=2)" "2" "$?"

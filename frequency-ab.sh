@@ -138,7 +138,7 @@ for leg in A1 B A2; do
   diag_run_single_runs "$TSV" "$leg" "$CPU" "$RUNS" "${AS_USER[@]}"
 done
 
-diag_restore_now
+diag_restore_now || diag_die "no_turbo restore failed; pending recovery is recorded in $DIAG_RESTORE_FILE"
 now="$(cat "$NO_TURBO_PATH")"
 printf 'RESTORED=%s\n' "$([[ "$now" == "$SAVED_NO_TURBO" ]] && echo 1 || echo 0)" >> "$META"
 [[ "$now" == "$SAVED_NO_TURBO" ]] || diag_warn "no_turbo restore verification FAILED (now $now)"
@@ -161,7 +161,7 @@ if [[ -n "$CAP_KHZ" && -n "$POLICY" ]]; then
   diag_run_single_runs "$TSV" "cap" "$CPU" "$RUNS" "${AS_USER[@]}"
   grep -P '^cap\t' "$TSV" > "$BUNDLE/results/frequency-cap.tsv" || true
   sed -i '/^cap\t/d' "$TSV"
-  diag_restore_now
+  diag_restore_now || diag_die "scaling_max_freq restore failed; pending recovery is recorded in $DIAG_RESTORE_FILE"
   now="$(cat "$smax_path")"
   printf 'RESTORED=%s\n' "$([[ "$now" == "$saved_smax" ]] && echo 1 || echo 0)" >> "$BUNDLE/results/frequency-cap.meta"
   [[ "$now" == "$saved_smax" ]] || diag_warn "scaling_max_freq restore verification FAILED"

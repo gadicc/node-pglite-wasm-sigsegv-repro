@@ -183,17 +183,57 @@ diag_restore_save() {
 }
 
 diag_restore_now() {
-  # Idempotent: restores every saved setting once, then disarms.
-  [[ "$DIAG_RESTORE_ARMED" == "1" ]] || return 0
-  [[ -n "$DIAG_RESTORE_FILE" && -f "$DIAG_RESTORE_FILE" ]] || return 0
-  local path value
-  # Restore in reverse save order.
-  while IFS=$'\t' read -r path value; do
+  # Restore in reverse save order, but only remove entries whose writes can be
+  # read back exactly. A failed restore remains durable for the next recovery
+  # attempt instead of being silently discarded.
+  [[ -n "$DIAG_RESTORE_FILE" && -s "$DIAG_RESTORE_FILE" ]] || {
+    DIAG_RESTORE_ARMED=0
+    return 0
+  }
+
+  local -a entries=() failed=()
+  mapfile -t entries < "$DIAG_RESTORE_FILE"
+  local i line path value actual
+  local restore_failed=0
+  for ((i = ${#entries[@]} - 1; i >= 0; i--)); do
+    line="${entries[$i]}"
+    IFS=$'\t' read -r path value <<< "$line"
     [[ -n "$path" ]] || continue
     diag_log "restoring $path <- $value"
-    diag_sysfs_write "$path" "$value" || diag_warn "failed to restore $path"
-  done < <(tac "$DIAG_RESTORE_FILE" 2> /dev/null || tail -r "$DIAG_RESTORE_FILE")
-  : > "$DIAG_RESTORE_FILE"
+    if ! diag_sysfs_write "$path" "$value"; then
+      diag_warn "failed to restore $path (write failed; recovery entry retained)"
+      failed[$i]="$line"
+      restore_failed=1
+      continue
+    fi
+    actual="$(cat "$path" 2> /dev/null || true)"
+    if [[ "$actual" != "$value" ]]; then
+      diag_warn "failed to verify restore of $path (read '$actual'; recovery entry retained)"
+      failed[$i]="$line"
+      restore_failed=1
+    fi
+  done
+
+  local tmp
+  if ! tmp="$(mktemp "${DIAG_RESTORE_FILE}.tmp.XXXXXX")"; then
+    DIAG_RESTORE_ARMED=1
+    diag_warn "could not update restore ledger; all recovery entries retained"
+    return 1
+  fi
+  for ((i = 0; i < ${#entries[@]}; i++)); do
+    [[ -n "${failed[$i]:-}" ]] && printf '%s\n' "${failed[$i]}" >> "$tmp"
+  done
+  if ! mv -- "$tmp" "$DIAG_RESTORE_FILE"; then
+    rm -f -- "$tmp"
+    DIAG_RESTORE_ARMED=1
+    diag_warn "could not replace restore ledger; all recovery entries retained"
+    return 1
+  fi
+
+  if ((restore_failed == 1)); then
+    DIAG_RESTORE_ARMED=1
+    return 1
+  fi
   DIAG_RESTORE_ARMED=0
 }
 
