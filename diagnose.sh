@@ -48,6 +48,12 @@ REDO_PHASES=""
 declare -a REDO_PLAN=()
 WORST_CPU_OVERRIDE=""
 SESSION_DID_WORK=0
+MODE_EXPLICIT=0
+GROUP_WAVES_EXPLICIT=0
+INDIVIDUAL_RUNS_EXPLICIT=0
+GDB_MAX_RUNS_EXPLICIT=0
+SKIP_GDB_EXPLICIT=0
+CPU_EXPLICIT=0
 REQUIRED_COMMANDS=(
   awk basename bash cat cut date dirname find grep head mkdir mktemp mv node
   nproc paste readlink rm sed sha256sum sleep sort sync tail taskset tee timeout
@@ -171,11 +177,13 @@ parse_args() {
     case "$1" in
       --quick)
         MODE="quick"
+        MODE_EXPLICIT=1
         mode_count=$((mode_count + 1))
         shift
         ;;
       --full)
         MODE="full"
+        MODE_EXPLICIT=1
         mode_count=$((mode_count + 1))
         shift
         ;;
@@ -195,12 +203,12 @@ parse_args() {
       --quick | --full) shift ;;
       --resume) RESUME_DIR="${2:?}"; shift 2 ;;
       --out-dir) OUT_DIR="${2:?}"; OUT_DIR_EXPLICIT=1; shift 2 ;;
-      --skip-gdb) SKIP_GDB=1; shift ;;
+      --skip-gdb) SKIP_GDB=1; SKIP_GDB_EXPLICIT=1; shift ;;
       --redo) REDO_PHASES="${2:?--redo needs a phase list}"; shift 2 ;;
-      --individual-runs) INDIVIDUAL_RUNS="${2:?}"; shift 2 ;;
-      --group-waves) GROUP_WAVES="${2:?}"; shift 2 ;;
-      --gdb-max-runs) GDB_MAX_RUNS="${2:?}"; shift 2 ;;
-      --cpu) WORST_CPU_OVERRIDE="${2:?}"; shift 2 ;;
+      --individual-runs) INDIVIDUAL_RUNS="${2:?}"; INDIVIDUAL_RUNS_EXPLICIT=1; shift 2 ;;
+      --group-waves) GROUP_WAVES="${2:?}"; GROUP_WAVES_EXPLICIT=1; shift 2 ;;
+      --gdb-max-runs) GDB_MAX_RUNS="${2:?}"; GDB_MAX_RUNS_EXPLICIT=1; shift 2 ;;
+      --cpu) WORST_CPU_OVERRIDE="${2:?}"; CPU_EXPLICIT=1; shift 2 ;;
       --dry-run) DRY_RUN=1; shift ;;
       --yes) ASSUME_YES=1; shift ;;
       -h | --help) usage; exit 0 ;;
@@ -287,6 +295,69 @@ persist_effective_config() {
   meta_set INDIVIDUAL_RUNS "$INDIVIDUAL_RUNS"
   meta_set GDB_MAX_RUNS "$GDB_MAX_RUNS"
   meta_set SKIP_GDB "$SKIP_GDB"
+}
+
+redo_plan_contains() {
+  local wanted="$1" phase
+  for phase in "${REDO_PLAN[@]}"; do
+    [[ "$phase" == "$wanted" ]] && return 0
+  done
+  return 1
+}
+
+metadata_value() {
+  local file="$1" key="$2"
+  sed -n "s/^${key}=//p" "$file" 2> /dev/null | tail -1
+}
+
+require_redo_for_completed_change() {
+  local phase="$1" description="$2"
+  [[ -f "$OUT_DIR/state/phase-$phase.done" ]] || return 0
+  redo_plan_contains "$phase" && return 0
+  diag_die "$description changes completed $phase evidence; resume with --redo $phase"
+}
+
+validate_completed_phase_overrides() {
+  [[ -n "$RESUME_DIR" ]] || return 0
+  local meta="$OUT_DIR/results/meta.env" stored
+
+  if ((MODE_EXPLICIT == 1)); then
+    stored="$(metadata_value "$meta" MODE)"
+    if [[ "$stored" != "$MODE" ]]; then
+      local phase
+      for phase in baseline groups individual gdb; do
+        require_redo_for_completed_change "$phase" "changing mode from $stored to $MODE"
+      done
+    fi
+  fi
+  if ((GROUP_WAVES_EXPLICIT == 1)); then
+    stored="$(metadata_value "$meta" GROUP_WAVES)"
+    [[ "$stored" == "$GROUP_WAVES" ]] ||
+      require_redo_for_completed_change groups "changing --group-waves from $stored to $GROUP_WAVES"
+  fi
+  if ((INDIVIDUAL_RUNS_EXPLICIT == 1)); then
+    stored="$(metadata_value "$meta" INDIVIDUAL_RUNS)"
+    [[ "$stored" == "$INDIVIDUAL_RUNS" ]] ||
+      require_redo_for_completed_change individual "changing --individual-runs from $stored to $INDIVIDUAL_RUNS"
+  fi
+  if ((GDB_MAX_RUNS_EXPLICIT == 1)); then
+    stored="$(metadata_value "$meta" GDB_MAX_RUNS)"
+    [[ "$stored" == "$GDB_MAX_RUNS" ]] ||
+      require_redo_for_completed_change gdb "changing --gdb-max-runs from $stored to $GDB_MAX_RUNS"
+  fi
+  if ((SKIP_GDB_EXPLICIT == 1)); then
+    stored="$(metadata_value "$meta" SKIP_GDB)"
+    [[ "$stored" == "$SKIP_GDB" ]] ||
+      require_redo_for_completed_change gdb "changing --skip-gdb from $stored to $SKIP_GDB"
+  fi
+  if ((CPU_EXPLICIT == 1)); then
+    stored="$(metadata_value "$OUT_DIR/results/gdb.meta" CPU)"
+    [[ -z "$stored" || "$stored" == "$WORST_CPU_OVERRIDE" ]] ||
+      require_redo_for_completed_change gdb "changing --cpu from $stored to $WORST_CPU_OVERRIDE"
+    stored="$(metadata_value "$OUT_DIR/results/frequency-ab.meta" CPU)"
+    [[ -z "$stored" || "$stored" == "$WORST_CPU_OVERRIDE" ]] ||
+      require_redo_for_completed_change frequency "changing --cpu from $stored to $WORST_CPU_OVERRIDE"
+  fi
 }
 
 prepare_commands_log() {
@@ -1115,6 +1186,7 @@ main() {
   if [[ -n "$WORST_CPU_OVERRIDE" ]] && ! diag_cpulist_contains "$ONLINE_CPUS" "$WORST_CPU_OVERRIDE"; then
     diag_die "--cpu $WORST_CPU_OVERRIDE is not in the usable CPU set ($ONLINE_CPUS)"
   fi
+  validate_completed_phase_overrides
 
   if [[ -z "$OUT_DIR" ]]; then
     OUT_DIR="diagnostics/$(date -u +%Y-%m-%dT%H%M%SZ)"

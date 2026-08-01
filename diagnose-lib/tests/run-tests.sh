@@ -529,8 +529,32 @@ printf 'MODE=quick\nINDIVIDUAL_RUNS=20\nCOMPLETED_PHASES=baseline\n' > "$RB/resu
   SKIP_GDB=0
   persist_effective_config
 )
-check_eq "resume persists overridden individual run count" "50" "$(sed -n 's/^INDIVIDUAL_RUNS=//p' "$RB/results/meta.env")"
-check_eq "persisting overrides retains completion metadata" "baseline" "$(sed -n 's/^COMPLETED_PHASES=//p' "$RB/results/meta.env")"
+check_eq "incomplete phase accepts overridden individual run count" "50" "$(sed -n 's/^INDIVIDUAL_RUNS=//p' "$RB/results/meta.env")"
+check_eq "persisting incomplete-phase override retains other completion metadata" "baseline" "$(sed -n 's/^COMPLETED_PHASES=//p' "$RB/results/meta.env")"
+
+OVERRIDE_RB="$TMP/completed-override-bundle"
+mkdir -p "$OVERRIDE_RB"/{results,state}
+cat > "$OVERRIDE_RB/results/meta.env" << EOF
+MODE=quick
+BASELINE_CHILDREN=8
+BASELINE_WAVES=10
+GROUP_WAVES=10
+INDIVIDUAL_RUNS=20
+GDB_MAX_RUNS=6
+SKIP_GDB=0
+COMPLETED_PHASES=individual,gdb
+EOF
+printf '19\t1\t139\t2\n' > "$OVERRIDE_RB/results/individual.tsv"
+printf 'CPU=19\nMAX_RUNS=6\nEXIT_CODE=0\n' > "$OVERRIDE_RB/results/gdb.meta"
+touch "$OVERRIDE_RB/state/phase-individual.done" "$OVERRIDE_RB/state/phase-gdb.done"
+"$REPO_ROOT/diagnose.sh" --resume "$OVERRIDE_RB" --individual-runs 50 --dry-run --yes > /dev/null 2>&1
+completed_override_rc=$?
+check_eq "completed individual evidence rejects changed run count without redo" "1" "$([[ $completed_override_rc -ne 0 && "$(sed -n 's/^INDIVIDUAL_RUNS=//p' "$OVERRIDE_RB/results/meta.env")" == 20 ]] && echo 1 || echo 0)"
+"$REPO_ROOT/diagnose.sh" --resume "$OVERRIDE_RB" --individual-runs 50 --redo individual --dry-run --yes > /dev/null 2>&1
+check_eq "completed individual override is accepted with redo" "0" "$?"
+"$REPO_ROOT/diagnose.sh" --resume "$OVERRIDE_RB" --gdb-max-runs 12 --dry-run --yes > /dev/null 2>&1
+completed_gdb_override_rc=$?
+check_eq "completed gdb evidence rejects changed attempt count without redo" "1" "$([[ $completed_gdb_override_rc -ne 0 ]] && echo 1 || echo 0)"
 
 echo "== node unit tests (stats, parsers) =="
 if (cd "$LIB" && node --test 'tests/*.test.mjs') > "$TMP/node-tests.log" 2>&1; then
