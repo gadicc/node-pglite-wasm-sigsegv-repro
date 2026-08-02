@@ -62,6 +62,8 @@ GROUP_WAVES_EXPLICIT=0
 INDIVIDUAL_RUNS_EXPLICIT=0
 GDB_MAX_RUNS_EXPLICIT=0
 SKIP_GDB_EXPLICIT=0
+SKIP_GDB_FLAG_SEEN=0
+RUN_GDB_FLAG_SEEN=0
 CPU_EXPLICIT=0
 REQUIRED_COMMANDS=(
   awk basename bash cat cut date dirname find grep head mkdir mktemp mv node
@@ -92,6 +94,7 @@ Options:
                         state/superseded/, never deleted.
   --out-dir DIR         output directory (default: diagnostics/<UTC timestamp>)
   --skip-gdb            skip the GDB capture phase
+  --run-gdb             run GDB even when a resumed bundle stored --skip-gdb
   --individual-runs N   runs per CPU (overrides mode default)
   --group-waves N       waves per CPU group (overrides mode default)
   --gdb-max-runs N      max gdb attempts (overrides mode default)
@@ -212,7 +215,18 @@ parse_args() {
       --quick | --full) shift ;;
       --resume) RESUME_DIR="${2:?}"; shift 2 ;;
       --out-dir) OUT_DIR="${2:?}"; OUT_DIR_EXPLICIT=1; shift 2 ;;
-      --skip-gdb) SKIP_GDB=1; SKIP_GDB_EXPLICIT=1; shift ;;
+      --skip-gdb)
+        SKIP_GDB=1
+        SKIP_GDB_EXPLICIT=1
+        SKIP_GDB_FLAG_SEEN=1
+        shift
+        ;;
+      --run-gdb)
+        SKIP_GDB=0
+        SKIP_GDB_EXPLICIT=1
+        RUN_GDB_FLAG_SEEN=1
+        shift
+        ;;
       --redo) REDO_PHASES="${2:?--redo needs a phase list}"; shift 2 ;;
       --individual-runs) INDIVIDUAL_RUNS="${2:?}"; INDIVIDUAL_RUNS_EXPLICIT=1; shift 2 ;;
       --group-waves) GROUP_WAVES="${2:?}"; GROUP_WAVES_EXPLICIT=1; shift 2 ;;
@@ -224,6 +238,8 @@ parse_args() {
       *) diag_die "unknown option '$1' (see --help)" ;;
     esac
   done
+  ((SKIP_GDB_FLAG_SEEN == 0 || RUN_GDB_FLAG_SEEN == 0)) ||
+    diag_die "--skip-gdb and --run-gdb conflict; pick one"
 }
 
 validate_config() {
@@ -357,7 +373,7 @@ validate_completed_phase_overrides() {
   if ((SKIP_GDB_EXPLICIT == 1)); then
     stored="$(metadata_value "$meta" SKIP_GDB)"
     [[ "$stored" == "$SKIP_GDB" ]] ||
-      require_redo_for_completed_change gdb "changing --skip-gdb from $stored to $SKIP_GDB"
+      require_redo_for_completed_change gdb "changing the GDB skip choice from $stored to $SKIP_GDB"
   fi
   if ((CPU_EXPLICIT == 1)); then
     stored="$(metadata_value "$OUT_DIR/results/gdb.meta" CPU)"

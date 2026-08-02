@@ -150,7 +150,10 @@ npm ci
 
 `--yes` accepts the safety warning (required when not interactive).
 Useful overrides: `--individual-runs N`, `--group-waves N`,
-`--gdb-max-runs N`, `--skip-gdb`, `--out-dir DIR`, `--cpu N`.
+`--gdb-max-runs N`, `--skip-gdb`, `--run-gdb`, `--out-dir DIR`, `--cpu N`.
+On resume, the stored GDB choice remains the default. Use `--run-gdb` to
+reverse an earlier `--skip-gdb`; if that skipped phase is already complete,
+also pass `--redo gdb` so its old terminal evidence is preserved first.
 
 ### Output layout and resumability
 

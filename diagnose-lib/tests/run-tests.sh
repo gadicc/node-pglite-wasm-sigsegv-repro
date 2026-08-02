@@ -1384,6 +1384,77 @@ check_eq "zero gdb attempts are rejected" "1" "$([[ $zero_gdb_rc -ne 0 ]] && ech
 unusable_cpu_rc=$?
 check_eq "unusable CPU override is rejected" "1" "$([[ $unusable_cpu_rc -ne 0 ]] && echo 1 || echo 0)"
 
+echo "== reversible GDB skip choice =="
+GDB_SKIP_RB="$TMP/gdb-skip-bundle"
+mkdir -p "$GDB_SKIP_RB"/{results,state}
+cat > "$GDB_SKIP_RB/results/meta.env" << EOF
+MODE=quick
+BASELINE_CHILDREN=8
+BASELINE_WAVES=10
+GROUP_WAVES=10
+INDIVIDUAL_RUNS=5
+GDB_MAX_RUNS=6
+SKIP_GDB=1
+COMPLETED_PHASES=
+EOF
+stored_skip_plan="$($REPO_ROOT/diagnose.sh --resume "$GDB_SKIP_RB" --dry-run --yes 2>&1)"
+check_eq "resume keeps the stored GDB skip choice by default" "1" \
+  "$([[ "$stored_skip_plan" == *"gdb capture        skipped"* ]] && echo 1 || echo 0)"
+run_gdb_plan="$($REPO_ROOT/diagnose.sh --resume "$GDB_SKIP_RB" --run-gdb --dry-run --yes 2>&1)"
+check_eq "--run-gdb overrides a stored skip for an incomplete phase" "1" \
+  "$([[ "$run_gdb_plan" == *"gdb capture        up to 6 runs"* ]] && echo 1 || echo 0)"
+check_eq "dry-run GDB override does not rewrite stored metadata" "1" \
+  "$([[ "$(sed -n 's/^SKIP_GDB=//p' "$GDB_SKIP_RB/results/meta.env")" == 1 && ! -e "$GDB_SKIP_RB/commands.log" ]] && echo 1 || echo 0)"
+
+cp "$GDB_SKIP_RB/results/meta.env" "$GDB_SKIP_RB/meta.before"
+for inverse_order in \
+  "--skip-gdb --run-gdb" \
+  "--run-gdb --skip-gdb"; do
+  # Deliberately split the fixed test strings into arguments.
+  # shellcheck disable=SC2086
+  "$REPO_ROOT/diagnose.sh" --resume "$GDB_SKIP_RB" $inverse_order --yes > /dev/null 2>&1
+  inverse_conflict_rc=$?
+  check_eq "conflicting GDB choices are rejected: $inverse_order" "1" \
+    "$([[ $inverse_conflict_rc -ne 0 ]] && echo 1 || echo 0)"
+done
+check_eq "conflicting GDB choices fail before bundle mutation" "1" \
+  "$(cmp -s "$GDB_SKIP_RB/meta.before" "$GDB_SKIP_RB/results/meta.env" && [[ ! -e "$GDB_SKIP_RB/commands.log" && ! -e "$GDB_SKIP_RB/state/superseded" ]] && echo 1 || echo 0)"
+
+printf 'SKIPPED=1\nSKIP_REASON=--skip-gdb\n' > "$GDB_SKIP_RB/results/gdb.meta"
+touch "$GDB_SKIP_RB/state/phase-gdb.done"
+sed -i 's/^COMPLETED_PHASES=.*/COMPLETED_PHASES=gdb/' "$GDB_SKIP_RB/results/meta.env"
+cp "$GDB_SKIP_RB/results/meta.env" "$GDB_SKIP_RB/completed-meta.before"
+cp "$GDB_SKIP_RB/results/gdb.meta" "$GDB_SKIP_RB/gdb-meta.before"
+"$REPO_ROOT/diagnose.sh" --resume "$GDB_SKIP_RB" --run-gdb --yes > /dev/null 2>&1
+completed_skip_override_rc=$?
+completed_skip_unchanged=0
+[[ $completed_skip_override_rc -ne 0 ]] &&
+  cmp -s "$GDB_SKIP_RB/completed-meta.before" "$GDB_SKIP_RB/results/meta.env" &&
+  cmp -s "$GDB_SKIP_RB/gdb-meta.before" "$GDB_SKIP_RB/results/gdb.meta" &&
+  [[ -f "$GDB_SKIP_RB/state/phase-gdb.done" ]] &&
+  [[ ! -e "$GDB_SKIP_RB/commands.log" && ! -e "$GDB_SKIP_RB/state/superseded" ]] && completed_skip_unchanged=1
+check_eq "completed skipped GDB phase rejects --run-gdb without redo" "1" "$completed_skip_unchanged"
+completed_run_gdb_plan="$($REPO_ROOT/diagnose.sh --resume "$GDB_SKIP_RB" --run-gdb --redo gdb --dry-run --yes 2>&1)"
+check_eq "completed skipped GDB phase accepts --run-gdb with redo" "1" \
+  "$([[ "$completed_run_gdb_plan" == *"redo phases        gdb"* && "$completed_run_gdb_plan" == *"gdb capture        up to 6 runs"* ]] && echo 1 || echo 0)"
+dependent_run_gdb_plan="$($REPO_ROOT/diagnose.sh --resume "$GDB_SKIP_RB" --run-gdb --redo individual --dry-run --yes 2>&1)"
+check_eq "dependent redo closure authorizes reversing the GDB skip" "1" \
+  "$([[ "$dependent_run_gdb_plan" == *"redo phases        individual frequency gdb"* && "$dependent_run_gdb_plan" == *"gdb capture        up to 6 runs"* ]] && echo 1 || echo 0)"
+
+GDB_RUN_RB="$TMP/gdb-run-bundle"
+mkdir -p "$GDB_RUN_RB"/{results,state}
+sed 's/^SKIP_GDB=1$/SKIP_GDB=0/; s/^COMPLETED_PHASES=$/COMPLETED_PHASES=gdb/' \
+  "$GDB_SKIP_RB/meta.before" > "$GDB_RUN_RB/results/meta.env"
+printf 'CPU=0\nMAX_RUNS=6\nEXIT_CODE=3\n' > "$GDB_RUN_RB/results/gdb.meta"
+touch "$GDB_RUN_RB/state/phase-gdb.done"
+"$REPO_ROOT/diagnose.sh" --resume "$GDB_RUN_RB" --skip-gdb --dry-run --yes > /dev/null 2>&1
+completed_run_to_skip_rc=$?
+check_eq "completed enabled GDB phase rejects --skip-gdb without redo" "1" \
+  "$([[ $completed_run_to_skip_rc -ne 0 ]] && echo 1 || echo 0)"
+completed_skip_gdb_plan="$($REPO_ROOT/diagnose.sh --resume "$GDB_RUN_RB" --skip-gdb --redo gdb --dry-run --yes 2>&1)"
+check_eq "completed enabled GDB phase accepts --skip-gdb with redo" "1" \
+  "$([[ "$completed_skip_gdb_plan" == *"redo phases        gdb"* && "$completed_skip_gdb_plan" == *"gdb capture        skipped"* ]] && echo 1 || echo 0)"
+
 echo "== effective resume configuration =="
 printf 'MODE=quick\nINDIVIDUAL_RUNS=20\nCOMPLETED_PHASES=baseline\n' > "$RB/results/meta.env"
 (
