@@ -35,9 +35,67 @@ DIAG_COMMANDS_LOG=""
 DIAG_RESTORE_FILE=""
 
 FREQUENCY_STAGE_DIR=""
+FREQUENCY_STAGE_RECORD=""
 FREQUENCY_OUTPUTS_PUBLISHED=0
 INVOKING_UID=""
 INVOKING_GID=""
+FREQUENCY_STATE_UID=""
+FREQUENCY_STATE_GID=""
+
+frequency_stage_record_clear() {
+  [[ -n "$FREQUENCY_STAGE_RECORD" ]] || return 0
+  rm -f -- "$FREQUENCY_STAGE_RECORD"
+}
+
+frequency_stage_record_write() {
+  local bundle="$1" tmp
+  [[ "$bundle" == /* && "$bundle" != *$'\n'* && "$bundle" != *$'\r'* && "$bundle" != *$'\t'* ]] ||
+    return 1
+  tmp="$(mktemp "${FREQUENCY_STAGE_RECORD}.tmp.XXXXXX")" || return 1
+  chmod 0600 "$tmp" || {
+    rm -f -- "$tmp"
+    return 1
+  }
+  printf '%s\n' "$bundle" > "$tmp" || {
+    rm -f -- "$tmp"
+    return 1
+  }
+  mv -fT -- "$tmp" "$FREQUENCY_STAGE_RECORD" || {
+    rm -f -- "$tmp"
+    return 1
+  }
+  diag_restore_private_file_is_safe "$FREQUENCY_STAGE_RECORD" "$FREQUENCY_STATE_UID" "$FREQUENCY_STATE_GID"
+}
+
+frequency_stage_record_read() {
+  local output_name="$1"
+  local -n output_ref="$output_name"
+  output_ref=""
+  diag_restore_private_file_is_safe "$FREQUENCY_STAGE_RECORD" "$FREQUENCY_STATE_UID" "$FREQUENCY_STATE_GID" || return 1
+  local -a lines=()
+  mapfile -t lines < "$FREQUENCY_STAGE_RECORD" || return 1
+  ((${#lines[@]} == 1)) || return 1
+  [[ "${lines[0]}" == /* && "${lines[0]}" != *$'\r'* && "${lines[0]}" != *$'\t'* ]] || return 1
+  output_ref="${lines[0]}"
+}
+
+frequency_quarantine_stage() {
+  local reason="$1" owner mode disposition
+  owner="$(stat -Lc '%u' -- "$FREQUENCY_STAGE_DIR" 2> /dev/null)" || return 1
+  mode="$(stat -Lc '%a' -- "$FREQUENCY_STAGE_DIR" 2> /dev/null)" || return 1
+  [[ -d "$FREQUENCY_STAGE_DIR" && ! -L "$FREQUENCY_STAGE_DIR" && "$mode" == 700 ]] || return 1
+  disposition="${FREQUENCY_STAGE_DIR}.unpublished.$(date +%s).$BASHPID"
+  if [[ "$owner" == "$INVOKING_UID" ]]; then
+    runuser -u "$SUDO_USER" -- mv -T -- "$FREQUENCY_STAGE_DIR" "$disposition" || return 1
+    diag_warn "$reason; invoking user owns unpublished evidence at $disposition"
+  elif [[ "$owner" == 0 ]]; then
+    mv -T -- "$FREQUENCY_STAGE_DIR" "$disposition" || return 1
+    diag_warn "$reason; root-private evidence quarantined at $disposition"
+  else
+    return 1
+  fi
+  frequency_stage_record_clear
+}
 
 frequency_publish_outputs() {
   [[ -n "$FREQUENCY_STAGE_DIR" ]] || return 0
@@ -95,11 +153,85 @@ frequency_publish_outputs() {
     return 1
   fi
   FREQUENCY_OUTPUTS_PUBLISHED=1
+  if ! frequency_stage_record_clear; then
+    diag_warn "frequency evidence was published but its durable staging record could not be cleared"
+    return 1
+  fi
+}
+
+frequency_recover_pending_outputs() {
+  local requested_bundle="$BUNDLE" pending_bundle="" stage_owner=""
+  local has_record=0
+  [[ -e "$FREQUENCY_STAGE_RECORD" || -L "$FREQUENCY_STAGE_RECORD" ]] && has_record=1
+
+  if [[ ! -e "$FREQUENCY_STAGE_DIR" && ! -L "$FREQUENCY_STAGE_DIR" ]]; then
+    if ((has_record == 1)); then
+      frequency_stage_record_read pending_bundle || {
+        diag_warn "durable frequency staging record is malformed or unsafe"
+        return 1
+      }
+      diag_warn "discarding stale frequency staging record because its exact stage is absent"
+      frequency_stage_record_clear || return 1
+    fi
+    return 0
+  fi
+
+  [[ -d "$FREQUENCY_STAGE_DIR" && ! -L "$FREQUENCY_STAGE_DIR" ]] || {
+    diag_warn "deterministic frequency staging path is unsafe; refusing to touch it"
+    return 1
+  }
+  stage_owner="$(stat -Lc '%u:%a' -- "$FREQUENCY_STAGE_DIR" 2> /dev/null)" || return 1
+  [[ "$stage_owner" == "0:700" || "$stage_owner" == "$INVOKING_UID:700" ]] || {
+    diag_warn "frequency staging path has unexpected ownership or mode; refusing recovery"
+    return 1
+  }
+
+  if ((has_record == 0)); then
+    frequency_quarantine_stage "found an unrecorded stage left before durable tracking completed" || return 1
+    return 0
+  fi
+  frequency_stage_record_read pending_bundle || {
+    diag_warn "durable frequency staging record is malformed or unsafe"
+    return 1
+  }
+
+  BUNDLE="$pending_bundle"
+  FREQUENCY_OUTPUTS_PUBLISHED=0
+  if [[ "$stage_owner" == "0:700" ]]; then
+    if frequency_publish_outputs; then
+      diag_log "recovered and published frequency evidence left by a killed invocation"
+      BUNDLE="$requested_bundle"
+      FREQUENCY_STAGE_DIR="/tmp/node-pglite-frequency-uid-$INVOKING_UID"
+      FREQUENCY_OUTPUTS_PUBLISHED=0
+      return 0
+    fi
+  else
+    if runuser -u "$SUDO_USER" -- /bin/bash \
+      "$SCRIPT_DIR/diagnose-lib/publish-frequency-output.sh" "$FREQUENCY_STAGE_DIR" "$BUNDLE"; then
+      frequency_stage_record_clear || return 1
+      diag_log "recovered and published user-owned frequency staging evidence"
+      BUNDLE="$requested_bundle"
+      FREQUENCY_STAGE_DIR="/tmp/node-pglite-frequency-uid-$INVOKING_UID"
+      FREQUENCY_OUTPUTS_PUBLISHED=0
+      return 0
+    fi
+  fi
+
+  BUNDLE="$requested_bundle"
+  frequency_quarantine_stage "could not republish frequency evidence left by a killed invocation" || return 1
+  FREQUENCY_STAGE_DIR="/tmp/node-pglite-frequency-uid-$INVOKING_UID"
+  FREQUENCY_OUTPUTS_PUBLISHED=0
 }
 
 diag_cleanup_artifacts() {
   frequency_publish_outputs
 }
+
+# Let the safe test suite exercise the staging transaction helpers without
+# entering the privileged experiment.
+if [[ "${FREQUENCY_AB_SOURCE_ONLY:-}" == "1" ]]; then
+  return 0
+fi
 
 usage() {
   cat >&2 << 'EOF'
@@ -178,6 +310,8 @@ INVOKING_GID="$(id -g "$SUDO_USER" 2> /dev/null)" ||
   diag_die "cannot resolve invoking group for '$SUDO_USER'"
 [[ "$INVOKING_UID" == "$SUDO_UID" ]] ||
   diag_die "SUDO_USER and SUDO_UID identify different invoking users"
+FREQUENCY_STATE_UID=0
+FREQUENCY_STATE_GID=0
 
 # Runtime settings reset on reboot, so /run provides durable-enough SIGKILL
 # recovery without placing privileged write authority in the user-owned
@@ -192,6 +326,8 @@ diag_restore_lock_acquire "$RESTORE_STATE_DIR/active.lock" 0 0 ||
   diag_die "cannot acquire the per-user frequency experiment lock"
 
 DIAG_RESTORE_FILE="$RESTORE_STATE_DIR/restore.tsv"
+FREQUENCY_STAGE_RECORD="$RESTORE_STATE_DIR/output-stage.pending"
+FREQUENCY_STAGE_DIR="/tmp/node-pglite-frequency-uid-$INVOKING_UID"
 diag_register_cleanup_traps
 diag_restore_private_file_prepare "$DIAG_RESTORE_FILE" 0 0 ||
   diag_die "secure restore ledger must be a root-owned mode-0600 regular file with one link"
@@ -212,6 +348,8 @@ diag_restore_rules_set "${restore_rules[@]}" ||
 # killed invocation before replacing output files or saving new state.
 diag_recover_pending_restore ||
   diag_die "refusing to start while a previous settings restore is pending"
+frequency_recover_pending_outputs ||
+  diag_die "refusing to start while prior frequency staging cannot be safely recovered"
 
 # Older versions placed restore authority in the bundle. It is intentionally
 # never trusted or migrated by this privileged script.
@@ -230,11 +368,12 @@ runuser -u "$SUDO_USER" -- mkdir -p -- "$BUNDLE/results" "$BUNDLE/freq" ||
 declare -a AS_USER=(runuser -u "$SUDO_USER" --)
 diag_log "workload legs and bundle placement run as user $SUDO_USER (via runuser)"
 
-# All privileged writes remain inside this unpredictable root-owned directory.
+# All privileged writes remain inside this deterministic root-owned directory;
+# its per-user identity makes a pre-record SIGKILL discoverable on the next run.
 # The cleanup hook publishes complete or partial evidence only after stopping
 # children/samplers and restoring settings.
-FREQUENCY_STAGE_DIR="$(mktemp -d /tmp/node-pglite-frequency.XXXXXX)" ||
-  diag_die "could not create private frequency output staging directory"
+mkdir -m 0700 -- "$FREQUENCY_STAGE_DIR" ||
+  diag_die "could not create deterministic private frequency output staging directory"
 [[ "$(stat -Lc '%u:%g:%a' -- "$FREQUENCY_STAGE_DIR" 2> /dev/null)" == "0:0:700" ]] ||
   diag_die "frequency output staging directory is not root-owned and mode 0700"
 mkdir -m 0700 -- "$FREQUENCY_STAGE_DIR/results" "$FREQUENCY_STAGE_DIR/freq"
@@ -243,6 +382,8 @@ DIAG_COMMANDS_LOG="$FREQUENCY_STAGE_DIR/commands.log"
 : > "$DIAG_COMMANDS_LOG"
 chmod 0600 "$DIAG_COMMANDS_LOG"
 printf '# frequency-ab %s\n' "$(date -Is)" > "$DIAG_COMMANDS_LOG"
+frequency_stage_record_write "$BUNDLE" ||
+  diag_die "could not durably record the frequency output staging transaction"
 
 cd "$SCRIPT_DIR"
 

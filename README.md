@@ -122,6 +122,9 @@ partial evidence into the bundle, including after a handled interruption.
 Before replacing any frequency evidence, publication removes the previous
 frequency completion marker; `diagnose.sh --resume` revalidates the new files
 before recreating it.
+The root-owned per-user state also tracks a deterministic staging location, so
+the next invocation publishes or explicitly quarantines evidence left by
+SIGKILL instead of silently orphaning an undiscoverable root-only directory.
 Requested *and* measured frequencies (turbostat preferred,
 `scaling_cur_freq` fallback) are reported per leg; never trust
 `scaling_max_freq` alone on intel_pstate/HWP. A separate, clearly labelled

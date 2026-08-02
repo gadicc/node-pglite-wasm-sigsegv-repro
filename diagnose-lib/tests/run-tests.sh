@@ -475,6 +475,84 @@ if ((EUID != 0)); then
     "$MIXED_BUNDLE/results.json")"
   check_eq "killed mixed-generation publish cannot satisfy assessFrequencyAb" "1" \
     "$([[ $mixed_publish_rc -ne 0 && ! -e "$MIXED_BUNDLE/state/phase-frequency.done" && "$(head -n 1 "$MIXED_BUNDLE/results/frequency-ab.tsv")" == $'A1\t1\t139\t2' && "$(head -n 1 "$MIXED_BUNDLE/results/frequency-ab.meta")" == 'CPU=19' && "$mixed_assessment" == 'incomplete|true' ]] && echo 1 || echo 0)"
+
+  STAGE_RECOVERY="$TMP/frequency-stage-recovery"
+  mkdir -p "$STAGE_RECOVERY/state" "$STAGE_RECOVERY/old-bundle/state" \
+    "$STAGE_RECOVERY/current-bundle"
+  (
+    FREQUENCY_AB_SOURCE_ONLY=1
+    source "$REPO_ROOT/frequency-ab.sh"
+    unset FREQUENCY_AB_SOURCE_ONLY
+    INVOKING_UID="$(id -u)"
+    INVOKING_GID="$(id -g)"
+    FREQUENCY_STATE_UID="$INVOKING_UID"
+    FREQUENCY_STATE_GID="$INVOKING_GID"
+    SUDO_USER="$(id -un)"
+    FREQUENCY_STAGE_DIR="$STAGE_RECOVERY/stage"
+    FREQUENCY_STAGE_RECORD="$STAGE_RECOVERY/state/output-stage.pending"
+    BUNDLE="$STAGE_RECOVERY/current-bundle"
+    runuser() {
+      [[ "$1" == -u && "$3" == -- ]] || return 1
+      shift 3
+      "$@"
+    }
+    mkdir -m 0700 "$FREQUENCY_STAGE_DIR" \
+      "$FREQUENCY_STAGE_DIR/results" "$FREQUENCY_STAGE_DIR/freq"
+    printf 'A1\t1\t0\t1\n' > "$FREQUENCY_STAGE_DIR/results/frequency-ab.tsv"
+    printf 'CPU=19\n' > "$FREQUENCY_STAGE_DIR/results/frequency-ab.meta"
+    printf 'staged command\n' > "$FREQUENCY_STAGE_DIR/commands.log"
+    chmod 0600 "$FREQUENCY_STAGE_DIR/results/frequency-ab.tsv" \
+      "$FREQUENCY_STAGE_DIR/results/frequency-ab.meta" \
+      "$FREQUENCY_STAGE_DIR/commands.log"
+    touch "$STAGE_RECOVERY/old-bundle/state/phase-frequency.done"
+    frequency_stage_record_write "$STAGE_RECOVERY/old-bundle"
+    frequency_recover_pending_outputs
+    [[ "$BUNDLE" == "$STAGE_RECOVERY/current-bundle" ]]
+  ) > /dev/null 2>&1
+  stage_recovery_rc=$?
+  check_eq "next invocation publishes SIGKILL-stranded frequency staging" "1" \
+    "$([[ $stage_recovery_rc -eq 0 && ! -e "$STAGE_RECOVERY/stage" && ! -e "$STAGE_RECOVERY/state/output-stage.pending" && ! -e "$STAGE_RECOVERY/old-bundle/state/phase-frequency.done" && "$(cat "$STAGE_RECOVERY/old-bundle/results/frequency-ab.tsv")" == $'A1\t1\t0\t1' ]] && echo 1 || echo 0)"
+
+  FORGED_RECOVERY="$TMP/frequency-forged-stage-record"
+  mkdir -p "$FORGED_RECOVERY/state"
+  printf '/tmp/allowed\t/forged\n' > "$FORGED_RECOVERY/state/output-stage.pending"
+  chmod 0600 "$FORGED_RECOVERY/state/output-stage.pending"
+  (
+    FREQUENCY_AB_SOURCE_ONLY=1
+    source "$REPO_ROOT/frequency-ab.sh"
+    unset FREQUENCY_AB_SOURCE_ONLY
+    FREQUENCY_STATE_UID="$(id -u)"
+    FREQUENCY_STATE_GID="$(id -g)"
+    FREQUENCY_STAGE_RECORD="$FORGED_RECOVERY/state/output-stage.pending"
+    pending=""
+    frequency_stage_record_read pending
+  ) > /dev/null 2>&1
+  forged_record_rc=$?
+  check_eq "frequency staging record rejects control-character ambiguity" "1" \
+    "$([[ $forged_record_rc -ne 0 && -s "$FORGED_RECOVERY/state/output-stage.pending" ]] && echo 1 || echo 0)"
+
+  UNRECORDED_RECOVERY="$TMP/frequency-unrecorded-stage"
+  mkdir -m 0700 "$UNRECORDED_RECOVERY"
+  (
+    FREQUENCY_AB_SOURCE_ONLY=1
+    source "$REPO_ROOT/frequency-ab.sh"
+    unset FREQUENCY_AB_SOURCE_ONLY
+    INVOKING_UID="$(id -u)"
+    INVOKING_GID="$(id -g)"
+    SUDO_USER="$(id -un)"
+    FREQUENCY_STAGE_DIR="$UNRECORDED_RECOVERY"
+    FREQUENCY_STAGE_RECORD="$TMP/no-frequency-stage-record"
+    BUNDLE="$TMP/unused-current-bundle"
+    runuser() {
+      [[ "$1" == -u && "$3" == -- ]] || return 1
+      shift 3
+      "$@"
+    }
+    frequency_recover_pending_outputs
+  ) > /dev/null 2>&1
+  unrecorded_recovery_rc=$?
+  check_eq "unrecorded deterministic stage is explicitly handed off" "1" \
+    "$([[ $unrecorded_recovery_rc -eq 0 && ! -e "$UNRECORDED_RECOVERY" ]] && compgen -G "$UNRECORDED_RECOVERY.unpublished.*" > /dev/null && echo 1 || echo 0)"
 else
   ok "frequency-ab.sh non-root guard [skipped while tests run as root]"
   ok "root-checks.sh non-root guard [skipped while tests run as root]"
@@ -482,6 +560,9 @@ else
   ok "unprivileged frequency publisher rejects a command-log symlink [skipped while tests run as root]"
   ok "frequency publisher aborts before artifact moves when marker invalidation fails [skipped while tests run as root]"
   ok "killed mixed-generation publish cannot satisfy assessFrequencyAb [skipped while tests run as root]"
+  ok "next invocation publishes SIGKILL-stranded frequency staging [skipped while tests run as root]"
+  ok "frequency staging record rejects control-character ambiguity [skipped while tests run as root]"
+  ok "unrecorded deterministic stage is explicitly handed off [skipped while tests run as root]"
 fi
 
 if ((EUID != 0)); then
