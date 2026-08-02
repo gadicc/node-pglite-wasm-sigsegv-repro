@@ -17,10 +17,11 @@
 //   gdb/*.txt                  capture transcripts
 //   freq/<tag>.samples         "epoch cpu khz" lines (or raw turbostat)
 
-import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { parseReproLog } from "./parse-repro-log.mjs";
 import { parseGdbCapture } from "./parse-gdb.mjs";
+import { assessBaselineEvidence } from "./baseline-evidence.mjs";
 
 function readKeyValues(file) {
   const out = {};
@@ -30,6 +31,91 @@ function readKeyValues(file) {
     if (m) out[m[1]] = m[2];
   }
   return out;
+}
+
+const RUN_CONFIG_KEYS = new Set([
+  "MODE", "BASELINE_CHILDREN", "BASELINE_WAVES", "GROUP_WAVES",
+  "INDIVIDUAL_RUNS", "GDB_MAX_RUNS", "SKIP_GDB", "CPU_TARGET",
+]);
+
+function readStoredRunMetadata(outDir) {
+  const values = {};
+  const reasons = [];
+  const root = path.resolve(outDir);
+  let bundleRootSafe = true;
+  let resultsDirSafe = true;
+  const inspect = (file, type, label) => {
+    let stat;
+    try {
+      stat = lstatSync(file);
+    } catch (error) {
+      if (error?.code === "ENOENT") return "missing";
+      reasons.push(`${label} could not be inspected`);
+      return "unsafe";
+    }
+    if (stat.isSymbolicLink() || (type === "directory" ? !stat.isDirectory() : !stat.isFile())) {
+      reasons.push(`${label} must be a real non-symlink ${type}`);
+      return "unsafe";
+    }
+    return "regular";
+  };
+  if (inspect(root, "directory", "bundle root") !== "regular") {
+    bundleRootSafe = false;
+    resultsDirSafe = false;
+  }
+  const resultsState = resultsDirSafe
+    ? inspect(path.join(root, "results"), "directory", "results directory")
+    : "unsafe";
+  if (resultsState !== "regular") resultsDirSafe = false;
+  const metaFile = path.join(root, "results", "meta.env");
+  const metaState = resultsDirSafe ? inspect(metaFile, "file", "stored run metadata") : "unsafe";
+  if (metaState === "missing") {
+    return { values, status: "incomplete", reasons: ["stored run metadata is missing"], bundleRootSafe, resultsDirSafe };
+  }
+  if (metaState !== "regular") {
+    return { values, status: "invalid", reasons: [...new Set(reasons)], bundleRootSafe, resultsDirSafe };
+  }
+  let text;
+  try {
+    text = readFileSync(metaFile, "utf8");
+  } catch {
+    return { values, status: "invalid", reasons: ["stored run metadata could not be read"], bundleRootSafe, resultsDirSafe };
+  }
+  const seenConfig = new Set();
+  for (const line of text.split("\n")) {
+    if (line === "") continue;
+    const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (!match) {
+      reasons.push("stored run metadata contains a malformed line");
+      continue;
+    }
+    const [, key, value] = match;
+    if (RUN_CONFIG_KEYS.has(key)) {
+      if (seenConfig.has(key)) {
+        reasons.push(`stored run metadata contains duplicate ${key} rows`);
+        continue;
+      }
+      seenConfig.add(key);
+    }
+    if (!Object.hasOwn(values, key)) values[key] = value;
+  }
+  const children = canonicalUint(values.BASELINE_CHILDREN);
+  const waves = canonicalUint(values.BASELINE_WAVES);
+  if (children === null || children < 1) {
+    reasons.push("stored BASELINE_CHILDREN is missing or not a canonical safe positive integer");
+  }
+  if (waves === null || waves < 1) {
+    reasons.push("stored BASELINE_WAVES is missing or not a canonical safe positive integer");
+  }
+  return {
+    values,
+    baselineChildren: children !== null && children > 0 ? children : null,
+    baselineWaves: waves !== null && waves > 0 ? waves : null,
+    status: reasons.length > 0 ? "invalid" : "complete",
+    reasons: [...new Set(reasons)],
+    bundleRootSafe,
+    resultsDirSafe,
+  };
 }
 
 function readTsv(file) {
@@ -577,8 +663,11 @@ export function assessGdb(meta, phaseDone, captures, transcriptCount, metaState 
 }
 
 export function collect(outDir) {
-  const meta = readKeyValues(path.join(outDir, "results", "meta.env"));
-  const envSummary = readKeyValues(path.join(outDir, "env", "summary.env"));
+  const runMetaState = readStoredRunMetadata(outDir);
+  const meta = runMetaState.values;
+  const envSummary = runMetaState.bundleRootSafe
+    ? readKeyValues(path.join(outDir, "env", "summary.env"))
+    : {};
   const resultsDir = path.join(outDir, "results");
 
   const results = {
@@ -590,8 +679,8 @@ export function collect(outDir) {
       startedAt: meta.START_ISO ?? null,
       startEpoch: num(meta.START_EPOCH),
       endEpoch: num(meta.END_EPOCH),
-      baselineChildren: num(meta.BASELINE_CHILDREN),
-      baselineWaves: num(meta.BASELINE_WAVES),
+      baselineChildren: runMetaState.baselineChildren ?? null,
+      baselineWaves: runMetaState.baselineWaves ?? null,
       groupWaves: num(meta.GROUP_WAVES),
       individualRuns: num(meta.INDIVIDUAL_RUNS),
       gdbMaxRuns: num(meta.GDB_MAX_RUNS),
@@ -606,13 +695,17 @@ export function collect(outDir) {
       completedPhases: (meta.COMPLETED_PHASES ?? "").split(",").filter(Boolean),
       interrupted: meta.INTERRUPTED === "1",
     },
+    configStatus: {
+      status: runMetaState.status,
+      reasons: runMetaState.reasons,
+    },
     environment: envSummary,
   };
 
   // Optional privileged reads produced by a manual `sudo ./root-checks.sh
   // <bundle>` run (kept separate from diagnose.sh, which never elevates).
   const rootDir = path.join(outDir, "env", "root");
-  if (existsSync(rootDir)) {
+  if (runMetaState.bundleRootSafe && existsSync(rootDir)) {
     const rootReads = {};
     for (const f of readdirSync(rootDir).sort()) {
       if (f.endsWith(".txt") || f.endsWith(".meta")) {
@@ -623,23 +716,39 @@ export function collect(outDir) {
   }
 
   // --- baseline ---
-  const baselineMeta = readKeyValues(path.join(resultsDir, "baseline.meta"));
-  if (baselineMeta.LOG) {
-    const logPath = path.join(outDir, baselineMeta.LOG);
-    if (existsSync(logPath)) {
-      const parsed = parseReproLog(readFileSync(logPath, "utf8"), {
-        expectedChildren: num(baselineMeta.CHILDREN),
-        expectedWaves: num(baselineMeta.WAVES),
-        exitCode: num(baselineMeta.EXIT_CODE),
-      });
-      results.baseline = {
-        ...parsed,
-        waves: undefined, // per-wave detail stays in the raw log
-        log: baselineMeta.LOG,
-        exitCode: num(baselineMeta.EXIT_CODE),
-        frequency: summarizeFreqSamples(outDir, "baseline"),
-      };
+  const baselineAssessment = assessBaselineEvidence(outDir, {
+    expectedChildren: runMetaState.baselineChildren,
+    expectedWaves: runMetaState.baselineWaves,
+    validateStoredConfig: true,
+  });
+  results.baselineStatus = {
+    status: baselineAssessment.status,
+    reasons: baselineAssessment.reasons,
+  };
+  if (baselineAssessment.parsed) {
+    results.baseline = {
+      ...baselineAssessment.parsed,
+      waves: undefined, // per-wave detail stays in the raw log
+      log: baselineAssessment.log,
+      exitCode:
+        baselineAssessment.meta.EXIT_CODE === "0" || baselineAssessment.meta.EXIT_CODE === "1"
+          ? Number(baselineAssessment.meta.EXIT_CODE)
+          : null,
+      envelopeStatus: baselineAssessment.status,
+      frequency:
+        baselineAssessment.status === "complete"
+          ? summarizeFreqSamples(outDir, "baseline")
+          : { available: false, note: "baseline evidence envelope is not complete" },
+    };
+  }
+  if (!runMetaState.resultsDirSafe) {
+    if (runMetaState.bundleRootSafe) {
+      writeFileSync(
+        path.join(outDir, "results.json"),
+        `${JSON.stringify(results, null, 2)}\n`,
+      );
     }
+    return results;
   }
 
   // --- groups ---

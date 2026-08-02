@@ -175,26 +175,50 @@ apply_mode_preset() {
 
 load_stored_config() {
   local meta="$1/results/meta.env"
-  [[ -f "$meta" ]] || return 0
-  local k v cpu_target_rows=0
+  [[ -d "$1/results" && ! -L "$1/results" ]] ||
+    diag_die "stored results directory must be a real non-symlink directory"
+  if [[ -e "$meta" || -L "$meta" ]]; then
+    [[ -f "$meta" && ! -L "$meta" ]] ||
+      diag_die "stored run metadata must be a real non-symlink regular file"
+  else
+    return 0
+  fi
+  local k v
+  local -A config_seen=()
   while IFS='=' read -r k v || [[ -n "$k" || -n "$v" ]]; do
     case "$k" in
+      MODE | BASELINE_CHILDREN | BASELINE_WAVES | GROUP_WAVES | INDIVIDUAL_RUNS | GDB_MAX_RUNS | SKIP_GDB | CPU_TARGET)
+        [[ -z "${config_seen[$k]:-}" ]] || diag_die "stored metadata contains duplicate $k rows"
+        config_seen[$k]=1
+        ;;
+    esac
+    case "$k" in
       MODE) MODE="$v" ;;
-      BASELINE_CHILDREN) BASELINE_CHILDREN="$v" ;;
-      BASELINE_WAVES) BASELINE_WAVES="$v" ;;
+      BASELINE_CHILDREN)
+        [[ "$v" =~ ^[1-9][0-9]*$ &&
+          (${#v} -lt 16 || (${#v} -eq 16 && "$v" < 9007199254740992)) ]] ||
+          diag_die "stored BASELINE_CHILDREN must be a canonical safe positive integer, got '$v'"
+        BASELINE_CHILDREN="$v"
+        ;;
+      BASELINE_WAVES)
+        [[ "$v" =~ ^[1-9][0-9]*$ &&
+          (${#v} -lt 16 || (${#v} -eq 16 && "$v" < 9007199254740992)) ]] ||
+          diag_die "stored BASELINE_WAVES must be a canonical safe positive integer, got '$v'"
+        BASELINE_WAVES="$v"
+        ;;
       GROUP_WAVES) GROUP_WAVES="$v" ;;
       INDIVIDUAL_RUNS) INDIVIDUAL_RUNS="$v" ;;
       GDB_MAX_RUNS) GDB_MAX_RUNS="$v" ;;
       SKIP_GDB) SKIP_GDB="$v" ;;
       CPU_TARGET)
-        cpu_target_rows=$((cpu_target_rows + 1))
-        ((cpu_target_rows == 1)) || diag_die "stored metadata contains duplicate CPU_TARGET rows"
         [[ "$v" == auto || "$v" =~ ^(0|[1-9][0-9]*)$ ]] ||
           diag_die "stored CPU_TARGET must be auto or a canonical non-negative integer, got '$v'"
         CPU_TARGET="$v"
         ;;
     esac
   done < "$meta"
+  [[ -n "${config_seen[BASELINE_CHILDREN]:-}" && -n "${config_seen[BASELINE_WAVES]:-}" ]] ||
+    diag_die "stored metadata is missing its exact baseline child/wave configuration"
   apply_cpu_target_runtime
 }
 
@@ -287,6 +311,10 @@ validate_config() {
     diag_die "--gdb-max-runs must be a canonical non-negative integer, got '$GDB_MAX_RUNS'"
   diag_require_uint "baseline children" "$BASELINE_CHILDREN"
   diag_require_uint "baseline waves" "$BASELINE_WAVES"
+  [[ "$BASELINE_CHILDREN" =~ ^[1-9][0-9]*$ && "$BASELINE_WAVES" =~ ^[1-9][0-9]*$ &&
+    (${#BASELINE_CHILDREN} -lt 16 || (${#BASELINE_CHILDREN} -eq 16 && "$BASELINE_CHILDREN" < 9007199254740992)) &&
+    (${#BASELINE_WAVES} -lt 16 || (${#BASELINE_WAVES} -eq 16 && "$BASELINE_WAVES" < 9007199254740992)) ]] ||
+    diag_die "baseline children and waves must be canonical safe positive integers"
   [[ "$SKIP_GDB" == "0" || "$SKIP_GDB" == "1" ]] ||
     diag_die "stored SKIP_GDB must be 0 or 1, got '$SKIP_GDB'"
   ((INDIVIDUAL_RUNS >= 1 && GROUP_WAVES >= 1 && GDB_MAX_RUNS >= 1 && BASELINE_CHILDREN >= 1 && BASELINE_WAVES >= 1)) ||
@@ -1358,6 +1386,39 @@ repro_result_is_complete() {
     "$logf" "$expected_children" "$expected_waves" "$rc"
 }
 
+baseline_evidence_is_complete() {
+  local validation_mode="${1:---validate-complete}"
+  node "$LIB/baseline-evidence.mjs" "$validation_mode" \
+    "$OUT_DIR" "$BASELINE_CHILDREN" "$BASELINE_WAVES"
+}
+
+baseline_prepare_fresh_targets() {
+  local meta="$OUT_DIR/results/baseline.meta"
+  local log_dir="$OUT_DIR/logs/baseline"
+  local log="$log_dir/run1.log"
+  local marker="$STATE_DIR/phase-baseline.done"
+  local samples="$OUT_DIR/freq/baseline.samples"
+  local method="$OUT_DIR/freq/baseline.method"
+  [[ -d "$OUT_DIR/results" && ! -L "$OUT_DIR/results" ]] ||
+    diag_die "baseline results directory is unsafe; preserve the bundle and resume with --redo baseline"
+  [[ -d "$OUT_DIR/logs" && ! -L "$OUT_DIR/logs" ]] ||
+    diag_die "baseline log directory is unsafe; preserve the bundle and resume with --redo baseline"
+  [[ -d "$OUT_DIR/freq" && ! -L "$OUT_DIR/freq" ]] ||
+    diag_die "baseline frequency directory is unsafe; preserve the bundle and resume with --redo baseline"
+  [[ -d "$STATE_DIR" && ! -L "$STATE_DIR" ]] ||
+    diag_die "baseline state directory is unsafe; preserve the bundle and resume with --redo baseline"
+  [[ ! -e "$meta" && ! -L "$meta" && ! -e "$log" && ! -L "$log" &&
+    ! -e "$marker" && ! -L "$marker" && ! -e "$samples" && ! -L "$samples" &&
+    ! -e "$method" && ! -L "$method" ]] ||
+    diag_die "existing baseline evidence conflicts with a fresh phase; preserve it and resume with --redo baseline"
+  if [[ -e "$log_dir" || -L "$log_dir" ]]; then
+    [[ -d "$log_dir" && ! -L "$log_dir" ]] ||
+      diag_die "baseline log destination is unsafe; preserve the bundle and resume with --redo baseline"
+  else
+    mkdir "$log_dir" || diag_die "cannot create baseline log directory"
+  fi
+}
+
 # ------------------------------------------------------------------
 # Sanitization helpers. Known identifiers are minimized before they reach
 # env/, but raw debugger/tool output still requires review before sharing.
@@ -1634,6 +1695,7 @@ phase_preflight() {
 # ------------------------------------------------------------------
 phase_baseline() {
   local logf="logs/baseline/run1.log"
+  baseline_prepare_fresh_targets
   diag_log "baseline: $BASELINE_CHILDREN children x $BASELINE_WAVES waves, STOP_ON_FAILURE=0"
   diag_freq_sampler_start baseline
   run_repro_logged "$OUT_DIR/$logf" "-" "$BASELINE_CHILDREN" "$BASELINE_WAVES"
@@ -1644,8 +1706,8 @@ phase_baseline() {
     printf 'LOG=%s\n' "$logf"
     printf 'EXIT_CODE=%s\n' "$REPRO_RC"
   } > "$OUT_DIR/results/baseline.meta"
-  repro_result_is_complete "$OUT_DIR/$logf" "$BASELINE_CHILDREN" "$BASELINE_WAVES" "$REPRO_RC" ||
-    diag_die "baseline did not produce a complete $BASELINE_WAVES-wave result (rc=$REPRO_RC); phase remains resumable"
+  baseline_evidence_is_complete --validate-before-mark ||
+    diag_die "baseline did not produce a valid complete evidence envelope (rc=$REPRO_RC); preserve it and resume with --redo baseline"
   mark_done baseline
 }
 
@@ -2297,7 +2359,8 @@ main() {
     fi
     RESUME_DIR="$resume_abs"
     OUT_DIR="$resume_abs"
-    [[ -f "$OUT_DIR/results/meta.env" ]] ||
+    [[ -d "$OUT_DIR/results" && ! -L "$OUT_DIR/results" &&
+      -f "$OUT_DIR/results/meta.env" && ! -L "$OUT_DIR/results/meta.env" ]] ||
       diag_die "resume directory '$OUT_DIR' is not a diagnostic bundle (missing results/meta.env)"
     load_stored_config "$OUT_DIR"
     # Stored values are already concrete; do not re-apply the mode preset.
@@ -2425,6 +2488,8 @@ main() {
 
   # ---- phase 2 ----
   if phase_is_done baseline; then
+    baseline_evidence_is_complete ||
+      diag_die "completed baseline phase has missing or invalid evidence; preserve it and resume with --redo baseline"
     diag_log "phase 2/7 baseline: already done, skipping (resume)"
   else
     diag_log "phase 2/7: baseline reproduction"

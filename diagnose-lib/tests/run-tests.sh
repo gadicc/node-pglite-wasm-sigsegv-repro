@@ -1835,9 +1835,14 @@ check_eq "ordinary stored offline CPU fails before bundle mutation" "1" \
   "$([[ $offline_stored_rc -ne 0 && ! -e "$OFFLINE_STORED_RB/commands.log" ]] && echo 1 || echo 0)"
 
 AUTO_OFFLINE_RB="$TMP/auto-offline-worst"
-mkdir -p "$AUTO_OFFLINE_RB"/{results,state}
+mkdir -p "$AUTO_OFFLINE_RB"/{results,state,logs/baseline,freq}
 sed 's/^CPU_TARGET=.*/CPU_TARGET=auto/; s/^COMPLETED_PHASES=.*/COMPLETED_PHASES=preflight,baseline,groups,individual/' \
   "$CPU_POLICY_RB/results/meta.env" > "$AUTO_OFFLINE_RB/results/meta.env"
+sed -i 's/^BASELINE_CHILDREN=.*/BASELINE_CHILDREN=4/; s/^BASELINE_WAVES=.*/BASELINE_WAVES=5/' \
+  "$AUTO_OFFLINE_RB/results/meta.env"
+cp "$FIX/repro-fail.log" "$AUTO_OFFLINE_RB/logs/baseline/run1.log"
+printf 'CHILDREN=4\nWAVES=5\nLOG=logs/baseline/run1.log\nEXIT_CODE=1\n' \
+  > "$AUTO_OFFLINE_RB/results/baseline.meta"
 printf 'VERSION=1\nTARGET_CPUS=%s\nRUNS_PER_CPU=1\nSKIPPED=0\nCOMPLETED=1\n' \
   "$TEST_OFFLINE_CANONICAL_CPU" > "$AUTO_OFFLINE_RB/results/individual.meta"
 printf '%s\t1\t139\t1\n' "$TEST_OFFLINE_CANONICAL_CPU" > "$AUTO_OFFLINE_RB/results/individual.tsv"
@@ -2612,6 +2617,85 @@ manifest_failure_rc=$?
 check_eq "failed hash pass preserves the previous manifest atomically" "1" \
   "$([[ $manifest_failure_rc -ne 0 && "$(cat "$MANIFEST_FAIL_BUNDLE/manifest.txt")" == 'previous manifest' ]] && ! compgen -G "${MANIFEST_FAIL_BUNDLE}.manifest.*" > /dev/null && echo 1 || echo 0)"
 
+echo "== baseline evidence envelope =="
+BASELINE_RUNNER="$TMP/baseline-runner"
+mkdir -p "$BASELINE_RUNNER"/{results,logs,state,freq}
+printf 'BASELINE_CHILDREN=4\nBASELINE_WAVES=5\nCOMPLETED_PHASES=\n' > "$BASELINE_RUNNER/results/meta.env"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$BASELINE_RUNNER"
+  STATE_DIR="$BASELINE_RUNNER/state"
+  META_FILE="$BASELINE_RUNNER/results/meta.env"
+  DIAG_LOG_FILE=""
+  BASELINE_CHILDREN=4
+  BASELINE_WAVES=5
+  diag_freq_sampler_start() { :; }
+  diag_freq_sampler_stop() { :; }
+  run_repro_logged() { cp "$FIX/repro-fail.log" "$1"; REPRO_RC=1; }
+  phase_baseline
+) > "$TMP/baseline-runner.output" 2>&1
+baseline_runner_rc=$?
+check_eq "baseline validates its envelope before publishing completion" "1" \
+  "$([[ $baseline_runner_rc -eq 0 && -f "$BASELINE_RUNNER/state/phase-baseline.done" ]] && echo 1 || echo 0)"
+
+baseline_fresh_guards=1
+for relative in results/baseline.meta logs/baseline/run1.log state/phase-baseline.done freq/baseline.samples freq/baseline.method; do
+  guard="$TMP/baseline-guard-${relative//\//-}"
+  mkdir -p "$guard"/{results,logs/baseline,state,freq}
+  : > "$guard/$relative"
+  (
+    DIAG_SOURCE_ONLY=1
+    source "$REPO_ROOT/diagnose.sh"
+    OUT_DIR="$guard"
+    STATE_DIR="$guard/state"
+    baseline_prepare_fresh_targets
+  ) > "$guard/output" 2>&1 && baseline_fresh_guards=0
+  grep -q -- '--redo baseline' "$guard/output" || baseline_fresh_guards=0
+done
+check_eq "fresh baseline refuses every preexisting fixed output and requires redo" "1" "$baseline_fresh_guards"
+
+BASELINE_SYMLINK_GUARD="$TMP/baseline-symlink-guard"
+mkdir -p "$BASELINE_SYMLINK_GUARD"/{results,logs/baseline,state,freq}
+ln -s "$TMP/outside-baseline-samples" "$BASELINE_SYMLINK_GUARD/freq/baseline.samples"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$BASELINE_SYMLINK_GUARD"
+  STATE_DIR="$BASELINE_SYMLINK_GUARD/state"
+  baseline_prepare_fresh_targets
+) > "$BASELINE_SYMLINK_GUARD/output" 2>&1
+baseline_symlink_rc=$?
+check_eq "fresh baseline refuses dangling sampler symlink" "1" \
+  "$([[ $baseline_symlink_rc -ne 0 ]] && grep -q -- '--redo baseline' "$BASELINE_SYMLINK_GUARD/output" && echo 1 || echo 0)"
+
+baseline_config_guards=1
+for variant in duplicate noncanonical meta-symlink results-symlink; do
+  config_bundle="$TMP/baseline-config-$variant"
+  config_outside="$TMP/baseline-config-$variant-outside"
+  mkdir -p "$config_bundle/results" "$config_outside"
+  printf 'MODE=quick\nBASELINE_CHILDREN=4\nBASELINE_WAVES=5\n' > "$config_bundle/results/meta.env"
+  case "$variant" in
+    duplicate) printf 'BASELINE_CHILDREN=4\n' >> "$config_bundle/results/meta.env" ;;
+    noncanonical) sed -i 's/BASELINE_WAVES=5/BASELINE_WAVES=05/' "$config_bundle/results/meta.env" ;;
+    meta-symlink)
+      mv "$config_bundle/results/meta.env" "$config_outside/meta.env"
+      ln -s "$config_outside/meta.env" "$config_bundle/results/meta.env"
+      ;;
+    results-symlink)
+      mv "$config_bundle/results/meta.env" "$config_outside/meta.env"
+      rmdir "$config_bundle/results"
+      ln -s "$config_outside" "$config_bundle/results"
+      ;;
+  esac
+  (
+    DIAG_SOURCE_ONLY=1
+    source "$REPO_ROOT/diagnose.sh"
+    load_stored_config "$config_bundle"
+  ) > "$config_bundle.output" 2>&1 && baseline_config_guards=0
+done
+check_eq "stored baseline config is unique, canonical, and loaded without symlinks" "1" "$baseline_config_guards"
+
 echo "== node unit tests (stats, parsers) =="
 if (cd "$LIB" && node --test 'tests/*.test.mjs') > "$TMP/node-tests.log" 2>&1; then
   ok "node --test stats+parsers"
@@ -2623,7 +2707,7 @@ fi
 echo "== end-to-end collect + report on synthetic bundle =="
 B="$TMP/bundle"
 mkdir -p "$B"/{results,logs/baseline,logs/groups,env,freq,gdb,state}
-touch "$B/state/phase-individual.done" "$B/state/phase-frequency.done" "$B/state/phase-gdb.done"
+touch "$B/state/phase-baseline.done" "$B/state/phase-individual.done" "$B/state/phase-frequency.done" "$B/state/phase-gdb.done"
 
 cat > "$B/results/meta.env" << EOF
 MODE=default
@@ -2761,6 +2845,7 @@ check("wave-level clustered counts propagated", r.baseline.sigsegvWaveCount === 
   r.baseline.sigsegvResolvedWaveCount === 5 && r.baseline.sigsegvUnresolvedWaveCount === 0 &&
   r.groups[1].sigsegvWaveCount === 2 && r.groups[0].sigsegvResolvedWaveCount === 5);
 check("baseline completion structure", r.baseline.completionStatus === "complete" && r.baseline.issues.length === 0);
+check("baseline evidence envelope", r.baselineStatus.status === "complete" && r.baselineStatus.reasons.length === 0);
 check("worst cpu is 19", r.worstCpu === 19);
 check("individual tally", r.individual.length === 2 && r.individual[1].sigsegv === 6 && r.individual[0].failures === 0);
 check("individual phase completion status", r.individualStatus.status === "complete" && r.individual[1].runs === 20);
@@ -2775,7 +2860,7 @@ check("root checks merged", Boolean(r.rootChecks) && r.rootChecks["cctk.txt"].in
 process.exit(failures === 0 ? 0 : 1);
 EOF
 if node "$TMP/check-results.mjs" "$B/results.json"; then
-  pass=$((pass + 17))
+  pass=$((pass + 18))
 else
   fail=$((fail + 1))
 fi
@@ -2806,13 +2891,14 @@ check_eq "complete bundle report has no truncation marker" "1" "$?"
 # the recovered counts and the partial flag reach results.json and the
 # report with no collect.mjs changes.
 B2="$TMP/bundle-truncated"
-mkdir -p "$B2"/{results,logs/baseline}
+mkdir -p "$B2"/{results,logs/baseline,state,freq}
+printf 'BASELINE_CHILDREN=2\nBASELINE_WAVES=5\n' > "$B2/results/meta.env"
 cp "$FIX/repro-truncated.log" "$B2/logs/baseline/run1.log"
 cat > "$B2/results/baseline.meta" << EOF
 CHILDREN=2
 WAVES=5
 LOG=logs/baseline/run1.log
-EXIT_CODE=139
+EXIT_CODE=1
 EOF
 node "$LIB/collect.mjs" "$B2" > /dev/null
 node "$LIB/report.mjs" "$B2" > /dev/null
@@ -2837,14 +2923,17 @@ else
 fi
 grep -q "log truncated; partial data" "$B2/report.md"
 check_eq "report marks truncated baseline as partial" "0" "$?"
-grep -q "1 SIGSEGV(s) across 4 child-process runs" "$B2/report.md"
-check_eq "truncated run conclusion counts recovered invocations" "0" "$?"
+grep -Eq 'The problem reproduced|No failure reproduced' "$B2/report.md"
+check_eq "truncated envelope is descriptive and excluded from reproduction conclusions" "1" \
+  "$([[ $? -ne 0 ]] && echo 1 || echo 0)"
 
 # Collector expectations are evidence: a clean-looking log whose header does
 # not match baseline.meta is structurally inconsistent and cannot become a
 # clean conclusion or rate bound.
 B3="$TMP/bundle-repro-mismatch"
-mkdir -p "$B3"/{results,logs/baseline}
+mkdir -p "$B3"/{results,logs/baseline,state,freq}
+printf 'BASELINE_CHILDREN=4\nBASELINE_WAVES=3\n' > "$B3/results/meta.env"
+touch "$B3/state/phase-baseline.done"
 cp "$FIX/repro-clean.log" "$B3/logs/baseline/run1.log"
 cat > "$B3/results/baseline.meta" << EOF
 CHILDREN=4

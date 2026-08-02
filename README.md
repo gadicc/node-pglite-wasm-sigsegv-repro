@@ -190,6 +190,11 @@ by running only the missing runs:
 ./diagnose.sh --resume diagnostics/2026-08-01T084335Z --yes
 ```
 
+Before a completed baseline is skipped, its fixed metadata/log envelope is
+validated against the stored child/wave configuration and completion marker.
+Missing, malformed, mismatched, or unsafe file types are preserved and require
+`--redo baseline`; they are never silently overwritten or used for conclusions.
+
 To instead *repeat* a phase from scratch in one contiguous session (for
 example the per-CPU tests, so all runs share one turbo/load regime), use
 `--redo`. The previous data is moved to `state/superseded/`, never

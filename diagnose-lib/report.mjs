@@ -103,6 +103,7 @@ function hasCompleteReproWaveCoverage(result) {
 
 function canSupportCleanReproConclusion(result) {
   return hasCompleteReproWaveCoverage(result) &&
+    (result.envelopeStatus ?? "complete") === "complete" &&
     reproCompletionStatus(result) === "complete" &&
     result.sigsegvUnresolvedWaveCount === 0;
 }
@@ -149,7 +150,11 @@ function reproWaveStatsCell(result) {
   const n = result.sigsegvResolvedWaveCount;
   const unresolved = result.sigsegvUnresolvedWaveCount;
   const status = reproCompletionStatus(result);
+  const envelopeStatus = result.envelopeStatus ?? "complete";
   if (n === 0) return `0/0 resolved waves (${unresolved} unresolved; no interval)`;
+  if (envelopeStatus !== "complete") {
+    return `${failures}/${n} = ${pct(failures / n)} (descriptive only; ${envelopeStatus} evidence envelope)`;
+  }
   if (status !== "complete") {
     return `${failures}/${n} = ${pct(failures / n)} (descriptive only; ${status} structure)`;
   }
@@ -280,10 +285,17 @@ export function renderReport(results) {
   L.push("");
   if (r.baseline) {
     const b = r.baseline;
+    const envelopeStatus = r.baselineStatus?.status ?? b.envelopeStatus ?? "complete";
     const failureCount = reproFailureCount(b);
     const completionStatus = reproCompletionStatus(b);
     L.push(`${b.children} concurrent children per wave, STOP_ON_FAILURE=0.`);
     L.push("");
+    if (envelopeStatus !== "complete") {
+      L.push(`**The baseline evidence envelope is ${envelopeStatus}. Its safely parsed`);
+      L.push("wave rows are shown descriptively but are excluded from reproduction and clean-rate conclusions.**");
+      for (const reason of r.baselineStatus?.reasons ?? []) L.push(`- ${reason}`);
+      L.push("");
+    }
     if (completionStatus === "partial") {
       L.push("**The baseline log has no completion footer (the run was");
       L.push("interrupted); wave counts below were recovered from per-wave");
@@ -320,7 +332,14 @@ export function renderReport(results) {
     L.push("independent and stationary.");
     L.push("");
   } else {
-    L.push("Not run (or no data collected).\n");
+    const status = r.baselineStatus?.status ?? "not-run";
+    if (status === "not-run") {
+      L.push("Not run (or no data collected).\n");
+    } else {
+      L.push(`Baseline evidence envelope: **${status}**. No baseline log was safe to parse.`);
+      for (const reason of r.baselineStatus?.reasons ?? []) L.push(`- ${reason}`);
+      L.push("");
+    }
   }
 
   // ------------------------------------------------------------------
@@ -551,6 +570,7 @@ function renderConclusions(r) {
   let totalRuns = 0;
   let hasIncompleteReproEvidence = false;
   let hasInvalidCountEvidence = false;
+  let hasInvalidBaselineEnvelope = false;
   const addAggregate = (sigsegv, other, unclassified, runs) => {
     if (sigsegv > Number.MAX_SAFE_INTEGER - totalSig ||
         other > Number.MAX_SAFE_INTEGER - totalOther ||
@@ -563,7 +583,11 @@ function renderConclusions(r) {
     return true;
   };
   if (r.baseline) {
-    if (validReproCounts(r.baseline)) {
+    const envelopeStatus = r.baselineStatus?.status ?? r.baseline.envelopeStatus ?? "complete";
+    if (envelopeStatus !== "complete") {
+      hasIncompleteReproEvidence = true;
+      hasInvalidBaselineEnvelope = envelopeStatus === "invalid";
+    } else if (validReproCounts(r.baseline)) {
       const added = addAggregate(
         r.baseline.sigsegvCount,
         r.baseline.otherFailureCount ?? 0,
@@ -575,6 +599,9 @@ function renderConclusions(r) {
     } else {
       hasInvalidCountEvidence = true;
     }
+  } else if (r.baselineStatus?.status === "invalid") {
+    hasInvalidBaselineEnvelope = true;
+    hasIncompleteReproEvidence = true;
   }
   for (const g of r.groups ?? []) {
     if (validReproCounts(g)) {
@@ -616,6 +643,9 @@ function renderConclusions(r) {
   }
   if (hasInvalidCountEvidence && totalRuns > 0) {
     C.push("- **Invalid failure-count evidence was excluded** from aggregate reproduction and localization conclusions.");
+  }
+  if (hasInvalidBaselineEnvelope) {
+    C.push("- **Invalid baseline evidence was excluded** from reproduction, clean-rate, and configuration conclusions; see phase 2 for the preserved descriptive evidence and validation reasons.");
   }
 
   // 2. Localization to CPUs / groups. Individual CPU batches run in fixed,
