@@ -28,6 +28,10 @@ LIB="$SCRIPT_DIR/diagnose-lib"
 # shellcheck source=diagnose-lib/common.sh
 source "$LIB/common.sh"
 
+# This unprivileged entrypoint never changes settings and must never inherit
+# restore authority from its environment or from a resumed bundle.
+DIAG_RESTORE_FILE=""
+
 # ---------------------------------------------------------------------------
 # Defaults (mode presets applied after arg pre-pass)
 # ---------------------------------------------------------------------------
@@ -1136,11 +1140,18 @@ finalize_report() {
   write_manifest || diag_die "manifest generation failed"
 }
 
+diagnose_cleanup_exit() {
+  local rc="$1"
+  trap - EXIT INT TERM
+  diag_freq_sampler_stop
+  exit "$rc"
+}
+
 on_interrupt() {
   local sig="$1"
-  diag_warn "received $sig - restoring settings and writing a partial report"
+  diag_warn "received $sig - stopping frequency sampling and writing a partial report"
   meta_set INTERRUPTED 1 2> /dev/null || true
-  diag_cleanup_now 2> /dev/null || true
+  diag_freq_sampler_stop 2> /dev/null || true
   # Best effort: a failed partial report must not mask the interrupt, so
   # the subshell contains diag_die's exit and the failure is swallowed.
   ( finalize_report ) 2> /dev/null || true
@@ -1277,13 +1288,12 @@ main() {
   OUT_DIR="$(cd "$OUT_DIR" && pwd)"
   META_FILE="$OUT_DIR/results/meta.env"
   STATE_DIR="$OUT_DIR/state"
-  DIAG_RESTORE_FILE="$OUT_DIR/state/restore.tsv"
   DIAG_FREQ_DIR="$OUT_DIR/freq"
   DIAG_LOG_FILE="$OUT_DIR/run.log"
   DIAG_COMMANDS_LOG="$OUT_DIR/commands.log"
   prepare_commands_log
 
-  trap 'diag_cleanup_exit $?' EXIT
+  trap 'diagnose_cleanup_exit $?' EXIT
   trap 'on_interrupt SIGINT' INT
   trap 'on_interrupt SIGTERM' TERM
 

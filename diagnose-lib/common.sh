@@ -4,8 +4,8 @@
 # Conventions:
 #   - No eval anywhere. Commands are executed as "$@" arrays.
 #   - All paths are quoted. Numeric inputs are validated with diag_is_uint.
-#   - Privileged writes go through diag_sysfs_write, which prefers a direct
-#     write and falls back to sudo tee. DIAG_SUDO can be emptied in tests.
+#   - Setting writes go through diag_sysfs_write. The library never enables
+#     sudo itself; privileged entrypoints must already be running as root.
 
 # ---------------------------------------------------------------------------
 # Output / logging
@@ -162,13 +162,7 @@ diag_cpulist_contains() {
 # root check EUID themselves and tell the user to re-run them with sudo.
 
 if [[ -z "${DIAG_SUDO+x}" ]]; then
-  if ((EUID == 0)); then
-    DIAG_SUDO=""
-  elif command -v sudo > /dev/null 2>&1; then
-    DIAG_SUDO="sudo"
-  else
-    DIAG_SUDO=""
-  fi
+  DIAG_SUDO=""
 fi
 
 # Write a value to a (typically sysfs) file. Prefers a direct write; uses
@@ -212,6 +206,9 @@ diag_restore_now() {
   # Restore in reverse save order, but only remove entries whose writes can be
   # read back exactly. A failed restore remains durable for the next recovery
   # attempt instead of being silently discarded.
+  # A nonempty path alone is never authority to restore: callers must arm the
+  # ledger by saving state or by explicitly validating pending recovery.
+  ((DIAG_RESTORE_ARMED == 1)) || return 0
   [[ -n "$DIAG_RESTORE_FILE" && -s "$DIAG_RESTORE_FILE" ]] || {
     DIAG_RESTORE_ARMED=0
     return 0

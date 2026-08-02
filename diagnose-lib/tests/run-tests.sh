@@ -130,6 +130,27 @@ recover_rc=$?
 check_eq "pending SIGKILL ledger is recovered before new work" "1" "$([[ $recover_rc -eq 0 && "$(cat "$RECOVER_DIR/value")" == original ]] && echo 1 || echo 0)"
 check_eq "successful pending recovery clears ledger" "1" "$([[ ! -s "$RECOVER_DIR/restore.tsv" ]] && echo 1 || echo 0)"
 
+UNARMED_DIR="$TMP/unarmed-restore"
+mkdir -p "$UNARMED_DIR"
+printf 'safe\n' > "$UNARMED_DIR/victim"
+printf '%s\tpwned\n' "$UNARMED_DIR/victim" > "$UNARMED_DIR/restore.tsv"
+(
+  DIAG_RESTORE_FILE="$UNARMED_DIR/restore.tsv"
+  DIAG_RESTORE_ARMED=0
+  diag_restore_now
+) > /dev/null 2>&1
+check_eq "unarmed restore ledger is inert" "1" "$([[ "$(cat "$UNARMED_DIR/victim")" == safe && -s "$UNARMED_DIR/restore.tsv" ]] && echo 1 || echo 0)"
+
+(
+  DIAG_RESTORE_FILE="$UNARMED_DIR/restore.tsv"
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  [[ -z "$DIAG_RESTORE_FILE" ]]
+  diagnose_cleanup_exit 0
+) > /dev/null 2>&1
+diagnose_restore_rc=$?
+check_eq "diagnose.sh discards inherited restore authority" "1" "$([[ $diagnose_restore_rc -eq 0 && "$(cat "$UNARMED_DIR/victim")" == safe ]] && echo 1 || echo 0)"
+
 LEDGER_GUARD_DIR="$TMP/ledger-guard"
 mkdir -p "$LEDGER_GUARD_DIR"
 printf 'safe\n' > "$LEDGER_GUARD_DIR/victim"
