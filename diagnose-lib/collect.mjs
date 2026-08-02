@@ -595,6 +595,12 @@ export function collect(outDir) {
       groupWaves: num(meta.GROUP_WAVES),
       individualRuns: num(meta.INDIVIDUAL_RUNS),
       gdbMaxRuns: num(meta.GDB_MAX_RUNS),
+      cpuTarget:
+        meta.CPU_TARGET === undefined || meta.CPU_TARGET === "auto"
+          ? null
+          : num(meta.CPU_TARGET),
+      cpuTargetPolicy:
+        meta.CPU_TARGET === undefined || meta.CPU_TARGET === "auto" ? "auto" : "fixed",
       frequencyAb: meta.FREQUENCY_AB === "1",
       skipGdb: meta.SKIP_GDB === "1",
       completedPhases: (meta.COMPLETED_PHASES ?? "").split(",").filter(Boolean),

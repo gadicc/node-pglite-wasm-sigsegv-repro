@@ -150,7 +150,15 @@ npm ci
 
 `--yes` accepts the safety warning (required when not interactive).
 Useful overrides: `--individual-runs N`, `--group-waves N`,
-`--gdb-max-runs N`, `--skip-gdb`, `--run-gdb`, `--out-dir DIR`, `--cpu N`.
+`--gdb-max-runs N`, `--skip-gdb`, `--run-gdb`, `--out-dir DIR`, and
+`--cpu N|auto`. The CPU selection policy is persisted in the bundle:
+`auto` (the default) uses the worst failing CPU from validated individual
+results, while a number pins the manual frequency hint and GDB capture to that
+CPU. Use `--cpu auto` on resume to clear a previously fixed choice; completed
+frequency or GDB evidence must still match the resolved CPU or be redone.
+In `results.json`, `config.cpuTarget` is the fixed CPU number or `null` for
+automatic selection, and `config.cpuTargetPolicy` makes that distinction
+explicit.
 On resume, the stored GDB choice remains the default. Use `--run-gdb` to
 reverse an earlier `--skip-gdb`; if that skipped phase is already complete,
 also pass `--redo gdb` so its old terminal evidence is preserved first.

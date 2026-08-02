@@ -36,6 +36,28 @@ check_eq() {
 # shellcheck source=../common.sh
 source "$LIB/common.sh"
 
+# Shared real/alternate CPU fixtures for persisted selection-policy tests.
+TEST_ONLINE_CPUS="$(sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' /proc/self/status)"
+TEST_ONLINE_CPU="$(diag_cpulist_expand "$TEST_ONLINE_CPUS" | head -1)"
+TEST_OTHER_CPU=$((TEST_ONLINE_CPU + 100000))
+TEST_OFFLINE_CANONICAL_CPU=65535
+while diag_cpulist_contains "$TEST_ONLINE_CPUS" "$TEST_OFFLINE_CANONICAL_CPU"; do
+  TEST_OFFLINE_CANONICAL_CPU=$((TEST_OFFLINE_CANONICAL_CPU - 1))
+done
+CPU_POLICY_RB="$TMP/cpu-policy-bundle"
+mkdir -p "$CPU_POLICY_RB"/{results,state}
+cat > "$CPU_POLICY_RB/results/meta.env" << EOF
+MODE=quick
+BASELINE_CHILDREN=8
+BASELINE_WAVES=10
+GROUP_WAVES=10
+INDIVIDUAL_RUNS=5
+GDB_MAX_RUNS=6
+SKIP_GDB=0
+CPU_TARGET=$TEST_ONLINE_CPU
+COMPLETED_PHASES=
+EOF
+
 echo "== cpulist helpers =="
 check_eq "expand ranges" $'0\n1\n2\n3\n8\n10\n11' "$(diag_cpulist_expand '0-3,8,10-11')"
 check_eq "expand single" "5" "$(diag_cpulist_expand '5')"
@@ -1548,18 +1570,293 @@ sed 's/^CONFIG	INDIVIDUAL_RUNS	5$/CONFIG	INDIVIDUAL_RUNS	05/' \
   "$INVALID_V2_DIR/valid" > "$INVALID_V2_DIR/noncanonical"
 write_test_v2_marker "$INVALID_V2_DIR/unreachable-mode" quick 16 50
 sed 's/^VERSION	2$/VERSION	1/' "$INVALID_V2_DIR/valid" > "$INVALID_V2_DIR/v1-with-config"
+sed '/^PHASE	gdb$/i CONFIG\tCPU_TARGET\tauto' \
+  "$INVALID_V2_DIR/valid" > "$INVALID_V2_DIR/valid-current"
+sed 's/^CONFIG	CPU_TARGET	auto$/CONFIG\tCPU_TARGET\t01/' \
+  "$INVALID_V2_DIR/valid-current" > "$INVALID_V2_DIR/bad-cpu-target"
+sed '/^CONFIG	MODE	quick$/a CONFIG\tCPU_TARGET\tauto' \
+  "$INVALID_V2_DIR/valid" > "$INVALID_V2_DIR/cpu-out-of-order"
 invalid_v2_result="$(
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
-  valid=0 rejected=0
+  valid=0 current=0 rejected=0 current_profile=0
   redo_transaction_validate "$INVALID_V2_DIR/valid" && valid=1
-  for marker in missing duplicate out-of-order noncanonical unreachable-mode v1-with-config; do
+  if redo_transaction_validate "$INVALID_V2_DIR/valid-current"; then
+    current=1
+    current_profile=$REDO_TXN_HAS_CPU_TARGET
+  fi
+  for marker in missing duplicate out-of-order noncanonical unreachable-mode v1-with-config bad-cpu-target cpu-out-of-order; do
     redo_transaction_validate "$INVALID_V2_DIR/$marker" || rejected=$((rejected + 1))
   done
-  printf '%s|%s\n' "$valid" "$rejected"
+  printf '%s|%s|%s|%s\n' "$valid" "$current" "$current_profile" "$rejected"
 )"
-check_eq "V2 grammar rejects missing, duplicate, out-of-order, noncanonical, unreachable, and V1 CONFIG rows" \
-  "1|6" "$invalid_v2_result"
+check_eq "V2 grammar accepts exact legacy/current profiles and rejects malformed CPU rows" \
+  "1|1|1|8" "$invalid_v2_result"
+
+generated_config_rows="$(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  MODE=quick BASELINE_CHILDREN=8 BASELINE_WAVES=10 GROUP_WAVES=10
+  INDIVIDUAL_RUNS=5 GDB_MAX_RUNS=6 SKIP_GDB=0 CPU_TARGET=auto
+  redo_write_config_records
+)"
+check_eq "generated V2 config ends with the eighth CPU_TARGET row" "1" \
+  "$([[ "$(printf '%s\n' "$generated_config_rows" | grep -c '^CONFIG')" -eq 8 && "$(printf '%s\n' "$generated_config_rows" | tail -1)" == $'CONFIG\tCPU_TARGET\tauto' ]] && echo 1 || echo 0)"
+
+echo "== pending CPU policy recovery =="
+make_cpu_pending_bundle() {
+  local bundle="$1" stored="$2" profile="$3" target="$4"
+  mkdir -p "$bundle"/{results,state}
+  cat > "$bundle/results/meta.env" << EOF
+MODE=quick
+BASELINE_CHILDREN=8
+BASELINE_WAVES=10
+GROUP_WAVES=10
+INDIVIDUAL_RUNS=5
+GDB_MAX_RUNS=6
+SKIP_GDB=0
+CPU_TARGET=$stored
+COMPLETED_PHASES=
+EOF
+  if [[ "$profile" == v1 ]]; then
+    printf 'VERSION\t1\nTXN\tredo-20260802T000000-cpuv1\nPHASE\tgdb\n' > "$bundle/state/redo.pending"
+  else
+    write_test_v2_marker "$bundle/state/redo.pending" quick 8 10
+    if [[ "$profile" == current8 ]]; then
+      sed -i "/^PHASE\tgdb$/i CONFIG\tCPU_TARGET\t$target" "$bundle/state/redo.pending"
+    fi
+  fi
+}
+
+LEGACY7_CPU_PENDING="$TMP/pending-cpu-legacy7"
+make_cpu_pending_bundle "$LEGACY7_CPU_PENDING" "$TEST_ONLINE_CPU" legacy7 auto
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$LEGACY7_CPU_PENDING" STATE_DIR="$LEGACY7_CPU_PENDING/state"
+  META_FILE="$LEGACY7_CPU_PENDING/results/meta.env" CPU_TARGET="$TEST_ONLINE_CPU"
+  apply_cpu_target_runtime
+  recover_pending_redo
+) > /dev/null 2>&1
+check_eq "legacy seven-key pending recovery retains the stored CPU target" "$TEST_ONLINE_CPU" \
+  "$(sed -n 's/^CPU_TARGET=//p' "$LEGACY7_CPU_PENDING/results/meta.env")"
+
+V1_CPU_PENDING="$TMP/pending-cpu-v1"
+make_cpu_pending_bundle "$V1_CPU_PENDING" "$TEST_ONLINE_CPU" v1 auto
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$V1_CPU_PENDING" STATE_DIR="$V1_CPU_PENDING/state"
+  META_FILE="$V1_CPU_PENDING/results/meta.env" CPU_TARGET="$TEST_ONLINE_CPU"
+  apply_cpu_target_runtime
+  recover_pending_redo
+) > /dev/null 2>&1
+check_eq "V1 pending recovery retains the stored CPU target" "$TEST_ONLINE_CPU" \
+  "$(sed -n 's/^CPU_TARGET=//p' "$V1_CPU_PENDING/results/meta.env")"
+
+CURRENT8_CPU_PENDING="$TMP/pending-cpu-current8"
+make_cpu_pending_bundle "$CURRENT8_CPU_PENDING" auto current8 "$TEST_ONLINE_CPU"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$CURRENT8_CPU_PENDING" STATE_DIR="$CURRENT8_CPU_PENDING/state"
+  META_FILE="$CURRENT8_CPU_PENDING/results/meta.env" CPU_TARGET=auto
+  apply_cpu_target_runtime
+  recover_pending_redo
+) > /dev/null 2>&1
+check_eq "current eight-key pending target is authoritative and restart-safe" "$TEST_ONLINE_CPU" \
+  "$(sed -n 's/^CPU_TARGET=//p' "$CURRENT8_CPU_PENDING/results/meta.env")"
+
+CURRENT8_CPU_POST_META="$TMP/pending-cpu-post-meta"
+make_cpu_pending_bundle "$CURRENT8_CPU_POST_META" auto current8 "$TEST_ONLINE_CPU"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$CURRENT8_CPU_POST_META" STATE_DIR="$CURRENT8_CPU_POST_META/state"
+  META_FILE="$CURRENT8_CPU_POST_META/results/meta.env" CPU_TARGET=auto
+  apply_cpu_target_runtime
+  redo_after_meta_publish() { return 97; }
+  recover_pending_redo
+) > /dev/null 2>&1
+current8_post_meta_rc=$?
+current8_post_meta_staged=0
+[[ $current8_post_meta_rc -ne 0 && -f "$CURRENT8_CPU_POST_META/state/redo.pending" &&
+  "$(sed -n 's/^CPU_TARGET=//p' "$CURRENT8_CPU_POST_META/results/meta.env")" == "$TEST_ONLINE_CPU" ]] &&
+  current8_post_meta_staged=1
+check_eq "fixed CPU target is committed before pending-marker unlink" "1" "$current8_post_meta_staged"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$CURRENT8_CPU_POST_META" STATE_DIR="$CURRENT8_CPU_POST_META/state"
+  META_FILE="$CURRENT8_CPU_POST_META/results/meta.env" CPU_TARGET="$TEST_ONLINE_CPU"
+  apply_cpu_target_runtime
+  recover_pending_redo
+) > /dev/null 2>&1
+check_eq "fresh-shell recovery retains fixed CPU after post-meta interruption" "1" \
+  "$([[ ! -e "$CURRENT8_CPU_POST_META/state/redo.pending" && "$(sed -n 's/^CPU_TARGET=//p' "$CURRENT8_CPU_POST_META/results/meta.env")" == "$TEST_ONLINE_CPU" ]] && echo 1 || echo 0)"
+
+LEGACY_CPU_CONFLICT="$TMP/pending-cpu-legacy-conflict"
+make_cpu_pending_bundle "$LEGACY_CPU_CONFLICT" "$TEST_ONLINE_CPU" legacy7 auto
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$LEGACY_CPU_CONFLICT" STATE_DIR="$LEGACY_CPU_CONFLICT/state"
+  META_FILE="$LEGACY_CPU_CONFLICT/results/meta.env"
+  CPU_TARGET="$TEST_OTHER_CPU" CPU_EXPLICIT=1
+  apply_cpu_target_runtime
+  reconcile_pending_redo_request
+) > /dev/null 2>&1
+legacy_cpu_conflict_rc=$?
+check_eq "legacy seven-key pending target rejects an explicit CPU mismatch" "1" \
+  "$([[ $legacy_cpu_conflict_rc -ne 0 && -f "$LEGACY_CPU_CONFLICT/state/redo.pending" ]] && echo 1 || echo 0)"
+
+echo "== completed CPU-target evidence gates =="
+CPU_EVIDENCE_RB="$TMP/cpu-evidence-gates"
+mkdir -p "$CPU_EVIDENCE_RB"/{results,state}
+cat > "$CPU_EVIDENCE_RB/results/meta.env" << EOF
+MODE=quick
+BASELINE_CHILDREN=8
+BASELINE_WAVES=10
+GROUP_WAVES=10
+INDIVIDUAL_RUNS=1
+GDB_MAX_RUNS=6
+SKIP_GDB=0
+CPU_TARGET=auto
+COMPLETED_PHASES=individual,gdb
+EOF
+printf 'VERSION=1\nTARGET_CPUS=%s\nRUNS_PER_CPU=1\nSKIPPED=0\nCOMPLETED=1\n' \
+  "$TEST_ONLINE_CPU" > "$CPU_EVIDENCE_RB/results/individual.meta"
+printf '%s\t1\t139\t1\n' "$TEST_ONLINE_CPU" > "$CPU_EVIDENCE_RB/results/individual.tsv"
+printf 'CPU=%s\nMAX_RUNS=6\nEXIT_CODE=3\n' "$TEST_ONLINE_CPU" > "$CPU_EVIDENCE_RB/results/gdb.meta"
+touch "$CPU_EVIDENCE_RB/state/phase-individual.done" "$CPU_EVIDENCE_RB/state/phase-gdb.done"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  RESUME_DIR="$CPU_EVIDENCE_RB" OUT_DIR="$CPU_EVIDENCE_RB" STATE_DIR="$CPU_EVIDENCE_RB/state"
+  META_FILE="$CPU_EVIDENCE_RB/results/meta.env" CPU_TARGET=auto
+  validate_completed_phase_overrides
+)
+check_eq "auto CPU policy accepts matching completed GDB evidence" "0" "$?"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  RESUME_DIR="$CPU_EVIDENCE_RB" OUT_DIR="$CPU_EVIDENCE_RB" STATE_DIR="$CPU_EVIDENCE_RB/state"
+  META_FILE="$CPU_EVIDENCE_RB/results/meta.env" CPU_TARGET="$TEST_OTHER_CPU"
+  validate_completed_phase_overrides
+) > /dev/null 2>&1
+cpu_evidence_mismatch_rc=$?
+check_eq "incompatible completed GDB CPU requires redo even without an explicit delta gate" "1" \
+  "$([[ $cpu_evidence_mismatch_rc -ne 0 ]] && echo 1 || echo 0)"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  RESUME_DIR="$CPU_EVIDENCE_RB" OUT_DIR="$CPU_EVIDENCE_RB" STATE_DIR="$CPU_EVIDENCE_RB/state"
+  META_FILE="$CPU_EVIDENCE_RB/results/meta.env" CPU_TARGET="$TEST_OTHER_CPU"
+  REDO_PLAN=(gdb)
+  validate_completed_phase_overrides
+)
+check_eq "redo closure authorizes replacement of incompatible GDB CPU evidence" "0" "$?"
+
+rm -f "$CPU_EVIDENCE_RB/results/individual.meta" "$CPU_EVIDENCE_RB/results/individual.tsv"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  RESUME_DIR="$CPU_EVIDENCE_RB" OUT_DIR="$CPU_EVIDENCE_RB" STATE_DIR="$CPU_EVIDENCE_RB/state"
+  META_FILE="$CPU_EVIDENCE_RB/results/meta.env" CPU_TARGET=auto
+  validate_completed_phase_overrides
+) > /dev/null 2>&1
+unresolved_auto_rc=$?
+check_eq "auto policy requires redo when its worst CPU cannot be resolved" "1" \
+  "$([[ $unresolved_auto_rc -ne 0 ]] && echo 1 || echo 0)"
+
+rm -f "$CPU_EVIDENCE_RB/state/phase-individual.done"
+printf 'SKIPPED=1\nSKIP_REASON=no failing CPU identified\n' > "$CPU_EVIDENCE_RB/results/gdb.meta"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$CPU_EVIDENCE_RB" STATE_DIR="$CPU_EVIDENCE_RB/state"
+  cpu_target_matches_completed_phase "$TEST_OTHER_CPU" gdb
+)
+check_eq "strict no-CPU GDB skip is independent of CPU selection" "0" "$?"
+printf 'CPU=%s\nSKIPPED=1\nSKIP_REASON=crafted\n' "$TEST_ONLINE_CPU" > "$CPU_EVIDENCE_RB/results/gdb.meta"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$CPU_EVIDENCE_RB" STATE_DIR="$CPU_EVIDENCE_RB/state"
+  ! cpu_target_matches_completed_phase "$TEST_OTHER_CPU" gdb
+)
+check_eq "a GDB record cannot claim both a CPU and skip exemption" "0" "$?"
+
+touch "$CPU_EVIDENCE_RB/state/phase-frequency.done"
+printf 'CPU=%s\nRUNS_PER_LEG=1\nRESTORED=1\nCOMPLETED=1\nSKIPPED=1\n' \
+  "$TEST_OTHER_CPU" > "$CPU_EVIDENCE_RB/results/frequency-ab.meta"
+printf 'A1\t1\t139\t1\nB\t1\t0\t1\nA2\t1\t139\t1\n' > "$CPU_EVIDENCE_RB/results/frequency-ab.tsv"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$CPU_EVIDENCE_RB" STATE_DIR="$CPU_EVIDENCE_RB/state"
+  ! cpu_target_matches_completed_phase "$TEST_ONLINE_CPU" frequency &&
+    ! frequency_result_is_complete "$TEST_ONLINE_CPU"
+)
+check_eq "frequency skip text cannot bypass exact expected-CPU validation" "0" "$?"
+
+CRAFTED_CPU_MARKER="$TMP/crafted-cpu-marker"
+mkdir -p "$CRAFTED_CPU_MARKER"/{results,state}
+cp "$CPU_POLICY_RB/results/meta.env" "$CRAFTED_CPU_MARKER/results/meta.env"
+printf 'CPU=%s\nMAX_RUNS=6\nEXIT_CODE=3\n' "$TEST_ONLINE_CPU" > "$CRAFTED_CPU_MARKER/results/gdb.meta"
+touch "$CRAFTED_CPU_MARKER/state/phase-gdb.done"
+write_test_v2_marker "$CRAFTED_CPU_MARKER/state/redo.pending" quick 8 10
+sed -i "s/^PHASE\tgdb$/CONFIG\tCPU_TARGET\t$TEST_OTHER_CPU\nPHASE\tbaseline/" \
+  "$CRAFTED_CPU_MARKER/state/redo.pending"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$CRAFTED_CPU_MARKER" STATE_DIR="$CRAFTED_CPU_MARKER/state"
+  META_FILE="$CRAFTED_CPU_MARKER/results/meta.env"
+  redo_transaction_validate "$CRAFTED_CPU_MARKER/state/redo.pending" &&
+    ! redo_transaction_target_is_authorized
+)
+check_eq "crafted current V2 target cannot retain mismatched completed CPU evidence" "0" "$?"
+
+echo "== unavailable CPU recovery ordering =="
+OFFLINE_PENDING_RB="$TMP/offline-pending-cpu"
+make_cpu_pending_bundle "$OFFLINE_PENDING_RB" auto current8 999999
+offline_pending_output="$("$REPO_ROOT/diagnose.sh" --resume "$OFFLINE_PENDING_RB" --yes 2>&1)"
+offline_pending_rc=$?
+check_eq "offline pending CPU target recovers its transaction before stopping" "1" \
+  "$([[ $offline_pending_rc -ne 0 && ! -e "$OFFLINE_PENDING_RB/state/redo.pending" && "$(sed -n 's/^CPU_TARGET=//p' "$OFFLINE_PENDING_RB/results/meta.env")" == 999999 && "$offline_pending_output" == *"resume using --cpu auto"* ]] && echo 1 || echo 0)"
+
+OFFLINE_STORED_RB="$TMP/offline-stored-cpu"
+mkdir -p "$OFFLINE_STORED_RB"/{results,state}
+sed "s/^CPU_TARGET=.*/CPU_TARGET=999999/" "$CPU_POLICY_RB/results/meta.env" > "$OFFLINE_STORED_RB/results/meta.env"
+"$REPO_ROOT/diagnose.sh" --resume "$OFFLINE_STORED_RB" --yes > /dev/null 2>&1
+offline_stored_rc=$?
+check_eq "ordinary stored offline CPU fails before bundle mutation" "1" \
+  "$([[ $offline_stored_rc -ne 0 && ! -e "$OFFLINE_STORED_RB/commands.log" ]] && echo 1 || echo 0)"
+
+AUTO_OFFLINE_RB="$TMP/auto-offline-worst"
+mkdir -p "$AUTO_OFFLINE_RB"/{results,state}
+sed 's/^CPU_TARGET=.*/CPU_TARGET=auto/; s/^COMPLETED_PHASES=.*/COMPLETED_PHASES=preflight,baseline,groups,individual/' \
+  "$CPU_POLICY_RB/results/meta.env" > "$AUTO_OFFLINE_RB/results/meta.env"
+printf 'VERSION=1\nTARGET_CPUS=%s\nRUNS_PER_CPU=1\nSKIPPED=0\nCOMPLETED=1\n' \
+  "$TEST_OFFLINE_CANONICAL_CPU" > "$AUTO_OFFLINE_RB/results/individual.meta"
+printf '%s\t1\t139\t1\n' "$TEST_OFFLINE_CANONICAL_CPU" > "$AUTO_OFFLINE_RB/results/individual.tsv"
+touch "$AUTO_OFFLINE_RB/state"/phase-{preflight,baseline,groups,individual}.done
+auto_offline_output="$("$REPO_ROOT/diagnose.sh" --resume "$AUTO_OFFLINE_RB" --yes 2>&1)"
+auto_offline_rc=$?
+check_eq "resolved automatic worst CPU must still be online before targeted phases" "1" \
+  "$([[ $auto_offline_rc -ne 0 && "$auto_offline_output" == *"resolved automatic worst CPU $TEST_OFFLINE_CANONICAL_CPU"* && ! -e "$AUTO_OFFLINE_RB/state/phase-frequency.done" && ! -e "$AUTO_OFFLINE_RB/state/phase-gdb.done" ]] && echo 1 || echo 0)"
+
+COLLECT_CPU_RB="$TMP/collect-cpu-policy"
+mkdir -p "$COLLECT_CPU_RB/results"
+printf 'MODE=quick\nCPU_TARGET=%s\n' "$TEST_ONLINE_CPU" > "$COLLECT_CPU_RB/results/meta.env"
+node "$LIB/collect.mjs" "$COLLECT_CPU_RB" > /dev/null
+collect_fixed_cpu="$(node -e 'const r=require(process.argv[1]); console.log(`${r.config.cpuTarget}|${r.config.cpuTargetPolicy}`)' "$COLLECT_CPU_RB/results.json")"
+check_eq "results JSON exposes numeric fixed CPU target and policy" "$TEST_ONLINE_CPU|fixed" "$collect_fixed_cpu"
+printf 'MODE=quick\nCPU_TARGET=auto\n' > "$COLLECT_CPU_RB/results/meta.env"
+node "$LIB/collect.mjs" "$COLLECT_CPU_RB" > /dev/null
+collect_auto_cpu="$(node -e 'const r=require(process.argv[1]); console.log(`${r.config.cpuTarget}|${r.config.cpuTargetPolicy}`)' "$COLLECT_CPU_RB/results.json")"
+check_eq "results JSON exposes null plus explicit policy for auto selection" "null|auto" "$collect_auto_cpu"
 
 META_TEMP_CLEANUP="$TMP/meta-temp-cleanup"
 mkdir -p "$META_TEMP_CLEANUP"/{results,state}
@@ -1943,12 +2240,12 @@ check_eq "malformed GDB accounting cannot close the phase" "1" \
 FREQUENCY_COMPLETE="$TMP/frequency-complete"
 mkdir -p "$FREQUENCY_COMPLETE/results"
 printf 'A1\t1\t139\t2\nB\t1\t0\t3\nA2\t1\t0\t2\n' > "$FREQUENCY_COMPLETE/results/frequency-ab.tsv"
-printf 'RUNS_PER_LEG=1\nRESTORED=1\nCOMPLETED=1\n' > "$FREQUENCY_COMPLETE/results/frequency-ab.meta"
+printf 'CPU=19\nRUNS_PER_LEG=1\nRESTORED=1\nCOMPLETED=1\n' > "$FREQUENCY_COMPLETE/results/frequency-ab.meta"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
   OUT_DIR="$FREQUENCY_COMPLETE"
-  frequency_result_is_complete
+  frequency_result_is_complete 19
 )
 check_eq "complete restored frequency A/B/A evidence is accepted" "0" "$?"
 sed -i '/^A2/d' "$FREQUENCY_COMPLETE/results/frequency-ab.tsv"
@@ -1956,7 +2253,7 @@ sed -i '/^A2/d' "$FREQUENCY_COMPLETE/results/frequency-ab.tsv"
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
   OUT_DIR="$FREQUENCY_COMPLETE"
-  frequency_result_is_complete
+  frequency_result_is_complete 19
 ) > /dev/null 2>&1
 check_eq "partial frequency A/B/A evidence is not phase-complete" "1" "$([[ $? -ne 0 ]] && echo 1 || echo 0)"
 
@@ -1999,6 +2296,60 @@ check_eq "non-canonical CPU overrides are rejected before execution" "1" \
 "$REPO_ROOT/diagnose.sh" --cpu 999999 --dry-run --yes > /dev/null 2>&1
 unusable_cpu_rc=$?
 check_eq "unusable CPU override is rejected" "1" "$([[ $unusable_cpu_rc -ne 0 ]] && echo 1 || echo 0)"
+
+echo "== persistent CPU selection policy =="
+fixed_cpu_plan="$($REPO_ROOT/diagnose.sh --cpu "$TEST_ONLINE_CPU" --dry-run --yes 2>&1)"
+check_eq "numeric --cpu selects a fixed persisted policy" "1" \
+  "$([[ "$fixed_cpu_plan" == *"CPU selection      fixed CPU $TEST_ONLINE_CPU"* ]] && echo 1 || echo 0)"
+
+stored_cpu_plan="$($REPO_ROOT/diagnose.sh --resume "$CPU_POLICY_RB" --dry-run --yes 2>&1)"
+auto_cpu_plan="$($REPO_ROOT/diagnose.sh --resume "$CPU_POLICY_RB" --cpu auto --dry-run --yes 2>&1)"
+check_eq "resume keeps a stored fixed CPU policy" "1" \
+  "$([[ "$stored_cpu_plan" == *"CPU selection      fixed CPU $TEST_ONLINE_CPU"* ]] && echo 1 || echo 0)"
+check_eq "--cpu auto clears a stored fixed CPU policy" "1" \
+  "$([[ "$auto_cpu_plan" == *"CPU selection      auto (worst failing CPU from individual results)"* ]] && echo 1 || echo 0)"
+"$REPO_ROOT/diagnose.sh" --cpu auto --cpu "$TEST_ONLINE_CPU" --dry-run --yes > /dev/null 2>&1
+repeated_cpu_rc=$?
+check_eq "repeated --cpu flags are rejected" "1" "$([[ $repeated_cpu_rc -ne 0 ]] && echo 1 || echo 0)"
+
+LEGACY_CPU_RB="$TMP/legacy-cpu-policy"
+mkdir -p "$LEGACY_CPU_RB"/{results,state}
+sed '/^CPU_TARGET=/d' "$CPU_POLICY_RB/results/meta.env" > "$LEGACY_CPU_RB/results/meta.env"
+legacy_cpu_plan="$($REPO_ROOT/diagnose.sh --resume "$LEGACY_CPU_RB" --dry-run --yes 2>&1)"
+check_eq "legacy metadata without CPU_TARGET defaults to auto" "1" \
+  "$([[ "$legacy_cpu_plan" == *"CPU selection      auto (worst failing CPU from individual results)"* ]] && echo 1 || echo 0)"
+for malformed_cpu_meta in duplicate malformed unterminated; do
+  BAD_CPU_RB="$TMP/bad-cpu-$malformed_cpu_meta"
+  mkdir -p "$BAD_CPU_RB"/{results,state}
+  cp "$CPU_POLICY_RB/results/meta.env" "$BAD_CPU_RB/results/meta.env"
+  case "$malformed_cpu_meta" in
+    duplicate) printf 'CPU_TARGET=auto\n' >> "$BAD_CPU_RB/results/meta.env" ;;
+    malformed) sed -i 's/^CPU_TARGET=.*/CPU_TARGET=01/' "$BAD_CPU_RB/results/meta.env" ;;
+    unterminated)
+      sed '/^CPU_TARGET=/d' "$BAD_CPU_RB/results/meta.env" > "$BAD_CPU_RB/meta.tmp"
+      mv "$BAD_CPU_RB/meta.tmp" "$BAD_CPU_RB/results/meta.env"
+      printf 'CPU_TARGET=01' >> "$BAD_CPU_RB/results/meta.env"
+      ;;
+  esac
+  "$REPO_ROOT/diagnose.sh" --resume "$BAD_CPU_RB" --dry-run --yes > /dev/null 2>&1
+  bad_cpu_meta_rc=$?
+  check_eq "malformed stored CPU policy fails closed: $malformed_cpu_meta" "1" \
+    "$([[ $bad_cpu_meta_rc -ne 0 && ! -e "$BAD_CPU_RB/commands.log" ]] && echo 1 || echo 0)"
+done
+
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$CPU_POLICY_RB"
+  STATE_DIR="$CPU_POLICY_RB/state"
+  META_FILE="$CPU_POLICY_RB/results/meta.env"
+  MODE=quick BASELINE_CHILDREN=8 BASELINE_WAVES=10 GROUP_WAVES=10
+  INDIVIDUAL_RUNS=5 GDB_MAX_RUNS=6 SKIP_GDB=0 CPU_TARGET=auto
+  apply_cpu_target_runtime
+  persist_effective_config
+)
+check_eq "ordinary atomic config rewrite persists one canonical CPU_TARGET" "1" \
+  "$([[ "$(grep -c '^CPU_TARGET=auto$' "$CPU_POLICY_RB/results/meta.env")" -eq 1 ]] && echo 1 || echo 0)"
 
 echo "== reversible GDB skip choice =="
 GDB_SKIP_RB="$TMP/gdb-skip-bundle"

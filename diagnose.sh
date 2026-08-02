@@ -54,6 +54,7 @@ REDO_MARKER_TEMP=""
 REDO_NEW_TXN_ID=""
 REDO_TXN_ID=""
 REDO_TXN_VERSION=""
+REDO_TXN_HAS_CPU_TARGET=0
 declare -a REDO_TXN_PHASES=()
 declare -a REDO_TXN_OWNERS=()
 declare -a REDO_TXN_PATHS=()
@@ -61,6 +62,7 @@ declare -A REDO_TXN_CONFIG=()
 REDO_REQUEST_SATISFIED_BY_PENDING=0
 REDO_RECOVERED_PENDING=0
 META_UPDATE_TEMP=""
+CPU_TARGET="auto"
 WORST_CPU_OVERRIDE=""
 SESSION_DID_WORK=0
 MODE_EXPLICIT=0
@@ -71,6 +73,8 @@ SKIP_GDB_EXPLICIT=0
 SKIP_GDB_FLAG_SEEN=0
 RUN_GDB_FLAG_SEEN=0
 CPU_EXPLICIT=0
+CPU_FLAG_SEEN=0
+PENDING_CPU_TARGET_UNAVAILABLE=0
 REQUIRED_COMMANDS=(
   awk basename bash cat cut date dirname find grep head mkdir mktemp mv node
   nproc paste readlink rm sed setsid sha256sum sleep sort sync tail taskset tee timeout
@@ -104,8 +108,8 @@ Options:
   --individual-runs N   runs per CPU (overrides mode default)
   --group-waves N       waves per CPU group (overrides mode default)
   --gdb-max-runs N      max gdb attempts (overrides mode default)
-  --cpu N               force the CPU suggested for the gdb phase and for
-                        the frequency-ab.sh hint
+  --cpu N|auto          use a fixed CPU for GDB/frequency evidence, or select
+                        the worst failing CPU automatically (default)
   --dry-run             print the resolved plan and exit without running
   --yes                 accept the safety warning (required non-interactively)
   -h, --help            this help
@@ -172,8 +176,8 @@ apply_mode_preset() {
 load_stored_config() {
   local meta="$1/results/meta.env"
   [[ -f "$meta" ]] || return 0
-  local k v
-  while IFS='=' read -r k v; do
+  local k v cpu_target_rows=0
+  while IFS='=' read -r k v || [[ -n "$k" || -n "$v" ]]; do
     case "$k" in
       MODE) MODE="$v" ;;
       BASELINE_CHILDREN) BASELINE_CHILDREN="$v" ;;
@@ -182,8 +186,24 @@ load_stored_config() {
       INDIVIDUAL_RUNS) INDIVIDUAL_RUNS="$v" ;;
       GDB_MAX_RUNS) GDB_MAX_RUNS="$v" ;;
       SKIP_GDB) SKIP_GDB="$v" ;;
+      CPU_TARGET)
+        cpu_target_rows=$((cpu_target_rows + 1))
+        ((cpu_target_rows == 1)) || diag_die "stored metadata contains duplicate CPU_TARGET rows"
+        [[ "$v" == auto || "$v" =~ ^(0|[1-9][0-9]*)$ ]] ||
+          diag_die "stored CPU_TARGET must be auto or a canonical non-negative integer, got '$v'"
+        CPU_TARGET="$v"
+        ;;
     esac
   done < "$meta"
+  apply_cpu_target_runtime
+}
+
+apply_cpu_target_runtime() {
+  if [[ "$CPU_TARGET" == auto ]]; then
+    WORST_CPU_OVERRIDE=""
+  else
+    WORST_CPU_OVERRIDE="$CPU_TARGET"
+  fi
 }
 
 parse_args() {
@@ -237,7 +257,14 @@ parse_args() {
       --individual-runs) INDIVIDUAL_RUNS="${2:?}"; INDIVIDUAL_RUNS_EXPLICIT=1; shift 2 ;;
       --group-waves) GROUP_WAVES="${2:?}"; GROUP_WAVES_EXPLICIT=1; shift 2 ;;
       --gdb-max-runs) GDB_MAX_RUNS="${2:?}"; GDB_MAX_RUNS_EXPLICIT=1; shift 2 ;;
-      --cpu) WORST_CPU_OVERRIDE="${2:?}"; CPU_EXPLICIT=1; shift 2 ;;
+      --cpu)
+        ((CPU_FLAG_SEEN == 0)) || diag_die "--cpu may be specified only once"
+        CPU_FLAG_SEEN=1
+        CPU_TARGET="${2:?}"
+        CPU_EXPLICIT=1
+        apply_cpu_target_runtime
+        shift 2
+        ;;
       --dry-run) DRY_RUN=1; shift ;;
       --yes) ASSUME_YES=1; shift ;;
       -h | --help) usage; exit 0 ;;
@@ -264,11 +291,9 @@ validate_config() {
     diag_die "stored SKIP_GDB must be 0 or 1, got '$SKIP_GDB'"
   ((INDIVIDUAL_RUNS >= 1 && GROUP_WAVES >= 1 && GDB_MAX_RUNS >= 1 && BASELINE_CHILDREN >= 1 && BASELINE_WAVES >= 1)) ||
     diag_die "runs, waves, children, and gdb attempts must all be >= 1"
-  if [[ -n "$WORST_CPU_OVERRIDE" ]]; then
-    diag_require_uint "--cpu" "$WORST_CPU_OVERRIDE"
-    [[ "$WORST_CPU_OVERRIDE" =~ ^(0|[1-9][0-9]*)$ ]] ||
-      diag_die "--cpu must be a canonical non-negative integer, got '$WORST_CPU_OVERRIDE'"
-  fi
+  [[ "$CPU_TARGET" == auto || "$CPU_TARGET" =~ ^(0|[1-9][0-9]*)$ ]] ||
+    diag_die "--cpu must be auto or a canonical non-negative integer, got '$CPU_TARGET'"
+  apply_cpu_target_runtime
   if [[ -n "$REDO_PHASES" && -z "$RESUME_DIR" ]]; then
     diag_die "--redo requires --resume DIR (it re-runs phases of an existing bundle)"
   fi
@@ -356,7 +381,7 @@ rewrite_meta_atomic() {
   while IFS= read -r line || [[ -n "$line" ]]; do
     key="${line%%=*}"
     case "$key" in
-      MODE | BASELINE_CHILDREN | BASELINE_WAVES | GROUP_WAVES | INDIVIDUAL_RUNS | GDB_MAX_RUNS | SKIP_GDB)
+      MODE | BASELINE_CHILDREN | BASELINE_WAVES | GROUP_WAVES | INDIVIDUAL_RUNS | GDB_MAX_RUNS | SKIP_GDB | CPU_TARGET)
         if ((include_config == 1)); then continue; fi
         ;;
       COMPLETED_PHASES)
@@ -378,6 +403,7 @@ rewrite_meta_atomic() {
       printf 'INDIVIDUAL_RUNS=%s\n' "$INDIVIDUAL_RUNS"
       printf 'GDB_MAX_RUNS=%s\n' "$GDB_MAX_RUNS"
       printf 'SKIP_GDB=%s\n' "$SKIP_GDB"
+      printf 'CPU_TARGET=%s\n' "$CPU_TARGET"
     fi
     ((include_completed == 0)) || printf 'COMPLETED_PHASES=%s\n' "$completed"
   } >> "$tmp" || {
@@ -417,10 +443,90 @@ metadata_value() {
   sed -n "s/^${key}=//p" "$file" 2> /dev/null | tail -1
 }
 
+metadata_exact_value() {
+  local file="$1" key="$2" count value
+  [[ -f "$file" && ! -L "$file" ]] || return 1
+  count="$(grep -c "^${key}=" "$file" 2> /dev/null || true)"
+  [[ "$count" == 1 ]] || return 1
+  value="$(sed -n "s/^${key}=//p" "$file")"
+  printf '%s\n' "$value"
+}
+
+stored_cpu_target_value() {
+  local file="$1" count value
+  [[ -f "$file" && ! -L "$file" ]] || return 1
+  count="$(grep -c '^CPU_TARGET=' "$file" 2> /dev/null || true)"
+  if [[ "$count" == 0 ]]; then
+    printf 'auto\n'
+    return 0
+  fi
+  [[ "$count" == 1 ]] || return 1
+  value="$(sed -n 's/^CPU_TARGET=//p' "$file")"
+  [[ "$value" == auto || "$value" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  printf '%s\n' "$value"
+}
+
+resolve_cpu_target_policy() {
+  local policy="$1"
+  if [[ "$policy" == auto ]]; then
+    worst_cpu
+  elif [[ "$policy" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    printf '%s\n' "$policy"
+  else
+    return 1
+  fi
+}
+
+cpu_target_matches_completed_phase() {
+  local policy="$1" phase="$2" meta actual expected
+  [[ -f "$STATE_DIR/phase-$phase.done" ]] || return 0
+  case "$phase" in
+    frequency) meta="$OUT_DIR/results/frequency-ab.meta" ;;
+    gdb) meta="$OUT_DIR/results/gdb.meta" ;;
+    *) return 1 ;;
+  esac
+  if [[ "$phase" == gdb ]] && gdb_meta_is_structurally_skipped "$meta"; then
+    return 0
+  fi
+  actual="$(metadata_exact_value "$meta" CPU 2> /dev/null || true)"
+  [[ "$actual" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  expected="$(resolve_cpu_target_policy "$policy" 2> /dev/null || true)"
+  [[ -n "$expected" && "$actual" == "$expected" ]]
+}
+
+gdb_meta_is_structurally_skipped() {
+  local meta="$1" line key value
+  local seen_skipped=0 seen_reason=0
+  [[ -f "$meta" && ! -L "$meta" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^([A-Z_]+)=(.*)$ ]] || return 1
+    key="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"
+    case "$key" in
+      SKIPPED) ((seen_skipped == 0)) || return 1; [[ "$value" == 1 ]] || return 1; seen_skipped=1 ;;
+      SKIP_REASON) ((seen_reason == 0)) || return 1; [[ -n "$value" ]] || return 1; seen_reason=1 ;;
+      *) return 1 ;;
+    esac
+  done < "$meta"
+  ((seen_skipped == 1 && seen_reason == 1))
+}
+
+validate_cpu_target_for_completed_phases() {
+  local target="$1" phase
+  for phase in frequency gdb; do
+    cpu_target_matches_completed_phase "$target" "$phase" ||
+      require_redo_for_completed_change "$phase" \
+        "CPU selection policy $target is incompatible with recorded $phase CPU evidence"
+  done
+}
+
 require_redo_for_completed_change() {
   local phase="$1" description="$2"
   [[ -f "$OUT_DIR/state/phase-$phase.done" ]] || return 0
   redo_plan_contains "$phase" && return 0
+  if [[ -n "$STATE_DIR" ]] && [[ -e "$STATE_DIR/redo.pending" || -L "$STATE_DIR/redo.pending" ]] &&
+    redo_transaction_has_phase "$phase"; then
+    return 0
+  fi
   diag_die "$description changes completed $phase evidence; resume with --redo $phase"
 }
 
@@ -457,14 +563,9 @@ validate_completed_phase_overrides() {
     [[ "$stored" == "$SKIP_GDB" ]] ||
       require_redo_for_completed_change gdb "changing the GDB skip choice from $stored to $SKIP_GDB"
   fi
-  if ((CPU_EXPLICIT == 1)); then
-    stored="$(metadata_value "$OUT_DIR/results/gdb.meta" CPU)"
-    [[ -z "$stored" || "$stored" == "$WORST_CPU_OVERRIDE" ]] ||
-      require_redo_for_completed_change gdb "changing --cpu from $stored to $WORST_CPU_OVERRIDE"
-    stored="$(metadata_value "$OUT_DIR/results/frequency-ab.meta" CPU)"
-    [[ -z "$stored" || "$stored" == "$WORST_CPU_OVERRIDE" ]] ||
-      require_redo_for_completed_change frequency "changing --cpu from $stored to $WORST_CPU_OVERRIDE"
-  fi
+  stored="$(stored_cpu_target_value "$meta")" ||
+    diag_die "stored CPU_TARGET metadata is malformed"
+  validate_cpu_target_for_completed_phases "$CPU_TARGET"
 }
 
 prepare_commands_log() {
@@ -560,6 +661,7 @@ redo_config_value_is_valid() {
       [[ "$value" =~ ^[1-9][0-9]*$ ]]
       ;;
     SKIP_GDB) [[ "$value" == 0 || "$value" == 1 ]] ;;
+    CPU_TARGET) [[ "$value" == auto || "$value" =~ ^(0|[1-9][0-9]*)$ ]] ;;
     *) return 1 ;;
   esac
 }
@@ -572,15 +674,17 @@ redo_write_config_records() {
   printf 'CONFIG\tINDIVIDUAL_RUNS\t%s\n' "$INDIVIDUAL_RUNS"
   printf 'CONFIG\tGDB_MAX_RUNS\t%s\n' "$GDB_MAX_RUNS"
   printf 'CONFIG\tSKIP_GDB\t%s\n' "$SKIP_GDB"
+  printf 'CONFIG\tCPU_TARGET\t%s\n' "$CPU_TARGET"
 }
 
 redo_transaction_validate() {
   local marker="$1" line kind owner path version="" txn="" last_rank=0 rank section=version
   local config_index=0 expected_key
-  local -a config_keys=(MODE BASELINE_CHILDREN BASELINE_WAVES GROUP_WAVES INDIVIDUAL_RUNS GDB_MAX_RUNS SKIP_GDB)
+  local -a config_keys=(MODE BASELINE_CHILDREN BASELINE_WAVES GROUP_WAVES INDIVIDUAL_RUNS GDB_MAX_RUNS SKIP_GDB CPU_TARGET)
   local -A phases=() records=()
   REDO_TXN_ID=""
   REDO_TXN_VERSION=""
+  REDO_TXN_HAS_CPU_TARGET=0
   REDO_TXN_PHASES=()
   REDO_TXN_OWNERS=()
   REDO_TXN_PATHS=()
@@ -612,7 +716,8 @@ redo_transaction_validate() {
         ;;
       PHASE)
         if [[ "$version" == 2 ]]; then
-          [[ ("$section" == config || "$section" == phases) && $config_index -eq ${#config_keys[@]} ]] || return 1
+          [[ ("$section" == config || "$section" == phases) &&
+            ($config_index -eq 7 || $config_index -eq ${#config_keys[@]}) ]] || return 1
         else
           [[ "$section" == phases ]] || return 1
         fi
@@ -646,8 +751,9 @@ redo_transaction_validate() {
     esac
   done < "$marker"
   [[ ("$version" == 1 || "$version" == 2) && -n "$txn" && ${#REDO_TXN_PHASES[@]} -gt 0 ]] || return 1
-  [[ "$version" == 1 || $config_index -eq ${#config_keys[@]} ]] || return 1
+  [[ "$version" == 1 || $config_index -eq 7 || $config_index -eq ${#config_keys[@]} ]] || return 1
   if [[ "$version" == 2 ]]; then
+    ((config_index == 8)) && REDO_TXN_HAS_CPU_TARGET=1
     case "${REDO_TXN_CONFIG[MODE]}" in
       quick)
         [[ "${REDO_TXN_CONFIG[BASELINE_CHILDREN]}" == 8 && "${REDO_TXN_CONFIG[BASELINE_WAVES]}" == 10 ]] || return 1
@@ -683,6 +789,10 @@ redo_adopt_pending_config() {
   INDIVIDUAL_RUNS="${REDO_TXN_CONFIG[INDIVIDUAL_RUNS]}"
   GDB_MAX_RUNS="${REDO_TXN_CONFIG[GDB_MAX_RUNS]}"
   SKIP_GDB="${REDO_TXN_CONFIG[SKIP_GDB]}"
+  if ((REDO_TXN_HAS_CPU_TARGET == 1)); then
+    CPU_TARGET="${REDO_TXN_CONFIG[CPU_TARGET]}"
+  fi
+  apply_cpu_target_runtime
 }
 
 redo_transaction_has_phase() {
@@ -703,7 +813,7 @@ redo_changed_config_authorized_for_phase() {
 # the config key that describes that phase's evidence.
 redo_transaction_target_is_authorized() {
   [[ "$REDO_TXN_VERSION" == 2 ]] || return 0
-  local key stored target phase
+  local key stored target phase target_cpu_policy
   for key in MODE BASELINE_CHILDREN BASELINE_WAVES GROUP_WAVES INDIVIDUAL_RUNS GDB_MAX_RUNS SKIP_GDB; do
     stored="$(metadata_value "$META_FILE" "$key")"
     target="${REDO_TXN_CONFIG[$key]}"
@@ -727,6 +837,15 @@ redo_transaction_target_is_authorized() {
         redo_changed_config_authorized_for_phase gdb || return 1
         ;;
     esac
+  done
+  if ((REDO_TXN_HAS_CPU_TARGET == 1)); then
+    target_cpu_policy="${REDO_TXN_CONFIG[CPU_TARGET]}"
+  else
+    target_cpu_policy="$(stored_cpu_target_value "$META_FILE")" || return 1
+  fi
+  for phase in frequency gdb; do
+    cpu_target_matches_completed_phase "$target_cpu_policy" "$phase" ||
+      redo_changed_config_authorized_for_phase "$phase" || return 1
   done
 }
 
@@ -752,7 +871,14 @@ redo_pending_explicit_config_matches_v2() {
     ((INDIVIDUAL_RUNS_EXPLICIT == 0)) || [[ "$INDIVIDUAL_RUNS" == "${REDO_TXN_CONFIG[INDIVIDUAL_RUNS]}" ]] || return 1
     ((GDB_MAX_RUNS_EXPLICIT == 0)) || [[ "$GDB_MAX_RUNS" == "${REDO_TXN_CONFIG[GDB_MAX_RUNS]}" ]] || return 1
   fi
-  ((SKIP_GDB_EXPLICIT == 0)) || [[ "$SKIP_GDB" == "${REDO_TXN_CONFIG[SKIP_GDB]}" ]]
+  ((SKIP_GDB_EXPLICIT == 0)) || [[ "$SKIP_GDB" == "${REDO_TXN_CONFIG[SKIP_GDB]}" ]] || return 1
+  if ((CPU_EXPLICIT == 1)); then
+    if ((REDO_TXN_HAS_CPU_TARGET == 1)); then
+      [[ "$CPU_TARGET" == "${REDO_TXN_CONFIG[CPU_TARGET]}" ]]
+    else
+      [[ "$CPU_TARGET" == "$(stored_cpu_target_value "$META_FILE")" ]]
+    fi
+  fi
 }
 
 redo_pending_explicit_config_matches_v1() {
@@ -766,7 +892,8 @@ redo_pending_explicit_config_matches_v1() {
     ((INDIVIDUAL_RUNS_EXPLICIT == 0)) || [[ "$INDIVIDUAL_RUNS" == "$(metadata_value "$META_FILE" INDIVIDUAL_RUNS)" ]] || return 1
     ((GDB_MAX_RUNS_EXPLICIT == 0)) || [[ "$GDB_MAX_RUNS" == "$(metadata_value "$META_FILE" GDB_MAX_RUNS)" ]] || return 1
   fi
-  ((SKIP_GDB_EXPLICIT == 0)) || [[ "$SKIP_GDB" == "$(metadata_value "$META_FILE" SKIP_GDB)" ]]
+  ((SKIP_GDB_EXPLICIT == 0)) || [[ "$SKIP_GDB" == "$(metadata_value "$META_FILE" SKIP_GDB)" ]] || return 1
+  ((CPU_EXPLICIT == 0)) || [[ "$CPU_TARGET" == "$(stored_cpu_target_value "$META_FILE")" ]]
 }
 
 # Reconcile an interrupted transaction before consent or any resumed-bundle
@@ -1805,7 +1932,7 @@ worst_cpu() {
 # print the exact manual command.
 phase_frequency() {
   local cpu="$1"
-  if frequency_result_is_complete; then
+  if frequency_result_is_complete "$cpu"; then
     diag_log "phase 5/7: frequency-ab.tsv present (manual frequency-ab.sh run); incorporating"
     mark_done frequency
     return 0
@@ -1823,14 +1950,17 @@ phase_frequency() {
 }
 
 frequency_result_is_complete() {
+  local expected_cpu="${1:-}"
   local tsv="$OUT_DIR/results/frequency-ab.tsv"
   local meta="$OUT_DIR/results/frequency-ab.meta"
   [[ -f "$meta" ]] || return 1
-  local runs restored completed
+  local runs restored completed actual_cpu
   runs="$(metadata_value "$meta" RUNS_PER_LEG)"
   restored="$(metadata_value "$meta" RESTORED)"
   completed="$(metadata_value "$meta" COMPLETED)"
+  actual_cpu="$(metadata_exact_value "$meta" CPU 2> /dev/null || true)"
   [[ "$restored" == "1" && "$completed" == "1" ]] || return 1
+  [[ "$expected_cpu" =~ ^(0|[1-9][0-9]*)$ && "$actual_cpu" == "$expected_cpu" ]] || return 1
   diag_frequency_rows_are_complete "$tsv" "$runs"
 }
 
@@ -2103,8 +2233,13 @@ on_interrupt() {
 # Plan printing (also used by --dry-run)
 # ---------------------------------------------------------------------------
 print_plan() {
-  local ncpus_online
+  local ncpus_online cpu_policy
   ncpus_online="$(diag_cpulist_count "$ONLINE_CPUS")"
+  if [[ "$CPU_TARGET" == auto ]]; then
+    cpu_policy="auto (worst failing CPU from individual results)"
+  else
+    cpu_policy="fixed CPU $CPU_TARGET"
+  fi
   cat << EOF
 Resolved configuration:
   mode               $MODE
@@ -2112,9 +2247,10 @@ Resolved configuration:
   baseline           $BASELINE_CHILDREN children x $BASELINE_WAVES waves (~$((BASELINE_CHILDREN * BASELINE_WAVES)) child runs)
   groups             ${#GROUP_NAME[@]} group(s) x $GROUP_WAVES waves
   individual runs    $INDIVIDUAL_RUNS per CPU (failing groups' CPUs, or all $ncpus_online online CPUs)
+  CPU selection      $cpu_policy
   redo phases        ${REDO_PLAN[*]:-none}
   frequency A/B/A    manual step (sudo ./frequency-ab.sh; never automatic)
-  gdb capture        $( [[ "$SKIP_GDB" == "1" ]] && printf 'skipped' || printf 'up to %s runs on the worst CPU' "$GDB_MAX_RUNS" )
+  gdb capture        $( [[ "$SKIP_GDB" == "1" ]] && printf 'skipped' || printf 'up to %s runs using %s' "$GDB_MAX_RUNS" "$cpu_policy" )
 
 Discovered topology:
   online CPUs        $ONLINE_CPUS
@@ -2185,9 +2321,9 @@ main() {
   fi
   validate_config
 
-  # A pending redo is authoritative for its seven persisted config keys. Read
-  # and reconcile it before dependency checks, topology discovery, consent, or
-  # any mutation of the resumed bundle.
+  # A pending redo is authoritative for its embedded persisted configuration.
+  # Read and reconcile it before dependency checks, topology discovery,
+  # consent, or any mutation of the resumed bundle.
   if [[ -n "$RESUME_DIR" ]]; then
     META_FILE="$OUT_DIR/results/meta.env"
     STATE_DIR="$OUT_DIR/state"
@@ -2204,7 +2340,11 @@ main() {
   discover_topology
 
   if [[ -n "$WORST_CPU_OVERRIDE" ]] && ! diag_cpulist_contains "$ONLINE_CPUS" "$WORST_CPU_OVERRIDE"; then
-    diag_die "--cpu $WORST_CPU_OVERRIDE is not in the usable CPU set ($ONLINE_CPUS)"
+    if [[ -n "$RESUME_DIR" ]] && [[ -e "$STATE_DIR/redo.pending" || -L "$STATE_DIR/redo.pending" ]]; then
+      PENDING_CPU_TARGET_UNAVAILABLE=1
+    else
+      diag_die "configured CPU target $WORST_CPU_OVERRIDE is not in the usable CPU set ($ONLINE_CPUS); resume using --cpu auto"
+    fi
   fi
   validate_completed_phase_overrides
 
@@ -2260,6 +2400,7 @@ main() {
       printf 'INDIVIDUAL_RUNS=%s\n' "$INDIVIDUAL_RUNS"
       printf 'GDB_MAX_RUNS=%s\n' "$GDB_MAX_RUNS"
       printf 'SKIP_GDB=%s\n' "$SKIP_GDB"
+      printf 'CPU_TARGET=%s\n' "$CPU_TARGET"
       printf 'INTERRUPTED=0\n'
     } > "$META_FILE"
   fi
@@ -2269,6 +2410,9 @@ main() {
   # commits config with completion metadata after all archive moves. Ordinary
   # resume overrides use the same atomic metadata rewrite without a marker.
   recover_pending_redo
+  if ((PENDING_CPU_TARGET_UNAVAILABLE == 1)); then
+    diag_die "pending redo recovered, but configured CPU target $CPU_TARGET is not usable ($ONLINE_CPUS); resume using --cpu auto"
+  fi
   if ((REDO_RECOVERED_PENDING == 0)); then
     if ((${#REDO_PLAN[@]} > 0)); then
       apply_redo_plan
@@ -2323,11 +2467,14 @@ main() {
   elif [[ -s "$OUT_DIR/results/individual.tsv" ]]; then
     target_cpu="$(worst_cpu)"
   fi
+  if [[ -n "$target_cpu" ]] && ! diag_cpulist_contains "$ONLINE_CPUS" "$target_cpu"; then
+    diag_die "resolved automatic worst CPU $target_cpu is not in the usable CPU set ($ONLINE_CPUS); resume using --cpu auto after redoing individual evidence"
+  fi
 
   # ---- phase 5 (manual; see frequency-ab.sh) ----
   if phase_is_done frequency; then
     diag_log "phase 5/7 frequency: already done, skipping (resume)"
-  elif frequency_result_is_complete; then
+  elif frequency_result_is_complete "$target_cpu"; then
     diag_log "phase 5/7: results from a manual frequency-ab.sh run found; incorporating"
     mark_done frequency
   elif [[ -z "$target_cpu" ]]; then
