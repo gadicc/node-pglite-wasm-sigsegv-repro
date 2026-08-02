@@ -784,6 +784,47 @@ grep -q "Privileged reads" "$B/report.md"
 check_eq "report contains privileged-reads section" "0" "$?"
 grep -q "IntelTME=Disabled" "$B/report.md"
 check_eq "report includes cctk allowlist data" "0" "$?"
+grep -q "log truncated" "$B/report.md"
+check_eq "complete bundle report has no truncation marker" "1" "$?"
+
+# A truncated baseline log (no completion footer) must still yield usable
+# counts: collect.mjs spreads the parser output into the baseline entry, so
+# the recovered counts and the partial flag reach results.json and the
+# report with no collect.mjs changes.
+B2="$TMP/bundle-truncated"
+mkdir -p "$B2"/{results,logs/baseline}
+cp "$FIX/repro-truncated.log" "$B2/logs/baseline/run1.log"
+cat > "$B2/results/baseline.meta" << EOF
+CHILDREN=2
+WAVES=5
+LOG=logs/baseline/run1.log
+EXIT_CODE=139
+EOF
+node "$LIB/collect.mjs" "$B2" > /dev/null
+node "$LIB/report.mjs" "$B2" > /dev/null
+
+cat > "$TMP/check-truncated.mjs" << 'EOF'
+import { readFileSync } from "node:fs";
+const r = JSON.parse(readFileSync(process.argv[2], "utf8"));
+let failures = 0;
+const check = (label, cond) => {
+  if (cond) console.log(`ok   ${label}`);
+  else { console.log(`FAIL ${label}`); failures += 1; }
+};
+check("truncated baseline marked partial", r.baseline.partial === true);
+check("truncated baseline recovered waves", r.baseline.completedWaves === 1 && r.baseline.failedWaves === 1);
+check("truncated baseline invocations nonzero", r.baseline.totalChildInvocations === 4);
+process.exit(failures === 0 ? 0 : 1);
+EOF
+if node "$TMP/check-truncated.mjs" "$B2/results.json"; then
+  pass=$((pass + 3))
+else
+  fail=$((fail + 1))
+fi
+grep -q "log truncated; partial data" "$B2/report.md"
+check_eq "report marks truncated baseline as partial" "0" "$?"
+grep -q "1 SIGSEGV(s) across 4 child-process runs" "$B2/report.md"
+check_eq "truncated run conclusion counts recovered invocations" "0" "$?"
 
 echo "== finalization failure handling =="
 # collect.mjs cannot write results.json into a missing bundle directory.

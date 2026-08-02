@@ -1,0 +1,4 @@
+1753950000	node=v25.2.1 v8=14.1.146.11-node.14 platform=linux arch=x64 children=2 waves=5
+1753950006	wave=1 passed=2/2
+1753950012	wave=2 passed=1/2
+1753950012	child=2 code=null signal=SIGSEGV elapsedMs=2310

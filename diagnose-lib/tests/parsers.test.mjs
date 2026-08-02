@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseReproLog } from "../parse-repro-log.mjs";
 import { parseGdbCapture } from "../parse-gdb.mjs";
+import { renderReport } from "../report.mjs";
 
 const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 const readFixture = (name) => readFileSync(path.join(fixtures, name), "utf8");
@@ -39,6 +40,114 @@ test("parseReproLog: clean log without timestamps", () => {
   assert.equal(r.sigsegvCount, 0);
   assert.equal(r.firstFailureAfterSec, null);
   assert.equal(r.durationSec, null);
+});
+
+test("parseReproLog: truncated log recovers wave counts from wave rows", () => {
+  const r = parseReproLog(readFixture("repro-truncated.log"));
+  assert.equal(r.partial, true);
+  assert.equal(r.finalLine, null);
+  assert.equal(r.children, 2);
+  assert.equal(r.requestedWaves, 5);
+  assert.equal(r.completedWaves, 1);
+  assert.equal(r.failedWaves, 1);
+  // Both printed waves forked all of their children, failed ones included,
+  // so the SIGSEGV can never be reported over zero invocations.
+  assert.equal(r.totalChildInvocations, 4);
+  assert.equal(r.sigsegvCount, 1);
+  assert.equal(r.otherFailureCount, 0);
+  assert.equal(r.firstFailureAfterSec, 12);
+  assert.equal(r.durationSec, 12);
+});
+
+test("parseReproLog: footer-present logs are not partial", () => {
+  assert.equal(parseReproLog(readFixture("repro-fail.log")).partial, false);
+  assert.equal(parseReproLog(readFixture("repro-clean.log")).partial, false);
+});
+
+test("parseReproLog: duplicate wave rows are not double-counted", () => {
+  const r = parseReproLog([
+    "node=v25.2.1 v8=14.1.146.11-node.14 platform=linux arch=x64 children=2 waves=5",
+    "wave=1 passed=2/2",
+    "wave=1 passed=1/2", // duplicate row: first occurrence wins
+    "wave=2 passed=1/2",
+  ].join("\n"));
+  assert.equal(r.partial, true);
+  assert.equal(r.completedWaves, 1);
+  assert.equal(r.failedWaves, 1);
+  assert.equal(r.totalChildInvocations, 4);
+  assert.ok(r.notes.some((n) => n.includes("duplicate wave=1")));
+});
+
+test("parseReproLog: wave rows disagreeing with the header are not counted", () => {
+  const r = parseReproLog([
+    "node=v25.2.1 v8=14.1.146.11-node.14 platform=linux arch=x64 children=2 waves=5",
+    "wave=1 passed=2/2",
+    "wave=2 passed=3/3", // of=3 disagrees with header children=2
+  ].join("\n"));
+  assert.equal(r.partial, true);
+  assert.equal(r.completedWaves, 1);
+  assert.equal(r.failedWaves, 0);
+  assert.equal(r.totalChildInvocations, 2);
+  assert.ok(r.notes.some((n) => n.includes("wave=2") && n.includes("disagrees")));
+});
+
+test("parseReproLog: wave rows outside the requested range are not counted", () => {
+  const r = parseReproLog([
+    "node=v25.2.1 v8=14.1.146.11-node.14 platform=linux arch=x64 children=2 waves=2",
+    "wave=1 passed=2/2",
+    "wave=3 passed=1/2", // outside requested waves 1..2
+  ].join("\n"));
+  assert.equal(r.partial, true);
+  assert.equal(r.completedWaves, 1);
+  assert.equal(r.failedWaves, 0);
+  assert.equal(r.totalChildInvocations, 2);
+  assert.ok(r.notes.some((n) => n.includes("wave=3") && n.includes("outside requested waves")));
+});
+
+test("renderReport: partial baseline and group data are marked as truncated", () => {
+  const baseline = {
+    children: 2,
+    requestedWaves: 5,
+    completedWaves: 1,
+    failedWaves: 1,
+    totalChildInvocations: 4,
+    sigsegvCount: 1,
+    otherFailureCount: 0,
+    firstFailureAfterSec: 12,
+    durationSec: 12,
+    partial: true,
+    log: "logs/baseline/run1.log",
+  };
+  const group = {
+    name: "pcores",
+    cpus: "0-7",
+    children: 2,
+    wavesRequested: 5,
+    completedWaves: 1,
+    failedWaves: 1,
+    totalChildInvocations: 4,
+    sigsegvCount: 1,
+    otherFailureCount: 0,
+    partial: true,
+  };
+  const results = {
+    collectedAt: "2026-08-02T00:00:00.000Z",
+    config: {},
+    environment: {},
+    baseline,
+    groups: [group],
+  };
+  const md = renderReport(results);
+  assert.ok(md.includes("| Waves | 1/5 completed, 1 failed (log truncated; partial data) |"));
+  assert.ok(md.includes("| pcores | 0-7 | 2 | 1/5 (1 failed) (log truncated; partial data) |"));
+
+  // The same counts from a completed run carry no truncation marker.
+  const complete = renderReport({
+    ...results,
+    baseline: { ...baseline, partial: false },
+    groups: [{ ...group, partial: false }],
+  });
+  assert.ok(!complete.includes("log truncated"));
 });
 
 test("parseGdbCapture: known +2^42 signature (real transcript)", () => {

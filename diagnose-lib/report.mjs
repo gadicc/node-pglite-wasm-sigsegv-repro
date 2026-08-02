@@ -143,9 +143,15 @@ export function renderReport(results) {
     const b = r.baseline;
     L.push(`${b.children} concurrent children per wave, STOP_ON_FAILURE=0.`);
     L.push("");
+    if (b.partial) {
+      L.push("**The baseline log has no completion footer (the run was");
+      L.push("interrupted); wave counts below were recovered from per-wave");
+      L.push("rows and are partial data, not a completed run.**");
+      L.push("");
+    }
     L.push("| Metric | Value |");
     L.push("| --- | --- |");
-    L.push(`| Waves | ${b.completedWaves}/${b.requestedWaves} completed, ${b.failedWaves} failed |`);
+    L.push(`| Waves | ${b.completedWaves}/${b.requestedWaves} completed, ${b.failedWaves} failed${b.partial ? " (log truncated; partial data)" : ""} |`);
     L.push(`| Child invocations | ${b.totalChildInvocations} |`);
     L.push(`| SIGSEGV | ${b.sigsegvCount} |`);
     L.push(`| Other failures | ${b.otherFailureCount} |`);
@@ -173,7 +179,7 @@ export function renderReport(results) {
       const f = g.sigsegvCount + (g.otherFailureCount ?? 0);
       const n = g.totalChildInvocations ?? 0;
       L.push(
-        `| ${g.name} | ${g.cpus} | ${g.children} | ${g.completedWaves ?? "?"}/${g.wavesRequested} (${g.failedWaves ?? "?"} failed) | ${f}/${n} | ${n ? `${pct(f / n)} ${ci(f, n)}` : "—"} | ${fmtMHz(g.frequency?.avgMHz)} / ${fmtMHz(g.frequency?.maxMHz)} |`,
+        `| ${g.name} | ${g.cpus} | ${g.children} | ${g.completedWaves ?? "?"}/${g.wavesRequested} (${g.failedWaves ?? "?"} failed)${g.partial ? " (log truncated; partial data)" : ""} | ${f}/${n} | ${n ? `${pct(f / n)} ${ci(f, n)}` : "—"} | ${fmtMHz(g.frequency?.avgMHz)} / ${fmtMHz(g.frequency?.maxMHz)} |`,
       );
     }
     L.push("");

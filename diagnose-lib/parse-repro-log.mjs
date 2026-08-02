@@ -24,6 +24,8 @@ export function parseReproLog(text) {
     firstFailureAfterSec: null, // requires epoch-prefixed log
     durationSec: null, // requires epoch-prefixed log
     finalLine: null,
+    partial: false, // true when the completion footer is missing (truncated log)
+    notes: [],
   };
 
   let currentWave = 0;
@@ -101,7 +103,42 @@ export function parseReproLog(text) {
     }
   }
 
-  if (out.children !== null) {
+  if (out.finalLine === null) {
+    // No completion footer: the run was interrupted and the log truncated.
+    // Recover wave counts from the validated wave rows so a failure count
+    // can never be reported over zero invocations. Note that recovered
+    // completedWaves counts only fully-passed waves, whereas the footer's
+    // completedWaves counts every wave that ran (repro.mjs sets it before
+    // checking for failures) — hence the partial flag on the result.
+    out.partial = true;
+    let invocations = 0;
+    const seen = new Set();
+    for (const w of out.waves) {
+      if (seen.has(w.wave)) {
+        out.notes.push(`duplicate wave=${w.wave} row ignored (first occurrence kept)`);
+        continue;
+      }
+      seen.add(w.wave);
+      if (out.children !== null && w.of !== out.children) {
+        out.notes.push(`wave=${w.wave} row ignored: passed=${w.passed}/${w.of} disagrees with header children=${out.children}`);
+        continue;
+      }
+      if (out.requestedWaves !== null && (w.wave < 1 || w.wave > out.requestedWaves)) {
+        out.notes.push(`wave=${w.wave} row ignored: outside requested waves 1..${out.requestedWaves}`);
+        continue;
+      }
+      if (w.passed > w.of) {
+        out.notes.push(`wave=${w.wave} row ignored: passed=${w.passed}/${w.of} is impossible`);
+        continue;
+      }
+      // Every printed wave row means that wave forked all of its children,
+      // failed ones included.
+      invocations += w.of;
+      if (w.passed === w.of) out.completedWaves += 1;
+      else out.failedWaves += 1;
+    }
+    out.totalChildInvocations = invocations;
+  } else if (out.children !== null) {
     out.totalChildInvocations = out.completedWaves * out.children;
   }
   if (firstEpoch !== null && lastEpoch !== null) {
