@@ -76,6 +76,10 @@ if ((EUID != 0)); then
   exit 4
 fi
 
+for dep in node setsid taskset; do
+  command -v "$dep" > /dev/null 2>&1 || diag_die "missing required command: $dep"
+done
+
 NO_TURBO_PATH="/sys/devices/system/cpu/intel_pstate/no_turbo"
 if [[ ! -e "$NO_TURBO_PATH" ]]; then
   diag_die "intel_pstate/no_turbo not present; A/B/A not applicable on this system"

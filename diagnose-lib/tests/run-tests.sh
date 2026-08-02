@@ -90,6 +90,36 @@ check_eq "SIGTERM restores promptly with rc=143 and reaps sampler" "1" "$([[ "$t
 check_eq "SIGINT restores promptly with rc=130 and reaps sampler" "1" "$([[ "$int_restore" =~ ^0\|130\|1\|1\|([0-4])\|1$ ]] && echo 1 || echo 0)"
 check_eq "normal exit restores and reaps sampler" "1" "$([[ "$exit_restore" =~ ^0\|0\|1\|1\|([0-4])\|1$ ]] && echo 1 || echo 0)"
 
+WORKLOAD_SIGNAL_DIR="$TMP/workload-signal"
+mkdir -p "$WORKLOAD_SIGNAL_DIR/bin"
+printf '0\n' > "$WORKLOAD_SIGNAL_DIR/no_turbo"
+cat > "$WORKLOAD_SIGNAL_DIR/bin/taskset" << 'EOF'
+#!/usr/bin/env bash
+[[ "$1" == "-c" ]] || exit 2
+shift 2
+exec "$@"
+EOF
+cat > "$WORKLOAD_SIGNAL_DIR/bin/node" << 'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$$" > "$WORKLOAD_PID_FILE"
+exec sleep 300
+EOF
+chmod +x "$WORKLOAD_SIGNAL_DIR/bin/taskset" "$WORKLOAD_SIGNAL_DIR/bin/node"
+workload_signal_start=$SECONDS
+bash "$FIX/workload-restore-child.sh" \
+  "$REPO_ROOT" \
+  "$WORKLOAD_SIGNAL_DIR/restore.tsv" \
+  "$WORKLOAD_SIGNAL_DIR/no_turbo" \
+  "$WORKLOAD_SIGNAL_DIR/ready" \
+  "$WORKLOAD_SIGNAL_DIR/bin" > /dev/null 2>&1
+workload_signal_rc=$?
+workload_signal_elapsed=$((SECONDS - workload_signal_start))
+workload_signal_pid="$(cat "$WORKLOAD_SIGNAL_DIR/ready" 2> /dev/null || true)"
+workload_signal_gone=0
+[[ -n "$workload_signal_pid" ]] && ! kill -0 "$workload_signal_pid" 2> /dev/null && workload_signal_gone=1
+check_eq "SIGTERM interrupts external workload and promptly restores" "1" \
+  "$([[ $workload_signal_rc -eq 143 && "$(cat "$WORKLOAD_SIGNAL_DIR/no_turbo")" == 0 && $workload_signal_elapsed -le 5 && $workload_signal_gone -eq 1 ]] && echo 1 || echo 0)"
+
 echo "== fail-closed settings restore =="
 RESTORE_FAIL_DIR="$TMP/restore-fail"
 mkdir -p "$RESTORE_FAIL_DIR"

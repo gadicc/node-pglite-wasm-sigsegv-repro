@@ -306,8 +306,9 @@ diag_require_not_symlink() {
 }
 
 diag_cleanup_now() {
-  # A sampler may still be reading a setting we are about to restore. Stop and
-  # reap it first, then perform the verified restore.
+  # A workload and sampler may still be using a setting we are about to
+  # restore. Stop and reap both first, then perform the verified restore.
+  diag_workload_stop
   diag_freq_sampler_stop
   diag_restore_now
 }
@@ -354,6 +355,25 @@ diag_register_restore_trap() {
 
 : "${DIAG_FREQ_DIR:=.}"
 DIAG_SAMPLER_PID=""
+DIAG_WORKLOAD_PID=""
+
+diag_workload_stop() {
+  [[ -n "$DIAG_WORKLOAD_PID" ]] || return 0
+  local pid="$DIAG_WORKLOAD_PID" i
+  # diag_run_single_runs starts each workload with setsid, so the PID is also
+  # its process-group ID. Signal the entire chain (runuser/taskset/node).
+  kill -TERM -- "-$pid" 2> /dev/null || kill -TERM "$pid" 2> /dev/null || true
+  for ((i = 0; i < 40; i++)); do
+    kill -0 "$pid" 2> /dev/null || break
+    sleep 0.05
+  done
+  if kill -0 "$pid" 2> /dev/null; then
+    diag_warn "workload process group did not stop after SIGTERM; sending SIGKILL"
+    kill -KILL -- "-$pid" 2> /dev/null || kill -KILL "$pid" 2> /dev/null || true
+  fi
+  wait "$pid" 2> /dev/null || true
+  DIAG_WORKLOAD_PID=""
+}
 
 diag_turbostat_usable() {
   command -v turbostat > /dev/null 2>&1 || return 1
@@ -419,8 +439,11 @@ diag_run_single_runs() {
   for ((i = 1; i <= runs; i++)); do
     start=$SECONDS
     set +e
-    "$@" taskset -c "$cpu" node child.mjs > /dev/null 2>&1
+    setsid "$@" taskset -c "$cpu" node child.mjs > /dev/null 2>&1 &
+    DIAG_WORKLOAD_PID=$!
+    wait "$DIAG_WORKLOAD_PID"
     rc=$?
+    DIAG_WORKLOAD_PID=""
     set -e
     elapsed=$((SECONDS - start))
     printf '%s\t%s\t%s\t%s\n' "$leg" "$i" "$rc" "$elapsed" >> "$tsv"
