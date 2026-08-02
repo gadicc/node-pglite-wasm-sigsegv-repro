@@ -943,6 +943,21 @@ test("renderReport: incomplete frequency artifacts are excluded from conclusions
   assert.doesNotMatch(md, /Frequency dependence was not tested \(requires/);
 });
 
+test("renderReport: stale cap artifacts are explicitly excluded", () => {
+  const md = renderReport({
+    collectedAt: "2026-08-02T00:00:00.000Z",
+    config: {},
+    environment: {},
+    frequencyCapStatus: {
+      status: "not-requested",
+      reasons: ["cap artifacts are not authoritative for the current A/B/A generation"],
+    },
+  });
+  assert.match(md, /Stale cap artifacts were excluded/);
+  assert.match(md, /not authoritative/);
+  assert.doesNotMatch(md, /requested cap .* MHz/);
+});
+
 test("renderReport: discordant A legs cannot support a pooled suppression claim", () => {
   const leg = (name, failures, noTurbo) => ({
     leg: name,

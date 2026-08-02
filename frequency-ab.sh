@@ -286,6 +286,18 @@ frequency_validate_cap_target() {
   value_output_ref="${values[0]}"
 }
 
+frequency_generation_is_valid() {
+  [[ "${1:-}" =~ ^[0-9a-f]{32}$ ]]
+}
+
+frequency_file_sha256() {
+  local path="$1" digest="" remainder=""
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  read -r digest remainder < <(sha256sum -- "$path") || return 1
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$digest"
+}
+
 frequency_not_applicable() {
   local message="$1"
   # No stage exists at this decision point. Clear its deterministic future
@@ -345,9 +357,15 @@ done
 
 diag_require_uint "cpu" "$CPU"
 diag_require_uint "runs-per-leg" "$RUNS"
-((RUNS >= 1)) || diag_die "runs-per-leg must be >= 1"
+[[ "$CPU" =~ ^(0|[1-9][0-9]*)$ && ${#CPU} -le 15 ]] ||
+  diag_die "cpu must be a canonical safe non-negative integer"
+((CPU <= 65535)) || diag_die "cpu must be <= 65535"
+[[ "$RUNS" =~ ^[1-9][0-9]*$ && ${#RUNS} -le 15 ]] ||
+  diag_die "runs-per-leg must be a canonical safe positive integer"
 if [[ -n "$CAP_KHZ" ]]; then
   diag_require_uint "--cap" "$CAP_KHZ"
+  [[ "$CAP_KHZ" =~ ^[1-9][0-9]*$ && ${#CAP_KHZ} -le 15 ]] ||
+    diag_die "--cap must be a canonical safe positive integer"
   ((CAP_KHZ >= 100000)) || diag_die "--cap must be >= 100000 kHz"
 fi
 [[ -d "$BUNDLE" ]] || diag_die "bundle directory '$BUNDLE' does not exist"
@@ -360,7 +378,7 @@ if ((EUID != 0)); then
   exit 4
 fi
 
-for dep in flock node runuser setsid stat taskset; do
+for dep in flock node runuser setsid sha256sum stat taskset; do
   command -v "$dep" > /dev/null 2>&1 || diag_die "missing required command: $dep"
 done
 
@@ -373,6 +391,8 @@ POLICY="$(readlink -f "/sys/devices/system/cpu/cpu${CPU}/cpufreq" 2> /dev/null |
 [[ -n "$POLICY" ]] || diag_warn "no cpufreq policy found for cpu $CPU"
 CAP_SCALING_MAX_PATH=""
 CAP_PREFLIGHT_SCALING_MAX=""
+CAP_REQUESTED=0
+[[ -n "$CAP_KHZ" ]] && CAP_REQUESTED=1
 
 DIAG_BUNDLE_ROOT="$BUNDLE"
 DIAG_REPO_ROOT="$SCRIPT_DIR"
@@ -480,6 +500,11 @@ if [[ -L "$LEGACY_RESTORE_FILE" || -s "$LEGACY_RESTORE_FILE" ]]; then
   diag_die "legacy bundle restore state cannot be trusted; inspect and remove it manually before continuing"
 fi
 
+FREQUENCY_GENERATION="$(cat /proc/sys/kernel/random/uuid 2> /dev/null || true)"
+FREQUENCY_GENERATION="${FREQUENCY_GENERATION//-/}"
+frequency_generation_is_valid "$FREQUENCY_GENERATION" ||
+  diag_die "could not create a canonical frequency evidence generation token"
+
 # Prepare the destination directories as the invoking user. Root never opens
 # or creates an output inside the user-mutable bundle.
 runuser -u "$SUDO_USER" -- test -d "$BUNDLE" &&
@@ -519,9 +544,12 @@ diag_restore_save "$NO_TURBO_PATH"
 diag_log "saved no_turbo=$SAVED_NO_TURBO (restored on exit/interrupt)"
 
 {
+  printf 'GENERATION=%s\n' "$FREQUENCY_GENERATION"
   printf 'CPU=%s\n' "$CPU"
   printf 'RUNS_PER_LEG=%s\n' "$RUNS"
   printf 'SAVED_NO_TURBO=%s\n' "$SAVED_NO_TURBO"
+  printf 'CAP_REQUESTED=%s\n' "$CAP_REQUESTED"
+  printf 'REQUESTED_CAP_KHZ=%s\n' "${CAP_KHZ:--}"
 } > "$META"
 chmod 0600 "$META"
 
@@ -565,6 +593,7 @@ if [[ -n "$CAP_KHZ" ]]; then
   diag_restore_save "$smax_path"
   diag_sysfs_write "$smax_path" "$CAP_KHZ"
   {
+    printf 'GENERATION=%s\n' "$FREQUENCY_GENERATION"
     printf 'CPU=%s\n' "$CPU"
     printf 'CAP_KHZ=%s\n' "$CAP_KHZ"
     printf 'SAVED_SCALING_MAX_KHZ=%s\n' "$saved_smax"
@@ -580,11 +609,48 @@ if [[ -n "$CAP_KHZ" ]]; then
   now="$(cat "$smax_path")"
   printf 'RESTORED=%s\n' "$([[ "$now" == "$saved_smax" ]] && echo 1 || echo 0)" >> "$FREQUENCY_STAGE_DIR/results/frequency-cap.meta"
   [[ "$now" == "$saved_smax" ]] || diag_warn "scaling_max_freq restore verification FAILED"
+  diag_frequency_cap_rows_are_complete "$FREQUENCY_STAGE_DIR/results/frequency-cap.tsv" "$RUNS" ||
+    diag_die "frequency-cap output is incomplete or contains non-SIGSEGV operational failures"
+  cap_rows_sha256="$(frequency_file_sha256 "$FREQUENCY_STAGE_DIR/results/frequency-cap.tsv")" ||
+    diag_die "could not hash frequency-cap rows"
+  cap_samples_sha256="$(frequency_file_sha256 "$FREQUENCY_STAGE_DIR/freq/freq-ab-cap.samples")" ||
+    diag_die "could not hash frequency-cap samples"
+  cap_method_sha256="$(frequency_file_sha256 "$FREQUENCY_STAGE_DIR/freq/freq-ab-cap.method")" ||
+    diag_die "could not hash frequency-cap method"
+  {
+    printf 'ROWS_SHA256=%s\n' "$cap_rows_sha256"
+    printf 'SAMPLES_SHA256=%s\n' "$cap_samples_sha256"
+    printf 'METHOD_SHA256=%s\n' "$cap_method_sha256"
+    printf 'COMPLETED=1\n'
+  } >> "$FREQUENCY_STAGE_DIR/results/frequency-cap.meta"
 fi
 
 diag_frequency_rows_are_complete "$TSV" "$RUNS" ||
   diag_die "frequency A/B/A output is incomplete or contains non-SIGSEGV operational failures"
-printf 'COMPLETED=1\n' >> "$META"
+ab_rows_sha256="$(frequency_file_sha256 "$TSV")" || diag_die "could not hash frequency A/B/A rows"
+a1_samples_sha256="$(frequency_file_sha256 "$FREQUENCY_STAGE_DIR/freq/freq-ab-A1.samples")" ||
+  diag_die "could not hash A1 frequency samples"
+a1_method_sha256="$(frequency_file_sha256 "$FREQUENCY_STAGE_DIR/freq/freq-ab-A1.method")" ||
+  diag_die "could not hash A1 frequency method"
+b_samples_sha256="$(frequency_file_sha256 "$FREQUENCY_STAGE_DIR/freq/freq-ab-B.samples")" ||
+  diag_die "could not hash B frequency samples"
+b_method_sha256="$(frequency_file_sha256 "$FREQUENCY_STAGE_DIR/freq/freq-ab-B.method")" ||
+  diag_die "could not hash B frequency method"
+a2_samples_sha256="$(frequency_file_sha256 "$FREQUENCY_STAGE_DIR/freq/freq-ab-A2.samples")" ||
+  diag_die "could not hash A2 frequency samples"
+a2_method_sha256="$(frequency_file_sha256 "$FREQUENCY_STAGE_DIR/freq/freq-ab-A2.method")" ||
+  diag_die "could not hash A2 frequency method"
+{
+  printf 'ROWS_SHA256=%s\n' "$ab_rows_sha256"
+  printf 'LEG_A1_SAMPLES_SHA256=%s\n' "$a1_samples_sha256"
+  printf 'LEG_A1_METHOD_SHA256=%s\n' "$a1_method_sha256"
+  printf 'LEG_B_SAMPLES_SHA256=%s\n' "$b_samples_sha256"
+  printf 'LEG_B_METHOD_SHA256=%s\n' "$b_method_sha256"
+  printf 'LEG_A2_SAMPLES_SHA256=%s\n' "$a2_samples_sha256"
+  printf 'LEG_A2_METHOD_SHA256=%s\n' "$a2_method_sha256"
+  printf 'CAP_COMPLETED=%s\n' "$CAP_REQUESTED"
+  printf 'COMPLETED=1\n'
+} >> "$META"
 
 diag_log "frequency A/B/A complete. Regenerate the report with:"
 diag_log "  ./diagnose.sh --resume \"$BUNDLE\" --yes"

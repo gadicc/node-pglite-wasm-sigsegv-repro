@@ -23,6 +23,7 @@ import { parseReproLog } from "./parse-repro-log.mjs";
 import { parseGdbCapture } from "./parse-gdb.mjs";
 import { assessBaselineEvidence } from "./baseline-evidence.mjs";
 import { assessGroupsEvidence, deriveIndividualTargetPolicy } from "./groups-evidence.mjs";
+import { inspectFrequencyEvidence, readBoundFrequencyArtifact } from "./frequency-evidence.mjs";
 
 function readKeyValues(file) {
   const out = {};
@@ -238,19 +239,34 @@ function summarizeTurbostatPerCpu(text, cpuFilter) {
 // Summarize a frequency sample file: "epoch cpu khz" lines (sysfs sampler)
 // or raw turbostat output (parsed per method). Only CPUs in cpuFilter (Set
 // of numbers) count when the filter is provided; null spans all CPUs.
-export function summarizeFreqSamples(outDir, tag, cpuFilter = null) {
+export function summarizeFreqSamples(outDir, tag, cpuFilter = null, binding = null) {
   const file = path.join(outDir, "freq", `${tag}.samples`);
   const methodFile = path.join(outDir, "freq", `${tag}.method`);
-  const method = existsSync(methodFile)
-    ? readFileSync(methodFile, "utf8").trim()
-    : null;
+  let method;
+  let text;
+  if (binding) {
+    const methodContent = readBoundFrequencyArtifact(
+      outDir, `freq/${tag}.method`, binding.methodSha256, 64 * 1024,
+    );
+    const sampleContent = readBoundFrequencyArtifact(
+      outDir, `freq/${tag}.samples`, binding.samplesSha256, 64 * 1024 * 1024,
+    );
+    if (methodContent === null || sampleContent === null) {
+      return { tag, method: null, file: path.relative(outDir, file), available: false,
+        note: "frequency samples changed after envelope validation and were excluded" };
+    }
+    method = methodContent.toString("utf8").trim();
+    text = sampleContent.toString("utf8");
+  } else {
+    method = existsSync(methodFile) ? readFileSync(methodFile, "utf8").trim() : null;
+    text = existsSync(file) ? readFileSync(file, "utf8") : null;
+  }
   const summary = { tag, method, file: path.relative(outDir, file) };
-  if (!existsSync(file)) {
+  if (text === null) {
     summary.available = false;
     return summary;
   }
   summary.available = true;
-  const text = readFileSync(file, "utf8");
   if (method === "scaling_cur_freq") {
     const perCpu = new Map();
     for (const line of text.split("\n")) {
@@ -576,65 +592,21 @@ export function collectFreqAb(outDir, rows, meta) {
       noTurbo: num(meta[`LEG_${leg.leg}_NO_TURBO`]),
       scalingMaxKhz: num(meta[`LEG_${leg.leg}_SCALING_MAX_KHZ`]),
       frequency: leg.leg
-        ? summarizeFreqSamples(outDir, `freq-ab-${leg.leg}`, cpu !== null ? new Set([cpu]) : null)
+        ? summarizeFreqSamples(
+          outDir,
+          `freq-ab-${leg.leg}`,
+          cpu !== null ? new Set([cpu]) : null,
+          leg.leg === "cap"
+            ? { samplesSha256: meta.SAMPLES_SHA256, methodSha256: meta.METHOD_SHA256 }
+            : {
+              samplesSha256: meta[`LEG_${leg.leg}_SAMPLES_SHA256`],
+              methodSha256: meta[`LEG_${leg.leg}_METHOD_SHA256`],
+            },
+        )
         : null,
     })),
   };
   return result;
-}
-
-export function assessFrequencyAb(rows, meta, phaseDone) {
-  const hasArtifacts = rows.length > 0 || Object.keys(meta).length > 0 || phaseDone;
-  if (!hasArtifacts) return { status: "not-run", reasons: [] };
-
-  const reasons = [];
-  if (!phaseDone) reasons.push("phase completion marker is missing");
-  if (meta.COMPLETED !== "1") reasons.push("frequency metadata is not marked complete");
-  if (meta.RESTORED !== "1") reasons.push("frequency settings are not verified as restored");
-  if (
-    meta.LEG_A1_NO_TURBO !== "0" ||
-    meta.LEG_B_NO_TURBO !== "1" ||
-    meta.LEG_A2_NO_TURBO !== "0"
-  ) {
-    reasons.push("A1/B/A2 frequency modes are missing or inconsistent");
-  }
-
-  const runs = Number(meta.RUNS_PER_LEG);
-  if (!/^\d+$/.test(meta.RUNS_PER_LEG ?? "") || !Number.isSafeInteger(runs) || runs < 1) {
-    reasons.push("RUNS_PER_LEG is missing or invalid");
-  } else {
-    const counts = { A1: 0, B: 0, A2: 0 };
-    const seen = new Set();
-    let invalidRow = false;
-    for (const row of rows) {
-      const [leg, runS, rcS, elapsedS] = row;
-      const run = Number(runS);
-      const elapsed = Number(elapsedS);
-      const valid =
-        row.length === 4 &&
-        Object.hasOwn(counts, leg) &&
-        /^\d+$/.test(runS) &&
-        Number.isSafeInteger(run) &&
-        run >= 1 &&
-        run <= runs &&
-        (rcS === "0" || rcS === "139") &&
-        /^\d+$/.test(elapsedS) &&
-        Number.isSafeInteger(elapsed);
-      const key = `${leg}:${runS}`;
-      if (!valid || seen.has(key)) {
-        invalidRow = true;
-        continue;
-      }
-      seen.add(key);
-      counts[leg] += 1;
-    }
-    if (invalidRow) reasons.push("frequency results contain an invalid or duplicate row");
-    if (Object.values(counts).some((count) => count !== runs)) {
-      reasons.push("frequency results do not contain every expected A1/B/A2 run");
-    }
-  }
-
-  return reasons.length > 0 ? { status: "incomplete", reasons } : { status: "complete", reasons: [] };
 }
 
 export function assessGdb(meta, phaseDone, captures, transcriptCount, metaState = { errors: [] }) {
@@ -872,24 +844,23 @@ export function collect(outDir) {
   } else results.worstCpu = null;
 
   // --- frequency A/B/A ---
-  const freqAbRows = readTsv(path.join(resultsDir, "frequency-ab.tsv"));
-  const freqAbMeta = readKeyValues(path.join(resultsDir, "frequency-ab.meta"));
-  results.frequencyAbStatus = assessFrequencyAb(
-    freqAbRows,
-    freqAbMeta,
-    existsSync(path.join(outDir, "state", "phase-frequency.done")),
-  );
+  const frequencyEvidence = inspectFrequencyEvidence(outDir);
+  const freqAbRows = frequencyEvidence.frequencyAbRows;
+  const freqAbMeta = frequencyEvidence.frequencyAbMeta;
+  results.frequencyAbStatus = frequencyEvidence.frequencyAbStatus;
   if (results.frequencyAbStatus.status === "complete") {
     results.frequencyAb = collectFreqAb(outDir, freqAbRows, freqAbMeta);
   }
 
   // --- optional per-CPU frequency cap experiment ---
-  const capRows = readTsv(path.join(resultsDir, "frequency-cap.tsv"));
-  const capMeta = readKeyValues(path.join(resultsDir, "frequency-cap.meta"));
-  if (capRows.length > 0) {
+  const capRows = frequencyEvidence.frequencyCapRows;
+  const capMeta = frequencyEvidence.frequencyCapMeta;
+  results.frequencyCapStatus = frequencyEvidence.frequencyCapStatus;
+  if (results.frequencyCapStatus.status === "complete") {
     results.frequencyCap = {
       cpu: num(capMeta.CPU),
       requestedCapKhz: num(capMeta.CAP_KHZ),
+      savedScalingMaxKhz: num(capMeta.SAVED_SCALING_MAX_KHZ),
       restored: capMeta.RESTORED === "1",
       note: "intel_pstate/HWP does not guarantee scaling_max_freq strictly clamps the effective clock; compare with measured samples",
       ...collectFreqAb(outDir, capRows, capMeta),

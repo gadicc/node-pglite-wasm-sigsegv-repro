@@ -36,6 +36,43 @@ check_eq() {
 # shellcheck source=../common.sh
 source "$LIB/common.sh"
 
+write_frequency_ab_fixture_meta() {
+  local bundle="$1" cpu="$2" runs="$3"
+  local generation=0123456789abcdef0123456789abcdef
+  local rows_sha a1_samples_sha a1_method_sha b_samples_sha b_method_sha a2_samples_sha a2_method_sha
+  rows_sha="$(sha256sum "$bundle/results/frequency-ab.tsv" | awk '{print $1}')"
+  a1_samples_sha="$(sha256sum "$bundle/freq/freq-ab-A1.samples" | awk '{print $1}')"
+  a1_method_sha="$(sha256sum "$bundle/freq/freq-ab-A1.method" | awk '{print $1}')"
+  b_samples_sha="$(sha256sum "$bundle/freq/freq-ab-B.samples" | awk '{print $1}')"
+  b_method_sha="$(sha256sum "$bundle/freq/freq-ab-B.method" | awk '{print $1}')"
+  a2_samples_sha="$(sha256sum "$bundle/freq/freq-ab-A2.samples" | awk '{print $1}')"
+  a2_method_sha="$(sha256sum "$bundle/freq/freq-ab-A2.method" | awk '{print $1}')"
+  cat > "$bundle/results/frequency-ab.meta" << EOF
+GENERATION=$generation
+CPU=$cpu
+RUNS_PER_LEG=$runs
+SAVED_NO_TURBO=0
+CAP_REQUESTED=0
+REQUESTED_CAP_KHZ=-
+LEG_A1_NO_TURBO=0
+LEG_A1_SCALING_MAX_KHZ=5500000
+LEG_B_NO_TURBO=1
+LEG_B_SCALING_MAX_KHZ=5500000
+LEG_A2_NO_TURBO=0
+LEG_A2_SCALING_MAX_KHZ=5500000
+RESTORED=1
+ROWS_SHA256=$rows_sha
+LEG_A1_SAMPLES_SHA256=$a1_samples_sha
+LEG_A1_METHOD_SHA256=$a1_method_sha
+LEG_B_SAMPLES_SHA256=$b_samples_sha
+LEG_B_METHOD_SHA256=$b_method_sha
+LEG_A2_SAMPLES_SHA256=$a2_samples_sha
+LEG_A2_METHOD_SHA256=$a2_method_sha
+CAP_COMPLETED=0
+COMPLETED=1
+EOF
+}
+
 # Shared real/alternate CPU fixtures for persisted selection-policy tests.
 TEST_ONLINE_CPUS="$(sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' /proc/self/status)"
 TEST_ONLINE_CPU="$(diag_cpulist_expand "$TEST_ONLINE_CPUS" | head -1)"
@@ -2482,9 +2519,13 @@ check_eq "malformed GDB accounting cannot close the phase" "1" \
   "$([[ $malformed_phase_rc -ne 0 && ! -e "$GDB_MALFORMED_PHASE/state/phase-gdb.done" ]] && echo 1 || echo 0)"
 
 FREQUENCY_COMPLETE="$TMP/frequency-complete"
-mkdir -p "$FREQUENCY_COMPLETE/results"
+mkdir -p "$FREQUENCY_COMPLETE/results" "$FREQUENCY_COMPLETE/freq"
 printf 'A1\t1\t139\t2\nB\t1\t0\t3\nA2\t1\t0\t2\n' > "$FREQUENCY_COMPLETE/results/frequency-ab.tsv"
-printf 'CPU=19\nRUNS_PER_LEG=1\nRESTORED=1\nCOMPLETED=1\n' > "$FREQUENCY_COMPLETE/results/frequency-ab.meta"
+for leg in A1 B A2; do
+  printf 'scaling_cur_freq\n' > "$FREQUENCY_COMPLETE/freq/freq-ab-${leg}.method"
+  printf '1753950000 19 4200000\n' > "$FREQUENCY_COMPLETE/freq/freq-ab-${leg}.samples"
+done
+write_frequency_ab_fixture_meta "$FREQUENCY_COMPLETE" 19 1
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
@@ -2492,6 +2533,25 @@ printf 'CPU=19\nRUNS_PER_LEG=1\nRESTORED=1\nCOMPLETED=1\n' > "$FREQUENCY_COMPLET
   frequency_result_is_complete 19
 )
 check_eq "complete restored frequency A/B/A evidence is accepted" "0" "$?"
+mkdir -p "$FREQUENCY_COMPLETE/state"
+touch "$FREQUENCY_COMPLETE/state/phase-frequency.done"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$FREQUENCY_COMPLETE"
+  frequency_result_is_complete 19 --complete
+) > /dev/null 2>&1
+check_eq "completed frequency marker authorizes only its strict evidence envelope" "0" "$?"
+rm -f "$FREQUENCY_COMPLETE/state/phase-frequency.done"
+ln -s "$FREQUENCY_COMPLETE/state/missing-marker" "$FREQUENCY_COMPLETE/state/phase-frequency.done"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$FREQUENCY_COMPLETE"
+  ! frequency_result_is_complete 19 --ready && ! frequency_result_is_complete 19 --complete
+) > /dev/null 2>&1
+check_eq "frequency evidence rejects a dangling completion marker in every mode" "0" "$?"
+rm -f "$FREQUENCY_COMPLETE/state/phase-frequency.done"
 sed -i '/^A2/d' "$FREQUENCY_COMPLETE/results/frequency-ab.tsv"
 (
   DIAG_SOURCE_ONLY=1
@@ -3185,24 +3245,12 @@ A2	2	139	2
 A2	3	0	2
 A2	4	0	2
 EOF
-cat > "$B/results/frequency-ab.meta" << EOF
-CPU=19
-RUNS_PER_LEG=4
-SAVED_NO_TURBO=0
-LEG_A1_NO_TURBO=0
-LEG_A1_SCALING_MAX_KHZ=5500000
-LEG_B_NO_TURBO=1
-LEG_B_SCALING_MAX_KHZ=5500000
-LEG_A2_NO_TURBO=0
-LEG_A2_SCALING_MAX_KHZ=5500000
-RESTORED=1
-COMPLETED=1
-EOF
 for leg in A1 B A2; do
   printf 'scaling_cur_freq\n' > "$B/freq/freq-ab-${leg}.method"
   if [[ "$leg" == "B" ]]; then mhz=2100000; else mhz=4700000; fi
   printf '1753950000 19 %s\n1753950001 19 %s\n' "$mhz" "$mhz" > "$B/freq/freq-ab-${leg}.samples"
 done
+write_frequency_ab_fixture_meta "$B" 19 4
 
 cp "$FIX/gdb-known.txt" "$B/gdb/cpu19-run1.txt"
 cat > "$B/results/gdb.meta" << EOF

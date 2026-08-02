@@ -2194,17 +2194,11 @@ phase_frequency() {
 
 frequency_result_is_complete() {
   local expected_cpu="${1:-}"
-  local tsv="$OUT_DIR/results/frequency-ab.tsv"
-  local meta="$OUT_DIR/results/frequency-ab.meta"
-  [[ -f "$meta" ]] || return 1
-  local runs restored completed actual_cpu
-  runs="$(metadata_value "$meta" RUNS_PER_LEG)"
-  restored="$(metadata_value "$meta" RESTORED)"
-  completed="$(metadata_value "$meta" COMPLETED)"
-  actual_cpu="$(metadata_exact_value "$meta" CPU 2> /dev/null || true)"
-  [[ "$restored" == "1" && "$completed" == "1" ]] || return 1
-  [[ "$expected_cpu" =~ ^(0|[1-9][0-9]*)$ && "$actual_cpu" == "$expected_cpu" ]] || return 1
-  diag_frequency_rows_are_complete "$tsv" "$runs"
+  local mode="${2:---ready}"
+  [[ "$expected_cpu" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  [[ "$mode" == --ready || "$mode" == --complete ]] || return 1
+  node "$SCRIPT_DIR/diagnose-lib/frequency-evidence.mjs" \
+    "$mode" "$OUT_DIR" "$expected_cpu" > /dev/null 2>&1
 }
 
 # ------------------------------------------------------------------
@@ -2729,6 +2723,8 @@ main() {
 
   # ---- phase 5 (manual; see frequency-ab.sh) ----
   if phase_is_done frequency; then
+    frequency_result_is_complete "$target_cpu" --complete ||
+      diag_die "completed frequency evidence is invalid or inconsistent; resume with --redo frequency"
     diag_log "phase 5/7 frequency: already done, skipping (resume)"
   elif frequency_result_is_complete "$target_cpu"; then
     diag_log "phase 5/7: results from a manual frequency-ab.sh run found; incorporating"

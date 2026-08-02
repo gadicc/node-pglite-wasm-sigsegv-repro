@@ -5,7 +5,6 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   assessIndividual,
-  assessFrequencyAb,
   collect,
   collectFreqAb,
   collectIndividual,
@@ -147,38 +146,6 @@ test("collectFreqAb: legs count only clean/SIGSEGV rows as valid runs", () => {
   assert.equal(b.runs, 1);
   assert.equal(b.failures, 0);
   assert.deepEqual(b.invalidRuns.map((f) => f.signal), ["SIGABRT"]);
-});
-
-test("assessFrequencyAb: requires completion, restoration, marker, and exact rows", () => {
-  const partial = assessFrequencyAb(
-    [["A1", "1", "139", "2"]],
-    { RUNS_PER_LEG: "1", RESTORED: "0", COMPLETED: "0" },
-    false,
-  );
-  assert.equal(partial.status, "incomplete");
-  assert.match(partial.reasons.join("; "), /completion marker/);
-  assert.match(partial.reasons.join("; "), /not marked complete/);
-  assert.match(partial.reasons.join("; "), /not verified as restored/);
-  assert.match(partial.reasons.join("; "), /frequency modes/);
-  assert.match(partial.reasons.join("; "), /every expected/);
-
-  const complete = assessFrequencyAb(
-    [
-      ["A1", "1", "139", "2"],
-      ["B", "1", "0", "3"],
-      ["A2", "1", "0", "2"],
-    ],
-    {
-      RUNS_PER_LEG: "1",
-      RESTORED: "1",
-      COMPLETED: "1",
-      LEG_A1_NO_TURBO: "0",
-      LEG_B_NO_TURBO: "1",
-      LEG_A2_NO_TURBO: "0",
-    },
-    true,
-  );
-  assert.deepEqual(complete, { status: "complete", reasons: [] });
 });
 
 test("collect: incomplete frequency artifacts are preserved as status, not evidence", () => {

@@ -491,6 +491,18 @@ export function renderReport(results) {
       L.push(`- ${leg.leg}: ${statsCell(leg.failures, leg.runs)}, measured avg ${fmtMHz(leg.frequency?.avgMHz)}, max ${fmtMHz(leg.frequency?.maxMHz)}`);
     }
     L.push("");
+  } else if (r.frequencyCapStatus?.status === "incomplete") {
+    L.push("### Per-CPU frequency-cap experiment");
+    L.push("");
+    L.push("Incomplete or stale cap artifacts were excluded from the report:");
+    for (const reason of r.frequencyCapStatus.reasons ?? []) L.push(`- ${reason}`);
+    L.push("");
+  } else if ((r.frequencyCapStatus?.reasons?.length ?? 0) > 0) {
+    L.push("### Per-CPU frequency-cap experiment");
+    L.push("");
+    L.push("Stale cap artifacts were excluded because the current A/B/A generation did not request a cap:");
+    for (const reason of r.frequencyCapStatus.reasons) L.push(`- ${reason}`);
+    L.push("");
   }
 
   // ------------------------------------------------------------------
