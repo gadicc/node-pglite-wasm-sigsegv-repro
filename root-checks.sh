@@ -178,7 +178,7 @@ echo "[root-checks] staging privileged reads for $out_dir"
 
 {
   echo "date=$(date -Is)"
-  echo "host_bundle=$bundle"
+  echo "host_bundle=."
 } > "$stage_dir/root-checks.meta"
 
 [[ -d "$out_dir" && ! -L "$out_dir" && "$out_dir" -ef "$anchored_out" ]] || {

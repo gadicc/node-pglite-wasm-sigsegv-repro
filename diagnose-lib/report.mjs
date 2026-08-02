@@ -107,8 +107,10 @@ export function renderReport(results) {
   // ------------------------------------------------------------------
   L.push("## Environment (sanitized)");
   L.push("");
-  L.push("Service tags, serial numbers, UUIDs, and MAC addresses were");
-  L.push("deliberately not collected. See `env/` for the raw sanitized files.");
+  L.push("Preflight intentionally excludes service tags, serial numbers, UUIDs,");
+  L.push("and MAC addresses. Raw GDB and third-party tool output can still contain");
+  L.push("local paths or unexpected identifiers; review `privacy-review.txt` and");
+  L.push("the raw files before sharing the bundle.");
   L.push("");
   L.push("| Field | Value |");
   L.push("| --- | --- |");
@@ -566,5 +568,5 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     process.exit(2);
   }
   writeReport(outDir);
-  console.log(`wrote ${path.join(outDir, "report.md")}`);
+  console.log("wrote report.md");
 }

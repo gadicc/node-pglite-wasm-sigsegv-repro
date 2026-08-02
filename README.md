@@ -51,10 +51,11 @@ npm run repro:sequential
 `diagnose.sh` automates the full investigation this repository documents:
 environment collection, baseline reproduction, CPU-group isolation,
 per-CPU isolation, GDB fault-signature capture, and a statistically honest
-Markdown report. It is meant to take a machine "from zero" to a shareable
+Markdown report. It is meant to take a machine "from zero" to a reviewable
 evidence bundle with one command, and every conclusion in the generated
 report is derived from that run's own measurements — nothing is assumed
-from prior results.
+from prior results. Known identifiers are minimized, but raw debugger and
+third-party tool output must still be reviewed before sharing.
 
 > [!CAUTION]
 > The workload is memory-intensive (~1.2 GiB per child process; the default
@@ -74,11 +75,13 @@ Preflight collects distribution/kernel/Node/V8 versions, CPU model,
 stepping, microcode, address sizes, topology (P/E cores, clusters, shared
 L2, cpufreq policies), cpufreq state, `intel_pstate/no_turbo`, power
 source, and relevant kernel warnings (MCE/EDAC/thermal/TME/microcode) from
-unprivileged sources. Service tags, serial numbers, UUIDs, MAC addresses,
-and BIOS passwords are never collected. Kernel-command-line collection uses
-an explicit CPU/frequency allowlist (rather than trying to denylist every
-possible identifier), and journal excerpts use message-only output without
-timestamp/hostname prefixes.
+unprivileged sources. Preflight intentionally excludes service tags, serial
+numbers, UUIDs, MAC addresses, and BIOS passwords. Kernel-command-line
+collection uses an explicit CPU/frequency allowlist (rather than trying to
+denylist every possible identifier), and journal excerpts use message-only
+output without timestamp/hostname prefixes. GDB mappings and optional tool
+output can still contain local paths or unexpected identifiers, so inspect
+`privacy-review.txt` and the flagged raw files before publishing a bundle.
 
 ### Privileged companion scripts (manual, reviewable)
 
@@ -139,12 +142,15 @@ Everything lands in a timestamped bundle, `diagnostics/<UTC timestamp>/`
 
 - `report.md` — the human report (see below)
 - `results.json` — machine-readable results
-- `commands.log`, `run.log` — exact command log and progress log
+- `commands.log`, `run.log` — shell-quoted command/progress logs, with known
+  bundle, repository, and home-directory prefixes replaced
 - `env/` — sanitized system-information files (`env/root/` if
   `root-checks.sh` was run)
 - `logs/` — raw stdout/stderr per phase
 - `freq/` — frequency samples per phase
 - `gdb/` — capture transcripts
+- `privacy-review.txt` — category/file-only sentinel scan for paths, UUIDs,
+  and MAC-shaped values; a flag means review the raw file, not that it is unsafe
 - `manifest.txt` — file names and SHA-256 checksums
 
 Phases mark completion under `state/`; an interrupted run (SIGINT/SIGTERM

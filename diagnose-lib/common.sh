@@ -13,9 +13,20 @@
 
 # DIAG_LOG_FILE, if set, receives a copy of every log line.
 : "${DIAG_LOG_FILE:=}"
+: "${DIAG_BUNDLE_ROOT:=}"
+: "${DIAG_REPO_ROOT:=}"
+
+diag_redact_log_text() {
+  local text="$1"
+  if [[ -n "$DIAG_BUNDLE_ROOT" ]]; then text="${text//"$DIAG_BUNDLE_ROOT"/<bundle>}"; fi
+  if [[ -n "$DIAG_REPO_ROOT" ]]; then text="${text//"$DIAG_REPO_ROOT"/<repo>}"; fi
+  if [[ -n "${HOME:-}" ]]; then text="${text//"$HOME"/~}"; fi
+  printf '%s\n' "$text"
+}
 
 diag_log() {
-  local msg="[$(date '+%H:%M:%S')] $*"
+  local msg
+  msg="[$(date '+%H:%M:%S')] $(diag_redact_log_text "$*")"
   printf '%s\n' "$msg"
   if [[ -n "$DIAG_LOG_FILE" ]]; then
     printf '%s\n' "$msg" >> "$DIAG_LOG_FILE"
@@ -39,7 +50,10 @@ diag_die() {
 diag_log_cmd() {
   [[ -n "${DIAG_COMMANDS_LOG:-}" ]] || return 0
   printf '+ ' >> "$DIAG_COMMANDS_LOG"
-  printf '%q ' "$@" >> "$DIAG_COMMANDS_LOG"
+  local arg
+  for arg in "$@"; do
+    printf '%q ' "$(diag_redact_log_text "$arg")" >> "$DIAG_COMMANDS_LOG"
+  done
   printf '\n' >> "$DIAG_COMMANDS_LOG"
 }
 

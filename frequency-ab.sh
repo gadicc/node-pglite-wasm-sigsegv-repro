@@ -103,6 +103,8 @@ done
 diag_require_not_symlink "${protected_bundle_paths[@]}"
 
 mkdir -p "$BUNDLE/results" "$BUNDLE/freq" "$BUNDLE/state"
+DIAG_BUNDLE_ROOT="$BUNDLE"
+DIAG_REPO_ROOT="$SCRIPT_DIR"
 DIAG_RESTORE_FILE="$BUNDLE/state/restore-frequency-ab.tsv"
 DIAG_FREQ_DIR="$BUNDLE/freq"
 DIAG_COMMANDS_LOG="$BUNDLE/commands.log"

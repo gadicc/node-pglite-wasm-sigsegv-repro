@@ -695,6 +695,19 @@ system_node_path="$(
 )"
 check_eq "node_path outside \$HOME is unchanged" "/usr/bin/node" "$system_node_path"
 
+PRIVACY_BUNDLE="$TMP/privacy-bundle"
+mkdir -p "$PRIVACY_BUNDLE/raw"
+printf 'path=%s/private token=550e8400-e29b-41d4-a716-446655440000\n' "$HOME" > "$PRIVACY_BUNDLE/raw/tool.txt"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$PRIVACY_BUNDLE"
+  SCRIPT_DIR="$REPO_ROOT"
+  write_privacy_review
+)
+check_eq "privacy scan flags files without copying sentinel values" "1" \
+  "$([[ "$(grep -c $'^known-home-path\traw/tool.txt$' "$PRIVACY_BUNDLE/privacy-review.txt")" == 1 && "$(grep -c $'^uuid-shape\traw/tool.txt$' "$PRIVACY_BUNDLE/privacy-review.txt")" == 1 && "$(grep -c '550e8400' "$PRIVACY_BUNDLE/privacy-review.txt")" == 0 ]] && echo 1 || echo 0)"
+
 echo "== manifest covers the final log lines =="
 MB="$TMP/manifest-bundle"
 mkdir -p "$MB"
@@ -702,6 +715,8 @@ mkdir -p "$MB"
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
   OUT_DIR="$MB"
+  DIAG_BUNDLE_ROOT="$MB"
+  DIAG_REPO_ROOT="$REPO_ROOT"
   DIAG_LOG_FILE="$MB/run.log"
   # Reproduce the real ordering: every log line precedes the hash pass.
   diag_log "done. Bundle: $OUT_DIR"
@@ -709,6 +724,8 @@ mkdir -p "$MB"
   write_manifest
 ) > /dev/null 2>&1
 check_eq "write_manifest succeeds after the final log lines" "0" "$?"
+check_eq "bundle log redacts local roots" "1" \
+  "$([[ "$(grep -Fc "$MB" "$MB/run.log")" == 0 && "$(grep -Fc "$REPO_ROOT" "$MB/run.log")" == 0 && "$(grep -Fc '<bundle>' "$MB/run.log")" -gt 0 ]] && echo 1 || echo 0)"
 (cd "$MB" && sha256sum -c manifest.txt) > /dev/null 2>&1
 check_eq "manifest verifies immediately after the run" "0" "$?"
 
@@ -845,6 +862,7 @@ const check = (label, cond) => {
   else { console.log(`FAIL ${label}`); failures += 1; }
 };
 check("baseline sigsegv count", r.baseline.sigsegvCount === 2);
+check("bundle path is relative", r.outDir === ".");
 check("baseline other failures", r.baseline.otherFailureCount === 1);
 check("baseline invocations", r.baseline.totalChildInvocations === 20);
 check("worst cpu is 19", r.worstCpu === 19);
@@ -859,7 +877,7 @@ check("root checks merged", Boolean(r.rootChecks) && r.rootChecks["cctk.txt"].in
 process.exit(failures === 0 ? 0 : 1);
 EOF
 if node "$TMP/check-results.mjs" "$B/results.json"; then
-  pass=$((pass + 12))
+  pass=$((pass + 13))
 else
   fail=$((fail + 1))
 fi
@@ -945,12 +963,16 @@ touch "$B/state"/phase-{preflight,baseline,groups,individual,frequency,gdb}.done
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
   OUT_DIR="$B"
+  DIAG_BUNDLE_ROOT="$B"
+  DIAG_REPO_ROOT="$REPO_ROOT"
   META_FILE="$B/results/meta.env"
   STATE_DIR="$B/state"
   DIAG_LOG_FILE="$B/run.log"
   finalize_report
 ) > /dev/null 2>&1
 check_eq "finalization succeeds on a complete bundle" "0" "$?"
+grep -q $'^status\t' "$B/privacy-review.txt"
+check_eq "finalization writes privacy review" "0" "$?"
 (cd "$B" && sha256sum -c manifest.txt) > /dev/null 2>&1
 check_eq "end-to-end bundle manifest verifies" "0" "$?"
 

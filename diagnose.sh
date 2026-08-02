@@ -412,7 +412,7 @@ build_redo_plan() {
 }
 
 archive_derived_outputs() {
-  local -a paths=(results.json report.md manifest.txt)
+  local -a paths=(results.json report.md privacy-review.txt manifest.txt)
   local -a existing=()
   local p
   for p in "${paths[@]}"; do
@@ -642,8 +642,8 @@ repro_result_is_complete() {
 }
 
 # ------------------------------------------------------------------
-# Sanitization helpers. The bundle is meant to be shareable, so identifying
-# values are redacted before they reach the env/ files.
+# Sanitization helpers. Known identifiers are minimized before they reach
+# env/, but raw debugger/tool output still requires review before sharing.
 
 # Retain only kernel parameters relevant to CPU/frequency behavior. A
 # denylist cannot anticipate identifiers or credentials carried by arbitrary
@@ -837,12 +837,14 @@ phase_preflight() {
   {
     printf '# required\n'
     for c in "${REQUIRED_COMMANDS[@]}"; do
-      printf '%-18s %s\n' "$c" "$(command -v "$c" 2> /dev/null || echo MISSING)"
+      local command_path
+      command_path="$(command -v "$c" 2> /dev/null || echo MISSING)"
+      printf '%-18s %s\n' "$c" "$(diag_redact_home_prefix "$command_path")"
     done
     printf '# optional\n'
     for c in "${opt[@]}"; do
       if command -v "$c" > /dev/null 2>&1; then
-        printf '%-18s %s\n' "$c" "$(command -v "$c")"
+        printf '%-18s %s\n' "$c" "$(diag_redact_home_prefix "$(command -v "$c")")"
       else
         printf '%-18s MISSING\n' "$c"
         missing_opt+=("$c")
@@ -1125,6 +1127,47 @@ gdb_result_is_complete() {
 }
 
 # ------------------------------------------------------------------
+write_privacy_review() {
+  local review="$OUT_DIR/privacy-review.txt" file rel found=0
+  {
+    printf '# Automated privacy sentinel scan\n'
+    printf '# Matches list only category and relative file; inspect raw files before sharing.\n'
+  } > "$review"
+
+  while IFS= read -r -d '' file; do
+    rel="${file#"$OUT_DIR"/}"
+    case "$rel" in
+      privacy-review.txt | manifest.txt) continue ;;
+    esac
+    if [[ -n "${HOME:-}" && "$HOME" != "/" ]] && grep -aFq -- "$HOME" "$file" 2> /dev/null; then
+      printf 'known-home-path\t%s\n' "$rel" >> "$review"
+      found=1
+    fi
+    if grep -aFq -- "$OUT_DIR" "$file" 2> /dev/null; then
+      printf 'known-bundle-path\t%s\n' "$rel" >> "$review"
+      found=1
+    fi
+    if grep -aFq -- "$SCRIPT_DIR" "$file" 2> /dev/null; then
+      printf 'known-repository-path\t%s\n' "$rel" >> "$review"
+      found=1
+    fi
+    if grep -aEq '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}' "$file" 2> /dev/null; then
+      printf 'uuid-shape\t%s\n' "$rel" >> "$review"
+      found=1
+    fi
+    if grep -aEiq '(^|[^0-9a-f])([0-9a-f]{2}[:-]){5}[0-9a-f]{2}([^0-9a-f]|$)' "$file" 2> /dev/null; then
+      printf 'mac-shape\t%s\n' "$rel" >> "$review"
+      found=1
+    fi
+  done < <(find "$OUT_DIR" -type f -print0 | sort -z)
+
+  if ((found == 0)); then
+    printf 'status\tno-known-sentinels\n' >> "$review"
+  else
+    printf 'status\treview-required\n' >> "$review"
+  fi
+}
+
 write_manifest() {
   # The hash pass must be the last filesystem write into the bundle: emit
   # the log line first, because diag_log appends to run.log, which is
@@ -1152,6 +1195,7 @@ finalize_report() {
   sync_meta_completed
   node "$LIB/collect.mjs" "$OUT_DIR" || diag_die "collect.mjs failed; results.json may be stale"
   node "$LIB/report.mjs" "$OUT_DIR" || diag_die "report.mjs failed; report.md may be stale"
+  write_privacy_review || diag_die "privacy sentinel scan failed"
   write_manifest || diag_die "manifest generation failed"
 }
 
@@ -1301,6 +1345,8 @@ main() {
 
   mkdir -p "$OUT_DIR"/{results,logs/individual,state,env,freq,gdb}
   OUT_DIR="$(cd "$OUT_DIR" && pwd)"
+  DIAG_BUNDLE_ROOT="$OUT_DIR"
+  DIAG_REPO_ROOT="$SCRIPT_DIR"
   META_FILE="$OUT_DIR/results/meta.env"
   STATE_DIR="$OUT_DIR/state"
   DIAG_FREQ_DIR="$OUT_DIR/freq"

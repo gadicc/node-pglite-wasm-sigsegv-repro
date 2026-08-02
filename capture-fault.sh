@@ -43,7 +43,7 @@ node_bin="$(command -v node)" || {
   exit 4
 }
 if [[ ! -f child.mjs ]]; then
-  echo "error: child.mjs not found in $PWD" >&2
+  echo "error: child.mjs not found in the current directory" >&2
   exit 4
 fi
 
@@ -80,7 +80,7 @@ for ((run = 1; run <= max_runs; run++)); do
 
   if grep -q "received signal SIGSEGV" "$out"; then
     captures=$((captures + 1))
-    echo "run=${run} cpu=${cpu} CAPTURED ($out)"
+    echo "run=${run} cpu=${cpu} CAPTURED (${out##*/})"
     if [ "$captures" -ge "$max_captures" ]; then
       echo "done: ${captures} capture(s) after ${run} run(s)"
       exit 0
@@ -91,7 +91,7 @@ for ((run = 1; run <= max_runs; run++)); do
     echo "run=${run} cpu=${cpu} clean"
   else
     error_runs=$((error_runs + 1))
-    echo "run=${run} cpu=${cpu} ERROR (transcript kept: $out)" >&2
+    echo "run=${run} cpu=${cpu} ERROR (transcript kept: ${out##*/})" >&2
   fi
 done
 

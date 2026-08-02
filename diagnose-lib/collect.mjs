@@ -332,7 +332,7 @@ export function collect(outDir) {
 
   const results = {
     schemaVersion: 1,
-    outDir,
+    outDir: ".",
     collectedAt: new Date().toISOString(),
     config: {
       mode: meta.MODE ?? null,
@@ -517,5 +517,5 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     process.exit(2);
   }
   collect(outDir);
-  console.log(`wrote ${path.join(outDir, "results.json")}`);
+  console.log("wrote results.json");
 }
