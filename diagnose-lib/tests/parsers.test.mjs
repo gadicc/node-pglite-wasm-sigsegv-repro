@@ -701,6 +701,44 @@ test("renderReport: CPU localization never prints an unsafe pooled clean denomin
   assert.doesNotMatch(md, /0\/9007199254740992/);
 });
 
+test("renderReport: preflight environment snapshots never create causal rule-outs", () => {
+  const md = renderReport({
+    collectedAt: "2026-08-02T00:00:00.000Z",
+    config: {},
+    environment: {
+      TME_STATE: "disabled (tme=off on kernel command line)",
+      POWER_SOURCE: "battery",
+      NO_TURBO: "1",
+      UNDERVOLT_STATE: "installed; service enabled/active",
+    },
+    individualStatus: { status: "complete", reasons: [] },
+    individual: [
+      { cpu: 19, runs: 1, failures: 1, sigsegv: 1, invalidRuns: [], failedRuns: [] },
+    ],
+  });
+
+  assert.match(md, /point snapshots collected during preflight/);
+  assert.match(md, /descriptive context only/);
+  assert.match(md, /TME state at preflight \(best effort\) \| disabled/);
+  assert.match(md, /Power source at preflight \| battery/);
+  assert.match(md, /intel_pstate no_turbo \(at preflight\) \| 1/);
+  assert.match(md, /intel-undervolt tool\/service at preflight \(not voltage offsets\) \| installed; service enabled\/active/);
+  assert.match(md, /\*\*The problem reproduced\*\*/);
+
+  const conclusions = md
+    .split("## Conclusions (derived from this run)\n")[1]
+    ?.split("\n## Limitations")[0];
+  assert.ok(conclusions);
+  assert.doesNotMatch(conclusions, /tme=off/i);
+  assert.doesNotMatch(conclusions, /battery/i);
+  assert.doesNotMatch(conclusions, /intel_pstate\/no_turbo/i);
+  assert.doesNotMatch(conclusions, /service enabled\/active/i);
+  assert.doesNotMatch(md, /TME\/MKTME is not required/);
+  assert.doesNotMatch(md, /External power delivery is not required/);
+  assert.doesNotMatch(md, /failure reproduced even though intel_pstate\/no_turbo/);
+  assert.doesNotMatch(md, /- Undervolting state:/);
+});
+
 test("renderReport: clean heterogeneous phases do not get a pooled rate bound", () => {
   const md = renderReport({
     collectedAt: "2026-08-02T00:00:00.000Z",

@@ -258,6 +258,9 @@ export function renderReport(results) {
   L.push("and MAC addresses. Raw GDB and third-party tool output can still contain");
   L.push("local paths or unexpected identifiers; review `privacy-review.txt` and");
   L.push("the raw files before sharing the bundle.");
+  L.push("These values are point snapshots collected during preflight. They are");
+  L.push("descriptive context only: they do not establish that the same state held");
+  L.push("during later workload phases and are not used for automatic causal rule-outs.");
   L.push("");
   L.push("| Field | Value |");
   L.push("| --- | --- |");
@@ -282,8 +285,9 @@ export function renderReport(results) {
     ["cpufreq driver", env.CPUFREQ_DRIVER],
     ["Governor / EPP", env.GOVERNOR && env.EPP ? `${env.GOVERNOR} / ${env.EPP}` : env.GOVERNOR],
     ["intel_pstate no_turbo (at preflight)", env.NO_TURBO],
-    ["TME state (best effort)", env.TME_STATE],
+    ["TME state at preflight (best effort)", env.TME_STATE],
     ["Power source at preflight", env.POWER_SOURCE],
+    ["intel-undervolt tool/service at preflight (not voltage offsets)", env.UNDERVOLT_STATE],
     ["Missing optional tools", env.MISSING_OPTIONAL],
   ];
   for (const [k, v] of envRows) {
@@ -831,23 +835,9 @@ function renderConclusions(r) {
     C.push("- GDB artifacts are incomplete and were excluded from signature conclusions.");
   }
 
-  // 5. Configuration-based rule-outs
-  const env = r.environment ?? {};
-  const reproduced = totalSig > 0;
-  if (reproduced && /disabled/i.test(env.TME_STATE ?? "")) {
-    C.push(`- TME/MKTME is not required for the failure: TME state is \"${env.TME_STATE}\" and the problem still reproduced.`);
-  }
-  if (reproduced && /battery/i.test(env.POWER_SOURCE ?? "")) {
-    C.push("- External power delivery is not required: the problem reproduced while running on battery.");
-  }
-  if (reproduced && env.NO_TURBO === "1") {
-    C.push("- The failure reproduced even though intel_pstate/no_turbo was already 1 at preflight time.");
-  }
-  if (reproduced && env.UNDERVOLT_STATE && !/unavailable|not installed/i.test(env.UNDERVOLT_STATE)) {
-    C.push(`- Undervolting state: ${env.UNDERVOLT_STATE}.`);
-  }
-
-  // 6. What remains uncertain
+  // 5. What remains uncertain. Preflight environment values are deliberately
+  // absent from conclusions: they are point snapshots, not proof of the state
+  // during later workload phases.
   const uncertain = [];
   if (cleanCpus.length > 0) {
     const weakest = cleanCpus.reduce((m, c) => Math.min(m, c.runs), Number.POSITIVE_INFINITY);
