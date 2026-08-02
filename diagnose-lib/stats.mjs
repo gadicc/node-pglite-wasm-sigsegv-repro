@@ -5,6 +5,7 @@
 //   node stats.mjs zero-upper <n> [confidence]
 //   node stats.mjs fisher <a> <b> <c> <d>
 //   node stats.mjs binom-zero <n> <rate>
+//   node stats.mjs permutation-cpu <iterations> <f1> <n1> [<f2> <n2> ...]
 //
 // All probability computations use log-space arithmetic so they stay
 // accurate for the sample sizes this project produces (tens to thousands).
@@ -115,6 +116,94 @@ export function binomZeroProbability(n, rate) {
   return Math.pow(1 - rate, n);
 }
 
+// mulberry32 PRNG (public domain, by Tommy Ettinger). Small and fast; used
+// with a FIXED seed so that identical inputs produce identical reports.
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Fixed seed for the permutation test: reports must be reproducible.
+const PERMUTATION_SEED = 0x5eed;
+export const DEFAULT_PERMUTATION_ITERATIONS = 20000;
+
+// Pearson chi-square statistic of the 2 x K table (failure/clean x CPUs)
+// against the per-CPU expected counts under a common per-run failure rate.
+function chiSquareFromExpected(failures, expected) {
+  let stat = 0;
+  for (let k = 0; k < failures.length; k += 1) {
+    const e = expected[k];
+    if (e.expF > 0) stat += ((failures[k] - e.expF) ** 2) / e.expF;
+    const clean = e.runs - failures[k];
+    if (e.expC > 0) stat += ((clean - e.expC) ** 2) / e.expC;
+  }
+  return stat;
+}
+
+// Permutation omnibus test for CPU localization. Null hypothesis: every run
+// has the same failure probability regardless of CPU. The failure labels are
+// shuffled uniformly among all runs with per-CPU run counts held fixed, and
+// p is the fraction of permutations whose chi-square statistic is at least
+// the observed one, with the +1 correction (the observed table is itself a
+// possible permutation), so 0 < p <= 1 always.
+//
+// counts = [{ failures, runs }, ...] per tested CPU. This is valid where a
+// Fisher test on a post-hoc failing-vs-clean grouping is not: the grouping
+// is never derived from the observed outcomes.
+export function permutationCpuTest(counts, iterations = DEFAULT_PERMUTATION_ITERATIONS) {
+  for (const c of counts) {
+    if (
+      !Number.isInteger(c?.failures) || !Number.isInteger(c?.runs) ||
+      c.failures < 0 || c.runs < 0 || c.failures > c.runs
+    ) {
+      throw new Error(`permutationCpuTest: invalid counts entry ${JSON.stringify(c)}`);
+    }
+  }
+  if (!Number.isInteger(iterations) || iterations <= 0) {
+    throw new Error(`permutationCpuTest: invalid iterations=${iterations}`);
+  }
+  const totalRuns = counts.reduce((s, c) => s + c.runs, 0);
+  const totalFailures = counts.reduce((s, c) => s + c.failures, 0);
+  // Expected counts depend only on the fixed margins, so they are computed
+  // once and shared by the observed table and every permutation.
+  const expected = counts.map((c) => {
+    const expF = totalRuns > 0 ? (c.runs * totalFailures) / totalRuns : 0;
+    return { runs: c.runs, expF, expC: c.runs - expF };
+  });
+  const observed = chiSquareFromExpected(counts.map((c) => c.failures), expected);
+  // One label per run; exactly totalFailures of them are failures.
+  const labels = new Array(totalRuns).fill(0);
+  for (let i = 0; i < totalFailures; i += 1) labels[i] = 1;
+  const permFailures = new Array(counts.length).fill(0);
+  const rand = mulberry32(PERMUTATION_SEED);
+  let extreme = 0;
+  for (let it = 0; it < iterations; it += 1) {
+    // Fisher-Yates shuffle with the seeded PRNG.
+    for (let i = labels.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(rand() * (i + 1));
+      const tmp = labels[i];
+      labels[i] = labels[j];
+      labels[j] = tmp;
+    }
+    // Deal the shuffled labels to the CPUs in order, run counts fixed.
+    let offset = 0;
+    for (let k = 0; k < counts.length; k += 1) {
+      let f = 0;
+      for (let run = 0; run < expected[k].runs; run += 1) f += labels[offset + run];
+      offset += expected[k].runs;
+      permFailures[k] = f;
+    }
+    if (chiSquareFromExpected(permFailures, expected) >= observed - 1e-9) extreme += 1;
+  }
+  return { p: (extreme + 1) / (iterations + 1), statistic: observed, iterations };
+}
+
 // Convenience bundle for one group's counts.
 export function summarize(failures, n) {
   const w = wilson(failures, n);
@@ -151,9 +240,23 @@ function cli(argv) {
     case "summarize":
       out = summarize(nums[0], nums[1]);
       break;
+    case "permutation-cpu": {
+      const [iterations, ...pairs] = nums;
+      if (pairs.length === 0 || pairs.length % 2 !== 0) {
+        console.error("permutation-cpu: expected <iterations> then <failures> <runs> pairs");
+        process.exitCode = 2;
+        return;
+      }
+      const counts = [];
+      for (let i = 0; i < pairs.length; i += 2) {
+        counts.push({ failures: pairs[i], runs: pairs[i + 1] });
+      }
+      out = permutationCpuTest(counts, iterations);
+      break;
+    }
     default:
       console.error(
-        "usage: node stats.mjs <wilson|zero-upper|fisher|binom-zero|summarize> ...",
+        "usage: node stats.mjs <wilson|zero-upper|fisher|binom-zero|summarize|permutation-cpu> ...",
       );
       process.exitCode = 2;
       return;

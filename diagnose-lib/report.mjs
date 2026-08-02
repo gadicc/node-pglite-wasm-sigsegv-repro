@@ -14,6 +14,7 @@ import {
   zeroFailureUpperBound,
   fisherExact2x2,
   binomZeroProbability,
+  permutationCpuTest,
 } from "./stats.mjs";
 
 function pct(x, digits = 1) {
@@ -314,6 +315,11 @@ export function renderReport(results) {
   L.push("- Observed failure rates can drift between batches; comparisons use");
   L.push("  exact tests on paired batches where possible, but small samples");
   L.push("  remain weak evidence.");
+  L.push("- The clean-CPU contrast behind CPU localization is a permutation");
+  L.push("  test across all tested CPUs (chi-square statistic, fixed seed), not");
+  L.push("  a Fisher test on a post-hoc failing-vs-clean grouping — that");
+  L.push("  grouping is defined by the outcomes, so testing it would separate");
+  L.push("  by construction.");
   L.push("- `scaling_cur_freq` under reports effective clocks on some");
   L.push("  intel_pstate/HWP systems; when available, turbostat samples are");
   L.push("  preferred and the method is recorded per measurement.");
@@ -349,21 +355,30 @@ function renderConclusions(r) {
     C.push("- No workload results were collected.");
   }
 
-  // 2. Localization to CPUs / groups
-  const failingCpus = (r.individual ?? []).filter((c) => c.failures > 0);
-  const cleanCpus = (r.individual ?? []).filter((c) => c.failures === 0 && c.runs > 0);
-  if (failingCpus.length > 0 && cleanCpus.length > 0) {
-    const fF = failingCpus.reduce((s, c) => s + c.failures, 0);
-    const fN = failingCpus.reduce((s, c) => s + c.runs, 0);
-    const cF = cleanCpus.reduce((s, c) => s + c.failures, 0);
-    const cN = cleanCpus.reduce((s, c) => s + c.runs, 0);
-    const p = fisherExact2x2(fF, fN - fF, cF, cN - cF);
-    const verdict = p < 0.05
-      ? `statistically significant (Fisher exact two-sided p = ${p.toExponential(2)})`
-      : `not statistically significant at this sample size (Fisher exact two-sided p = ${p.toExponential(2)})`;
-    C.push(`- **CPU localization**: failures observed only on CPU(s) ${failingCpus.map((c) => c.cpu).join(", ")} (${fF}/${fN} runs) and none on ${cleanCpus.length} other tested CPU(s) (${cF}/${cN} runs); ${verdict}.`);
-  } else if (failingCpus.length > 0) {
-    C.push(`- Failures observed on CPU(s) ${failingCpus.map((c) => c.cpu).join(", ")}; no clean CPUs were available for contrast.`);
+  // 2. Localization to CPUs / groups. The statistical claim is an omnibus
+  // permutation test across ALL tested CPUs — never a Fisher test on a
+  // failing-vs-clean partition defined after seeing the outcomes, which
+  // would separate by construction and ignore the CPU search multiplicity.
+  const testedCpus = (r.individual ?? []).filter((c) => c.runs > 0);
+  const failingCpus = testedCpus.filter((c) => c.sigsegv > 0);
+  const cleanCpus = testedCpus.filter((c) => c.sigsegv === 0);
+  if (failingCpus.length > 0) {
+    let line = `- **CPU localization**: failures observed on CPU(s) ${failingCpus.map((c) => `${c.cpu} at ${c.sigsegv}/${c.runs}`).join(", ")}`;
+    if (cleanCpus.length > 0) {
+      const cleanN = cleanCpus.reduce((s, c) => s + c.runs, 0);
+      line += `; zero on the other ${cleanCpus.length} tested CPU(s) at 0/${cleanN}`;
+    } else if (testedCpus.length > 1) {
+      line += "; every other tested CPU also observed at least one failure";
+    }
+    if (testedCpus.length > 1) {
+      const perm = permutationCpuTest(testedCpus.map((c) => ({ failures: c.sigsegv, runs: c.runs })));
+      line += `. Permutation test across all ${testedCpus.length} tested CPUs (chi-square statistic, ${perm.iterations} seeded shuffles): p = ${perm.p.toExponential(2)}`;
+    } else {
+      line += ". Only one CPU was tested, so no cross-CPU concentration test is possible";
+    }
+    C.push(`${line}.`);
+  } else if (testedCpus.length > 0) {
+    C.push("- CPU localization: no failures observed on any tested CPU; the cross-CPU concentration test is not applicable (zero total failures).");
   }
   const failingGroups = (r.groups ?? []).filter((g) => (g.sigsegvCount ?? 0) > 0);
   const cleanGroups = (r.groups ?? []).filter((g) => (g.sigsegvCount ?? 0) === 0 && (g.totalChildInvocations ?? 0) > 0);
