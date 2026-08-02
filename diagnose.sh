@@ -208,6 +208,17 @@ apply_mode_preset() {
   esac
 }
 
+validate_count_config() {
+  local label value
+  while (($#)); do
+    label="$1"
+    value="$2"
+    shift 2
+    diag_is_safe_positive_uint "$value" ||
+      diag_die "$label must be a canonical safe positive integer, got '$value'"
+  done
+}
+
 load_stored_config() {
   local meta="$1/results/meta.env"
   [[ -d "$1/results" && ! -L "$1/results" ]] ||
@@ -230,25 +241,30 @@ load_stored_config() {
     case "$k" in
       MODE) MODE="$v" ;;
       BASELINE_CHILDREN)
-        [[ "$v" =~ ^[1-9][0-9]*$ &&
-          (${#v} -lt 16 || (${#v} -eq 16 && "$v" < 9007199254740992)) ]] ||
+        diag_is_safe_positive_uint "$v" ||
           diag_die "stored BASELINE_CHILDREN must be a canonical safe positive integer, got '$v'"
         BASELINE_CHILDREN="$v"
         ;;
       BASELINE_WAVES)
-        [[ "$v" =~ ^[1-9][0-9]*$ &&
-          (${#v} -lt 16 || (${#v} -eq 16 && "$v" < 9007199254740992)) ]] ||
+        diag_is_safe_positive_uint "$v" ||
           diag_die "stored BASELINE_WAVES must be a canonical safe positive integer, got '$v'"
         BASELINE_WAVES="$v"
         ;;
       GROUP_WAVES)
-        [[ "$v" =~ ^[1-9][0-9]*$ &&
-          (${#v} -lt 16 || (${#v} -eq 16 && "$v" < 9007199254740992)) ]] ||
+        diag_is_safe_positive_uint "$v" ||
           diag_die "stored GROUP_WAVES must be a canonical safe positive integer, got '$v'"
         GROUP_WAVES="$v"
         ;;
-      INDIVIDUAL_RUNS) INDIVIDUAL_RUNS="$v" ;;
-      GDB_MAX_RUNS) GDB_MAX_RUNS="$v" ;;
+      INDIVIDUAL_RUNS)
+        diag_is_safe_positive_uint "$v" ||
+          diag_die "stored INDIVIDUAL_RUNS must be a canonical safe positive integer, got '$v'"
+        INDIVIDUAL_RUNS="$v"
+        ;;
+      GDB_MAX_RUNS)
+        diag_is_safe_positive_uint "$v" ||
+          diag_die "stored GDB_MAX_RUNS must be a canonical safe positive integer, got '$v'"
+        GDB_MAX_RUNS="$v"
+        ;;
       SKIP_GDB) SKIP_GDB="$v" ;;
       CPU_TARGET)
         [[ "$v" == auto || "$v" =~ ^(0|[1-9][0-9]*)$ ]] ||
@@ -345,24 +361,14 @@ validate_config() {
     default | quick | full) ;;
     *) diag_die "stored mode must be default, quick, or full, got '$MODE'" ;;
   esac
-  diag_require_uint "--individual-runs" "$INDIVIDUAL_RUNS"
-  diag_require_uint "--group-waves" "$GROUP_WAVES"
-  diag_require_uint "--gdb-max-runs" "$GDB_MAX_RUNS"
-  [[ "$GDB_MAX_RUNS" =~ ^(0|[1-9][0-9]*)$ ]] ||
-    diag_die "--gdb-max-runs must be a canonical non-negative integer, got '$GDB_MAX_RUNS'"
-  diag_require_uint "baseline children" "$BASELINE_CHILDREN"
-  diag_require_uint "baseline waves" "$BASELINE_WAVES"
-  [[ "$BASELINE_CHILDREN" =~ ^[1-9][0-9]*$ && "$BASELINE_WAVES" =~ ^[1-9][0-9]*$ &&
-    (${#BASELINE_CHILDREN} -lt 16 || (${#BASELINE_CHILDREN} -eq 16 && "$BASELINE_CHILDREN" < 9007199254740992)) &&
-    (${#BASELINE_WAVES} -lt 16 || (${#BASELINE_WAVES} -eq 16 && "$BASELINE_WAVES" < 9007199254740992)) ]] ||
-    diag_die "baseline children and waves must be canonical safe positive integers"
-  [[ "$GROUP_WAVES" =~ ^[1-9][0-9]*$ &&
-    (${#GROUP_WAVES} -lt 16 || (${#GROUP_WAVES} -eq 16 && "$GROUP_WAVES" < 9007199254740992)) ]] ||
-    diag_die "--group-waves must be a canonical safe positive integer"
+  validate_count_config \
+    "--individual-runs" "$INDIVIDUAL_RUNS" \
+    "--group-waves" "$GROUP_WAVES" \
+    "--gdb-max-runs" "$GDB_MAX_RUNS" \
+    "baseline children" "$BASELINE_CHILDREN" \
+    "baseline waves" "$BASELINE_WAVES"
   [[ "$SKIP_GDB" == "0" || "$SKIP_GDB" == "1" ]] ||
     diag_die "stored SKIP_GDB must be 0 or 1, got '$SKIP_GDB'"
-  ((INDIVIDUAL_RUNS >= 1 && GROUP_WAVES >= 1 && GDB_MAX_RUNS >= 1 && BASELINE_CHILDREN >= 1 && BASELINE_WAVES >= 1)) ||
-    diag_die "runs, waves, children, and gdb attempts must all be >= 1"
   [[ "$CPU_TARGET" == auto || "$CPU_TARGET" =~ ^(0|[1-9][0-9]*)$ ]] ||
     diag_die "--cpu must be auto or a canonical non-negative integer, got '$CPU_TARGET'"
   apply_cpu_target_runtime
@@ -755,11 +761,10 @@ redo_config_value_is_valid() {
   case "$key" in
     MODE) [[ "$value" == default || "$value" == quick || "$value" == full ]] ;;
     BASELINE_CHILDREN | BASELINE_WAVES | INDIVIDUAL_RUNS | GDB_MAX_RUNS)
-      [[ "$value" =~ ^[1-9][0-9]*$ ]]
+      diag_is_safe_positive_uint "$value"
       ;;
     GROUP_WAVES)
-      [[ "$value" =~ ^[1-9][0-9]*$ &&
-        (${#value} -lt 16 || (${#value} -eq 16 && "$value" < 9007199254740992)) ]]
+      diag_is_safe_positive_uint "$value"
       ;;
     SKIP_GDB) [[ "$value" == 0 || "$value" == 1 ]] ;;
     CPU_TARGET) [[ "$value" == auto || "$value" =~ ^(0|[1-9][0-9]*)$ ]] ;;
@@ -2143,7 +2148,7 @@ individual_cpulist_is_canonical() {
 individual_rows_are_valid() {
   local tsv="$1" targets="$2" expected_total="$3" require_complete="$4" target_csv
   [[ -f "$tsv" && ! -L "$tsv" ]] || return 1
-  [[ "$expected_total" =~ ^[1-9][0-9]*$ && "$require_complete" =~ ^[01]$ ]] || return 1
+  diag_is_safe_positive_uint "$expected_total" && [[ "$require_complete" =~ ^[01]$ ]] || return 1
   individual_cpulist_is_canonical "$targets" || return 1
   target_csv="$(cpu_list_sorted "$targets" | paste -sd, -)"
   awk -F'\t' -v targets="$target_csv" -v expected="$expected_total" -v complete="$require_complete" '
@@ -2225,8 +2230,9 @@ individual_meta_read() {
   [[ -n "${seen[VERSION]:-}" && -n "${seen[TARGET_CPUS]:-}" && -n "${seen[RUNS_PER_CPU]:-}" &&
     -n "${seen[SKIPPED]:-}" && -n "${seen[COMPLETED]:-}" ]] || return 1
   [[ "$INDIVIDUAL_META_VERSION" == 1 || "$INDIVIDUAL_META_VERSION" == 2 ]] || return 1
-  [[ "$INDIVIDUAL_META_RUNS" =~ ^[1-9][0-9]*$ && "$INDIVIDUAL_META_SKIPPED" =~ ^[01]$ &&
+  [[ "$INDIVIDUAL_META_SKIPPED" =~ ^[01]$ &&
     "$INDIVIDUAL_META_COMPLETED" =~ ^[01]$ ]] || return 1
+  diag_is_safe_positive_uint "$INDIVIDUAL_META_RUNS" || return 1
   if [[ "$INDIVIDUAL_META_VERSION" == 1 ]]; then
     [[ -z "${seen[TARGET_POLICY]:-}" && -z "${seen[GROUP_PLAN_DIGEST]:-}" ]] || return 1
   else
@@ -2372,7 +2378,7 @@ gdb_run_counts_read() {
   GDB_CLEAN_RUNS=""
   GDB_CAPTURED_RUNS=""
   GDB_ERROR_RUNS=""
-  [[ -f "$logf" && ! -L "$logf" && "$max_runs" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ -f "$logf" && ! -L "$logf" ]] && diag_is_safe_positive_uint "$max_runs" || return 1
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -n "$line" ]] && last_nonempty="$line"
     if [[ "$line" == GDB_RUN_COUNTS* ]]; then
@@ -2427,7 +2433,8 @@ phase_gdb() {
 
 gdb_result_is_complete() {
   local rc="$1" max_runs="$2" attempted="$3" clean="$4" captured="$5" errors="$6"
-  [[ "$max_runs" =~ ^[1-9][0-9]*$ && "$attempted" =~ ^(0|[1-9][0-9]*)$ &&
+  diag_is_safe_positive_uint "$max_runs" || return 1
+  [[ "$attempted" =~ ^(0|[1-9][0-9]*)$ &&
     "$clean" =~ ^(0|[1-9][0-9]*)$ && "$captured" =~ ^(0|[1-9][0-9]*)$ &&
     "$errors" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
   ((attempted <= max_runs && attempted == clean + captured + errors)) || return 1
@@ -3414,6 +3421,9 @@ main() {
     META_FILE="$OUT_DIR/results/meta.env"
     STATE_DIR="$OUT_DIR/state"
     reconcile_pending_redo_request
+    # A V2 redo record owns the configuration adopted above. Re-run the full
+    # validator so no future persisted field can bypass the ordinary contract.
+    validate_config
   fi
 
   # Work from the repository root regardless of the caller's CWD.

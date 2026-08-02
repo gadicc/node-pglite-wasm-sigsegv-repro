@@ -71,6 +71,19 @@ diag_is_uint() {
   [[ "${1:-}" =~ ^[0-9]+$ ]]
 }
 
+diag_is_safe_positive_uint() {
+  local value="${1:-}"
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || return 1
+  ((${#value} < 16)) ||
+    { ((${#value} == 16)) && [[ "$value" < 9007199254740992 ]]; }
+}
+
+diag_require_safe_positive_uint() {
+  local name="$1" value="$2"
+  diag_is_safe_positive_uint "$value" ||
+    diag_die "$name must be a canonical safe positive integer, got '$value'"
+}
+
 diag_require_uint() {
   local name="$1" value="$2"
   diag_is_uint "$value" || diag_die "$name must be a non-negative integer, got '$value'"

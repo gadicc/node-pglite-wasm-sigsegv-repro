@@ -402,12 +402,10 @@ while (($#)); do
 done
 
 diag_require_uint "cpu" "$CPU"
-diag_require_uint "runs-per-leg" "$RUNS"
+diag_require_safe_positive_uint "runs-per-leg" "$RUNS"
 [[ "$CPU" =~ ^(0|[1-9][0-9]*)$ && ${#CPU} -le 15 ]] ||
   diag_die "cpu must be a canonical safe non-negative integer"
 ((CPU <= 65535)) || diag_die "cpu must be <= 65535"
-[[ "$RUNS" =~ ^[1-9][0-9]*$ && ${#RUNS} -le 15 ]] ||
-  diag_die "runs-per-leg must be a canonical safe positive integer"
 if [[ -n "$CAP_KHZ" ]]; then
   diag_require_uint "--cap" "$CAP_KHZ"
   [[ "$CAP_KHZ" =~ ^[1-9][0-9]*$ && ${#CAP_KHZ} -le 15 ]] ||

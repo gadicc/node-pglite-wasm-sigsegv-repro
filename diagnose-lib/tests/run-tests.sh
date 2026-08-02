@@ -36,6 +36,18 @@ check_eq() {
 # shellcheck source=../common.sh
 source "$LIB/common.sh"
 
+safe_uint_boundaries="$({
+  for value in 1 9 9007199254740991; do
+    diag_is_safe_positive_uint "$value" && printf 'accept:%s\n' "$value"
+  done
+  for value in '' 0 00 01 +1 -1 ' 1' '1 ' 9007199254740992 10000000000000000; do
+    diag_is_safe_positive_uint "$value" || printf 'reject:%s\n' "$value"
+  done
+})"
+check_eq "safe positive integer validation uses JavaScript boundaries" \
+  $'accept:1\naccept:9\naccept:9007199254740991\nreject:\nreject:0\nreject:00\nreject:01\nreject:+1\nreject:-1\nreject: 1\nreject:1 \nreject:9007199254740992\nreject:10000000000000000' \
+  "$safe_uint_boundaries"
+
 write_preflight_fixture() {
   local bundle="$1" generation="${2:-0123456789abcdef0123456789abcdef}"
   local -a files=(
@@ -2718,6 +2730,10 @@ awk '
 ' "$INVALID_V2_DIR/valid" > "$INVALID_V2_DIR/out-of-order"
 sed 's/^CONFIG	INDIVIDUAL_RUNS	5$/CONFIG	INDIVIDUAL_RUNS	05/' \
   "$INVALID_V2_DIR/valid" > "$INVALID_V2_DIR/noncanonical"
+sed 's/INDIVIDUAL_RUNS.*5$/INDIVIDUAL_RUNS\t9007199254740992/' \
+  "$INVALID_V2_DIR/valid" > "$INVALID_V2_DIR/oversized-individual"
+sed 's/GDB_MAX_RUNS.*6$/GDB_MAX_RUNS\t9007199254740992/' \
+  "$INVALID_V2_DIR/valid" > "$INVALID_V2_DIR/oversized-gdb"
 write_test_v2_marker "$INVALID_V2_DIR/unreachable-mode" quick 16 50
 sed 's/^VERSION	2$/VERSION	1/' "$INVALID_V2_DIR/valid" > "$INVALID_V2_DIR/v1-with-config"
 sed '/^PHASE	gdb$/i CONFIG\tCPU_TARGET\tauto' \
@@ -2735,13 +2751,13 @@ invalid_v2_result="$(
     current=1
     current_profile=$REDO_TXN_HAS_CPU_TARGET
   fi
-  for marker in missing duplicate out-of-order noncanonical unreachable-mode v1-with-config bad-cpu-target cpu-out-of-order; do
+  for marker in missing duplicate out-of-order noncanonical oversized-individual oversized-gdb unreachable-mode v1-with-config bad-cpu-target cpu-out-of-order; do
     redo_transaction_validate "$INVALID_V2_DIR/$marker" || rejected=$((rejected + 1))
   done
   printf '%s|%s|%s|%s\n' "$valid" "$current" "$current_profile" "$rejected"
 )"
 check_eq "V2 grammar accepts exact legacy/current profiles and rejects malformed CPU rows" \
-  "1|1|1|8" "$invalid_v2_result"
+  "1|1|1|10" "$invalid_v2_result"
 
 generated_config_rows="$(
   DIAG_SOURCE_ONLY=1
@@ -3545,6 +3561,18 @@ check_eq "zero gdb attempts are rejected" "1" "$([[ $zero_gdb_rc -ne 0 ]] && ech
 noncanonical_gdb_rc=$?
 check_eq "non-canonical gdb attempts are rejected before execution" "1" \
   "$([[ $noncanonical_gdb_rc -ne 0 ]] && echo 1 || echo 0)"
+"$REPO_ROOT/diagnose.sh" --individual-runs 01 --dry-run --yes > /dev/null 2>&1
+noncanonical_individual_rc=$?
+check_eq "non-canonical individual runs are rejected before execution" "1" \
+  "$([[ $noncanonical_individual_rc -ne 0 ]] && echo 1 || echo 0)"
+"$REPO_ROOT/diagnose.sh" --individual-runs 9007199254740992 --dry-run --yes > /dev/null 2>&1
+oversized_individual_rc=$?
+check_eq "oversized individual runs are rejected before execution" "1" \
+  "$([[ $oversized_individual_rc -ne 0 ]] && echo 1 || echo 0)"
+"$REPO_ROOT/diagnose.sh" --gdb-max-runs 9007199254740992 --dry-run --yes > /dev/null 2>&1
+oversized_gdb_rc=$?
+check_eq "oversized gdb attempts are rejected before execution" "1" \
+  "$([[ $oversized_gdb_rc -ne 0 ]] && echo 1 || echo 0)"
 "$REPO_ROOT/diagnose.sh" --group-waves 010 --dry-run --yes > /dev/null 2>&1
 noncanonical_group_waves_rc=$?
 check_eq "non-canonical group waves are rejected before execution" "1" \
@@ -3553,6 +3581,19 @@ check_eq "non-canonical group waves are rejected before execution" "1" \
 noncanonical_cpu_rc=$?
 check_eq "non-canonical CPU overrides are rejected before execution" "1" \
   "$([[ $noncanonical_cpu_rc -ne 0 ]] && echo 1 || echo 0)"
+unsafe_stored_counts_rejected=0
+for unsafe_key in INDIVIDUAL_RUNS GDB_MAX_RUNS; do
+  UNSAFE_COUNT_BUNDLE="$TMP/unsafe-count-bundle-${unsafe_key,,}"
+  mkdir -p "$UNSAFE_COUNT_BUNDLE/results"
+  cp "$RB/results/meta.env" "$UNSAFE_COUNT_BUNDLE/results/meta.env"
+  sed -i "s/^${unsafe_key}=.*/${unsafe_key}=9007199254740992/" \
+    "$UNSAFE_COUNT_BUNDLE/results/meta.env"
+  if ! "$REPO_ROOT/diagnose.sh" --resume "$UNSAFE_COUNT_BUNDLE" --dry-run --yes > /dev/null 2>&1; then
+    unsafe_stored_counts_rejected=$((unsafe_stored_counts_rejected + 1))
+  fi
+done
+check_eq "oversized stored individual and gdb counts are rejected before resume mutation" \
+  "2" "$unsafe_stored_counts_rejected"
 "$REPO_ROOT/diagnose.sh" --cpu 999999 --dry-run --yes > /dev/null 2>&1
 unusable_cpu_rc=$?
 check_eq "unusable CPU override is rejected" "1" "$([[ $unusable_cpu_rc -ne 0 ]] && echo 1 || echo 0)"
