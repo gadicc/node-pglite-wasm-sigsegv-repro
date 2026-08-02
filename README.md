@@ -192,6 +192,12 @@ deleted:
   --redo individual --individual-runs 50 --yes
 ```
 
+GDB capture attempts are not combined across resumes. Before phase 6 runs or
+writes any terminal skip result, a prior incomplete attempt (metadata, capture,
+or runner log) and its stale derived reports are preserved together under one
+`state/superseded/` transaction. Empty setup directories are ignored, and an
+interrupted archive is recovered before phase execution on the next resume.
+
 ### Interpreting the report
 
 Rates are reported with Wilson 95% confidence intervals; the concentration

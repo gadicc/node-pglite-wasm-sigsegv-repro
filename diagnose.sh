@@ -51,6 +51,7 @@ ASSUME_YES=0
 REDO_PHASES=""
 declare -a REDO_PLAN=()
 REDO_MARKER_TEMP=""
+REDO_NEW_TXN_ID=""
 REDO_TXN_ID=""
 declare -a REDO_TXN_PHASES=()
 declare -a REDO_TXN_OWNERS=()
@@ -623,24 +624,43 @@ redo_transaction_execute() {
     fi
   done
   rm -f -- "$marker" || diag_die "pending redo completed but its transaction marker could not be removed"
-  diag_log "--redo: previous evidence preserved under ${stash#"$OUT_DIR"/}; phases ${REDO_TXN_PHASES[*]} will run fresh"
+  diag_log "archive: previous evidence preserved under ${stash#"$OUT_DIR"/}; phases ${REDO_TXN_PHASES[*]} will run fresh"
 }
 
 redo_record_if_present() {
   local kind="$1" owner="$2" path="$3"
   [[ -e "$OUT_DIR/$path" || -L "$OUT_DIR/$path" ]] || return 0
-  redo_source_parent_is_safe "$path" || diag_die "--redo source parent is unsafe for $path"
+  redo_source_parent_is_safe "$path" || diag_die "archive source parent is unsafe for $path"
   printf '%s\t%s\t%s\n' "$kind" "$owner" "$path"
+}
+
+redo_transaction_prepare() {
+  local pending="$STATE_DIR/redo.pending"
+  [[ ! -e "$pending" && ! -L "$pending" ]] ||
+    diag_die "a pending redo transaction must be recovered before starting another"
+  REDO_MARKER_TEMP="$(mktemp "$STATE_DIR/.redo.pending.XXXXXX")" ||
+    diag_die "cannot prepare redo transaction"
+  REDO_NEW_TXN_ID="redo-$(date +%Y%m%dT%H%M%S)-${REDO_MARKER_TEMP##*.}"
+}
+
+redo_transaction_publish() {
+  local pending="$STATE_DIR/redo.pending"
+  chmod 0600 "$REDO_MARKER_TEMP" || diag_die "cannot protect redo transaction"
+  redo_transaction_validate "$REDO_MARKER_TEMP" ||
+    diag_die "generated redo transaction failed validation"
+  mv -nT -- "$REDO_MARKER_TEMP" "$pending" || diag_die "cannot publish redo transaction"
+  [[ ! -e "$REDO_MARKER_TEMP" ]] || diag_die "another redo transaction appeared concurrently"
+  REDO_MARKER_TEMP=""
+  REDO_NEW_TXN_ID=""
+  redo_transaction_execute
 }
 
 apply_redo_plan() {
   ((${#REDO_PLAN[@]} > 0)) || return 0
-  local pending="$STATE_DIR/redo.pending"
-  [[ ! -e "$pending" && ! -L "$pending" ]] || diag_die "a pending redo transaction must be recovered before starting another"
-  REDO_MARKER_TEMP="$(mktemp "$STATE_DIR/.redo.pending.XXXXXX")" || diag_die "cannot prepare redo transaction"
-  local txn="redo-$(date +%Y%m%dT%H%M%S)-${REDO_MARKER_TEMP##*.}" phase path artifact
+  redo_transaction_prepare
+  local phase path artifact
   {
-    printf 'VERSION\t1\nTXN\t%s\n' "$txn"
+    printf 'VERSION\t1\nTXN\t%s\n' "$REDO_NEW_TXN_ID"
     for phase in "${REDO_PLAN[@]}"; do printf 'PHASE\t%s\n' "$phase"; done
     for path in results.json report.md privacy-review.txt manifest.txt; do
       redo_record_if_present DERIVED - "$path"
@@ -667,12 +687,7 @@ apply_redo_plan() {
       for path in "${paths[@]}"; do redo_record_if_present ARTIFACT "$phase" "$path"; done
     done
   } > "$REDO_MARKER_TEMP" || diag_die "cannot write redo transaction"
-  chmod 0600 "$REDO_MARKER_TEMP" || diag_die "cannot protect redo transaction"
-  redo_transaction_validate "$REDO_MARKER_TEMP" || diag_die "generated redo transaction failed validation"
-  mv -nT -- "$REDO_MARKER_TEMP" "$pending" || diag_die "cannot publish redo transaction"
-  [[ ! -e "$REDO_MARKER_TEMP" ]] || diag_die "another redo transaction appeared concurrently"
-  REDO_MARKER_TEMP=""
-  redo_transaction_execute
+  redo_transaction_publish
 }
 
 recover_pending_redo() {
@@ -686,6 +701,7 @@ redo_marker_temp_cleanup() {
   [[ -n "$REDO_MARKER_TEMP" ]] || return 0
   case "$REDO_MARKER_TEMP" in "$STATE_DIR"/.redo.pending.*) rm -f -- "$REDO_MARKER_TEMP" ;; esac
   REDO_MARKER_TEMP=""
+  REDO_NEW_TXN_ID=""
 }
 
 # ---------------------------------------------------------------------------
@@ -1506,6 +1522,63 @@ gdb_result_is_complete() {
   [[ "$1" == "0" || "$1" == "3" ]]
 }
 
+gdb_attempt_path_is_meaningful() {
+  local path="$1" entry=""
+  [[ -e "$path" || -L "$path" ]] || return 1
+  [[ -d "$path" && ! -L "$path" ]] || return 0
+  entry="$(find "$path" -mindepth 1 -maxdepth 1 -print -quit 2> /dev/null)" ||
+    return 0
+  [[ -n "$entry" ]]
+}
+
+gdb_incomplete_attempt_is_meaningful() {
+  phase_is_done gdb && return 1
+  [[ -e "$OUT_DIR/results/gdb.meta" || -L "$OUT_DIR/results/gdb.meta" ]] && return 0
+  gdb_attempt_path_is_meaningful "$OUT_DIR/gdb" && return 0
+  gdb_attempt_path_is_meaningful "$OUT_DIR/logs/gdb" && return 0
+  return 1
+}
+
+archive_incomplete_gdb_attempt() {
+  gdb_incomplete_attempt_is_meaningful || return 0
+  redo_transaction_prepare
+  local path
+  {
+    printf 'VERSION\t1\nTXN\t%s\nPHASE\tgdb\n' "$REDO_NEW_TXN_ID"
+    for path in results.json report.md privacy-review.txt manifest.txt; do
+      redo_record_if_present DERIVED - "$path"
+    done
+    for path in results/gdb.meta gdb logs/gdb; do
+      redo_record_if_present ARTIFACT gdb "$path"
+    done
+  } > "$REDO_MARKER_TEMP" || diag_die "cannot write incomplete GDB archive transaction"
+  redo_transaction_publish
+}
+
+phase_gdb_dispatch() {
+  local target_cpu="$1"
+  # A prior non-terminal attempt must be archived before any replacement,
+  # including a skip result. Empty directories created for a fresh bundle do
+  # not constitute an attempt.
+  archive_incomplete_gdb_attempt
+  if [[ "$SKIP_GDB" == "1" ]]; then
+    diag_log "phase 6/7: skipped (--skip-gdb)"
+    printf 'SKIPPED=1\nSKIP_REASON=--skip-gdb\n' > "$OUT_DIR/results/gdb.meta"
+    mark_done gdb
+  elif ! command -v gdb > /dev/null 2>&1; then
+    diag_warn "phase 6/7: gdb not installed; skipping"
+    printf 'SKIPPED=1\nSKIP_REASON=gdb not installed\n' > "$OUT_DIR/results/gdb.meta"
+    mark_done gdb
+  elif [[ -z "$target_cpu" ]]; then
+    diag_warn "phase 6/7: no failing CPU identified; skipping"
+    printf 'SKIPPED=1\nSKIP_REASON=no failing CPU identified\n' > "$OUT_DIR/results/gdb.meta"
+    mark_done gdb
+  else
+    diag_log "phase 6/7: gdb signature capture on cpu $target_cpu (max $GDB_MAX_RUNS runs)"
+    phase_gdb "$target_cpu"
+  fi
+}
+
 # ------------------------------------------------------------------
 write_privacy_review() {
   local review="$OUT_DIR/privacy-review.txt" file rel found=0
@@ -1856,21 +1929,8 @@ main() {
   # ---- phase 6 ----
   if phase_is_done gdb; then
     diag_log "phase 6/7 gdb: already done, skipping (resume)"
-  elif [[ "$SKIP_GDB" == "1" ]]; then
-    diag_log "phase 6/7: skipped (--skip-gdb)"
-    printf 'SKIPPED=1\nSKIP_REASON=--skip-gdb\n' > "$OUT_DIR/results/gdb.meta"
-    mark_done gdb
-  elif ! command -v gdb > /dev/null 2>&1; then
-    diag_warn "phase 6/7: gdb not installed; skipping"
-    printf 'SKIPPED=1\nSKIP_REASON=gdb not installed\n' > "$OUT_DIR/results/gdb.meta"
-    mark_done gdb
-  elif [[ -z "$target_cpu" ]]; then
-    diag_warn "phase 6/7: no failing CPU identified; skipping"
-    printf 'SKIPPED=1\nSKIP_REASON=no failing CPU identified\n' > "$OUT_DIR/results/gdb.meta"
-    mark_done gdb
   else
-    diag_log "phase 6/7: gdb signature capture on cpu $target_cpu (max $GDB_MAX_RUNS runs)"
-    phase_gdb "$target_cpu"
+    phase_gdb_dispatch "$target_cpu"
   fi
 
   # ---- phase 7 ----

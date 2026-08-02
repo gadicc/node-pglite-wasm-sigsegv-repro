@@ -805,6 +805,168 @@ gdb_redo_ok=0
   [[ ! -f "$GB/state/phase-gdb.done" ]] && gdb_redo_ok=1
 check_eq "--redo gdb preserves distinct capture and runner paths" "1" "$gdb_redo_ok"
 
+GDB_PREDICATE_RB="$TMP/gdb-incomplete-predicate"
+mkdir -p "$GDB_PREDICATE_RB"/{results,state,gdb,logs/gdb}
+gdb_predicate_result="$(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$GDB_PREDICATE_RB"
+  STATE_DIR="$GDB_PREDICATE_RB/state"
+  empty=0 meta=0 capture=0 log_entry=0 nondir=0 symlink=0 completed=0
+  gdb_incomplete_attempt_is_meaningful && empty=1
+  printf 'CPU=19\n' > "$GDB_PREDICATE_RB/results/gdb.meta"
+  gdb_incomplete_attempt_is_meaningful && meta=1
+  rm -f "$GDB_PREDICATE_RB/results/gdb.meta"
+  printf 'capture\n' > "$GDB_PREDICATE_RB/gdb/run1.txt"
+  gdb_incomplete_attempt_is_meaningful && capture=1
+  rm -f "$GDB_PREDICATE_RB/gdb/run1.txt"
+  printf 'runner\n' > "$GDB_PREDICATE_RB/logs/gdb/runner.log"
+  gdb_incomplete_attempt_is_meaningful && log_entry=1
+  rm -rf "$GDB_PREDICATE_RB/gdb" "$GDB_PREDICATE_RB/logs/gdb"
+  printf 'not a directory\n' > "$GDB_PREDICATE_RB/gdb"
+  gdb_incomplete_attempt_is_meaningful && nondir=1
+  rm -f "$GDB_PREDICATE_RB/gdb"
+  mkdir -p "$GDB_PREDICATE_RB/logs"
+  ln -s "$GDB_PREDICATE_RB/missing" "$GDB_PREDICATE_RB/logs/gdb"
+  gdb_incomplete_attempt_is_meaningful && symlink=1
+  touch "$GDB_PREDICATE_RB/state/phase-gdb.done"
+  gdb_incomplete_attempt_is_meaningful && completed=1
+  printf '%s|%s|%s|%s|%s|%s|%s\n' "$empty" "$meta" "$capture" "$log_entry" "$nondir" "$symlink" "$completed"
+)"
+check_eq "incomplete GDB predicate distinguishes empty setup from attempt evidence" \
+  "0|1|1|1|1|1|0" "$gdb_predicate_result"
+
+GDB_EMPTY_RB="$TMP/gdb-empty-retry-bundle"
+mkdir -p "$GDB_EMPTY_RB"/{results,state,gdb,logs/gdb}
+printf 'COMPLETED_PHASES=baseline\n' > "$GDB_EMPTY_RB/results/meta.env"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$GDB_EMPTY_RB"
+  STATE_DIR="$GDB_EMPTY_RB/state"
+  META_FILE="$GDB_EMPTY_RB/results/meta.env"
+  archive_incomplete_gdb_attempt
+) > /dev/null 2>&1
+gdb_empty_archive_rc=$?
+check_eq "empty precreated GDB directories do not create an archive transaction" "1" \
+  "$([[ $gdb_empty_archive_rc -eq 0 && -d "$GDB_EMPTY_RB/gdb" && -d "$GDB_EMPTY_RB/logs/gdb" && ! -e "$GDB_EMPTY_RB/state/redo.pending" && ! -e "$GDB_EMPTY_RB/state/superseded" ]] && echo 1 || echo 0)"
+
+GDB_RETRY_RB="$TMP/gdb-incomplete-retry-bundle"
+mkdir -p "$GDB_RETRY_RB"/{results,state,gdb,logs/gdb}
+printf 'CPU=19\nMAX_RUNS=6\nEXIT_CODE=5\n' > "$GDB_RETRY_RB/results/gdb.meta"
+printf 'old capture\n' > "$GDB_RETRY_RB/gdb/cpu19-run1.txt"
+printf 'old runner\n' > "$GDB_RETRY_RB/logs/gdb/runner.log"
+printf 'old results\n' > "$GDB_RETRY_RB/results.json"
+printf 'old report\n' > "$GDB_RETRY_RB/report.md"
+printf 'old review\n' > "$GDB_RETRY_RB/privacy-review.txt"
+printf 'old manifest\n' > "$GDB_RETRY_RB/manifest.txt"
+printf 'COMPLETED_PHASES=baseline\n' > "$GDB_RETRY_RB/results/meta.env"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$GDB_RETRY_RB"
+  STATE_DIR="$GDB_RETRY_RB/state"
+  META_FILE="$GDB_RETRY_RB/results/meta.env"
+  archive_incomplete_gdb_attempt
+  archive_incomplete_gdb_attempt
+) > /dev/null 2>&1
+gdb_retry_archive_rc=$?
+gdb_retry_stash="$(find "$GDB_RETRY_RB/state/superseded" -mindepth 1 -maxdepth 1 -type d -name 'redo-*' -print -quit)"
+gdb_retry_archive_ok=0
+[[ $gdb_retry_archive_rc -eq 0 ]] &&
+  [[ "$(find "$GDB_RETRY_RB/state/superseded" -mindepth 1 -maxdepth 1 -type d -name 'redo-*' | wc -l)" -eq 1 ]] &&
+  [[ "$(cat "$gdb_retry_stash/gdb/results/gdb.meta")" == $'CPU=19\nMAX_RUNS=6\nEXIT_CODE=5' ]] &&
+  [[ "$(cat "$gdb_retry_stash/gdb/gdb/cpu19-run1.txt")" == "old capture" ]] &&
+  [[ "$(cat "$gdb_retry_stash/gdb/logs/gdb/runner.log")" == "old runner" ]] &&
+  [[ "$(cat "$gdb_retry_stash/derived/results.json")" == "old results" ]] &&
+  [[ "$(cat "$gdb_retry_stash/derived/report.md")" == "old report" ]] &&
+  [[ "$(cat "$gdb_retry_stash/derived/privacy-review.txt")" == "old review" ]] &&
+  [[ "$(cat "$gdb_retry_stash/derived/manifest.txt")" == "old manifest" ]] &&
+  [[ ! -e "$GDB_RETRY_RB/results/gdb.meta" && ! -e "$GDB_RETRY_RB/gdb" && ! -e "$GDB_RETRY_RB/logs/gdb" ]] &&
+  [[ ! -e "$GDB_RETRY_RB/results.json" && ! -e "$GDB_RETRY_RB/report.md" ]] &&
+  [[ ! -e "$GDB_RETRY_RB/state/redo.pending" ]] && gdb_retry_archive_ok=1
+check_eq "incomplete GDB evidence and stale derived outputs share one stable archive" "1" "$gdb_retry_archive_ok"
+
+GDB_RETRY_FAIL_RB="$TMP/gdb-incomplete-retry-failure"
+mkdir -p "$GDB_RETRY_FAIL_RB"/{results,state,gdb,logs/gdb}
+printf 'CPU=19\nEXIT_CODE=5\n' > "$GDB_RETRY_FAIL_RB/results/gdb.meta"
+printf 'old capture\n' > "$GDB_RETRY_FAIL_RB/gdb/run1.txt"
+printf 'old runner\n' > "$GDB_RETRY_FAIL_RB/logs/gdb/runner.log"
+printf 'old report\n' > "$GDB_RETRY_FAIL_RB/report.md"
+printf 'COMPLETED_PHASES=baseline\n' > "$GDB_RETRY_FAIL_RB/results/meta.env"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$GDB_RETRY_FAIL_RB"
+  STATE_DIR="$GDB_RETRY_FAIL_RB/state"
+  META_FILE="$GDB_RETRY_FAIL_RB/results/meta.env"
+  move_count=0
+  mv() {
+    move_count=$((move_count + 1))
+    ((move_count != 3)) || return 97
+    command mv "$@"
+  }
+  archive_incomplete_gdb_attempt
+) > /dev/null 2>&1
+gdb_retry_fail_rc=$?
+gdb_retry_fail_stash="$(find "$GDB_RETRY_FAIL_RB/state/superseded" -mindepth 1 -maxdepth 1 -type d -name 'redo-*' -print -quit)"
+gdb_retry_failure_ok=0
+[[ $gdb_retry_fail_rc -ne 0 ]] &&
+  [[ -f "$GDB_RETRY_FAIL_RB/state/redo.pending" ]] &&
+  [[ "$(stat -c '%a' "$GDB_RETRY_FAIL_RB/state/redo.pending")" == 600 ]] &&
+  [[ "$(cat "$gdb_retry_fail_stash/derived/report.md")" == "old report" ]] &&
+  [[ -f "$GDB_RETRY_FAIL_RB/results/gdb.meta" ]] &&
+  [[ ! -e "$GDB_RETRY_FAIL_RB/state/phase-gdb.done" ]] && gdb_retry_failure_ok=1
+check_eq "incomplete GDB archive failure leaves a recoverable transaction" "1" "$gdb_retry_failure_ok"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$GDB_RETRY_FAIL_RB"
+  STATE_DIR="$GDB_RETRY_FAIL_RB/state"
+  META_FILE="$GDB_RETRY_FAIL_RB/results/meta.env"
+  recover_pending_redo
+  recover_pending_redo
+) > /dev/null 2>&1
+gdb_retry_recovery_rc=$?
+gdb_retry_recovery_ok=0
+[[ $gdb_retry_recovery_rc -eq 0 ]] &&
+  [[ ! -e "$GDB_RETRY_FAIL_RB/state/redo.pending" ]] &&
+  [[ "$(find "$GDB_RETRY_FAIL_RB/state/superseded" -mindepth 1 -maxdepth 1 -type d -name 'redo-*' | wc -l)" -eq 1 ]] &&
+  [[ -f "$gdb_retry_fail_stash/gdb/results/gdb.meta" ]] &&
+  [[ -f "$gdb_retry_fail_stash/gdb/gdb/run1.txt" ]] &&
+  [[ -f "$gdb_retry_fail_stash/gdb/logs/gdb/runner.log" ]] &&
+  [[ ! -e "$GDB_RETRY_FAIL_RB/results/gdb.meta" && ! -e "$GDB_RETRY_FAIL_RB/gdb" && ! -e "$GDB_RETRY_FAIL_RB/logs/gdb" ]] && gdb_retry_recovery_ok=1
+check_eq "incomplete GDB recovery finishes the same transaction idempotently" "1" "$gdb_retry_recovery_ok"
+
+GDB_SKIP_ORDER_RB="$TMP/gdb-incomplete-to-skip"
+mkdir -p "$GDB_SKIP_ORDER_RB"/{results,state,gdb,logs/gdb}
+printf 'CPU=19\nEXIT_CODE=5\n' > "$GDB_SKIP_ORDER_RB/results/gdb.meta"
+printf 'old capture\n' > "$GDB_SKIP_ORDER_RB/gdb/run1.txt"
+printf 'old runner\n' > "$GDB_SKIP_ORDER_RB/logs/gdb/runner.log"
+printf 'old report\n' > "$GDB_SKIP_ORDER_RB/report.md"
+printf 'COMPLETED_PHASES=baseline\n' > "$GDB_SKIP_ORDER_RB/results/meta.env"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$GDB_SKIP_ORDER_RB"
+  STATE_DIR="$GDB_SKIP_ORDER_RB/state"
+  META_FILE="$GDB_SKIP_ORDER_RB/results/meta.env"
+  SKIP_GDB=1
+  phase_gdb_dispatch 19
+) > /dev/null 2>&1
+gdb_skip_order_rc=$?
+gdb_skip_order_stash="$(find "$GDB_SKIP_ORDER_RB/state/superseded" -mindepth 1 -maxdepth 1 -type d -name 'redo-*' -print -quit)"
+gdb_skip_order_ok=0
+[[ $gdb_skip_order_rc -eq 0 ]] &&
+  [[ "$(cat "$gdb_skip_order_stash/gdb/results/gdb.meta")" == $'CPU=19\nEXIT_CODE=5' ]] &&
+  [[ "$(cat "$gdb_skip_order_stash/gdb/gdb/run1.txt")" == "old capture" ]] &&
+  [[ "$(cat "$gdb_skip_order_stash/gdb/logs/gdb/runner.log")" == "old runner" ]] &&
+  [[ "$(cat "$gdb_skip_order_stash/derived/report.md")" == "old report" ]] &&
+  [[ "$(cat "$GDB_SKIP_ORDER_RB/results/gdb.meta")" == $'SKIPPED=1\nSKIP_REASON=--skip-gdb' ]] &&
+  [[ -f "$GDB_SKIP_ORDER_RB/state/phase-gdb.done" ]] &&
+  [[ ! -e "$GDB_SKIP_ORDER_RB/state/redo.pending" ]] && gdb_skip_order_ok=1
+check_eq "explicit skip archives an incomplete GDB attempt before replacing metadata" "1" "$gdb_skip_order_ok"
+
 FB="$TMP/redo-frequency-bundle"
 mkdir -p "$FB"/{results,state,freq}
 printf 'A1\t1\t0\t2\n' > "$FB/results/frequency-ab.tsv"
