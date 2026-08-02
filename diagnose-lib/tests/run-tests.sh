@@ -648,6 +648,7 @@ fi
 echo "== end-to-end collect + report on synthetic bundle =="
 B="$TMP/bundle"
 mkdir -p "$B"/{results,logs/baseline,logs/groups,env,freq,gdb,state}
+touch "$B/state/phase-frequency.done"
 
 cat > "$B/results/meta.env" << EOF
 MODE=default
@@ -720,7 +721,6 @@ B	1	0	3
 B	2	0	3
 B	3	0	3
 B	4	0	3
-B	5	126	0
 A2	1	139	2
 A2	2	139	2
 A2	3	0	2
@@ -779,13 +779,12 @@ check("gdb signature match", r.gdb.captures.length === 1 && r.gdb.captures[0].ma
 check("gdb capture file trimmed", r.gdb.captures[0].mappings === undefined);
 check("freq ab restored + legs", r.frequencyAb.restored === true && r.frequencyAb.legs.length === 3);
 check("freq leg B measured clock", r.frequencyAb.legs[1].frequency.avgMHz === 2100);
-check("freq leg B invalid run excluded", r.frequencyAb.legs[1].runs === 4 && r.frequencyAb.legs[1].invalidRuns.length === 1);
 check("group failure tally", r.groups.length === 2 && r.groups[1].sigsegvCount === 2 && r.groups[0].sigsegvCount === 0);
 check("root checks merged", Boolean(r.rootChecks) && r.rootChecks["cctk.txt"].includes("IntelTME=Disabled"));
 process.exit(failures === 0 ? 0 : 1);
 EOF
 if node "$TMP/check-results.mjs" "$B/results.json"; then
-  pass=$((pass + 13))
+  pass=$((pass + 12))
 else
   fail=$((fail + 1))
 fi
@@ -800,8 +799,6 @@ grep -q "documented pattern" "$B/report.md"
 check_eq "report contains signature conclusion" "0" "$?"
 grep -q "Fisher exact" "$B/report.md"
 check_eq "report contains Fisher test" "0" "$?"
-grep -q "1 invalid run(s) excluded (non-SIGSEGV exits)" "$B/report.md"
-check_eq "report notes excluded invalid runs" "0" "$?"
 grep -q "TME" "$B/report.md"
 check_eq "report contains TME rule-out" "0" "$?"
 grep -q "battery" "$B/report.md"

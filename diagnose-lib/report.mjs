@@ -251,6 +251,14 @@ export function renderReport(results) {
       }
       L.push("");
     }
+  } else if (r.frequencyAbStatus?.status === "incomplete") {
+    L.push("Incomplete manual A/B/A artifacts were preserved but excluded from");
+    L.push("all statistics and conclusions:");
+    for (const reason of r.frequencyAbStatus.reasons ?? []) L.push(`- ${reason}`);
+    L.push("");
+    L.push("Finish or redo the manual experiment, then run");
+    L.push("`./diagnose.sh --resume <this bundle> --yes` to regenerate this report.");
+    L.push("");
   } else {
     L.push("Not run automatically. This experiment changes `intel_pstate`");
     L.push("settings, so it is only ever performed manually as root:");
@@ -411,6 +419,8 @@ function renderConclusions(r) {
         C.push(`- Frequency A/B/A: turbo-on ${aF}/${aN}, turbo-off ${bF}/${bN} (SIGSEGV over valid runs); Fisher exact p = ${p.toExponential(2)} — inconclusive at this sample size.${invalidNote}`);
       }
     }
+  } else if (r.frequencyAbStatus?.status === "incomplete") {
+    C.push("- Frequency dependence was not analyzed because the manual A/B/A artifacts are incomplete or restoration was not verified.");
   } else {
     C.push("- Frequency dependence was not tested (requires the manual `sudo ./frequency-ab.sh` step).");
   }

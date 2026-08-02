@@ -3,7 +3,13 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { summarizeFreqSamples, collect, collectIndividual, collectFreqAb } from "../collect.mjs";
+import {
+  assessFrequencyAb,
+  collect,
+  collectFreqAb,
+  collectIndividual,
+  summarizeFreqSamples,
+} from "../collect.mjs";
 
 // Representative capture from `turbostat --quiet --interval 1` (no --Summary):
 // the header repeats every interval, the "- -" row is the whole-system
@@ -128,6 +134,45 @@ test("collectFreqAb: legs count only clean/SIGSEGV rows as valid runs", () => {
   assert.equal(b.runs, 1);
   assert.equal(b.failures, 0);
   assert.deepEqual(b.invalidRuns.map((f) => f.signal), ["SIGABRT"]);
+});
+
+test("assessFrequencyAb: requires completion, restoration, marker, and exact rows", () => {
+  const partial = assessFrequencyAb(
+    [["A1", "1", "139", "2"]],
+    { RUNS_PER_LEG: "1", RESTORED: "0", COMPLETED: "0" },
+    false,
+  );
+  assert.equal(partial.status, "incomplete");
+  assert.match(partial.reasons.join("; "), /completion marker/);
+  assert.match(partial.reasons.join("; "), /not marked complete/);
+  assert.match(partial.reasons.join("; "), /not verified as restored/);
+  assert.match(partial.reasons.join("; "), /every expected/);
+
+  const complete = assessFrequencyAb(
+    [
+      ["A1", "1", "139", "2"],
+      ["B", "1", "0", "3"],
+      ["A2", "1", "0", "2"],
+    ],
+    { RUNS_PER_LEG: "1", RESTORED: "1", COMPLETED: "1" },
+    true,
+  );
+  assert.deepEqual(complete, { status: "complete", reasons: [] });
+});
+
+test("collect: incomplete frequency artifacts are preserved as status, not evidence", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "collect-test-"));
+  tmpDirs.push(dir);
+  mkdirSync(path.join(dir, "results"));
+  writeFileSync(path.join(dir, "results", "frequency-ab.tsv"), "A1\t1\t139\t2\n");
+  writeFileSync(
+    path.join(dir, "results", "frequency-ab.meta"),
+    "RUNS_PER_LEG=1\nRESTORED=0\nCOMPLETED=0\n",
+  );
+
+  const r = collect(dir);
+  assert.equal(r.frequencyAb, undefined);
+  assert.equal(r.frequencyAbStatus.status, "incomplete");
 });
 
 test("collect: worstCpu ranks by SIGSEGV, ignoring non-SIGSEGV exits", () => {

@@ -242,6 +242,53 @@ export function collectFreqAb(outDir, rows, meta) {
   return result;
 }
 
+export function assessFrequencyAb(rows, meta, phaseDone) {
+  const hasArtifacts = rows.length > 0 || Object.keys(meta).length > 0 || phaseDone;
+  if (!hasArtifacts) return { status: "not-run", reasons: [] };
+
+  const reasons = [];
+  if (!phaseDone) reasons.push("phase completion marker is missing");
+  if (meta.COMPLETED !== "1") reasons.push("frequency metadata is not marked complete");
+  if (meta.RESTORED !== "1") reasons.push("frequency settings are not verified as restored");
+
+  const runs = Number(meta.RUNS_PER_LEG);
+  if (!/^\d+$/.test(meta.RUNS_PER_LEG ?? "") || !Number.isSafeInteger(runs) || runs < 1) {
+    reasons.push("RUNS_PER_LEG is missing or invalid");
+  } else {
+    const counts = { A1: 0, B: 0, A2: 0 };
+    const seen = new Set();
+    let invalidRow = false;
+    for (const row of rows) {
+      const [leg, runS, rcS, elapsedS] = row;
+      const run = Number(runS);
+      const elapsed = Number(elapsedS);
+      const valid =
+        row.length === 4 &&
+        Object.hasOwn(counts, leg) &&
+        /^\d+$/.test(runS) &&
+        Number.isSafeInteger(run) &&
+        run >= 1 &&
+        run <= runs &&
+        (rcS === "0" || rcS === "139") &&
+        /^\d+$/.test(elapsedS) &&
+        Number.isSafeInteger(elapsed);
+      const key = `${leg}:${runS}`;
+      if (!valid || seen.has(key)) {
+        invalidRow = true;
+        continue;
+      }
+      seen.add(key);
+      counts[leg] += 1;
+    }
+    if (invalidRow) reasons.push("frequency results contain an invalid or duplicate row");
+    if (Object.values(counts).some((count) => count !== runs)) {
+      reasons.push("frequency results do not contain every expected A1/B/A2 run");
+    }
+  }
+
+  return reasons.length > 0 ? { status: "incomplete", reasons } : { status: "complete", reasons: [] };
+}
+
 export function collect(outDir) {
   const meta = readKeyValues(path.join(outDir, "results", "meta.env"));
   const envSummary = readKeyValues(path.join(outDir, "env", "summary.env"));
@@ -351,7 +398,12 @@ export function collect(outDir) {
   // --- frequency A/B/A ---
   const freqAbRows = readTsv(path.join(resultsDir, "frequency-ab.tsv"));
   const freqAbMeta = readKeyValues(path.join(resultsDir, "frequency-ab.meta"));
-  if (freqAbRows.length > 0) {
+  results.frequencyAbStatus = assessFrequencyAb(
+    freqAbRows,
+    freqAbMeta,
+    existsSync(path.join(outDir, "state", "phase-frequency.done")),
+  );
+  if (results.frequencyAbStatus.status === "complete") {
     results.frequencyAb = collectFreqAb(outDir, freqAbRows, freqAbMeta);
   }
 

@@ -150,6 +150,21 @@ test("renderReport: partial baseline and group data are marked as truncated", ()
   assert.ok(!complete.includes("log truncated"));
 });
 
+test("renderReport: incomplete frequency artifacts are excluded from conclusions", () => {
+  const md = renderReport({
+    collectedAt: "2026-08-02T00:00:00.000Z",
+    config: {},
+    environment: {},
+    frequencyAbStatus: {
+      status: "incomplete",
+      reasons: ["frequency settings are not verified as restored"],
+    },
+  });
+  assert.match(md, /artifacts were preserved but excluded/);
+  assert.match(md, /Frequency dependence was not analyzed/);
+  assert.doesNotMatch(md, /Frequency dependence was not tested \(requires/);
+});
+
 test("parseGdbCapture: known +2^42 signature (real transcript)", () => {
   const r = parseGdbCapture(readFixture("gdb-known.txt"));
   assert.equal(r.captured, true);
