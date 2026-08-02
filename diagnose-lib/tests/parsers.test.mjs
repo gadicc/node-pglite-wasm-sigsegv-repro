@@ -335,6 +335,7 @@ test("parseGdbCapture: known +2^42 signature (real transcript)", () => {
   assert.equal(r.intendedMapped, true);
   assert.equal(r.intendedWritable, true);
   assert.equal(r.intendedMappingFile, "[heap]");
+  assert.equal(r.mappingsComplete, true);
   assert.equal(r.siAddrMapped, false);
   assert.equal(r.addrDiffHex, "0x40000000000");
   assert.deepEqual(r.diffBits, [42]);
@@ -346,6 +347,15 @@ test("parseGdbCapture: known +2^42 signature (real transcript)", () => {
   assert.ok(r.mappings.length > 100);
 });
 
+test("parseGdbCapture: accepts GDB's lowercase objfile mapping header", () => {
+  const text = readFixture("gdb-known.txt").replace("Perms File ", "Perms objfile ");
+  const r = parseGdbCapture(text);
+  assert.equal(r.mappingsComplete, true);
+  assert.equal(r.siAddrMapped, false);
+  assert.equal(r.matchesKnownSignature, true);
+  assert.equal(r.classification, "known-signature");
+});
+
 test("parseGdbCapture: unknown instruction is preserved for manual review", () => {
   const r = parseGdbCapture(readFixture("gdb-unknown.txt"));
   assert.equal(r.captured, true);
@@ -355,6 +365,7 @@ test("parseGdbCapture: unknown instruction is preserved for manual review", () =
   assert.equal(r.instruction, "mov %rax,0x10(%rbx)");
   assert.equal(r.siAddr, "0x1000010");
   assert.equal(r.intendedAddr, null);
+  assert.equal(r.mappingsComplete, true);
   assert.equal(r.siAddrMapped, false);
   assert.ok(r.notes.some((n) => n.includes("manual classification")));
   assert.equal(r.threadCount, 2);
@@ -376,8 +387,84 @@ test("parseGdbCapture: bit-flip arithmetic without mapping data is unverified", 
   assert.equal(r.matchesKnownArithmetic, true);
   assert.equal(r.matchesKnownSignature, false);
   assert.equal(r.classification, "bit-flip-unverified");
-  assert.ok(r.notes.some((n) => n.includes("no mapping data in transcript")));
+  assert.ok(r.notes.some((n) => n.includes("no complete mapping data in transcript")));
   assert.ok(r.notes.some((n) => n.includes("mapping preconditions are not verified")));
+});
+
+test("parseGdbCapture: complete-looking legacy mappings without a marker cannot confirm absence", () => {
+  const text = readFixture("gdb-known.txt").replace("MAPPINGS_COMPLETE=1\n", "");
+  const r = parseGdbCapture(text);
+  assert.equal(r.mappings.length > 100, true);
+  assert.equal(r.mappingsComplete, false);
+  assert.equal(r.intendedMapped, true);
+  assert.equal(r.intendedWritable, true);
+  assert.equal(r.siAddrMapped, null);
+  assert.equal(r.matchesKnownArithmetic, true);
+  assert.equal(r.matchesKnownSignature, false);
+  assert.equal(r.classification, "bit-flip-unverified");
+  assert.ok(r.notes.some((n) => n.includes("mapping table did not complete")));
+});
+
+test("parseGdbCapture: truncated mappings retain positive membership but not absence", () => {
+  const lines = readFixture("gdb-known.txt").split("\n");
+  const heapRow = lines.findIndex((line) => line.endsWith("rw-p  [heap] "));
+  assert.notEqual(heapRow, -1);
+  const r = parseGdbCapture(`${lines.slice(0, heapRow + 1).join("\n")}\n`);
+  assert.equal(r.mappingsComplete, false);
+  assert.equal(r.intendedMapped, true);
+  assert.equal(r.intendedWritable, true);
+  assert.equal(r.siAddrMapped, null);
+  assert.equal(r.matchesKnownSignature, false);
+  assert.equal(r.classification, "bit-flip-unverified");
+});
+
+test("parseGdbCapture: an unrecognized marked mapping row fails closed", () => {
+  const text = readFixture("gdb-known.txt").replace(
+    "MAPPINGS_COMPLETE=1",
+    "0x0000040006700000 0x0000040006800000 rw-p [shifted alternate format]\nMAPPINGS_COMPLETE=1",
+  );
+  const r = parseGdbCapture(text);
+  assert.equal(r.mappingsComplete, false);
+  assert.equal(r.intendedMapped, true);
+  assert.equal(r.siAddrMapped, null);
+  assert.equal(r.matchesKnownSignature, false);
+  assert.equal(r.classification, "bit-flip-unverified");
+  assert.ok(r.notes.some((n) => n.includes("unrecognized nonblank row")));
+});
+
+test("parseGdbCapture: impossible mapping permissions fail closed", () => {
+  const text = readFixture("gdb-known.txt").replace("rw-p  [heap]", "wwwp  [heap]");
+  const r = parseGdbCapture(text);
+  assert.equal(r.mappingsComplete, false);
+  assert.equal(r.intendedMapped, null);
+  assert.equal(r.intendedWritable, null);
+  assert.equal(r.siAddrMapped, null);
+  assert.equal(r.matchesKnownSignature, false);
+  assert.equal(r.classification, "bit-flip-unverified");
+});
+
+test("parseGdbCapture: a hidden row before the mapping header fails closed", () => {
+  const header = "Start Addr         End Addr           Size               Offset             Perms File ";
+  const text = readFixture("gdb-known.txt").replace(
+    header,
+    `0x0000040006700000 0x0000040006800000 0x100000           0x0                rw-p  [pre-header shifted]\n${header}`,
+  );
+  const r = parseGdbCapture(text);
+  assert.equal(r.mappingsComplete, false);
+  assert.equal(r.intendedMapped, true);
+  assert.equal(r.siAddrMapped, null);
+  assert.equal(r.matchesKnownSignature, false);
+  assert.equal(r.classification, "bit-flip-unverified");
+  assert.ok(r.notes.some((n) => n.includes("before its expected header")));
+});
+
+test("parseGdbCapture: rows after the completion marker are not mapping evidence", () => {
+  const text = `${readFixture("gdb-known.txt")}0x0000040006700000 0x0000040006800000 0x100000           0x0                rw-p  [late shifted]\n`;
+  const r = parseGdbCapture(text);
+  assert.equal(r.mappingsComplete, true);
+  assert.equal(r.siAddrMapped, false);
+  assert.equal(r.matchesKnownSignature, true);
+  assert.equal(r.mappings.some((mapping) => mapping.file === "[late shifted]"), false);
 });
 
 test("parseGdbCapture: explicit nil SI_ADDR cannot be overwritten by CR2-like values", () => {
@@ -429,9 +516,10 @@ test("parseGdbCapture: bit-flip into a non-writable mapping is unverified", () =
 
 test("parseGdbCapture: bit-flip with intended address unmapped is unverified", () => {
   const base = readFixture("gdb-known.txt").split("Mapped address spaces:")[0];
-  const text = `${base}Mapped address spaces:\n\nStart Addr         End Addr           Size               Offset             Perms File \n0x0000000000400000 0x000000000078f000 0x38f000           0x0                r--p  /usr/bin/node \n0x00007ffffffde000 0x00007ffffffff000 0x21000            0x0                rw-p  [stack] \n`;
+  const text = `${base}Mapped address spaces:\n\nStart Addr         End Addr           Size               Offset             Perms File \n0x0000000000400000 0x000000000078f000 0x38f000           0x0                r--p  /usr/bin/node \n0x00007ffffffde000 0x00007ffffffff000 0x21000            0x0                rw-p  [stack] \nMAPPINGS_COMPLETE=1\n`;
   const r = parseGdbCapture(text);
   assert.equal(r.mappings.length, 2);
+  assert.equal(r.mappingsComplete, true);
   assert.equal(r.intendedMapped, false);
   assert.equal(r.intendedWritable, false);
   assert.equal(r.matchesKnownArithmetic, true);
@@ -441,8 +529,12 @@ test("parseGdbCapture: bit-flip with intended address unmapped is unverified", (
 });
 
 test("parseGdbCapture: mapped shifted address is not a confirmed signature", () => {
-  const text = `${readFixture("gdb-known.txt")}\n0x0000040006700000 0x0000040006800000 0x100000           0x0                rw-p  [shifted]\n`;
+  const text = readFixture("gdb-known.txt").replace(
+    "0x000004d1f3e00000",
+    "0x0000040006700000 0x0000040006800000 0x100000           0x0                rw-p  [shifted]\n0x000004d1f3e00000",
+  );
   const r = parseGdbCapture(text);
+  assert.equal(r.mappingsComplete, true);
   assert.equal(r.intendedMapped, true);
   assert.equal(r.intendedWritable, true);
   assert.equal(r.siAddrMapped, true);

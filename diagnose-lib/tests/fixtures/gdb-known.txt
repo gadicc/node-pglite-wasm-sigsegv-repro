@@ -271,3 +271,4 @@ Start Addr         End Addr           Size               Offset             Perm
 0x00007ffff7ffe000 0x00007ffff7fff000 0x1000             0x0                rw-p   
 0x00007ffffffde000 0x00007ffffffff000 0x21000            0x0                rw-p  [stack] 
 0xffffffffff600000 0xffffffffff601000 0x1000             0x0                --xp  [vsyscall] 
+MAPPINGS_COMPLETE=1

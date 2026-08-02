@@ -53,6 +53,7 @@ export function parseGdbCapture(text) {
     threadCount: 0,
     processId: null,
     mappings: [],
+    mappingsComplete: false,
     classification: "no-fault",
     knownInstruction: false,
     intendedAddr: null,
@@ -69,6 +70,10 @@ export function parseGdbCapture(text) {
 
   let inMappings = false;
   let mappingHeaderSeen = false;
+  let mappingCollectionClosed = false;
+  let mappingTableValid = true;
+  let lastMappingEnd = null;
+  let mappingIssueNoted = false;
   let sawInstruction = false;
   const explicitSiAddrSeen = lines.some((line) => /^SI_ADDR=/.test(line));
 
@@ -145,26 +150,77 @@ export function parseGdbCapture(text) {
       continue;
     }
 
-    if (/^Mapped address spaces:/.test(line)) {
+    if (line === "MAPPINGS_COMPLETE=1") {
+      if (inMappings && mappingHeaderSeen && mappingTableValid) {
+        out.mappingsComplete = true;
+      } else {
+        out.notes.push(
+          inMappings && mappingHeaderSeen
+            ? "mapping-completion marker followed an invalid or unrecognized mapping row"
+            : "mapping-completion marker appeared outside a mapping table",
+        );
+      }
+      inMappings = false;
+      mappingCollectionClosed = true;
+      continue;
+    }
+    if (!mappingCollectionClosed && !inMappings && /^Mapped address spaces:/.test(line)) {
       inMappings = true;
       mappingHeaderSeen = false;
+      mappingTableValid = true;
+      lastMappingEnd = null;
+      mappingIssueNoted = false;
       continue;
     }
     if (inMappings) {
       if (!mappingHeaderSeen) {
-        if (/Start Addr/.test(line)) mappingHeaderSeen = true;
+        if (
+          /^\s*Start Addr\s+End Addr\s+Size\s+Offset\s+Perms(?:\s+(?:File|[Oo]bjfile))?\s*$/.test(
+            line,
+          )
+        ) {
+          mappingHeaderSeen = true;
+        } else if (line.trim() !== "") {
+          mappingTableValid = false;
+          if (!mappingIssueNoted) {
+            out.notes.push("mapping table contains content before its expected header");
+            mappingIssueNoted = true;
+          }
+        }
         continue;
       }
       m = line.match(
-        /^(0x[0-9a-f]+)\s+(0x[0-9a-f]+)\s+(0x[0-9a-f]+)\s+(0x[0-9a-f]+)\s+([rwxps-]{4,5})\s*(.*)$/,
+        /^(0x[0-9a-f]+)\s+(0x[0-9a-f]+)\s+(0x[0-9a-f]+)\s+(0x[0-9a-f]+)\s+([r-][w-][x-][ps])\s*(.*)$/,
       );
       if (m) {
-        out.mappings.push({
-          start: m[1],
-          end: m[2],
-          perms: m[5],
-          file: m[6].trim(),
-        });
+        const start = BigInt(m[1]);
+        const end = BigInt(m[2]);
+        const size = BigInt(m[3]);
+        if (
+          end <= start ||
+          size !== end - start ||
+          (lastMappingEnd !== null && start < lastMappingEnd)
+        ) {
+          mappingTableValid = false;
+          if (!mappingIssueNoted) {
+            out.notes.push("mapping table contains invalid bounds, size, order, or overlap");
+            mappingIssueNoted = true;
+          }
+        } else {
+          out.mappings.push({
+            start: m[1],
+            end: m[2],
+            perms: m[5],
+            file: m[6].trim(),
+          });
+          lastMappingEnd = end;
+        }
+      } else if (line.trim() !== "") {
+        mappingTableValid = false;
+        if (!mappingIssueNoted) {
+          out.notes.push("mapping table contains an unrecognized nonblank row");
+          mappingIssueNoted = true;
+        }
       }
       continue;
     }
@@ -182,17 +238,18 @@ export function parseGdbCapture(text) {
   }
   out.classification = "manual";
 
-  // Locate si_addr relative to mappings. No mapping rows means "unknown"
-  // (null), which is distinct from "not among the parsed mappings" (false).
+  // A parsed mapping proves membership even in a truncated table. Absence only
+  // proves an address is unmapped when GDB reached the command immediately
+  // following `info proc mappings` and emitted its completion marker.
   const hasMappings = out.mappings.length > 0;
   const findMapping = (addrBig) =>
     out.mappings.find(
       (mp) => BigInt(mp.start) <= addrBig && addrBig < BigInt(mp.end),
     );
 
-  if (out.siAddr !== null && hasMappings) {
+  if (out.siAddr !== null) {
     const si = BigInt(out.siAddr);
-    out.siAddrMapped = Boolean(findMapping(si));
+    out.siAddrMapped = findMapping(si) ? true : out.mappingsComplete ? false : null;
   }
 
   // Intended address for the exact known instructions only.
@@ -208,12 +265,12 @@ export function parseGdbCapture(text) {
       const intended = BigInt(baseHex) + known.displacement;
       out.intendedAddr = `0x${intended.toString(16)}`;
       const intendedMap = findMapping(intended);
-      if (hasMappings) {
-        out.intendedMapped = Boolean(intendedMap);
-        out.intendedWritable = intendedMap
-          ? intendedMap.perms.includes("w")
-          : false;
-      }
+      out.intendedMapped = intendedMap ? true : out.mappingsComplete ? false : null;
+      out.intendedWritable = intendedMap
+        ? intendedMap.perms.includes("w")
+        : out.mappingsComplete
+          ? false
+          : null;
       if (intendedMap) out.intendedMappingFile = intendedMap.file;
 
       if (out.siAddr !== null) {
@@ -240,8 +297,8 @@ export function parseGdbCapture(text) {
             out.classification = "known-signature";
           } else {
             out.classification = "bit-flip-unverified";
-            const reason = !hasMappings
-              ? "no mapping data in transcript; address validity is unknown"
+            const reason = !out.mappingsComplete && !hasMappings
+              ? "no complete mapping data in transcript; address validity is unknown"
               : out.intendedMapped === false
                 ? "intended address not found in process mappings"
                 : out.intendedWritable === false
@@ -249,7 +306,7 @@ export function parseGdbCapture(text) {
                   : out.siAddrMapped === true
                     ? "shifted fault address is itself mapped"
                     : out.siAddrMapped !== false
-                      ? "shifted fault address mapping state is unknown"
+                      ? "mapping table did not complete; shifted fault address mapping state is unknown"
                       : "fault address came from an ambiguous legacy GDB convenience variable";
             out.notes.push(
               `si_addr matches the +2^42 single-bit-42 arithmetic, but the mapping preconditions are not verified: ${reason}`,

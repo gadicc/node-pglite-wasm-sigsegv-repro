@@ -36,3 +36,4 @@ Start Addr         End Addr           Size               Offset             Perm
 0x0000000000400000 0x000000000078f000 0x38f000           0x0                r--p  /usr/bin/node
 0x0000000006658000 0x0000000007129000 0xad1000           0x0                rw-p  [heap]
 0x00007ffffffde000 0x00007ffffffff000 0x21000            0x0                rw-p  [stack]
+MAPPINGS_COMPLETE=1

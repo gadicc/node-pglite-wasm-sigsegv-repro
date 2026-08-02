@@ -75,6 +75,7 @@ for ((run = 1; run <= max_runs; run++)); do
       -ex "printf \"CR2=%p\n\", (void*)\$cr2" \
       -ex "info threads" \
       -ex "info proc mappings" \
+      -ex "printf \"MAPPINGS_COMPLETE=1\\n\"" \
       --args "$node_bin" child.mjs
   } > "$out" 2>&1
 
