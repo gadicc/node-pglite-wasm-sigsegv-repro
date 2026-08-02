@@ -165,9 +165,12 @@ deleted:
 
 ### Interpreting the report
 
-Rates are reported with Wilson 95% confidence intervals; groups/CPUs are
-compared with Fisher's exact test; the frequency legs get an exact
-comparison plus, separately labelled, the binomial probability of the
+Rates are reported with Wilson 95% confidence intervals; the concentration
+of failures across CPUs is assessed with a permutation test (chi-square
+statistic over the per-CPU counts, seeded shuffles — never a Fisher test on
+an outcome-defined grouping); the frequency legs get an exact
+comparison on SIGSEGV counts over valid runs plus, separately labelled, the
+binomial probability of the
 clean leg *under an assumed fixed baseline rate*. Wave failures are kept
 distinct from individual child-process failures. The conclusions section
 states only what this run supports: whether the problem reproduced,
