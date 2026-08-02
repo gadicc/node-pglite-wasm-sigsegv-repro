@@ -10,6 +10,19 @@ import { renderReport } from "../report.mjs";
 const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 const readFixture = (name) => readFileSync(path.join(fixtures, name), "utf8");
 
+function assertFailureSlots(r) {
+  const summaryFailures = r.waves.reduce((sum, wave) => sum + wave.of - wave.passed, 0);
+  assert.equal(
+    r.sigsegvCount + r.otherFailureCount + r.unclassifiedFailureCount,
+    summaryFailures,
+  );
+  assert.ok(summaryFailures <= r.totalChildInvocations);
+  assert.equal(
+    new Set(r.failures.map((failure) => `${failure.wave}:${failure.child}`)).size,
+    r.failures.length,
+  );
+}
+
 test("parseReproLog: epoch-prefixed log with failures", () => {
   const r = parseReproLog(readFixture("repro-fail.log"));
   assert.equal(r.node, "v25.2.1");
@@ -216,8 +229,187 @@ test("parseReproLog: child detail attached to a duplicate row cannot migrate", (
   assert.equal(r.completionStatus, "inconsistent");
   assert.equal(r.totalChildInvocations, 4);
   assert.equal(r.sigsegvCount, 0);
+  assert.equal(r.otherFailureCount, 0);
+  assert.equal(r.unclassifiedFailureCount, 0);
   assert.equal(r.failures.length, 0);
+  assertFailureSlots(r);
   assert.ok(r.notes.some((note) => note.includes("rejected wave=1")));
+});
+
+test("parseReproLog: exact duplicate child detail does not inflate a failure slot", () => {
+  const r = parseReproLog([
+    "node=v25.2.1 v8=14.1 platform=linux arch=x64 children=2 waves=1",
+    "wave=1 passed=1/2",
+    "child=1 code=null signal=SIGSEGV elapsedMs=4",
+    "child=1 code=null signal=SIGSEGV elapsedMs=4",
+    "failedWaves=1 completedWaves=1 requestedWaves=1",
+  ].join("\n"));
+  assert.equal(r.sigsegvCount, 1);
+  assert.equal(r.otherFailureCount, 0);
+  assert.equal(r.unclassifiedFailureCount, 0);
+  assert.equal(r.failures.length, 1);
+  assert.match(r.issues.map(({ code }) => code).join(" "), /duplicate-child-detail/);
+  assertFailureSlots(r);
+});
+
+test("parseReproLog: conflicting duplicate makes its failure slot unclassified", () => {
+  const r = parseReproLog([
+    "node=v25.2.1 v8=14.1 platform=linux arch=x64 children=2 waves=1",
+    "wave=1 passed=1/2",
+    "child=1 code=null signal=SIGSEGV elapsedMs=4",
+    "child=1 code=13 signal=null elapsedMs=5",
+    "failedWaves=1 completedWaves=1 requestedWaves=1",
+  ].join("\n"));
+  assert.equal(r.sigsegvCount, 0);
+  assert.equal(r.otherFailureCount, 0);
+  assert.equal(r.unclassifiedFailureCount, 1);
+  assert.equal(r.failures.length, 0);
+  assert.match(r.issues.map(({ code }) => code).join(" "), /conflicting-child-detail/);
+  assertFailureSlots(r);
+});
+
+test("parseReproLog: elapsed-only duplicate disagreement retains the unambiguous outcome", () => {
+  const r = parseReproLog([
+    "node=v25.2.1 v8=14.1 platform=linux arch=x64 children=2 waves=1",
+    "wave=1 passed=1/2",
+    "child=1 code=null signal=SIGSEGV elapsedMs=4",
+    "child=1 code=null signal=SIGSEGV elapsedMs=5",
+    "failedWaves=1 completedWaves=1 requestedWaves=1",
+  ].join("\n"));
+  assert.equal(r.sigsegvCount, 1);
+  assert.equal(r.otherFailureCount, 0);
+  assert.equal(r.unclassifiedFailureCount, 0);
+  assert.equal(r.failures.length, 1);
+  assert.equal(r.failures[0].elapsedMs, null);
+  assert.match(r.issues.map(({ code }) => code).join(" "), /duplicate-child-metadata/);
+  assertFailureSlots(r);
+});
+
+test("parseReproLog: overfull unique child detail classifies none", () => {
+  const r = parseReproLog([
+    "node=v25.2.1 v8=14.1 platform=linux arch=x64 children=3 waves=1",
+    "wave=1 passed=2/3",
+    "child=1 code=null signal=SIGSEGV elapsedMs=4",
+    "child=2 code=13 signal=null elapsedMs=5",
+    "failedWaves=1 completedWaves=1 requestedWaves=1",
+  ].join("\n"));
+  assert.equal(r.sigsegvCount, 0);
+  assert.equal(r.otherFailureCount, 0);
+  assert.equal(r.unclassifiedFailureCount, 1);
+  assert.equal(r.failures.length, 0);
+  assert.match(r.issues.map(({ code }) => code).join(" "), /overfull-child-details/);
+  assertFailureSlots(r);
+});
+
+test("parseReproLog: child ids outside 1..of never contribute", () => {
+  const r = parseReproLog([
+    "node=v25.2.1 v8=14.1 platform=linux arch=x64 children=2 waves=1",
+    "wave=1 passed=0/2",
+    "child=0 code=null signal=SIGSEGV elapsedMs=4",
+    "child=3 code=13 signal=null elapsedMs=5",
+    "failedWaves=1 completedWaves=1 requestedWaves=1",
+  ].join("\n"));
+  assert.equal(r.sigsegvCount, 0);
+  assert.equal(r.otherFailureCount, 0);
+  assert.equal(r.unclassifiedFailureCount, 2);
+  assert.equal(r.failures.length, 0);
+  assert.equal(r.issues.filter(({ code }) => code === "child-out-of-range").length, 2);
+  assertFailureSlots(r);
+});
+
+test("parseReproLog: impossible child outcomes remain unclassified", () => {
+  const r = parseReproLog([
+    "node=v25.2.1 v8=14.1 platform=linux arch=x64 children=4 waves=1",
+    "wave=1 passed=0/4",
+    "child=1 code=0 signal=null elapsedMs=4",
+    "child=2 code=null signal=null elapsedMs=5",
+    "child=3 code=13 signal=SIGSEGV elapsedMs=6",
+    "child=4 code=0 signal=SIGSEGV elapsedMs=7",
+    "failedWaves=1 completedWaves=1 requestedWaves=1",
+  ].join("\n"));
+  assert.equal(r.sigsegvCount, 0);
+  assert.equal(r.otherFailureCount, 0);
+  assert.equal(r.unclassifiedFailureCount, 4);
+  assert.equal(r.failures.length, 0);
+  assert.equal(r.issues.filter(({ code }) => code === "invalid-child-outcome").length, 4);
+  assertFailureSlots(r);
+});
+
+test("parseReproLog: invented signal names never become failure evidence", () => {
+  const r = parseReproLog([
+    "node=v25.2.1 v8=14.1 platform=linux arch=x64 children=1 waves=1",
+    "wave=1 passed=0/1",
+    "child=1 code=null signal=SIGBANANA elapsedMs=4",
+    "failedWaves=1 completedWaves=1 requestedWaves=1",
+  ].join("\n"));
+  assert.equal(r.sigsegvCount, 0);
+  assert.equal(r.otherFailureCount, 0);
+  assert.equal(r.unclassifiedFailureCount, 1);
+  assert.equal(r.failures.length, 0);
+  assert.match(r.issues.map(({ code }) => code).join(" "), /invalid-child-outcome/);
+  assertFailureSlots(r);
+});
+
+test("parseReproLog: exit status outside the producer's byte range is impossible", () => {
+  const r = parseReproLog([
+    "node=v25.2.1 v8=14.1 platform=linux arch=x64 children=1 waves=1",
+    "wave=1 passed=0/1",
+    "child=1 code=256 signal=null elapsedMs=4",
+    "failedWaves=1 completedWaves=1 requestedWaves=1",
+  ].join("\n"));
+  assert.equal(r.sigsegvCount, 0);
+  assert.equal(r.otherFailureCount, 0);
+  assert.equal(r.unclassifiedFailureCount, 1);
+  assert.equal(r.failures.length, 0);
+  assert.match(r.issues.map(({ code }) => code).join(" "), /invalid-child-outcome/);
+  assertFailureSlots(r);
+});
+
+test("parseReproLog: summed child invocation denominator must stay a safe integer", () => {
+  const max = Number.MAX_SAFE_INTEGER;
+  const r = parseReproLog([
+    `node=v25.2.1 v8=14.1 platform=linux arch=x64 children=${max} waves=2`,
+    `wave=1 passed=0/${max}`,
+    `wave=2 passed=0/${max}`,
+    "failedWaves=2 completedWaves=2 requestedWaves=2",
+  ].join("\n"));
+  assert.equal(r.totalChildInvocations, max);
+  assert.equal(r.unclassifiedFailureCount, max);
+  assert.equal(r.completedWaves, 1);
+  assert.equal(r.completionStatus, "inconsistent");
+  assert.match(r.issues.map(({ code }) => code).join(" "), /invocation-count-overflow/);
+  assertFailureSlots(r);
+});
+
+test("parseReproLog: malformed trailing numeric detail never contributes", () => {
+  const r = parseReproLog([
+    "node=v25.2.1 v8=14.1 platform=linux arch=x64 children=1 waves=1",
+    "wave=1 passed=0/1",
+    "child=1 code=13 signal=null elapsedMs=4x",
+    "failedWaves=1 completedWaves=1 requestedWaves=1",
+  ].join("\n"));
+  assert.equal(r.sigsegvCount, 0);
+  assert.equal(r.otherFailureCount, 0);
+  assert.equal(r.unclassifiedFailureCount, 1);
+  assert.equal(r.failures.length, 0);
+  assert.match(r.issues.map(({ code }) => code).join(" "), /malformed-record/);
+  assertFailureSlots(r);
+});
+
+test("parseReproLog: malformed child row does not detach later canonical detail", () => {
+  const r = parseReproLog([
+    "node=v25.2.1 v8=14.1 platform=linux arch=x64 children=2 waves=1",
+    "wave=1 passed=0/2",
+    "child=1 code=13 signal=null elapsedMs=4x",
+    "child=2 code=null signal=SIGSEGV elapsedMs=5",
+    "failedWaves=1 completedWaves=1 requestedWaves=1",
+  ].join("\n"));
+  assert.equal(r.sigsegvCount, 1);
+  assert.equal(r.otherFailureCount, 0);
+  assert.equal(r.unclassifiedFailureCount, 1);
+  assert.deepEqual(r.failures.map(({ wave, child }) => [wave, child]), [[1, 2]]);
+  assert.match(r.issues.map(({ code }) => code).join(" "), /malformed-record/);
+  assertFailureSlots(r);
 });
 
 test("parseReproLog: structural record order and timestamp provenance are strict", () => {
@@ -350,6 +542,109 @@ test("renderReport: inconsistent clean-looking repro rows stay descriptive", () 
   assert.doesNotMatch(md, /\*\*No failure reproduced\*\*/);
   assert.doesNotMatch(md, /clean group\(s\): pcores/);
   assert.doesNotMatch(md, /0\/4 \(95% upper/);
+});
+
+test("renderReport: impossible failure counts never throw or get an interval", () => {
+  const md = renderReport({
+    collectedAt: "2026-08-02T00:00:00.000Z",
+    config: {},
+    environment: {},
+    baseline: {
+      children: 2,
+      requestedWaves: 1,
+      processedWaves: 1,
+      completedWaves: 1,
+      failedWaves: 1,
+      totalChildInvocations: 0,
+      sigsegvCount: 3,
+      otherFailureCount: 0,
+      unclassifiedFailureCount: 0,
+      completionStatus: "complete",
+      log: "logs/baseline/run1.log",
+    },
+    groups: [{
+      name: "bad-counts",
+      cpus: "0-1",
+      children: 2,
+      wavesRequested: 1,
+      processedWaves: 1,
+      failedWaves: 1,
+      totalChildInvocations: 2,
+      sigsegvCount: 4,
+      otherFailureCount: 0,
+      unclassifiedFailureCount: 0,
+      completionStatus: "inconsistent",
+    }, {
+      name: "zero-denominator",
+      cpus: "2",
+      children: 1,
+      wavesRequested: 1,
+      processedWaves: 0,
+      failedWaves: 1,
+      totalChildInvocations: 0,
+      sigsegvCount: 1,
+      otherFailureCount: 0,
+      unclassifiedFailureCount: 0,
+      completionStatus: "inconsistent",
+    }],
+    individualStatus: { status: "complete", reasons: [] },
+    individual: [{
+      cpu: 3,
+      runs: 1,
+      failures: 0,
+      sigsegv: 1,
+      invalidRuns: [],
+      failedRuns: [],
+    }],
+  });
+  assert.match(md, /SIGSEGV \| 3/);
+  assert.match(md, /Child failure rate \| invalid\/missing counts; no interval/);
+  assert.match(md, /bad-counts.*invalid\/2.*invalid\/missing counts; no interval/);
+  assert.match(md, /zero-denominator.*invalid\/0.*invalid\/missing counts; no interval/);
+  assert.match(md, /invalid\/inconsistent counts; no interval/);
+  assert.match(md, /inconsistent failure counts; excluded from conclusions/);
+  assert.match(md, /impossible failure-count evidence was excluded/);
+  assert.doesNotMatch(md, /\*\*The problem reproduced\*\*/);
+  assert.doesNotMatch(md, /\*\*Group isolation\*\*/);
+
+  const missingPrimary = renderReport({
+    collectedAt: "2026-08-02T00:00:00.000Z",
+    config: {},
+    environment: {},
+    baseline: {
+      children: 1,
+      requestedWaves: 1,
+      processedWaves: 1,
+      completedWaves: 1,
+      failedWaves: 0,
+      totalChildInvocations: 1,
+      otherFailureCount: 0,
+      unclassifiedFailureCount: 0,
+      completionStatus: "complete",
+      log: "logs/baseline/run1.log",
+    },
+  });
+  assert.match(missingPrimary, /SIGSEGV \| invalid\/missing/);
+  assert.match(missingPrimary, /invalid\/missing counts; no interval/);
+  assert.match(missingPrimary, /impossible failure-count evidence was excluded/);
+  assert.doesNotMatch(missingPrimary, /NaN\/1/);
+  assert.doesNotMatch(missingPrimary, /\*\*No failure reproduced\*\*/);
+});
+
+test("renderReport: CPU localization never prints an unsafe pooled clean denominator", () => {
+  const md = renderReport({
+    collectedAt: "2026-08-02T00:00:00.000Z",
+    config: {},
+    environment: {},
+    individualStatus: { status: "complete", reasons: [] },
+    individual: [
+      { cpu: 1, runs: 1, failures: 1, sigsegv: 1, invalidRuns: [], failedRuns: [] },
+      { cpu: 2, runs: Number.MAX_SAFE_INTEGER, failures: 0, sigsegv: 0, invalidRuns: [], failedRuns: [] },
+      { cpu: 3, runs: 1, failures: 0, sigsegv: 0, invalidRuns: [], failedRuns: [] },
+    ],
+  });
+  assert.match(md, /pooled run count exceeds the safe integer range/);
+  assert.doesNotMatch(md, /0\/9007199254740992/);
 });
 
 test("renderReport: clean heterogeneous phases do not get a pooled rate bound", () => {

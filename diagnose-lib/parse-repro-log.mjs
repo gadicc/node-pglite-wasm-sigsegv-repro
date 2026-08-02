@@ -5,6 +5,7 @@
 // completion footer is corroborating structure, never a source of trials.
 
 import { readFileSync } from "node:fs";
+import { constants as osConstants } from "node:os";
 
 const UINT = "(?:0|[1-9][0-9]*)";
 const POSITIVE_UINT = "(?:[1-9][0-9]*)";
@@ -13,11 +14,12 @@ const HEADER_RE = new RegExp(
 );
 const WAVE_RE = new RegExp(`^wave=(${POSITIVE_UINT}) passed=(${UINT})/(${POSITIVE_UINT})$`);
 const CHILD_RE = new RegExp(
-  `^child=(${POSITIVE_UINT}) code=(null|${UINT}) signal=(null|SIG[A-Z0-9]+) elapsedMs=(${UINT})$`,
+  `^child=(${UINT}) code=(null|${UINT}) signal=(null|SIG[A-Z0-9]+) elapsedMs=(${UINT})$`,
 );
 const FOOTER_RE = new RegExp(
   `^failedWaves=(${UINT}) completedWaves=(${UINT}) requestedWaves=(${POSITIVE_UINT})$`,
 );
+const KNOWN_SIGNALS = new Set(Object.keys(osConstants.signals));
 
 function safeUint(value) {
   const number = Number(value);
@@ -38,6 +40,15 @@ function stripTimestamp(rawLine) {
 
 function isReserved(line) {
   return /^(?:node=|wave=|child=|failedWaves=)/.test(line);
+}
+
+function sameChildOutcome(left, right) {
+  return left.code === right.code &&
+    left.signal === right.signal;
+}
+
+function childDetailFingerprint(detail) {
+  return `${detail.code ?? "null"}\u0000${detail.signal ?? "null"}\u0000${detail.elapsedMs}`;
 }
 
 export function parseReproLog(text, expectations = {}) {
@@ -142,13 +153,28 @@ export function parseReproLog(text, expectations = {}) {
         signal: match[3] === "null" ? null : match[3],
         elapsedMs: safeUint(match[4]),
         _epoch: epoch,
+        _line: lineNumber,
       };
       const detailIsValid = detail.child !== null && detail.elapsedMs !== null &&
         (match[2] === "null" || detail.code !== null);
+      const isExitFailure = detail.code !== null && detail.code > 0 && detail.code <= 255 && detail.signal === null;
+      const isSignalFailure = detail.code === null && KNOWN_SIGNALS.has(detail.signal);
       if (!detailIsValid) {
         issue("numeric-range", "child numeric fields exceed the safe integer range", lineNumber);
+      } else if (!isExitFailure && !isSignalFailure) {
+        issue(
+          "invalid-child-outcome",
+          `child=${detail.child} row does not describe exactly one nonzero exit code or known signal`,
+          lineNumber,
+        );
       } else if (currentOccurrence === null) {
         issue("orphan-child", "child failure detail is not attached to a preceding wave row", lineNumber);
+      } else if (detail.child < 1 || detail.child > currentOccurrence.of) {
+        issue(
+          "child-out-of-range",
+          `child=${detail.child} row ignored: outside wave=${currentOccurrence.wave} children 1..${currentOccurrence.of}`,
+          lineNumber,
+        );
       } else {
         currentOccurrence.details.push(detail);
       }
@@ -178,7 +204,11 @@ export function parseReproLog(text, expectations = {}) {
     if (isReserved(line)) {
       issue("malformed-record", `line ${lineNumber} resembles a repro record but is not canonical`, lineNumber);
       structuralRecords.push({ kind: "malformed", line: lineNumber, epoch, timestampStyle });
-      currentOccurrence = null;
+      // A malformed child record cannot contribute evidence, but it also
+      // cannot make a later canonical child record migrate away from the
+      // otherwise unambiguous preceding wave. Other malformed structural
+      // records break that attachment.
+      if (!line.startsWith("child=")) currentOccurrence = null;
     }
   }
 
@@ -222,6 +252,7 @@ export function parseReproLog(text, expectations = {}) {
 
   const seenWaves = new Set();
   let expectedSequence = 1;
+  let acceptedInvocationCount = 0;
   for (const occurrence of occurrences) {
     let accepted = occurrence._numericValid;
     if (occurrence.passed > occurrence.of) accepted = false;
@@ -256,6 +287,18 @@ export function parseReproLog(text, expectations = {}) {
     } else {
       expectedSequence += 1;
     }
+    if (accepted) {
+      if (occurrence.of > Number.MAX_SAFE_INTEGER - acceptedInvocationCount) {
+        issue(
+          "invocation-count-overflow",
+          `wave=${occurrence.wave} row ignored: cumulative accepted child invocations would exceed the safe integer range`,
+          occurrence.line,
+        );
+        accepted = false;
+      } else {
+        acceptedInvocationCount += occurrence.of;
+      }
+    }
     occurrence.accepted = accepted;
     if (!accepted && occurrence.details.length > 0) {
       out.notes.push(`child failure detail attached to rejected wave=${occurrence.wave} row ignored`);
@@ -270,8 +313,66 @@ export function parseReproLog(text, expectations = {}) {
     out.totalChildInvocations += occurrence.of;
     if (occurrence.passed === occurrence.of) out.fullyPassedWaves += 1;
     else out.failedWaves += 1;
+
+    const expectedFailures = occurrence.of - occurrence.passed;
+    const detailsByChild = new Map();
     for (const detail of occurrence.details) {
+      const previous = detailsByChild.get(detail.child);
+      if (!previous) {
+        detailsByChild.set(detail.child, {
+          detail,
+          fingerprints: new Set([childDetailFingerprint(detail)]),
+          conflicted: false,
+        });
+      } else if (!previous.conflicted && sameChildOutcome(previous.detail, detail)) {
+        const fingerprint = childDetailFingerprint(detail);
+        const isExactDuplicate = previous.fingerprints.has(fingerprint);
+        issue(
+          isExactDuplicate ? "duplicate-child-detail" : "duplicate-child-metadata",
+          isExactDuplicate
+            ? `duplicate child=${detail.child} detail for wave=${occurrence.wave} ignored`
+            : `duplicate child=${detail.child} outcome for wave=${occurrence.wave} has conflicting elapsed time; outcome retained without timing`,
+          detail._line,
+        );
+        previous.fingerprints.add(fingerprint);
+        if (!isExactDuplicate) previous.detail.elapsedMs = null;
+      } else {
+        if (!previous.conflicted) {
+          issue(
+            "conflicting-child-detail",
+            `conflicting child=${detail.child} details for wave=${occurrence.wave}; that failure slot is unclassified`,
+            detail._line,
+          );
+        }
+        previous.conflicted = true;
+      }
+    }
+
+    if (detailsByChild.size > expectedFailures) {
+      issue(
+        "overfull-child-details",
+        `wave=${occurrence.wave} has ${detailsByChild.size} unique child detail id(s), exceeding ${expectedFailures} failure slot(s) in its summary`,
+        occurrence.line,
+      );
+      out.unclassifiedFailureCount += expectedFailures;
+      out.notes.push(
+        `wave=${occurrence.wave} child details conflict with its summary; all ${expectedFailures} failure(s) remain unclassified`,
+      );
+      continue;
+    }
+
+    let classifiedFailures = 0;
+    for (const { detail, conflicted } of detailsByChild.values()) {
+      if (conflicted) continue;
       out.failures.push({ wave: occurrence.wave, ...detail });
+      classifiedFailures += 1;
+    }
+    const unclassifiedFailures = expectedFailures - classifiedFailures;
+    out.unclassifiedFailureCount += unclassifiedFailures;
+    if (unclassifiedFailures > 0) {
+      out.notes.push(
+        `wave=${occurrence.wave} summary reports ${expectedFailures} failure(s), but only ${classifiedFailures} child detail line(s) were usable`,
+      );
     }
   }
 
@@ -279,21 +380,6 @@ export function parseReproLog(text, expectations = {}) {
     if (failure.signal === "SIGSEGV") out.sigsegvCount += 1;
     else out.otherFailureCount += 1;
   }
-  for (const wave of out.waves) {
-    const expectedFailures = wave.of - wave.passed;
-    const detailedFailures = out.failures.filter((failure) => failure.wave === wave.wave).length;
-    if (detailedFailures < expectedFailures) {
-      out.unclassifiedFailureCount += expectedFailures - detailedFailures;
-      out.notes.push(
-        `wave=${wave.wave} summary reports ${expectedFailures} failure(s), but only ${detailedFailures} child detail line(s) were present`,
-      );
-    } else if (detailedFailures > expectedFailures) {
-      out.notes.push(
-        `wave=${wave.wave} has ${detailedFailures} child detail line(s), exceeding the ${expectedFailures} failure(s) in its summary`,
-      );
-    }
-  }
-
   const footer = footers[0] ?? null;
   if (footer) {
     if (structuralRecords.at(-1)?.kind !== "footer") {
@@ -397,7 +483,10 @@ export function parseReproLog(text, expectations = {}) {
   if (startEpoch !== null && startEpoch !== undefined && timingEpochs.length > 0) {
     out.durationSec = Math.max(...timingEpochs) - startEpoch;
   }
-  for (const failure of out.failures) delete failure._epoch;
+  for (const failure of out.failures) {
+    delete failure._epoch;
+    delete failure._line;
+  }
   return out;
 }
 

@@ -32,8 +32,41 @@ function fmtMHz(x) {
   return x >= 1000 ? `${(x / 1000).toFixed(2)} GHz` : `${Math.round(x)} MHz`;
 }
 
+function validBinomialCounts(failures, n) {
+  return Number.isSafeInteger(failures) && Number.isSafeInteger(n) &&
+    n > 0 && failures >= 0 && failures <= n;
+}
+
+function validReproCounts(result) {
+  if (!result || !Object.hasOwn(result, "sigsegvCount")) return false;
+  const counts = [
+    result.sigsegvCount,
+    result?.otherFailureCount ?? 0,
+    result?.unclassifiedFailureCount ?? 0,
+  ];
+  const n = result?.totalChildInvocations;
+  if (!counts.every((value) => Number.isSafeInteger(value) && value >= 0) ||
+      !Number.isSafeInteger(n) || n < 0) return false;
+  const failures = counts.reduce((sum, value) => sum + value, 0);
+  return Number.isSafeInteger(failures) && failures <= n;
+}
+
+function reproFailureCount(result) {
+  if (!validReproCounts(result)) return null;
+  return result.sigsegvCount +
+    (result.otherFailureCount ?? 0) +
+    (result.unclassifiedFailureCount ?? 0);
+}
+
+function validIndividualCounts(result) {
+  return Number.isSafeInteger(result?.runs) && result.runs > 0 &&
+    Number.isSafeInteger(result?.failures) && result.failures >= 0 &&
+    Number.isSafeInteger(result?.sigsegv) && result.sigsegv >= 0 &&
+    result.failures === result.sigsegv && result.failures <= result.runs;
+}
+
 function ci(failures, n) {
-  if (!n) return "—";
+  if (!validBinomialCounts(failures, n)) return "interval unavailable";
   const w = wilson(failures, n);
   return `[${pct(w.low)}, ${pct(w.high)}]`;
 }
@@ -48,7 +81,8 @@ function esc(s) {
 }
 
 function statsCell(failures, n) {
-  if (!n) return "no valid runs";
+  if (failures === 0 && n === 0) return "no valid runs";
+  if (!validBinomialCounts(failures, n)) return `${failures}/${n} (invalid count; no interval)`;
   if (failures === 0) return `0/${n} (95% upper ${zeroBound(n)})`;
   return `${failures}/${n} = ${pct(failures / n)} ${ci(failures, n)}`;
 }
@@ -59,7 +93,8 @@ function reproCompletionStatus(result) {
 }
 
 function reproStatsCell(failures, n, status) {
-  if (!n) return "no accepted runs";
+  if (failures === 0 && n === 0) return "no accepted runs";
+  if (!validBinomialCounts(failures, n)) return `${failures}/${n} (invalid count; no interval)`;
   if (status === "complete") return statsCell(failures, n);
   return `${failures}/${n} = ${pct(failures / n)} (descriptive only; ${status} structure)`;
 }
@@ -182,6 +217,7 @@ export function renderReport(results) {
   L.push("");
   if (r.baseline) {
     const b = r.baseline;
+    const failureCount = reproFailureCount(b);
     const completionStatus = reproCompletionStatus(b);
     L.push(`${b.children} concurrent children per wave, STOP_ON_FAILURE=0.`);
     L.push("");
@@ -204,10 +240,10 @@ export function renderReport(results) {
       : completionStatus === "inconsistent" ? " (structurally inconsistent; descriptive only)" : "";
     L.push(`| Waves | ${b.processedWaves ?? b.completedWaves}/${b.requestedWaves} processed, ${b.failedWaves} failed${statusNote} |`);
     L.push(`| Child invocations | ${b.totalChildInvocations} |`);
-    L.push(`| SIGSEGV | ${b.sigsegvCount} |`);
+    L.push(`| SIGSEGV | ${b.sigsegvCount ?? "invalid/missing"} |`);
     L.push(`| Other failures | ${b.otherFailureCount} |`);
     if ((b.unclassifiedFailureCount ?? 0) > 0) L.push(`| Unclassified failures (summary only) | ${b.unclassifiedFailureCount} |`);
-    L.push(`| Child failure rate | ${reproStatsCell(b.sigsegvCount + b.otherFailureCount + (b.unclassifiedFailureCount ?? 0), b.totalChildInvocations, completionStatus)} |`);
+    L.push(`| Child failure rate | ${failureCount === null ? "invalid/missing counts; no interval" : reproStatsCell(failureCount, b.totalChildInvocations, completionStatus)} |`);
     L.push(`| Time to first failure | ${fmtSec(b.firstFailureAfterSec)} |`);
     L.push(`| Duration | ${fmtSec(b.durationSec)} |`);
     L.push(`| Frequency (${b.frequency?.method ?? "n/a"}) | avg ${fmtMHz(b.frequency?.avgMHz)}, max ${fmtMHz(b.frequency?.maxMHz)} |`);
@@ -228,17 +264,23 @@ export function renderReport(results) {
     L.push("| Group | CPUs | Children | Waves | Child failures | Rate / 95% CI | Eff. freq (avg/max) |");
     L.push("| --- | --- | --- | --- | --- | --- | --- |");
     for (const g of r.groups) {
-      const f = g.sigsegvCount + (g.otherFailureCount ?? 0) + (g.unclassifiedFailureCount ?? 0);
+      const f = reproFailureCount(g);
       const n = g.totalChildInvocations ?? 0;
       const completionStatus = reproCompletionStatus(g);
       const statusNote = completionStatus === "partial"
         ? " (log truncated; partial data)"
         : completionStatus === "inconsistent" ? " (structurally inconsistent; descriptive only)" : "";
-      const rate = completionStatus === "complete" && n
-        ? `${pct(f / n)} ${ci(f, n)}`
-        : n ? `${pct(f / n)} (descriptive only; ${completionStatus})` : "—";
+      const rate = f === null
+        ? "invalid/missing counts; no interval"
+        : f === 0 && n === 0
+        ? "—"
+        : !validBinomialCounts(f, n)
+          ? "invalid count; no interval"
+          : completionStatus === "complete"
+            ? `${pct(f / n)} ${ci(f, n)}`
+            : `${pct(f / n)} (descriptive only; ${completionStatus})`;
       L.push(
-        `| ${g.name} | ${g.cpus} | ${g.children} | ${g.processedWaves ?? g.completedWaves ?? "?"}/${g.wavesRequested} processed (${g.failedWaves ?? "?"} failed)${statusNote} | ${f}/${n}${(g.unclassifiedFailureCount ?? 0) > 0 ? ` (${g.unclassifiedFailureCount} unclassified)` : ""} | ${rate} | ${fmtMHz(g.frequency?.avgMHz)} / ${fmtMHz(g.frequency?.maxMHz)} |`,
+        `| ${g.name} | ${g.cpus} | ${g.children} | ${g.processedWaves ?? g.completedWaves ?? "?"}/${g.wavesRequested} processed (${g.failedWaves ?? "?"} failed)${statusNote} | ${f ?? "invalid"}/${n}${(g.unclassifiedFailureCount ?? 0) > 0 ? ` (${g.unclassifiedFailureCount} unclassified)` : ""} | ${rate} | ${fmtMHz(g.frequency?.avgMHz)} / ${fmtMHz(g.frequency?.maxMHz)} |`,
       );
     }
     L.push("");
@@ -272,13 +314,15 @@ export function renderReport(results) {
     L.push("| --- | --- | --- | --- | --- |");
     for (const c of r.individual) {
       const notes = [];
-      if (individualComplete && c.cpu === r.worstCpu && c.failures > 0) notes.push("highest observed rate");
+      const countsValid = validIndividualCounts(c);
+      if (!countsValid) notes.push("inconsistent failure counts; excluded from conclusions");
+      if (countsValid && individualComplete && c.cpu === r.worstCpu && c.failures > 0) notes.push("highest observed rate");
       if (c.invalidRuns?.length > 0) notes.push(`${c.invalidRuns.length} invalid run(s) excluded (non-SIGSEGV exits)`);
       if (c.failedRuns?.length) {
         notes.push(`failed runs: ${c.failedRuns.map((f) => `#${f.run} (${f.signal})`).join(", ")}`);
       }
       L.push(
-        `| ${c.cpu} | ${c.runs} | ${c.failures} | ${statsCell(c.failures, c.runs)} | ${notes.join("; ") || "—"} |`,
+        `| ${c.cpu} | ${c.runs} | ${c.failures} | ${countsValid ? statsCell(c.failures, c.runs) : "invalid/inconsistent counts; no interval"} | ${notes.join("; ") || "—"} |`,
       );
     }
     L.push("");
@@ -439,23 +483,52 @@ function renderConclusions(r) {
   let totalUnclassified = 0;
   let totalRuns = 0;
   let hasIncompleteReproEvidence = false;
+  let hasInvalidCountEvidence = false;
+  const addAggregate = (sigsegv, other, unclassified, runs) => {
+    if (sigsegv > Number.MAX_SAFE_INTEGER - totalSig ||
+        other > Number.MAX_SAFE_INTEGER - totalOther ||
+        unclassified > Number.MAX_SAFE_INTEGER - totalUnclassified ||
+        runs > Number.MAX_SAFE_INTEGER - totalRuns) return false;
+    totalSig += sigsegv;
+    totalOther += other;
+    totalUnclassified += unclassified;
+    totalRuns += runs;
+    return true;
+  };
   if (r.baseline) {
-    totalSig += r.baseline.sigsegvCount;
-    totalOther += r.baseline.otherFailureCount ?? 0;
-    totalUnclassified += r.baseline.unclassifiedFailureCount ?? 0;
-    totalRuns += r.baseline.totalChildInvocations;
-    if (reproCompletionStatus(r.baseline) !== "complete") hasIncompleteReproEvidence = true;
+    if (validReproCounts(r.baseline)) {
+      const added = addAggregate(
+        r.baseline.sigsegvCount,
+        r.baseline.otherFailureCount ?? 0,
+        r.baseline.unclassifiedFailureCount ?? 0,
+        r.baseline.totalChildInvocations,
+      );
+      if (!added) hasInvalidCountEvidence = true;
+      if (added && reproCompletionStatus(r.baseline) !== "complete") hasIncompleteReproEvidence = true;
+    } else {
+      hasInvalidCountEvidence = true;
+    }
   }
   for (const g of r.groups ?? []) {
-    totalSig += g.sigsegvCount ?? 0;
-    totalOther += g.otherFailureCount ?? 0;
-    totalUnclassified += g.unclassifiedFailureCount ?? 0;
-    totalRuns += g.totalChildInvocations ?? 0;
-    if (reproCompletionStatus(g) !== "complete") hasIncompleteReproEvidence = true;
+    if (validReproCounts(g)) {
+      const added = addAggregate(
+        g.sigsegvCount ?? 0,
+        g.otherFailureCount ?? 0,
+        g.unclassifiedFailureCount ?? 0,
+        g.totalChildInvocations,
+      );
+      if (!added) hasInvalidCountEvidence = true;
+      if (added && reproCompletionStatus(g) !== "complete") hasIncompleteReproEvidence = true;
+    } else {
+      hasInvalidCountEvidence = true;
+    }
   }
   for (const c of r.individual ?? []) {
-    totalSig += c.sigsegv;
-    totalRuns += c.runs;
+    if (validIndividualCounts(c)) {
+      if (!addAggregate(c.sigsegv, 0, 0, c.runs)) hasInvalidCountEvidence = true;
+    } else {
+      hasInvalidCountEvidence = true;
+    }
   }
   if (totalSig > 0) {
     const unresolved = totalUnclassified > 0 ? ` Another ${totalUnclassified} failure(s) were visible only in wave summaries and could not be classified.` : "";
@@ -466,23 +539,38 @@ function renderConclusions(r) {
     C.push(`- **No failure reproduced** across ${totalRuns} child-process observations spanning different phases/configurations. No pooled rate bound is valid across these heterogeneous strata; use the phase-, group-, and CPU-specific bounds above. This does not rule out the defect; see Limitations.`);
   } else if (totalRuns > 0) {
     C.push(`- No failure was observed in ${totalRuns} accepted child-process observations, but partial or structurally inconsistent repro evidence prevents a clean non-reproduction conclusion or rate bound.`);
+  } else if (hasInvalidCountEvidence) {
+    C.push("- No trustworthy workload reproduction conclusion is available because impossible failure-count evidence was excluded.");
   } else {
     C.push("- No workload results were collected.");
+  }
+  if (hasInvalidCountEvidence && totalRuns > 0) {
+    C.push("- **Invalid failure-count evidence was excluded** from aggregate reproduction and localization conclusions.");
   }
 
   // 2. Localization to CPUs / groups. Individual CPU batches run in fixed,
   // sequential order, so CPU labels are not exchangeable with respect to
   // temporal/thermal drift. Keep this descriptive; do not attach a p-value.
   const testedCpus = r.individualStatus?.status === "complete"
-    ? (r.individual ?? []).filter((c) => c.runs > 0)
+    ? (r.individual ?? []).filter((c) => validIndividualCounts(c))
     : [];
   const failingCpus = testedCpus.filter((c) => c.sigsegv > 0);
   const cleanCpus = testedCpus.filter((c) => c.sigsegv === 0);
   if (failingCpus.length > 0) {
     let line = `- **CPU localization**: failures observed on CPU(s) ${failingCpus.map((c) => `${c.cpu} at ${c.sigsegv}/${c.runs}`).join(", ")}`;
     if (cleanCpus.length > 0) {
-      const cleanN = cleanCpus.reduce((s, c) => s + c.runs, 0);
-      line += `; zero on the other ${cleanCpus.length} tested CPU(s) at 0/${cleanN}`;
+      let cleanN = 0;
+      let cleanNSafe = true;
+      for (const cpu of cleanCpus) {
+        if (cpu.runs > Number.MAX_SAFE_INTEGER - cleanN) {
+          cleanNSafe = false;
+          break;
+        }
+        cleanN += cpu.runs;
+      }
+      line += cleanNSafe
+        ? `; zero on the other ${cleanCpus.length} tested CPU(s) at 0/${cleanN}`
+        : `; zero on the other ${cleanCpus.length} tested CPU(s), whose pooled run count exceeds the safe integer range (use the per-CPU table)`;
     } else if (testedCpus.length > 1) {
       line += "; every other tested CPU also observed at least one failure";
     }
@@ -493,9 +581,12 @@ function renderConclusions(r) {
   } else if (testedCpus.length > 0) {
     C.push("- CPU localization: no failures observed on any tested CPU; sequential per-CPU results remain descriptive only.");
   }
-  const failingGroups = (r.groups ?? []).filter((g) => (g.sigsegvCount ?? 0) > 0);
+  const failingGroups = (r.groups ?? []).filter(
+    (g) => validReproCounts(g) && (g.sigsegvCount ?? 0) > 0,
+  );
   const cleanGroups = (r.groups ?? []).filter(
     (g) =>
+      validReproCounts(g) &&
       reproCompletionStatus(g) === "complete" &&
       (g.sigsegvCount ?? 0) === 0 &&
       (g.otherFailureCount ?? 0) === 0 &&
@@ -503,7 +594,8 @@ function renderConclusions(r) {
       (g.totalChildInvocations ?? 0) > 0,
   );
   const unresolvedGroups = (r.groups ?? []).filter(
-    (g) => (g.sigsegvCount ?? 0) === 0 && ((g.otherFailureCount ?? 0) > 0 || (g.unclassifiedFailureCount ?? 0) > 0),
+    (g) => validReproCounts(g) && (g.sigsegvCount ?? 0) === 0 &&
+      ((g.otherFailureCount ?? 0) > 0 || (g.unclassifiedFailureCount ?? 0) > 0),
   );
   if (failingGroups.length > 0) {
     C.push(`- **Group isolation**: SIGSEGV in group(s) ${failingGroups.map((g) => `${g.name} (${g.cpus})`).join(", ")}; clean group(s): ${cleanGroups.length > 0 ? cleanGroups.map((g) => `${g.name} (${g.cpus})`).join(", ") : "none"}${unresolvedGroups.length > 0 ? `; unresolved non-SIGSEGV/unclassified failures in: ${unresolvedGroups.map((g) => `${g.name} (${g.cpus})`).join(", ")}` : ""}.`);
