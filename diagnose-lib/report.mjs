@@ -315,11 +315,11 @@ export function renderReport(results) {
     const g = r.gdb;
     L.push(`Fault captured on CPU ${g.cpu} (pinned by taskset, so the faulting CPU is known by construction).`);
     L.push("");
-    L.push("| Capture | Instruction | Intended addr | si_addr | Diff | Differing bits | Intended mapped/writable | Classification |");
-    L.push("| --- | --- | --- | --- | --- | --- | --- | --- |");
+    L.push("| Capture | Instruction | Intended addr | si_addr | Diff | Differing bits | Intended mapped/writable | si_addr mapped | Classification |");
+    L.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
     for (const c of g.captures) {
       L.push(
-        `| \`${c.file}\` | \`${c.instruction ?? "?"}\` | ${c.intendedAddr ?? "—"} | ${c.siAddr ?? "—"} | ${c.addrDiffHex ?? "—"} | ${c.diffBits?.length ? c.diffBits.join(",") : "—"} | ${c.intendedMapped === null ? "—" : `${c.intendedMapped}/${c.intendedWritable}`} | ${c.classification} |`,
+        `| \`${c.file}\` | \`${c.instruction ?? "?"}\` | ${c.intendedAddr ?? "—"} | ${c.siAddr ?? "—"} | ${c.addrDiffHex ?? "—"} | ${c.diffBits?.length ? c.diffBits.join(",") : "—"} | ${c.intendedMapped === null ? "—" : `${c.intendedMapped}/${c.intendedWritable}`} | ${c.siAddrMapped === null ? "—" : c.siAddrMapped} | ${c.classification} |`,
       );
     }
     L.push("");
@@ -479,21 +479,22 @@ function renderConclusions(r) {
   // 4. GDB signature
   if (r.gdb?.status === "captured") {
     // Only "known-signature" captures are verified: the +2^42 arithmetic
-    // matched AND the intended address was evidenced as mapped+writable.
+    // matched, the intended address was mapped+writable, and si_addr was
+    // explicitly absent from the parsed mappings.
     const known = r.gdb.captures.filter((c) => c.classification === "known-signature");
     const unverified = r.gdb.captures.filter((c) => c.classification === "bit-flip-unverified");
     const manual = r.gdb.captures.filter(
       (c) => c.classification !== "known-signature" && c.classification !== "bit-flip-unverified",
     );
     if (known.length === r.gdb.captures.length) {
-      C.push(`- **Fault signature matches the documented pattern**: ${known.length} capture(s), each an intended valid address reported by the kernel as intended + 2^42 (single differing bit 42).`);
+      C.push(`- **Fault signature matches the documented pattern**: ${known.length} capture(s), each with a mapped/writable intended address and an unmapped fault address at intended + 2^42 (single differing bit 42).`);
     } else {
       const parts = [];
       if (known.length > 0) {
-        parts.push(`${known.length} capture(s) match the documented pattern: an intended valid (mapped and writable) address reported by the kernel as intended + 2^42`);
+        parts.push(`${known.length} capture(s) match the documented pattern: mapped/writable intended address plus an unmapped fault address at intended + 2^42`);
       }
       if (unverified.length > 0) {
-        parts.push(`${unverified.length} capture(s) match the +2^42 arithmetic but their intended addresses could not be verified as mapped and writable (see phase 6), so they are NOT confirmed signature matches`);
+        parts.push(`${unverified.length} capture(s) match the +2^42 arithmetic but do not verify all mapping preconditions (intended mapped/writable and shifted address unmapped; see phase 6), so they are NOT confirmed signature matches`);
       }
       if (manual.length > 0) {
         parts.push(`${manual.length} capture(s) need manual classification (see phase 6)`);
@@ -501,7 +502,7 @@ function renderConclusions(r) {
       if (known.length > 0) {
         C.push(`- Fault signature: ${parts.join("; ")}.`);
       } else if (unverified.length > 0) {
-        C.push(`- **Fault signature NOT confirmed**: ${parts.join("; ")}. Matching bit-flip arithmetic without address-validity evidence is not the documented signature; do not assume the previously reported root cause.`);
+        C.push(`- **Fault signature NOT confirmed**: ${parts.join("; ")}. Matching bit-flip arithmetic without both mapping checks is not the documented signature; do not assume the previously reported root cause.`);
       } else {
         C.push(`- **Fault signature does NOT match** the documented +2^42 pattern; ${manual.length} capture(s) preserved for manual classification. Do not assume the previously reported root cause.`);
       }

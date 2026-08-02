@@ -60,6 +60,7 @@ export function parseGdbCapture(text) {
     addrDiff: null,
     addrDiffHex: null,
     diffBits: [],
+    matchesKnownArithmetic: false,
     matchesKnownSignature: false,
     notes: [],
   };
@@ -199,22 +200,30 @@ export function parseGdbCapture(text) {
           if ((xor >> bit) & 1n) out.diffBits.push(Number(bit));
         }
         if (diff === BIT42 && out.diffBits.length === 1 && out.diffBits[0] === 42) {
-          // matchesKnownSignature is the pure arithmetic flag. The
-          // "known-signature" classification additionally requires mapping
-          // evidence that the intended address was a valid (mapped and
-          // writable) target; arithmetic alone is not enough.
-          out.matchesKnownSignature = true;
-          if (out.intendedMapped === true && out.intendedWritable === true) {
+          out.matchesKnownArithmetic = true;
+          // The confirmed signature requires a valid intended write target
+          // and evidence that the +2^42 fault address is outside every
+          // parsed mapping. Arithmetic alone is not enough.
+          if (
+            out.intendedMapped === true &&
+            out.intendedWritable === true &&
+            out.siAddrMapped === false
+          ) {
+            out.matchesKnownSignature = true;
             out.classification = "known-signature";
           } else {
             out.classification = "bit-flip-unverified";
             const reason = !hasMappings
-              ? "no mapping data in transcript; intended address validity unknown"
+              ? "no mapping data in transcript; address validity is unknown"
               : out.intendedMapped === false
                 ? "intended address not found in process mappings"
-                : "intended mapping is not writable";
+                : out.intendedWritable === false
+                  ? "intended mapping is not writable"
+                  : out.siAddrMapped === true
+                    ? "shifted fault address is itself mapped"
+                    : "shifted fault address mapping state is unknown";
             out.notes.push(
-              `si_addr matches the +2^42 single-bit-42 arithmetic, but the intended address is not verified as valid: ${reason}`,
+              `si_addr matches the +2^42 single-bit-42 arithmetic, but the mapping preconditions are not verified: ${reason}`,
             );
           }
         } else {

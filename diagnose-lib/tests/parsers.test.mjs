@@ -313,6 +313,7 @@ test("parseGdbCapture: known +2^42 signature (real transcript)", () => {
   assert.equal(r.siAddrMapped, false);
   assert.equal(r.addrDiffHex, "0x40000000000");
   assert.deepEqual(r.diffBits, [42]);
+  assert.equal(r.matchesKnownArithmetic, true);
   assert.equal(r.matchesKnownSignature, true);
   assert.equal(r.classification, "known-signature");
   assert.equal(r.threadCount, 11);
@@ -347,11 +348,11 @@ test("parseGdbCapture: bit-flip arithmetic without mapping data is unverified", 
   assert.equal(r.siAddrMapped, null);
   assert.equal(r.addrDiffHex, "0x40000000000");
   assert.deepEqual(r.diffBits, [42]);
-  // The arithmetic flag still fires; the classification must not.
-  assert.equal(r.matchesKnownSignature, true);
+  assert.equal(r.matchesKnownArithmetic, true);
+  assert.equal(r.matchesKnownSignature, false);
   assert.equal(r.classification, "bit-flip-unverified");
   assert.ok(r.notes.some((n) => n.includes("no mapping data in transcript")));
-  assert.ok(r.notes.some((n) => n.includes("not verified as valid")));
+  assert.ok(r.notes.some((n) => n.includes("mapping preconditions are not verified")));
 });
 
 test("parseGdbCapture: bit-flip into a non-writable mapping is unverified", () => {
@@ -359,7 +360,8 @@ test("parseGdbCapture: bit-flip into a non-writable mapping is unverified", () =
   const r = parseGdbCapture(text);
   assert.equal(r.intendedMapped, true);
   assert.equal(r.intendedWritable, false);
-  assert.equal(r.matchesKnownSignature, true);
+  assert.equal(r.matchesKnownArithmetic, true);
+  assert.equal(r.matchesKnownSignature, false);
   assert.equal(r.classification, "bit-flip-unverified");
   assert.ok(r.notes.some((n) => n.includes("intended mapping is not writable")));
 });
@@ -371,9 +373,22 @@ test("parseGdbCapture: bit-flip with intended address unmapped is unverified", (
   assert.equal(r.mappings.length, 2);
   assert.equal(r.intendedMapped, false);
   assert.equal(r.intendedWritable, false);
-  assert.equal(r.matchesKnownSignature, true);
+  assert.equal(r.matchesKnownArithmetic, true);
+  assert.equal(r.matchesKnownSignature, false);
   assert.equal(r.classification, "bit-flip-unverified");
   assert.ok(r.notes.some((n) => n.includes("intended address not found in process mappings")));
+});
+
+test("parseGdbCapture: mapped shifted address is not a confirmed signature", () => {
+  const text = `${readFixture("gdb-known.txt")}\n0x0000040006700000 0x0000040006800000 0x100000           0x0                rw-p  [shifted]\n`;
+  const r = parseGdbCapture(text);
+  assert.equal(r.intendedMapped, true);
+  assert.equal(r.intendedWritable, true);
+  assert.equal(r.siAddrMapped, true);
+  assert.equal(r.matchesKnownArithmetic, true);
+  assert.equal(r.matchesKnownSignature, false);
+  assert.equal(r.classification, "bit-flip-unverified");
+  assert.ok(r.notes.some((n) => n.includes("shifted fault address is itself mapped")));
 });
 
 test("parseGdbCapture: arithmetic mismatch stays manual", () => {
