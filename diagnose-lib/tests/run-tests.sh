@@ -648,7 +648,7 @@ fi
 echo "== end-to-end collect + report on synthetic bundle =="
 B="$TMP/bundle"
 mkdir -p "$B"/{results,logs/baseline,logs/groups,env,freq,gdb,state}
-touch "$B/state/phase-frequency.done"
+touch "$B/state/phase-frequency.done" "$B/state/phase-gdb.done"
 
 cat > "$B/results/meta.env" << EOF
 MODE=default
@@ -775,7 +775,7 @@ check("baseline invocations", r.baseline.totalChildInvocations === 20);
 check("worst cpu is 19", r.worstCpu === 19);
 check("individual tally", r.individual.length === 2 && r.individual[1].sigsegv === 6 && r.individual[0].failures === 0);
 check("individual invalid runs excluded", r.individual[1].runs === 20 && r.individual[1].invalidRuns.length === 1 && r.individual[1].invalidRuns[0].rc === 126);
-check("gdb signature match", r.gdb.captures.length === 1 && r.gdb.captures[0].matchesKnownSignature === true);
+check("gdb signature match", r.gdb.status === "captured" && r.gdb.captures.length === 1 && r.gdb.captures[0].matchesKnownSignature === true);
 check("gdb capture file trimmed", r.gdb.captures[0].mappings === undefined);
 check("freq ab restored + legs", r.frequencyAb.restored === true && r.frequencyAb.legs.length === 3);
 check("freq leg B measured clock", r.frequencyAb.legs[1].frequency.avgMHz === 2100);

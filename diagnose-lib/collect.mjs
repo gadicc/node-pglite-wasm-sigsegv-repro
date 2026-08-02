@@ -289,6 +289,35 @@ export function assessFrequencyAb(rows, meta, phaseDone) {
   return reasons.length > 0 ? { status: "incomplete", reasons } : { status: "complete", reasons: [] };
 }
 
+export function assessGdb(meta, phaseDone, captures, transcriptCount) {
+  const hasMeta = Object.keys(meta).length > 0;
+  if (!hasMeta && !phaseDone && transcriptCount === 0) {
+    return { status: "not-run", reason: null };
+  }
+  if (meta.SKIPPED === "1") {
+    if (!phaseDone) return { status: "incomplete", reason: "skip metadata has no phase completion marker" };
+    if (captures.length > 0) return { status: "incomplete", reason: "skip metadata conflicts with captured faults" };
+    return { status: "skipped", reason: meta.SKIP_REASON ?? null };
+  }
+
+  const exitCode = num(meta.EXIT_CODE);
+  if (exitCode !== null && exitCode !== 0 && exitCode !== 3) {
+    return { status: "failed", reason: `capture runner exited with code ${exitCode}` };
+  }
+  if (!phaseDone) {
+    return { status: "incomplete", reason: "phase completion marker is missing" };
+  }
+  if (exitCode === 0 && captures.length > 0) return { status: "captured", reason: null };
+  if (exitCode === 0) {
+    return { status: "incomplete", reason: "runner reported a capture but no fault transcript was parsed" };
+  }
+  if (exitCode === 3 && captures.length === 0) return { status: "no-fault", reason: null };
+  if (exitCode === 3) {
+    return { status: "incomplete", reason: "no-fault exit code conflicts with captured faults" };
+  }
+  return { status: "incomplete", reason: "GDB metadata has no terminal exit code" };
+}
+
 export function collect(outDir) {
   const meta = readKeyValues(path.join(outDir, "results", "meta.env"));
   const envSummary = readKeyValues(path.join(outDir, "env", "summary.env"));
@@ -423,20 +452,28 @@ export function collect(outDir) {
   // --- gdb ---
   const gdbMeta = readKeyValues(path.join(resultsDir, "gdb.meta"));
   const gdbDir = path.join(outDir, "gdb");
-  if (gdbMeta.CPU !== undefined || existsSync(gdbDir)) {
-    const captures = [];
-    if (existsSync(gdbDir)) {
-      for (const f of readdirSync(gdbDir).sort()) {
-        if (!f.endsWith(".txt")) continue;
-        const rel = path.join("gdb", f);
-        const parsed = parseGdbCapture(readFileSync(path.join(outDir, rel), "utf8"));
-        if (!parsed.captured) continue; // clean-run transcripts carry no signature
-        // Full mappings stay in the raw transcript; keep the JSON compact.
-        parsed.mappings = undefined;
-        parsed.file = rel;
-        captures.push(parsed);
-      }
+  const captures = [];
+  let transcriptCount = 0;
+  if (existsSync(gdbDir)) {
+    for (const f of readdirSync(gdbDir).sort()) {
+      if (!f.endsWith(".txt")) continue;
+      transcriptCount += 1;
+      const rel = path.join("gdb", f);
+      const parsed = parseGdbCapture(readFileSync(path.join(outDir, rel), "utf8"));
+      if (!parsed.captured) continue; // clean-run transcripts carry no signature
+      // Full mappings stay in the raw transcript; keep the JSON compact.
+      parsed.mappings = undefined;
+      parsed.file = rel;
+      captures.push(parsed);
     }
+  }
+  const gdbStatus = assessGdb(
+    gdbMeta,
+    existsSync(path.join(outDir, "state", "phase-gdb.done")),
+    captures,
+    transcriptCount,
+  );
+  if (gdbStatus.status !== "not-run") {
     const identical =
       captures.length > 1 &&
       captures.every(
@@ -447,11 +484,10 @@ export function collect(outDir) {
           JSON.stringify(c.diffBits) === JSON.stringify(captures[0].diffBits),
       );
     results.gdb = {
+      ...gdbStatus,
       cpu: num(gdbMeta.CPU),
       maxRuns: num(gdbMeta.MAX_RUNS),
       exitCode: num(gdbMeta.EXIT_CODE),
-      skipped: gdbMeta.SKIPPED === "1",
-      skipReason: gdbMeta.SKIP_REASON ?? null,
       captures,
       capturesIdentical: captures.length > 1 ? identical : null,
     };

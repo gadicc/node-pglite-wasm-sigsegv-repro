@@ -175,6 +175,33 @@ test("collect: incomplete frequency artifacts are preserved as status, not evide
   assert.equal(r.frequencyAbStatus.status, "incomplete");
 });
 
+test("collect: a precreated empty GDB directory is not evidence that GDB ran", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "collect-test-"));
+  tmpDirs.push(dir);
+  mkdirSync(path.join(dir, "results"));
+  mkdirSync(path.join(dir, "gdb"));
+  const r = collect(dir);
+  assert.equal(r.gdb, undefined);
+});
+
+test("collect: terminal GDB metadata distinguishes no-fault from failure", () => {
+  const noFaultDir = mkdtempSync(path.join(tmpdir(), "collect-test-"));
+  tmpDirs.push(noFaultDir);
+  mkdirSync(path.join(noFaultDir, "results"));
+  mkdirSync(path.join(noFaultDir, "state"));
+  writeFileSync(path.join(noFaultDir, "results", "gdb.meta"), "CPU=19\nMAX_RUNS=6\nEXIT_CODE=3\n");
+  writeFileSync(path.join(noFaultDir, "state", "phase-gdb.done"), "");
+  const noFault = collect(noFaultDir);
+  assert.equal(noFault.gdb.status, "no-fault");
+
+  const failedDir = mkdtempSync(path.join(tmpdir(), "collect-test-"));
+  tmpDirs.push(failedDir);
+  mkdirSync(path.join(failedDir, "results"));
+  writeFileSync(path.join(failedDir, "results", "gdb.meta"), "CPU=19\nMAX_RUNS=6\nEXIT_CODE=5\n");
+  const failed = collect(failedDir);
+  assert.equal(failed.gdb.status, "failed");
+});
+
 test("collect: worstCpu ranks by SIGSEGV, ignoring non-SIGSEGV exits", () => {
   const dir = mkdtempSync(path.join(tmpdir(), "collect-test-"));
   tmpDirs.push(dir);

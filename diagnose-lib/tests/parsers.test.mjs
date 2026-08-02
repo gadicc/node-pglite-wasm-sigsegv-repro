@@ -165,6 +165,29 @@ test("renderReport: incomplete frequency artifacts are excluded from conclusions
   assert.doesNotMatch(md, /Frequency dependence was not tested \(requires/);
 });
 
+test("renderReport: GDB failure is not described as a clean bounded run", () => {
+  const md = renderReport({
+    collectedAt: "2026-08-02T00:00:00.000Z",
+    config: {},
+    environment: {},
+    gdb: { status: "failed", reason: "capture runner exited with code 5", captures: [] },
+  });
+  assert.match(md, /capture runner failed/);
+  assert.match(md, /neither a no-fault bound nor a signature conclusion/);
+  assert.doesNotMatch(md, /captured no fault within the run limit/);
+});
+
+test("renderReport: GDB exit 3 has an explicit no-fault bound", () => {
+  const md = renderReport({
+    collectedAt: "2026-08-02T00:00:00.000Z",
+    config: {},
+    environment: {},
+    gdb: { status: "no-fault", cpu: 19, maxRuns: 6, exitCode: 3, captures: [] },
+  });
+  assert.match(md, /Ran 6 pinned attempt/);
+  assert.match(md, /95% upper bound/);
+});
+
 test("parseGdbCapture: known +2^42 signature (real transcript)", () => {
   const r = parseGdbCapture(readFixture("gdb-known.txt"));
   assert.equal(r.captured, true);

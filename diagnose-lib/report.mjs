@@ -281,30 +281,38 @@ export function renderReport(results) {
   // ------------------------------------------------------------------
   L.push("## Phase 6: GDB fault signature");
   L.push("");
-  if (r.gdb && !r.gdb.skipped) {
+  if (r.gdb?.status === "captured") {
     const g = r.gdb;
-    L.push(`Captures attempted on CPU ${g.cpu} (pinned by taskset, so the faulting CPU is known by construction). Exit code ${g.exitCode ?? "—"} (0 = captured, 3 = no fault within limit, 4 = missing dependency, 5 = runner failure).`);
+    L.push(`Fault captured on CPU ${g.cpu} (pinned by taskset, so the faulting CPU is known by construction).`);
     L.push("");
-    if (g.captures.length > 0) {
-      L.push("| Capture | Instruction | Intended addr | si_addr | Diff | Differing bits | Intended mapped/writable | Classification |");
-      L.push("| --- | --- | --- | --- | --- | --- | --- | --- |");
-      for (const c of g.captures) {
-        L.push(
-          `| \`${c.file}\` | \`${c.instruction ?? "?"}\` | ${c.intendedAddr ?? "—"} | ${c.siAddr ?? "—"} | ${c.addrDiffHex ?? "—"} | ${c.diffBits?.length ? c.diffBits.join(",") : "—"} | ${c.intendedMapped === null ? "—" : `${c.intendedMapped}/${c.intendedWritable}`} | ${c.classification} |`,
-        );
-      }
-      L.push("");
-      if (g.captures.length > 1) {
-        L.push(`Multiple-capture comparison: material fields (instruction, intended address, si_addr, differing bits) are ${g.capturesIdentical ? "**identical** across captures" : "**NOT identical** across captures"}.`);
-        L.push("");
-      }
-    } else {
-      L.push("No fault was captured within the run limit. This bounds the");
-      L.push("rate but does not disprove the defect.");
+    L.push("| Capture | Instruction | Intended addr | si_addr | Diff | Differing bits | Intended mapped/writable | Classification |");
+    L.push("| --- | --- | --- | --- | --- | --- | --- | --- |");
+    for (const c of g.captures) {
+      L.push(
+        `| \`${c.file}\` | \`${c.instruction ?? "?"}\` | ${c.intendedAddr ?? "—"} | ${c.siAddr ?? "—"} | ${c.addrDiffHex ?? "—"} | ${c.diffBits?.length ? c.diffBits.join(",") : "—"} | ${c.intendedMapped === null ? "—" : `${c.intendedMapped}/${c.intendedWritable}`} | ${c.classification} |`,
+      );
+    }
+    L.push("");
+    if (g.captures.length > 1) {
+      L.push(`Multiple-capture comparison: material fields (instruction, intended address, si_addr, differing bits) are ${g.capturesIdentical ? "**identical** across captures" : "**NOT identical** across captures"}.`);
       L.push("");
     }
+  } else if (r.gdb?.status === "no-fault") {
+    L.push(`Ran ${r.gdb.maxRuns ?? "the configured number of"} pinned attempt(s) on CPU ${r.gdb.cpu ?? "—"} without capturing a fault.`);
+    if (r.gdb.maxRuns > 0) L.push(`The zero-failure 95% upper bound per attempt is ${pct(zeroFailureUpperBound(r.gdb.maxRuns))}; this does not disprove the defect.`);
+    L.push("");
+  } else if (r.gdb?.status === "failed") {
+    L.push(`The capture runner failed before producing valid completed evidence${r.gdb.reason ? `: ${r.gdb.reason}` : "."}`);
+    L.push("No no-fault bound or signature conclusion is drawn.");
+    L.push("");
+  } else if (r.gdb?.status === "incomplete") {
+    L.push(`Incomplete GDB artifacts were preserved but excluded from conclusions${r.gdb.reason ? `: ${r.gdb.reason}` : "."}`);
+    L.push("");
+  } else if (r.gdb?.status === "skipped") {
+    L.push(`Skipped${r.gdb.reason ? `: ${r.gdb.reason}` : "."}`);
+    L.push("");
   } else {
-    L.push(`Skipped${r.gdb?.skipReason ? `: ${r.gdb.skipReason}` : ""}.`);
+    L.push("Not run.");
     L.push("");
   }
 
@@ -426,7 +434,7 @@ function renderConclusions(r) {
   }
 
   // 4. GDB signature
-  if (r.gdb && !r.gdb.skipped && r.gdb.captures.length > 0) {
+  if (r.gdb?.status === "captured") {
     // Only "known-signature" captures are verified: the +2^42 arithmetic
     // matched AND the intended address was evidenced as mapped+writable.
     const known = r.gdb.captures.filter((c) => c.classification === "known-signature");
@@ -455,8 +463,13 @@ function renderConclusions(r) {
         C.push(`- **Fault signature does NOT match** the documented +2^42 pattern; ${manual.length} capture(s) preserved for manual classification. Do not assume the previously reported root cause.`);
       }
     }
-  } else if (r.gdb && !r.gdb.skipped) {
-    C.push("- GDB phase ran but captured no fault within the run limit.");
+  } else if (r.gdb?.status === "no-fault") {
+    const bound = r.gdb.maxRuns > 0 ? ` (95% upper bound ${pct(zeroFailureUpperBound(r.gdb.maxRuns))} per attempt)` : "";
+    C.push(`- GDB capture ran to its limit without observing a fault${bound}; no fresh signature was obtained.`);
+  } else if (r.gdb?.status === "failed") {
+    C.push("- GDB capture failed operationally; it provides neither a no-fault bound nor a signature conclusion.");
+  } else if (r.gdb?.status === "incomplete") {
+    C.push("- GDB artifacts are incomplete and were excluded from signature conclusions.");
   }
 
   // 5. Configuration-based rule-outs
@@ -482,7 +495,7 @@ function renderConclusions(r) {
     uncertain.push(`clean CPU verdicts are statistical only (smallest sample ${weakest} runs excludes rates above ${pct(zeroFailureUpperBound(weakest))})`);
   }
   if (!r.frequencyAb) uncertain.push("frequency dependence untested (manual: sudo ./frequency-ab.sh)");
-  if (!r.gdb || r.gdb.skipped || r.gdb.captures.length === 0) uncertain.push("no fresh GDB signature captured");
+  if (r.gdb?.status !== "captured") uncertain.push("no fresh GDB signature captured");
   if (uncertain.length > 0) {
     C.push(`- Remaining uncertainty: ${uncertain.join("; ")}.`);
   }
