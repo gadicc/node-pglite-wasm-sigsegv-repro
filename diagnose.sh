@@ -62,6 +62,9 @@ declare -A REDO_TXN_CONFIG=()
 REDO_REQUEST_SATISFIED_BY_PENDING=0
 REDO_RECOVERED_PENDING=0
 META_UPDATE_TEMP=""
+GROUP_PLAN_TEMP=""
+GROUP_META_TEMP=""
+GROUP_PLAN_DIGEST=""
 CPU_TARGET="auto"
 WORST_CPU_OVERRIDE=""
 SESSION_DID_WORK=0
@@ -206,7 +209,12 @@ load_stored_config() {
           diag_die "stored BASELINE_WAVES must be a canonical safe positive integer, got '$v'"
         BASELINE_WAVES="$v"
         ;;
-      GROUP_WAVES) GROUP_WAVES="$v" ;;
+      GROUP_WAVES)
+        [[ "$v" =~ ^[1-9][0-9]*$ &&
+          (${#v} -lt 16 || (${#v} -eq 16 && "$v" < 9007199254740992)) ]] ||
+          diag_die "stored GROUP_WAVES must be a canonical safe positive integer, got '$v'"
+        GROUP_WAVES="$v"
+        ;;
       INDIVIDUAL_RUNS) INDIVIDUAL_RUNS="$v" ;;
       GDB_MAX_RUNS) GDB_MAX_RUNS="$v" ;;
       SKIP_GDB) SKIP_GDB="$v" ;;
@@ -217,8 +225,9 @@ load_stored_config() {
         ;;
     esac
   done < "$meta"
-  [[ -n "${config_seen[BASELINE_CHILDREN]:-}" && -n "${config_seen[BASELINE_WAVES]:-}" ]] ||
-    diag_die "stored metadata is missing its exact baseline child/wave configuration"
+  [[ -n "${config_seen[BASELINE_CHILDREN]:-}" && -n "${config_seen[BASELINE_WAVES]:-}" &&
+    -n "${config_seen[GROUP_WAVES]:-}" ]] ||
+    diag_die "stored metadata is missing its exact baseline/group configuration"
   apply_cpu_target_runtime
 }
 
@@ -315,6 +324,9 @@ validate_config() {
     (${#BASELINE_CHILDREN} -lt 16 || (${#BASELINE_CHILDREN} -eq 16 && "$BASELINE_CHILDREN" < 9007199254740992)) &&
     (${#BASELINE_WAVES} -lt 16 || (${#BASELINE_WAVES} -eq 16 && "$BASELINE_WAVES" < 9007199254740992)) ]] ||
     diag_die "baseline children and waves must be canonical safe positive integers"
+  [[ "$GROUP_WAVES" =~ ^[1-9][0-9]*$ &&
+    (${#GROUP_WAVES} -lt 16 || (${#GROUP_WAVES} -eq 16 && "$GROUP_WAVES" < 9007199254740992)) ]] ||
+    diag_die "--group-waves must be a canonical safe positive integer"
   [[ "$SKIP_GDB" == "0" || "$SKIP_GDB" == "1" ]] ||
     diag_die "stored SKIP_GDB must be 0 or 1, got '$SKIP_GDB'"
   ((INDIVIDUAL_RUNS >= 1 && GROUP_WAVES >= 1 && GDB_MAX_RUNS >= 1 && BASELINE_CHILDREN >= 1 && BASELINE_WAVES >= 1)) ||
@@ -660,7 +672,7 @@ redo_path_is_allowed() {
   local phase="$1" path="$2" suffix
   redo_relative_path_is_safe "$path" || return 1
   case "$phase:$path" in
-    baseline:results/baseline.meta|baseline:logs/baseline|baseline:freq/baseline.samples|baseline:freq/baseline.method|groups:results/groups.tsv|groups:logs/groups|individual:results/individual.tsv|individual:results/individual.meta|individual:logs/individual|gdb:results/gdb.meta|gdb:gdb|gdb:logs/gdb|frequency:results/frequency-ab.tsv|frequency:results/frequency-ab.meta|frequency:results/frequency-cap.tsv|frequency:results/frequency-cap.meta) return 0 ;;
+    baseline:results/baseline.meta|baseline:logs/baseline|baseline:freq/baseline.samples|baseline:freq/baseline.method|groups:results/groups.tsv|groups:results/groups.meta|groups:logs/groups|individual:results/individual.tsv|individual:results/individual.meta|individual:logs/individual|gdb:results/gdb.meta|gdb:gdb|gdb:logs/gdb|frequency:results/frequency-ab.tsv|frequency:results/frequency-ab.meta|frequency:results/frequency-cap.tsv|frequency:results/frequency-cap.meta) return 0 ;;
   esac
   if [[ "$phase" == groups && "$path" == freq/group-* ]]; then
     suffix="${path#freq/group-}"
@@ -685,8 +697,12 @@ redo_config_value_is_valid() {
   local key="$1" value="$2"
   case "$key" in
     MODE) [[ "$value" == default || "$value" == quick || "$value" == full ]] ;;
-    BASELINE_CHILDREN | BASELINE_WAVES | GROUP_WAVES | INDIVIDUAL_RUNS | GDB_MAX_RUNS)
+    BASELINE_CHILDREN | BASELINE_WAVES | INDIVIDUAL_RUNS | GDB_MAX_RUNS)
       [[ "$value" =~ ^[1-9][0-9]*$ ]]
+      ;;
+    GROUP_WAVES)
+      [[ "$value" =~ ^[1-9][0-9]*$ &&
+        (${#value} -lt 16 || (${#value} -eq 16 && "$value" < 9007199254740992)) ]]
       ;;
     SKIP_GDB) [[ "$value" == 0 || "$value" == 1 ]] ;;
     CPU_TARGET) [[ "$value" == auto || "$value" =~ ^(0|[1-9][0-9]*)$ ]] ;;
@@ -1162,7 +1178,7 @@ apply_redo_plan() {
       local -a paths=()
       case "$phase" in
         baseline) paths=(results/baseline.meta logs/baseline freq/baseline.samples freq/baseline.method) ;;
-        groups) paths=(results/groups.tsv logs/groups) ;;
+        groups) paths=(results/groups.tsv results/groups.meta logs/groups) ;;
         individual) paths=(results/individual.tsv results/individual.meta logs/individual) ;;
         frequency) paths=(results/frequency-ab.tsv results/frequency-ab.meta results/frequency-cap.tsv results/frequency-cap.meta) ;;
         gdb) paths=(results/gdb.meta gdb logs/gdb) ;;
@@ -1200,6 +1216,15 @@ redo_marker_temp_cleanup() {
   if [[ -n "$META_UPDATE_TEMP" ]]; then
     case "$META_UPDATE_TEMP" in "${META_FILE%/*}"/.meta.env.*) rm -f -- "$META_UPDATE_TEMP" ;; esac
     META_UPDATE_TEMP=""
+  fi
+  if [[ -n "$GROUP_PLAN_TEMP" ]]; then
+    case "$GROUP_PLAN_TEMP" in /tmp/.groups.plan.*) rm -f -- "$GROUP_PLAN_TEMP" ;; esac
+    GROUP_PLAN_TEMP=""
+    GROUP_PLAN_DIGEST=""
+  fi
+  if [[ -n "$GROUP_META_TEMP" ]]; then
+    case "$GROUP_META_TEMP" in "${OUT_DIR:-}/results"/.groups.meta.*) rm -f -- "$GROUP_META_TEMP" ;; esac
+    GROUP_META_TEMP=""
   fi
 }
 
@@ -1253,20 +1278,35 @@ discover_topology() {
     declare -A cluster_map=()
     local cpu cid
     while read -r cpu; do
-      cid="-"
+      cid="unknown"
       if [[ -r "/sys/devices/system/cpu/cpu${cpu}/topology/cluster_id" ]]; then
-        cid="$(cat "/sys/devices/system/cpu/cpu${cpu}/topology/cluster_id")"
-      elif [[ -r "/sys/devices/system/cpu/cpu${cpu}/cache/index2/shared_cpu_list" ]]; then
-        cid="l2:$(cat "/sys/devices/system/cpu/cpu${cpu}/cache/index2/shared_cpu_list")"
+        local discovered_cid
+        discovered_cid="$(cat "/sys/devices/system/cpu/cpu${cpu}/topology/cluster_id")"
+        if [[ "$discovered_cid" =~ ^(0|[1-9][0-9]*)$ ]] &&
+          ((${#discovered_cid} < 6 || (${#discovered_cid} == 5 && discovered_cid <= 65535))); then
+          cid="$discovered_cid"
+        fi
+      fi
+      if [[ "$cid" == unknown && -r "/sys/devices/system/cpu/cpu${cpu}/cache/index2/shared_cpu_list" ]]; then
+        local shared_l2
+        shared_l2="$(cat "/sys/devices/system/cpu/cpu${cpu}/cache/index2/shared_cpu_list")"
+        shared_l2="$(diag_cpulist_intersect "$shared_l2" "$ONLINE_CPUS")"
+        [[ -n "$shared_l2" ]] && cid="l2:$shared_l2"
       fi
       cluster_map[$cid]="${cluster_map[$cid]:+${cluster_map[$cid]},}$cpu"
     done < <(cpu_list_sorted "$E_CORES")
-    local cid_key cpus
+    local cid_key cpus group_name cluster_hash
     while read -r cid_key; do
       [[ -n "$cid_key" ]] || continue
       cpus="$(cpu_list_sorted "${cluster_map[$cid_key]}" | diag_cpulist_compress)"
-      add_group "ecluster-${cid_key}" "ecluster" "$cpus" "$cid_key"
-    done < <(printf '%s\n' "${!cluster_map[@]}" | sort -n)
+      if [[ "$cid_key" == l2:* ]]; then
+        cluster_hash="$(printf '%s' "$cid_key" | sha256sum | cut -c1-12)"
+        group_name="ecluster-l2-$cluster_hash"
+      else
+        group_name="ecluster-${cid_key}"
+      fi
+      add_group "$group_name" "ecluster" "$cpus" "$cid_key"
+    done < <(printf '%s\n' "${!cluster_map[@]}" | LC_ALL=C sort)
   fi
   if [[ -z "$P_CORES" && -z "$E_CORES" ]]; then
     add_group "all-cpus" "uniform" "$ONLINE_CPUS" "-"
@@ -1390,6 +1430,75 @@ baseline_evidence_is_complete() {
   local validation_mode="${1:---validate-complete}"
   node "$LIB/baseline-evidence.mjs" "$validation_mode" \
     "$OUT_DIR" "$BASELINE_CHILDREN" "$BASELINE_WAVES"
+}
+
+groups_plan_prepare() {
+  [[ -n "$GROUP_PLAN_TEMP" && -f "$GROUP_PLAN_TEMP" && ! -L "$GROUP_PLAN_TEMP" ]] && return 0
+  GROUP_PLAN_TEMP="$(mktemp /tmp/.groups.plan.XXXXXX)" || diag_die "cannot prepare the discovered groups plan"
+  local i name kind cpus cluster children logf freq_tag
+  for ((i = 0; i < ${#GROUP_NAME[@]}; i++)); do
+    name="${GROUP_NAME[$i]}"
+    kind="${GROUP_KIND[$i]}"
+    cpus="${GROUP_CPUS[$i]}"
+    cluster="${GROUP_CLUSTER[$i]}"
+    children="$(group_children "$cpus")"
+    logf="logs/groups/${name}.log"
+    freq_tag="group-${name}"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$name" "$kind" "$cpus" "$cluster" "$children" "$GROUP_WAVES" \
+      "$logf" "$freq_tag" >> "$GROUP_PLAN_TEMP"
+  done
+  GROUP_PLAN_DIGEST="$(node "$LIB/groups-evidence.mjs" --plan-digest "$GROUP_PLAN_TEMP")" ||
+    diag_die "rediscovered CPU-group plan is invalid"
+}
+
+groups_evidence_is_complete() {
+  local validation_mode="${1:---validate-complete}"
+  groups_plan_prepare
+  node "$LIB/groups-evidence.mjs" "$validation_mode" \
+    "$OUT_DIR" "$GROUP_PLAN_TEMP" "$GROUP_WAVES"
+}
+
+groups_meta_publish() {
+  local completed="$1" total=${#GROUP_NAME[@]}
+  GROUP_META_TEMP="$(mktemp "$OUT_DIR/results/.groups.meta.XXXXXX")" ||
+    diag_die "cannot prepare groups metadata"
+  {
+    printf 'VERSION=1\n'
+    printf 'EXPECTED_ROWS=%s\n' "$total"
+    printf 'GROUP_WAVES=%s\n' "$GROUP_WAVES"
+    printf 'PLAN_DIGEST=%s\n' "$GROUP_PLAN_DIGEST"
+    printf 'COMPLETED=%s\n' "$completed"
+  } > "$GROUP_META_TEMP" || diag_die "cannot write groups metadata"
+  chmod 0600 "$GROUP_META_TEMP" || diag_die "cannot protect groups metadata"
+  mv -fT -- "$GROUP_META_TEMP" "$OUT_DIR/results/groups.meta" ||
+    diag_die "cannot publish groups metadata"
+  GROUP_META_TEMP=""
+}
+
+groups_prepare_fresh_targets() {
+  groups_plan_prepare
+  if ! node "$LIB/groups-evidence.mjs" --check-fresh \
+    "$OUT_DIR" "$GROUP_PLAN_TEMP" "$GROUP_WAVES"; then
+    diag_die "existing CPU-group evidence conflicts with a fresh phase; preserve it and resume with --redo groups"
+  fi
+  if [[ ! -e "$OUT_DIR/logs/groups" && ! -L "$OUT_DIR/logs/groups" ]]; then
+    mkdir "$OUT_DIR/logs/groups" || diag_die "cannot create CPU-group log directory"
+  fi
+}
+
+groups_require_fresh_row_targets() {
+  local name="$1" freq_tag="$2"
+  local log="$OUT_DIR/logs/groups/${name}.log"
+  local samples="$OUT_DIR/freq/${freq_tag}.samples"
+  local method="$OUT_DIR/freq/${freq_tag}.method"
+  [[ -d "$OUT_DIR/logs/groups" && ! -L "$OUT_DIR/logs/groups" &&
+    -d "$OUT_DIR/freq" && ! -L "$OUT_DIR/freq" &&
+    -f "$OUT_DIR/results/groups.tsv" && ! -L "$OUT_DIR/results/groups.tsv" &&
+    -f "$OUT_DIR/results/groups.meta" && ! -L "$OUT_DIR/results/groups.meta" &&
+    ! -e "$log" && ! -L "$log" && ! -e "$samples" && ! -L "$samples" &&
+    ! -e "$method" && ! -L "$method" ]] ||
+    diag_die "CPU-group output target for $name appeared or became unsafe; preserve it and resume with --redo groups"
 }
 
 baseline_prepare_fresh_targets() {
@@ -1713,7 +1822,11 @@ phase_baseline() {
 
 # ------------------------------------------------------------------
 phase_groups() {
-  : > "$OUT_DIR/results/groups.tsv"
+  groups_prepare_fresh_targets
+  if ! (set -o noclobber; : > "$OUT_DIR/results/groups.tsv") 2> /dev/null; then
+    diag_die "cannot safely create groups results; preserve the bundle and resume with --redo groups"
+  fi
+  groups_meta_publish 0
   local i name kind cpus cluster children logf freq_tag
   local total=${#GROUP_NAME[@]}
   for ((i = 0; i < total; i++)); do
@@ -1724,16 +1837,22 @@ phase_groups() {
     children="$(group_children "$cpus")"
     logf="logs/groups/${name}.log"
     freq_tag="group-${name}"
+    groups_require_fresh_row_targets "$name" "$freq_tag"
     diag_log "group $((i + 1))/$total: $name cpus=$cpus children=$children waves=$GROUP_WAVES"
     diag_freq_sampler_start "$freq_tag"
     run_repro_logged "$OUT_DIR/$logf" "$cpus" "$children" "$GROUP_WAVES"
     diag_freq_sampler_stop
     repro_result_is_complete "$OUT_DIR/$logf" "$children" "$GROUP_WAVES" "$REPRO_RC" ||
-      diag_die "group $name did not produce a complete $GROUP_WAVES-wave result (rc=$REPRO_RC); phase remains resumable"
+      diag_die "group $name did not produce a complete $GROUP_WAVES-wave result (rc=$REPRO_RC); preserve it and resume with --redo groups"
+    [[ -f "$OUT_DIR/results/groups.tsv" && ! -L "$OUT_DIR/results/groups.tsv" ]] ||
+      diag_die "groups results became unsafe; preserve the bundle and resume with --redo groups"
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$name" "$kind" "$cpus" "$cluster" "$children" "$GROUP_WAVES" \
       "$logf" "$freq_tag" "$REPRO_RC" >> "$OUT_DIR/results/groups.tsv"
   done
+  groups_meta_publish 1
+  groups_evidence_is_complete --validate-before-mark ||
+    diag_die "groups did not produce a valid complete evidence envelope; preserve it and resume with --redo groups"
   mark_done groups
 }
 
@@ -2498,6 +2617,8 @@ main() {
 
   # ---- phase 3 ----
   if phase_is_done groups; then
+    groups_evidence_is_complete ||
+      diag_die "completed groups phase has missing, stale, or invalid evidence; preserve it and resume with --redo groups"
     diag_log "phase 3/7 groups: already done, skipping (resume)"
   else
     diag_log "phase 3/7: CPU-group isolation (${#GROUP_NAME[@]} groups x $GROUP_WAVES waves)"

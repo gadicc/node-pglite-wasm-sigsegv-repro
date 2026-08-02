@@ -1113,6 +1113,7 @@ check_eq "dry run shows the dependent redo plan" "1" "$([[ "$redo_plan" == *"red
 DEPENDENT_RB="$TMP/redo-dependent-bundle"
 mkdir -p "$DEPENDENT_RB"/{results,state,logs/groups,logs/individual,gdb,logs/gdb,freq}
 printf 'groups\n' > "$DEPENDENT_RB/results/groups.tsv"
+printf 'groups meta\n' > "$DEPENDENT_RB/results/groups.meta"
 printf 'individual\n' > "$DEPENDENT_RB/results/individual.tsv"
 printf 'frequency\n' > "$DEPENDENT_RB/results/frequency-ab.tsv"
 printf 'gdb\n' > "$DEPENDENT_RB/results/gdb.meta"
@@ -1156,6 +1157,7 @@ dependent_redo_ok=0
   [[ ! -e "$DEPENDENT_RB/report.md" ]] &&
   [[ ! -e "$DEPENDENT_RB/manifest.txt" ]] &&
   [[ -f "$dependent_stash/groups/results/groups.tsv" ]] &&
+  [[ -f "$dependent_stash/groups/results/groups.meta" ]] &&
   [[ -f "$dependent_stash/individual/results/individual.tsv" ]] &&
   [[ -f "$dependent_stash/frequency/results/frequency-ab.tsv" ]] &&
   [[ -f "$dependent_stash/gdb/results/gdb.meta" ]] &&
@@ -1846,6 +1848,36 @@ printf 'CHILDREN=4\nWAVES=5\nLOG=logs/baseline/run1.log\nEXIT_CODE=1\n' \
 printf 'VERSION=1\nTARGET_CPUS=%s\nRUNS_PER_CPU=1\nSKIPPED=0\nCOMPLETED=1\n' \
   "$TEST_OFFLINE_CANONICAL_CPU" > "$AUTO_OFFLINE_RB/results/individual.meta"
 printf '%s\t1\t139\t1\n' "$TEST_OFFLINE_CANONICAL_CPU" > "$AUTO_OFFLINE_RB/results/individual.tsv"
+# This fixture deliberately reaches the post-individual automatic-CPU guard;
+# construct a genuine topology-bound completed group envelope so phase 3 does
+# not fail first for the unrelated (and now invalid) marker-only condition.
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$AUTO_OFFLINE_RB" STATE_DIR="$AUTO_OFFLINE_RB/state" GROUP_WAVES=10
+  discover_topology
+  mkdir -p "$AUTO_OFFLINE_RB/logs/groups"
+  groups_plan_prepare
+  : > "$AUTO_OFFLINE_RB/results/groups.tsv"
+  for ((group_i = 0; group_i < ${#GROUP_NAME[@]}; group_i++)); do
+    group_name="${GROUP_NAME[$group_i]}"
+    group_children_count="$(group_children "${GROUP_CPUS[$group_i]}")"
+    group_log="logs/groups/${group_name}.log"
+    {
+      printf 'node=v25.2.1 v8=test platform=linux arch=x64 children=%s waves=10\n' "$group_children_count"
+      for group_wave in $(seq 1 10); do
+        printf 'wave=%s passed=%s/%s\n' "$group_wave" "$group_children_count" "$group_children_count"
+      done
+      printf 'failedWaves=0 completedWaves=10 requestedWaves=10\n'
+    } > "$AUTO_OFFLINE_RB/$group_log"
+    printf '%s\t%s\t%s\t%s\t%s\t10\t%s\tgroup-%s\t0\n' \
+      "$group_name" "${GROUP_KIND[$group_i]}" "${GROUP_CPUS[$group_i]}" \
+      "${GROUP_CLUSTER[$group_i]}" "$group_children_count" "$group_log" "$group_name" \
+      >> "$AUTO_OFFLINE_RB/results/groups.tsv"
+  done
+  groups_meta_publish 1
+  rm -f -- "$GROUP_PLAN_TEMP"
+) > /dev/null 2>&1
 touch "$AUTO_OFFLINE_RB/state"/phase-{preflight,baseline,groups,individual}.done
 auto_offline_output="$("$REPO_ROOT/diagnose.sh" --resume "$AUTO_OFFLINE_RB" --yes 2>&1)"
 auto_offline_rc=$?
@@ -2312,6 +2344,10 @@ check_eq "zero gdb attempts are rejected" "1" "$([[ $zero_gdb_rc -ne 0 ]] && ech
 noncanonical_gdb_rc=$?
 check_eq "non-canonical gdb attempts are rejected before execution" "1" \
   "$([[ $noncanonical_gdb_rc -ne 0 ]] && echo 1 || echo 0)"
+"$REPO_ROOT/diagnose.sh" --group-waves 010 --dry-run --yes > /dev/null 2>&1
+noncanonical_group_waves_rc=$?
+check_eq "non-canonical group waves are rejected before execution" "1" \
+  "$([[ $noncanonical_group_waves_rc -ne 0 ]] && echo 1 || echo 0)"
 "$REPO_ROOT/diagnose.sh" --cpu 01 --dry-run --yes > /dev/null 2>&1
 noncanonical_cpu_rc=$?
 check_eq "non-canonical CPU overrides are rejected before execution" "1" \
@@ -2669,6 +2705,97 @@ baseline_symlink_rc=$?
 check_eq "fresh baseline refuses dangling sampler symlink" "1" \
   "$([[ $baseline_symlink_rc -ne 0 ]] && grep -q -- '--redo baseline' "$BASELINE_SYMLINK_GUARD/output" && echo 1 || echo 0)"
 
+echo "== groups evidence envelope runner =="
+GROUPS_RUNNER="$TMP/groups-runner"
+mkdir -p "$GROUPS_RUNNER"/{results,logs,state,freq}
+printf 'BASELINE_CHILDREN=4\nBASELINE_WAVES=5\nGROUP_WAVES=5\nCOMPLETED_PHASES=\n' > "$GROUPS_RUNNER/results/meta.env"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$GROUPS_RUNNER"
+  STATE_DIR="$GROUPS_RUNNER/state"
+  META_FILE="$GROUPS_RUNNER/results/meta.env"
+  DIAG_LOG_FILE=""
+  GROUP_WAVES=5
+  GROUP_NAME=(pcores ecluster-64)
+  GROUP_KIND=(pcore ecluster)
+  GROUP_CPUS=(0-3 16-19)
+  GROUP_CLUSTER=(- 64)
+  diag_freq_sampler_start() { :; }
+  diag_freq_sampler_stop() { :; }
+  run_repro_logged() {
+    if [[ "$1" == */pcores.log ]]; then cp "$FIX/repro-clean-4x5.log" "$1"; REPRO_RC=0
+    else cp "$FIX/repro-fail.log" "$1"; REPRO_RC=1
+    fi
+  }
+  phase_groups
+) > "$GROUPS_RUNNER/output" 2>&1
+groups_runner_rc=$?
+check_eq "groups validates its exact plan envelope before publishing completion" "1" \
+  "$([[ $groups_runner_rc -eq 0 && -f "$GROUPS_RUNNER/state/phase-groups.done" && "$(sed -n 's/^COMPLETED=//p' "$GROUPS_RUNNER/results/groups.meta")" == 1 ]] && echo 1 || echo 0)"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$GROUPS_RUNNER" STATE_DIR="$GROUPS_RUNNER/state" GROUP_WAVES=5
+  GROUP_NAME=(pcores ecluster-64) GROUP_KIND=(pcore ecluster)
+  GROUP_CPUS=(0-3 16-19) GROUP_CLUSTER=(- 64)
+  groups_evidence_is_complete
+) > /dev/null 2>&1
+check_eq "completed groups envelope validates on resume" "0" "$?"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$GROUPS_RUNNER" STATE_DIR="$GROUPS_RUNNER/state" GROUP_WAVES=5
+  GROUP_NAME=(pcores ecluster-64) GROUP_KIND=(pcore ecluster)
+  GROUP_CPUS=(0-3 20-23) GROUP_CLUSTER=(- 64)
+  groups_evidence_is_complete
+) > /dev/null 2>&1
+groups_plan_mismatch_rc=$?
+check_eq "resume rejects a rediscovered topology-plan generation mismatch" "1" "$([[ $groups_plan_mismatch_rc -ne 0 ]] && echo 1 || echo 0)"
+
+GROUPS_PARTIAL="$TMP/groups-partial"
+mkdir -p "$GROUPS_PARTIAL"/{results,logs,state,freq}
+printf 'BASELINE_CHILDREN=4\nBASELINE_WAVES=5\nGROUP_WAVES=5\nCOMPLETED_PHASES=\n' > "$GROUPS_PARTIAL/results/meta.env"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$GROUPS_PARTIAL" STATE_DIR="$GROUPS_PARTIAL/state" META_FILE="$GROUPS_PARTIAL/results/meta.env"
+  DIAG_LOG_FILE="" GROUP_WAVES=5
+  GROUP_NAME=(pcores) GROUP_KIND=(pcore) GROUP_CPUS=(0-3) GROUP_CLUSTER=(-)
+  diag_freq_sampler_start() { :; }
+  diag_freq_sampler_stop() { :; }
+  run_repro_logged() { cp "$FIX/repro-truncated.log" "$1"; REPRO_RC=1; }
+  phase_groups
+) > "$GROUPS_PARTIAL/first.output" 2>&1
+groups_partial_first_rc=$?
+groups_partial_before="$(sha256sum "$GROUPS_PARTIAL/results/groups.tsv" "$GROUPS_PARTIAL/results/groups.meta" "$GROUPS_PARTIAL/logs/groups/pcores.log")"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$GROUPS_PARTIAL" STATE_DIR="$GROUPS_PARTIAL/state" META_FILE="$GROUPS_PARTIAL/results/meta.env"
+  DIAG_LOG_FILE="" GROUP_WAVES=5
+  GROUP_NAME=(pcores) GROUP_KIND=(pcore) GROUP_CPUS=(0-3) GROUP_CLUSTER=(-)
+  phase_groups
+) > "$GROUPS_PARTIAL/second.output" 2>&1
+groups_partial_second_rc=$?
+groups_partial_after="$(sha256sum "$GROUPS_PARTIAL/results/groups.tsv" "$GROUPS_PARTIAL/results/groups.meta" "$GROUPS_PARTIAL/logs/groups/pcores.log")"
+check_eq "interrupted groups evidence is preserved and explicitly requires redo" "1" \
+  "$([[ $groups_partial_first_rc -ne 0 && $groups_partial_second_rc -ne 0 && "$groups_partial_before" == "$groups_partial_after" ]] && grep -q -- '--redo groups' "$GROUPS_PARTIAL/second.output" && echo 1 || echo 0)"
+
+GROUPS_TARGET_GUARD="$TMP/groups-target-guard"
+mkdir -p "$GROUPS_TARGET_GUARD"/{results,logs,state,freq}
+ln -s "$TMP/outside-group-samples" "$GROUPS_TARGET_GUARD/freq/group-pcores.samples"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$GROUPS_TARGET_GUARD" STATE_DIR="$GROUPS_TARGET_GUARD/state" GROUP_WAVES=5
+  GROUP_NAME=(pcores) GROUP_KIND=(pcore) GROUP_CPUS=(0-3) GROUP_CLUSTER=(-)
+  groups_prepare_fresh_targets
+) > "$GROUPS_TARGET_GUARD/output" 2>&1
+groups_target_guard_rc=$?
+check_eq "fresh groups refuses dangling fixed sampler targets" "1" \
+  "$([[ $groups_target_guard_rc -ne 0 ]] && grep -q -- '--redo groups' "$GROUPS_TARGET_GUARD/output" && echo 1 || echo 0)"
+
 baseline_config_guards=1
 for variant in duplicate noncanonical meta-symlink results-symlink; do
   config_bundle="$TMP/baseline-config-$variant"
@@ -2707,7 +2834,7 @@ fi
 echo "== end-to-end collect + report on synthetic bundle =="
 B="$TMP/bundle"
 mkdir -p "$B"/{results,logs/baseline,logs/groups,env,freq,gdb,state}
-touch "$B/state/phase-baseline.done" "$B/state/phase-individual.done" "$B/state/phase-frequency.done" "$B/state/phase-gdb.done"
+touch "$B/state/phase-baseline.done" "$B/state/phase-groups.done" "$B/state/phase-individual.done" "$B/state/phase-frequency.done" "$B/state/phase-gdb.done"
 
 cat > "$B/results/meta.env" << EOF
 MODE=default
@@ -2750,8 +2877,16 @@ EOF
 cp "$FIX/repro-fail.log" "$B/logs/groups/ecluster-64.log"
 cp "$FIX/repro-clean-4x5.log" "$B/logs/groups/pcores.log"
 cat > "$B/results/groups.tsv" << EOF
-pcores	pcore	0-7	-	4	5	logs/groups/pcores.log	group-pcores	0
+pcores	pcore	0-3	-	4	5	logs/groups/pcores.log	group-pcores	0
 ecluster-64	ecluster	16-19	64	4	5	logs/groups/ecluster-64.log	group-ecluster-64	1
+EOF
+groups_plan_digest="$(cut -f1-8 "$B/results/groups.tsv" | sha256sum | cut -d' ' -f1)"
+cat > "$B/results/groups.meta" << EOF
+VERSION=1
+EXPECTED_ROWS=2
+GROUP_WAVES=5
+PLAN_DIGEST=$groups_plan_digest
+COMPLETED=1
 EOF
 
 # CPU 8: 20 clean runs; CPU 19: 6 SIGSEGV in 20 runs.

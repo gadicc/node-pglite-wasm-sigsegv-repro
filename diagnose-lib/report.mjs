@@ -345,7 +345,14 @@ export function renderReport(results) {
   // ------------------------------------------------------------------
   L.push("## Phase 3: CPU-group isolation");
   L.push("");
-  if (r.groups?.length) {
+  const groupsStatus = r.groupsStatus?.status ?? (r.groups?.length ? "complete" : "not-run");
+  if (groupsStatus !== "complete" && groupsStatus !== "not-run") {
+    L.push(`**CPU-group evidence envelope: ${groupsStatus}.** Its rows and logs are`);
+    L.push("excluded from aggregate reproduction and group-localization conclusions.");
+    for (const reason of r.groupsStatus?.reasons ?? []) L.push(`- ${reason}`);
+    L.push("");
+  }
+  if (groupsStatus === "complete" && r.groups?.length) {
     L.push("Groups were discovered from sysfs topology, not hardcoded.");
     L.push("");
     L.push("| Group | CPUs | Children | Waves | Child failures (descriptive) | SIGSEGV waves / resolved-wave rate (95% CI) | Unresolved waves | Eff. freq (avg/max) |");
@@ -370,7 +377,7 @@ export function renderReport(results) {
     L.push("Excluding unresolved waves can also bias a resolved-wave interval; their");
     L.push("count is shown rather than silently treating them as negative trials.");
     L.push("");
-  } else {
+  } else if (groupsStatus === "not-run") {
     L.push("Not run (or no data collected).\n");
   }
 
@@ -571,6 +578,7 @@ function renderConclusions(r) {
   let hasIncompleteReproEvidence = false;
   let hasInvalidCountEvidence = false;
   let hasInvalidBaselineEnvelope = false;
+  const groupsEvidenceStatus = r.groupsStatus?.status ?? (r.groups?.length ? "complete" : "not-run");
   const addAggregate = (sigsegv, other, unclassified, runs) => {
     if (sigsegv > Number.MAX_SAFE_INTEGER - totalSig ||
         other > Number.MAX_SAFE_INTEGER - totalOther ||
@@ -603,7 +611,10 @@ function renderConclusions(r) {
     hasInvalidBaselineEnvelope = true;
     hasIncompleteReproEvidence = true;
   }
-  for (const g of r.groups ?? []) {
+  if (groupsEvidenceStatus !== "complete" && groupsEvidenceStatus !== "not-run") {
+    hasIncompleteReproEvidence = true;
+  }
+  for (const g of groupsEvidenceStatus === "complete" ? (r.groups ?? []) : []) {
     if (validReproCounts(g)) {
       const added = addAggregate(
         g.sigsegvCount ?? 0,
@@ -647,6 +658,9 @@ function renderConclusions(r) {
   if (hasInvalidBaselineEnvelope) {
     C.push("- **Invalid baseline evidence was excluded** from reproduction, clean-rate, and configuration conclusions; see phase 2 for the preserved descriptive evidence and validation reasons.");
   }
+  if (groupsEvidenceStatus !== "complete" && groupsEvidenceStatus !== "not-run") {
+    C.push("- **Incomplete or invalid CPU-group evidence was excluded** from reproduction and group-localization conclusions; see phase 3 for validation reasons.");
+  }
 
   // 2. Localization to CPUs / groups. Individual CPU batches run in fixed,
   // sequential order, so CPU labels are not exchangeable with respect to
@@ -681,10 +695,11 @@ function renderConclusions(r) {
   } else if (testedCpus.length > 0) {
     C.push("- CPU localization: no failures observed on any tested CPU; sequential per-CPU results remain descriptive only.");
   }
-  const failingGroups = (r.groups ?? []).filter(
+  const conclusionGroups = groupsEvidenceStatus === "complete" ? (r.groups ?? []) : [];
+  const failingGroups = conclusionGroups.filter(
     (g) => validReproCounts(g) && (g.sigsegvCount ?? 0) > 0,
   );
-  const cleanGroups = (r.groups ?? []).filter(
+  const cleanGroups = conclusionGroups.filter(
     (g) =>
       validReproCounts(g) &&
       canSupportCleanReproConclusion(g) &&
@@ -693,7 +708,7 @@ function renderConclusions(r) {
       (g.unclassifiedFailureCount ?? 0) === 0 &&
       (g.totalChildInvocations ?? 0) > 0,
   );
-  const unresolvedGroups = (r.groups ?? []).filter(
+  const unresolvedGroups = conclusionGroups.filter(
     (g) => validReproCounts(g) && (g.sigsegvCount ?? 0) === 0 &&
       (!canSupportCleanReproConclusion(g) ||
         (g.otherFailureCount ?? 0) > 0 || (g.unclassifiedFailureCount ?? 0) > 0),

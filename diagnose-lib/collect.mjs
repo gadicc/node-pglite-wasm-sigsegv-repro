@@ -22,6 +22,7 @@ import path from "node:path";
 import { parseReproLog } from "./parse-repro-log.mjs";
 import { parseGdbCapture } from "./parse-gdb.mjs";
 import { assessBaselineEvidence } from "./baseline-evidence.mjs";
+import { assessGroupsEvidence } from "./groups-evidence.mjs";
 
 function readKeyValues(file) {
   const out = {};
@@ -82,6 +83,7 @@ function readStoredRunMetadata(outDir) {
     return { values, status: "invalid", reasons: ["stored run metadata could not be read"], bundleRootSafe, resultsDirSafe };
   }
   const seenConfig = new Set();
+  const duplicateConfig = new Set();
   for (const line of text.split("\n")) {
     if (line === "") continue;
     const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
@@ -93,6 +95,7 @@ function readStoredRunMetadata(outDir) {
     if (RUN_CONFIG_KEYS.has(key)) {
       if (seenConfig.has(key)) {
         reasons.push(`stored run metadata contains duplicate ${key} rows`);
+        duplicateConfig.add(key);
         continue;
       }
       seenConfig.add(key);
@@ -101,16 +104,21 @@ function readStoredRunMetadata(outDir) {
   }
   const children = canonicalUint(values.BASELINE_CHILDREN);
   const waves = canonicalUint(values.BASELINE_WAVES);
+  const groupWaves = duplicateConfig.has("GROUP_WAVES") ? null : canonicalUint(values.GROUP_WAVES);
   if (children === null || children < 1) {
     reasons.push("stored BASELINE_CHILDREN is missing or not a canonical safe positive integer");
   }
   if (waves === null || waves < 1) {
     reasons.push("stored BASELINE_WAVES is missing or not a canonical safe positive integer");
   }
+  if (groupWaves === null || groupWaves < 1) {
+    reasons.push("stored GROUP_WAVES is missing or not a canonical safe positive integer");
+  }
   return {
     values,
     baselineChildren: children !== null && children > 0 ? children : null,
     baselineWaves: waves !== null && waves > 0 ? waves : null,
+    groupWaves: groupWaves !== null && groupWaves > 0 ? groupWaves : null,
     status: reasons.length > 0 ? "invalid" : "complete",
     reasons: [...new Set(reasons)],
     bundleRootSafe,
@@ -681,7 +689,7 @@ export function collect(outDir) {
       endEpoch: num(meta.END_EPOCH),
       baselineChildren: runMetaState.baselineChildren ?? null,
       baselineWaves: runMetaState.baselineWaves ?? null,
-      groupWaves: num(meta.GROUP_WAVES),
+      groupWaves: runMetaState.groupWaves ?? null,
       individualRuns: num(meta.INDIVIDUAL_RUNS),
       gdbMaxRuns: num(meta.GDB_MAX_RUNS),
       cpuTarget:
@@ -752,55 +760,41 @@ export function collect(outDir) {
   }
 
   // --- groups ---
-  const groupRows = readTsv(path.join(resultsDir, "groups.tsv"));
-  if (groupRows.length > 0) {
-    results.groups = [];
-    for (const row of groupRows) {
-      const [name, kind, cpus, clusterId, childrenS, wavesS, logRel, freqTag, exitCodeS] = row;
-      const entry = {
-        name,
-        kind,
-        cpus,
-        clusterId: clusterId === "-" ? null : num(clusterId),
-        children: num(childrenS),
-        wavesRequested: num(wavesS),
-        log: logRel,
-        exitCode: num(exitCodeS),
-        frequency: summarizeFreqSamples(outDir, freqTag, cpuSetFromList(cpus)),
-      };
-      const logPath = path.join(outDir, logRel);
-      if (existsSync(logPath)) {
-        const parsed = parseReproLog(readFileSync(logPath, "utf8"), {
-          expectedChildren: num(childrenS),
-          expectedWaves: num(wavesS),
-          exitCode: num(exitCodeS),
-        });
-        Object.assign(entry, {
-          processedWaves: parsed.processedWaves,
-          completedWaves: parsed.completedWaves,
-          fullyPassedWaves: parsed.fullyPassedWaves,
-          failedWaves: parsed.failedWaves,
-          totalChildInvocations: parsed.totalChildInvocations,
-          sigsegvCount: parsed.sigsegvCount,
-          otherFailureCount: parsed.otherFailureCount,
-          unclassifiedFailureCount: parsed.unclassifiedFailureCount,
-          sigsegvWaveCount: parsed.sigsegvWaveCount,
-          sigsegvResolvedWaveCount: parsed.sigsegvResolvedWaveCount,
-          sigsegvUnresolvedWaveCount: parsed.sigsegvUnresolvedWaveCount,
-          otherFailureWaveCount: parsed.otherFailureWaveCount,
-          unclassifiedFailureWaveCount: parsed.unclassifiedFailureWaveCount,
-          firstFailureAfterSec: parsed.firstFailureAfterSec,
-          durationSec: parsed.durationSec,
-          failures: parsed.failures,
-          footer: parsed.footer,
-          completionStatus: parsed.completionStatus,
-          issues: parsed.issues,
-          notes: parsed.notes,
-          partial: parsed.partial,
-        });
-      }
-      results.groups.push(entry);
-    }
+  const groupsAssessment = assessGroupsEvidence(outDir, {
+    expectedGroupWaves: runMetaState.status === "complete" ? runMetaState.groupWaves : null,
+    requireMarker: true,
+  });
+  results.groupsStatus = {
+    status: groupsAssessment.status,
+    reasons: groupsAssessment.reasons,
+  };
+  if (groupsAssessment.status === "complete") {
+    results.groups = groupsAssessment.entries.map(({ parsed, freqTag, ...entry }) => ({
+      ...entry,
+      processedWaves: parsed.processedWaves,
+      completedWaves: parsed.completedWaves,
+      fullyPassedWaves: parsed.fullyPassedWaves,
+      failedWaves: parsed.failedWaves,
+      totalChildInvocations: parsed.totalChildInvocations,
+      sigsegvCount: parsed.sigsegvCount,
+      otherFailureCount: parsed.otherFailureCount,
+      unclassifiedFailureCount: parsed.unclassifiedFailureCount,
+      sigsegvWaveCount: parsed.sigsegvWaveCount,
+      sigsegvResolvedWaveCount: parsed.sigsegvResolvedWaveCount,
+      sigsegvUnresolvedWaveCount: parsed.sigsegvUnresolvedWaveCount,
+      otherFailureWaveCount: parsed.otherFailureWaveCount,
+      unclassifiedFailureWaveCount: parsed.unclassifiedFailureWaveCount,
+      firstFailureAfterSec: parsed.firstFailureAfterSec,
+      durationSec: parsed.durationSec,
+      failures: parsed.failures,
+      footer: parsed.footer,
+      completionStatus: parsed.completionStatus,
+      issues: parsed.issues,
+      notes: parsed.notes,
+      partial: parsed.partial,
+      envelopeStatus: groupsAssessment.status,
+      frequency: summarizeFreqSamples(outDir, freqTag, cpuSetFromList(entry.cpus)),
+    }));
   }
 
   // --- individual ---
