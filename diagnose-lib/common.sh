@@ -522,6 +522,12 @@ diag_cleanup_now() {
   diag_restore_now
 }
 
+# Privileged callers may override this to hand staged artifacts to an
+# unprivileged publisher after workloads stop and settings are restored.
+diag_cleanup_artifacts() {
+  return 0
+}
+
 diag_cleanup_exit() {
   local rc="$1" cleanup_rc=0
   trap - EXIT INT TERM
@@ -529,6 +535,9 @@ diag_cleanup_exit() {
     :
   else
     cleanup_rc=$?
+  fi
+  if ! diag_cleanup_artifacts; then
+    cleanup_rc=1
   fi
   if ! diag_restore_lock_release; then
     cleanup_rc=1
@@ -542,6 +551,7 @@ diag_cleanup_signal() {
   trap - EXIT INT TERM
   diag_warn "received $name"
   diag_cleanup_now || true
+  diag_cleanup_artifacts || true
   diag_restore_lock_release || true
   exit "$rc"
 }

@@ -12,7 +12,8 @@
 # exit, failure, SIGINT, or SIGTERM; the restore is verified and recorded.
 # SIGKILL recovery state lives under a root-owned /run directory, never in
 # the user-owned diagnostics bundle.
-# Workload legs run as the invoking user (via runuser) when possible.
+# Workload legs and final bundle placement run as the invoking user via
+# runuser; direct-root invocation is refused.
 # Results land in the bundle (results/frequency-ab.tsv|.meta); regenerate
 # the report afterwards with:
 #
@@ -21,10 +22,84 @@
 # Exit codes: 0 success, 2 usage, 4 not applicable / missing dependency.
 set -Eeuo pipefail
 ulimit -c 0
+umask 077
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=diagnose-lib/common.sh
 source "$SCRIPT_DIR/diagnose-lib/common.sh"
+
+# Never honor inherited output paths while privileged. All diagnostic output
+# is assigned below to either the trusted restore area or private staging.
+DIAG_LOG_FILE=""
+DIAG_COMMANDS_LOG=""
+DIAG_RESTORE_FILE=""
+
+FREQUENCY_STAGE_DIR=""
+FREQUENCY_OUTPUTS_PUBLISHED=0
+INVOKING_UID=""
+INVOKING_GID=""
+
+frequency_publish_outputs() {
+  [[ -n "$FREQUENCY_STAGE_DIR" ]] || return 0
+  ((FREQUENCY_OUTPUTS_PUBLISHED == 0)) || return 0
+
+  local dir rel file tag
+  for dir in "$FREQUENCY_STAGE_DIR" "$FREQUENCY_STAGE_DIR/results" "$FREQUENCY_STAGE_DIR/freq"; do
+    [[ -d "$dir" && ! -L "$dir" ]] || {
+      diag_warn "frequency output staging directory became unsafe; partial evidence remains in $FREQUENCY_STAGE_DIR"
+      return 1
+    }
+    [[ "$(stat -Lc '%u:%g:%a' -- "$dir" 2> /dev/null)" == "0:0:700" ]] || {
+      diag_warn "frequency output staging directory has unsafe ownership or mode; partial evidence remains in $FREQUENCY_STAGE_DIR"
+      return 1
+    }
+  done
+
+  local -a staged_files=(commands.log)
+  local -a candidates=(
+    results/frequency-ab.tsv
+    results/frequency-ab.meta
+    results/frequency-cap.tsv
+    results/frequency-cap.meta
+  )
+  for tag in A1 B A2 cap; do
+    candidates+=("freq/freq-ab-${tag}.samples" "freq/freq-ab-${tag}.method")
+  done
+  for rel in "${candidates[@]}"; do
+    [[ -e "$FREQUENCY_STAGE_DIR/$rel" || -L "$FREQUENCY_STAGE_DIR/$rel" ]] && staged_files+=("$rel")
+  done
+  for rel in "${staged_files[@]}"; do
+    file="$FREQUENCY_STAGE_DIR/$rel"
+    [[ -f "$file" && ! -L "$file" ]] || {
+      diag_warn "unsafe staged frequency artifact $rel; partial evidence remains in $FREQUENCY_STAGE_DIR"
+      return 1
+    }
+    [[ "$(stat -Lc '%u:%g:%a:%h' -- "$file" 2> /dev/null)" == "0:0:600:1" ]] || {
+      diag_warn "staged frequency artifact $rel has unsafe ownership, mode, or links; partial evidence remains in $FREQUENCY_STAGE_DIR"
+      return 1
+    }
+  done
+
+  # Root touches only the private staging tree. Once ownership is handed off,
+  # this shell performs no more filesystem operations there or in the bundle;
+  # the unprivileged helper does every destination open and rename.
+  for rel in "${staged_files[@]}"; do
+    chown "$INVOKING_UID:$INVOKING_GID" "$FREQUENCY_STAGE_DIR/$rel" || return 1
+  done
+  for dir in "$FREQUENCY_STAGE_DIR/results" "$FREQUENCY_STAGE_DIR/freq" "$FREQUENCY_STAGE_DIR"; do
+    chown "$INVOKING_UID:$INVOKING_GID" "$dir" || return 1
+  done
+  if ! runuser -u "$SUDO_USER" -- /bin/bash \
+    "$SCRIPT_DIR/diagnose-lib/publish-frequency-output.sh" "$FREQUENCY_STAGE_DIR" "$BUNDLE"; then
+    diag_warn "could not publish partial frequency evidence; invoking user owns staging directory $FREQUENCY_STAGE_DIR"
+    return 1
+  fi
+  FREQUENCY_OUTPUTS_PUBLISHED=1
+}
+
+diag_cleanup_artifacts() {
+  frequency_publish_outputs
+}
 
 usage() {
   cat >&2 << 'EOF'
@@ -78,7 +153,7 @@ if ((EUID != 0)); then
   exit 4
 fi
 
-for dep in flock node setsid stat taskset; do
+for dep in flock node runuser setsid stat taskset; do
   command -v "$dep" > /dev/null 2>&1 || diag_die "missing required command: $dep"
 done
 
@@ -90,38 +165,19 @@ fi
 POLICY="$(readlink -f "/sys/devices/system/cpu/cpu${CPU}/cpufreq" 2> /dev/null || echo "")"
 [[ -n "$POLICY" ]] || diag_warn "no cpufreq policy found for cpu $CPU"
 
-declare -a protected_bundle_paths=(
-  "$BUNDLE/results" "$BUNDLE/freq" "$BUNDLE/state" "$BUNDLE/commands.log"
-  "$BUNDLE/results/frequency-ab.tsv" "$BUNDLE/results/frequency-ab.meta"
-  "$BUNDLE/results/frequency-cap.tsv" "$BUNDLE/results/frequency-cap.meta"
-)
-for tag in A1 B A2 cap; do
-  protected_bundle_paths+=(
-    "$BUNDLE/freq/freq-ab-${tag}.samples"
-    "$BUNDLE/freq/freq-ab-${tag}.method"
-  )
-done
-diag_require_not_symlink "${protected_bundle_paths[@]}"
-
-mkdir -p "$BUNDLE/results" "$BUNDLE/freq" "$BUNDLE/state"
 DIAG_BUNDLE_ROOT="$BUNDLE"
 DIAG_REPO_ROOT="$SCRIPT_DIR"
-DIAG_FREQ_DIR="$BUNDLE/freq"
-DIAG_COMMANDS_LOG="$BUNDLE/commands.log"
 
-INVOKING_UID=0
-if [[ -n "${SUDO_UID:-}" ]]; then
-  diag_require_uint "SUDO_UID" "$SUDO_UID"
-  INVOKING_UID="$SUDO_UID"
-fi
-if [[ -n "${SUDO_USER:-}" ]]; then
-  resolved_sudo_uid="$(id -u "$SUDO_USER" 2> /dev/null)" ||
-    diag_die "cannot resolve invoking user '$SUDO_USER'"
-  if [[ -n "${SUDO_UID:-}" && "$resolved_sudo_uid" != "$INVOKING_UID" ]]; then
-    diag_die "SUDO_USER and SUDO_UID identify different invoking users"
-  fi
-  INVOKING_UID="$resolved_sudo_uid"
-fi
+[[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]] ||
+  diag_die "run through sudo from a non-root account so bundle output can be published without root privileges"
+diag_require_uint "SUDO_UID" "${SUDO_UID:-}"
+((SUDO_UID > 0)) || diag_die "SUDO_UID must identify a non-root invoking user"
+INVOKING_UID="$(id -u "$SUDO_USER" 2> /dev/null)" ||
+  diag_die "cannot resolve invoking user '$SUDO_USER'"
+INVOKING_GID="$(id -g "$SUDO_USER" 2> /dev/null)" ||
+  diag_die "cannot resolve invoking group for '$SUDO_USER'"
+[[ "$INVOKING_UID" == "$SUDO_UID" ]] ||
+  diag_die "SUDO_USER and SUDO_UID identify different invoking users"
 
 # Runtime settings reset on reboot, so /run provides durable-enough SIGKILL
 # recovery without placing privileged write authority in the user-owned
@@ -164,20 +220,36 @@ if [[ -L "$LEGACY_RESTORE_FILE" || -s "$LEGACY_RESTORE_FILE" ]]; then
   diag_die "legacy bundle restore state cannot be trusted; inspect and remove it manually before continuing"
 fi
 
-# Run workload legs as the invoking user when we can.
-declare -a AS_USER=()
-if [[ -n "${SUDO_USER:-}" ]] && command -v runuser > /dev/null 2>&1; then
-  AS_USER=(runuser -u "$SUDO_USER" --)
-  diag_log "workload legs run as user $SUDO_USER (via runuser)"
-else
-  diag_warn "workload legs run as root (no SUDO_USER/runuser)"
-fi
+# Prepare the destination directories as the invoking user. Root never opens
+# or creates an output inside the user-mutable bundle.
+runuser -u "$SUDO_USER" -- test -d "$BUNDLE" &&
+  runuser -u "$SUDO_USER" -- test -w "$BUNDLE" ||
+  diag_die "invoking user cannot write the diagnostics bundle"
+runuser -u "$SUDO_USER" -- mkdir -p -- "$BUNDLE/results" "$BUNDLE/freq" ||
+  diag_die "invoking user could not prepare bundle output directories"
+declare -a AS_USER=(runuser -u "$SUDO_USER" --)
+diag_log "workload legs and bundle placement run as user $SUDO_USER (via runuser)"
+
+# All privileged writes remain inside this unpredictable root-owned directory.
+# The cleanup hook publishes complete or partial evidence only after stopping
+# children/samplers and restoring settings.
+FREQUENCY_STAGE_DIR="$(mktemp -d /tmp/node-pglite-frequency.XXXXXX)" ||
+  diag_die "could not create private frequency output staging directory"
+[[ "$(stat -Lc '%u:%g:%a' -- "$FREQUENCY_STAGE_DIR" 2> /dev/null)" == "0:0:700" ]] ||
+  diag_die "frequency output staging directory is not root-owned and mode 0700"
+mkdir -m 0700 -- "$FREQUENCY_STAGE_DIR/results" "$FREQUENCY_STAGE_DIR/freq"
+DIAG_FREQ_DIR="$FREQUENCY_STAGE_DIR/freq"
+DIAG_COMMANDS_LOG="$FREQUENCY_STAGE_DIR/commands.log"
+: > "$DIAG_COMMANDS_LOG"
+chmod 0600 "$DIAG_COMMANDS_LOG"
+printf '# frequency-ab %s\n' "$(date -Is)" > "$DIAG_COMMANDS_LOG"
 
 cd "$SCRIPT_DIR"
 
-TSV="$BUNDLE/results/frequency-ab.tsv"
-META="$BUNDLE/results/frequency-ab.meta"
+TSV="$FREQUENCY_STAGE_DIR/results/frequency-ab.tsv"
+META="$FREQUENCY_STAGE_DIR/results/frequency-ab.meta"
 : > "$TSV"
+chmod 0600 "$TSV"
 
 SAVED_NO_TURBO="$(cat "$NO_TURBO_PATH")"
 diag_restore_save "$NO_TURBO_PATH"
@@ -188,6 +260,7 @@ diag_log "saved no_turbo=$SAVED_NO_TURBO (restored on exit/interrupt)"
   printf 'RUNS_PER_LEG=%s\n' "$RUNS"
   printf 'SAVED_NO_TURBO=%s\n' "$SAVED_NO_TURBO"
 } > "$META"
+chmod 0600 "$META"
 
 for leg in A1 B A2; do
   case "$leg" in
@@ -227,26 +300,22 @@ if [[ -n "$CAP_KHZ" && -n "$POLICY" ]]; then
     printf 'CAP_KHZ=%s\n' "$CAP_KHZ"
     printf 'SAVED_SCALING_MAX_KHZ=%s\n' "$saved_smax"
     printf 'RUNS_PER_LEG=%s\n' "$RUNS"
-  } > "$BUNDLE/results/frequency-cap.meta"
+  } > "$FREQUENCY_STAGE_DIR/results/frequency-cap.meta"
+  chmod 0600 "$FREQUENCY_STAGE_DIR/results/frequency-cap.meta"
   diag_log "cap leg: scaling_max_freq=$CAP_KHZ on $(basename "$POLICY"); $RUNS runs on cpu $CPU"
   diag_run_single_runs "$TSV" "cap" "$CPU" "$RUNS" "${AS_USER[@]}"
-  grep -P '^cap\t' "$TSV" > "$BUNDLE/results/frequency-cap.tsv" || true
+  grep -P '^cap\t' "$TSV" > "$FREQUENCY_STAGE_DIR/results/frequency-cap.tsv" || true
+  chmod 0600 "$FREQUENCY_STAGE_DIR/results/frequency-cap.tsv"
   sed -i '/^cap\t/d' "$TSV"
   diag_restore_now || diag_die "scaling_max_freq restore failed; secure recovery state was retained"
   now="$(cat "$smax_path")"
-  printf 'RESTORED=%s\n' "$([[ "$now" == "$saved_smax" ]] && echo 1 || echo 0)" >> "$BUNDLE/results/frequency-cap.meta"
+  printf 'RESTORED=%s\n' "$([[ "$now" == "$saved_smax" ]] && echo 1 || echo 0)" >> "$FREQUENCY_STAGE_DIR/results/frequency-cap.meta"
   [[ "$now" == "$saved_smax" ]] || diag_warn "scaling_max_freq restore verification FAILED"
 fi
 
 diag_frequency_rows_are_complete "$TSV" "$RUNS" ||
   diag_die "frequency A/B/A output is incomplete or contains non-SIGSEGV operational failures"
 printf 'COMPLETED=1\n' >> "$META"
-
-# Hand ownership back to the invoking user.
-if [[ -n "${SUDO_USER:-}" ]]; then
-  chown -R "$SUDO_USER":"$(id -gn "$SUDO_USER")" \
-    "$BUNDLE/results" "$BUNDLE/freq" "$BUNDLE/state" "$BUNDLE/commands.log" 2> /dev/null || true
-fi
 
 diag_log "frequency A/B/A complete. Regenerate the report with:"
 diag_log "  ./diagnose.sh --resume \"$BUNDLE\" --yes"

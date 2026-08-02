@@ -111,13 +111,16 @@ deliberately a separate manual step run as root. It saves the original
 CPU you give it (use the highest-failure CPU from phase 4) as **A**
 (original state) → **B** (turbo disabled) → **A** (original state
 restored). Every setting is restored on normal exit, failure, SIGINT, or
-SIGTERM, and the restore is verified and recorded in the bundle. Workload
-legs run as the invoking user via `runuser` when possible. Requested *and*
-measured frequencies (turbostat preferred, `scaling_cur_freq` fallback)
-are reported per leg; never trust `scaling_max_freq` alone on
-intel_pstate/HWP. A separate, clearly labelled per-CPU cap experiment is
-available via `--cap KHZ`. BIOS settings are never changed. SIGKILL recovery
-uses a mode-0700, root-owned per-invoking-UID directory under
+SIGTERM, and the restore is verified and recorded in the bundle. Invoke the
+script through `sudo` from a non-root account: workload legs run as that user,
+while root writes evidence only to a private staging directory. After settings
+are restored, a helper running as the invoking user publishes complete or
+partial evidence into the bundle, including after a handled interruption.
+Requested *and* measured frequencies (turbostat preferred,
+`scaling_cur_freq` fallback) are reported per leg; never trust
+`scaling_max_freq` alone on intel_pstate/HWP. A separate, clearly labelled
+per-CPU cap experiment is available via `--cap KHZ`. BIOS settings are never
+changed. SIGKILL recovery uses a mode-0700, root-owned per-invoking-UID directory under
 `/run/node-pglite-wasm-sigsegv-repro/`; the restore ledger is never stored in
 the user-owned diagnostics bundle. A live per-UID lock refuses overlapping
 experiments, while a dead owner's lock is reclaimed so its validated ledger

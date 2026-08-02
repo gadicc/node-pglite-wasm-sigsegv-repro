@@ -90,6 +90,21 @@ check_eq "SIGTERM restores promptly with rc=143 and reaps sampler" "1" "$([[ "$t
 check_eq "SIGINT restores promptly with rc=130 and reaps sampler" "1" "$([[ "$int_restore" =~ ^0\|130\|1\|1\|([0-4])\|1$ ]] && echo 1 || echo 0)"
 check_eq "normal exit restores and reaps sampler" "1" "$([[ "$exit_restore" =~ ^0\|0\|1\|1\|([0-4])\|1$ ]] && echo 1 || echo 0)"
 
+CLEANUP_ARTIFACT_MARKER="$TMP/cleanup-artifacts.marker"
+(
+  DIAG_WORKLOAD_PID=""
+  DIAG_SAMPLER_PID=""
+  DIAG_RESTORE_ARMED=0
+  DIAG_RESTORE_LOCK_FILE=""
+  diag_cleanup_artifacts() {
+    printf 'partial evidence\n' > "$CLEANUP_ARTIFACT_MARKER"
+  }
+  diag_cleanup_signal SIGTERM 143
+) > /dev/null 2>&1
+cleanup_artifact_rc=$?
+check_eq "handled interruption runs artifact cleanup hook" "1" \
+  "$([[ $cleanup_artifact_rc -eq 143 && "$(cat "$CLEANUP_ARTIFACT_MARKER" 2> /dev/null)" == "partial evidence" ]] && echo 1 || echo 0)"
+
 WORKLOAD_SIGNAL_DIR="$TMP/workload-signal"
 mkdir -p "$WORKLOAD_SIGNAL_DIR/bin"
 printf '0\n' > "$WORKLOAD_SIGNAL_DIR/no_turbo"
@@ -368,9 +383,59 @@ if ((EUID != 0)); then
   check_eq "frequency-ab.sh refuses non-root (rc=4)" "4" "$?"
   bash "$REPO_ROOT/root-checks.sh" "$TMP" > /dev/null 2>&1
   check_eq "root-checks.sh refuses non-root (rc=4)" "4" "$?"
+
+  PUBLISH_BUNDLE="$TMP/frequency-publish-bundle"
+  PUBLISH_STAGE="$TMP/frequency-publish-stage"
+  mkdir -p "$PUBLISH_BUNDLE/results" "$PUBLISH_BUNDLE/freq" \
+    "$PUBLISH_STAGE/results" "$PUBLISH_STAGE/freq"
+  chmod 0700 "$PUBLISH_STAGE" "$PUBLISH_STAGE/results" "$PUBLISH_STAGE/freq"
+  printf 'old command\n' > "$PUBLISH_BUNDLE/commands.log"
+  printf 'safe victim\n' > "$TMP/frequency-publish-victim"
+  ln -s "$TMP/frequency-publish-victim" "$PUBLISH_BUNDLE/results/frequency-ab.tsv"
+  printf 'new evidence\n' > "$PUBLISH_STAGE/results/frequency-ab.tsv"
+  printf 'CPU=19\n' > "$PUBLISH_STAGE/results/frequency-ab.meta"
+  printf 'sample\n' > "$PUBLISH_STAGE/freq/freq-ab-A1.samples"
+  printf 'scaling_cur_freq\n' > "$PUBLISH_STAGE/freq/freq-ab-A1.method"
+  printf 'new command\n' > "$PUBLISH_STAGE/commands.log"
+  chmod 0600 \
+    "$PUBLISH_STAGE/results/frequency-ab.tsv" \
+    "$PUBLISH_STAGE/results/frequency-ab.meta" \
+    "$PUBLISH_STAGE/freq/freq-ab-A1.samples" \
+    "$PUBLISH_STAGE/freq/freq-ab-A1.method" \
+    "$PUBLISH_STAGE/commands.log"
+  bash "$LIB/publish-frequency-output.sh" "$PUBLISH_STAGE" "$PUBLISH_BUNDLE" \
+    > /dev/null 2>&1
+  publish_rc=$?
+  publish_safe=0
+  [[ $publish_rc -eq 0 ]] &&
+    [[ "$(cat "$TMP/frequency-publish-victim")" == "safe victim" ]] &&
+    [[ -f "$PUBLISH_BUNDLE/results/frequency-ab.tsv" && ! -L "$PUBLISH_BUNDLE/results/frequency-ab.tsv" ]] &&
+    [[ "$(cat "$PUBLISH_BUNDLE/results/frequency-ab.tsv")" == "new evidence" ]] &&
+    [[ "$(cat "$PUBLISH_BUNDLE/freq/freq-ab-A1.method")" == "scaling_cur_freq" ]] &&
+    grep -q '^old command$' "$PUBLISH_BUNDLE/commands.log" &&
+    grep -q '^new command$' "$PUBLISH_BUNDLE/commands.log" &&
+    [[ ! -e "$PUBLISH_STAGE" ]] && publish_safe=1
+  check_eq "unprivileged frequency publisher safely replaces a raced output symlink" "1" "$publish_safe"
+
+  COMMAND_LINK_BUNDLE="$TMP/frequency-command-link-bundle"
+  COMMAND_LINK_STAGE="$TMP/frequency-command-link-stage"
+  mkdir -p "$COMMAND_LINK_BUNDLE/results" "$COMMAND_LINK_BUNDLE/freq" \
+    "$COMMAND_LINK_STAGE/results" "$COMMAND_LINK_STAGE/freq"
+  chmod 0700 "$COMMAND_LINK_STAGE" "$COMMAND_LINK_STAGE/results" "$COMMAND_LINK_STAGE/freq"
+  printf 'partial command\n' > "$COMMAND_LINK_STAGE/commands.log"
+  chmod 0600 "$COMMAND_LINK_STAGE/commands.log"
+  printf 'safe command victim\n' > "$TMP/frequency-command-victim"
+  ln -s "$TMP/frequency-command-victim" "$COMMAND_LINK_BUNDLE/commands.log"
+  bash "$LIB/publish-frequency-output.sh" "$COMMAND_LINK_STAGE" "$COMMAND_LINK_BUNDLE" \
+    > /dev/null 2>&1
+  command_link_rc=$?
+  check_eq "unprivileged frequency publisher rejects a command-log symlink" "1" \
+    "$([[ $command_link_rc -ne 0 && "$(cat "$TMP/frequency-command-victim")" == "safe command victim" && -f "$COMMAND_LINK_STAGE/commands.log" ]] && echo 1 || echo 0)"
 else
   ok "frequency-ab.sh non-root guard [skipped while tests run as root]"
   ok "root-checks.sh non-root guard [skipped while tests run as root]"
+  ok "unprivileged frequency publisher safely replaces a raced output symlink [skipped while tests run as root]"
+  ok "unprivileged frequency publisher rejects a command-log symlink [skipped while tests run as root]"
 fi
 
 ROOT_GUARD="$TMP/root-checks-guard"
