@@ -404,7 +404,7 @@ function renderConclusions(r) {
   } else if (totalOther > 0 || totalUnclassified > 0) {
     C.push(`- Workload failures occurred across ${totalRuns} child-process runs, but none were confirmed as SIGSEGV (${totalOther} classified other failure(s), ${totalUnclassified} unclassified summary-only failure(s)).`);
   } else if (totalRuns > 0) {
-    C.push(`- **No failure reproduced** in ${totalRuns} child-process runs (95% upper bound on the pooled per-run rate: ${pct(zeroFailureUpperBound(totalRuns))}). This does not rule out the defect; see Limitations.`);
+    C.push(`- **No failure reproduced** across ${totalRuns} child-process observations spanning different phases/configurations. No pooled rate bound is valid across these heterogeneous strata; use the phase-, group-, and CPU-specific bounds above. This does not rule out the defect; see Limitations.`);
   } else {
     C.push("- No workload results were collected.");
   }

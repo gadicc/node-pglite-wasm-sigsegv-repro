@@ -197,6 +197,43 @@ test("renderReport: unclassified truncated failures are never called clean", () 
   assert.doesNotMatch(md, /No failure reproduced/);
 });
 
+test("renderReport: clean heterogeneous phases do not get a pooled rate bound", () => {
+  const md = renderReport({
+    collectedAt: "2026-08-02T00:00:00.000Z",
+    config: {},
+    environment: {},
+    baseline: {
+      children: 2,
+      requestedWaves: 5,
+      processedWaves: 5,
+      completedWaves: 5,
+      failedWaves: 0,
+      totalChildInvocations: 10,
+      sigsegvCount: 0,
+      otherFailureCount: 0,
+      unclassifiedFailureCount: 0,
+      partial: false,
+      log: "logs/baseline/run1.log",
+    },
+    groups: [{
+      name: "pcores",
+      cpus: "0-7",
+      children: 2,
+      wavesRequested: 10,
+      processedWaves: 10,
+      failedWaves: 0,
+      totalChildInvocations: 20,
+      sigsegvCount: 0,
+      otherFailureCount: 0,
+      unclassifiedFailureCount: 0,
+    }],
+    individual: [{ cpu: 0, runs: 30, failures: 0, sigsegv: 0, invalidRuns: [], failedRuns: [] }],
+  });
+  assert.match(md, /No pooled rate bound is valid/);
+  assert.match(md, /phase-, group-, and CPU-specific bounds/);
+  assert.doesNotMatch(md, /pooled per-run rate/);
+});
+
 test("renderReport: incomplete frequency artifacts are excluded from conclusions", () => {
   const md = renderReport({
     collectedAt: "2026-08-02T00:00:00.000Z",
