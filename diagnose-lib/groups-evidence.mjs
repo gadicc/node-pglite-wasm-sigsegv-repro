@@ -220,25 +220,38 @@ export function groupsPlanDigest(planRows) {
 }
 
 // Derive phase-4 selection exclusively from a completed, validated groups
-// envelope. In particular, parsed failed-wave counts include accepted failures
-// that have no child detail row, while the no-failure fallback retains the CPU
-// universe recorded by the group plan rather than consulting live topology.
+// envelope. Full mode always retains the CPU universe recorded by the group
+// plan. Default and quick mode use parsed failed-wave counts, which include
+// accepted failures that have no child detail row; default falls back to the
+// stored plan when no group failed, while quick records an explicit skip.
 export function deriveIndividualTargetPolicy(groupsAssessment, mode) {
   if (groupsAssessment?.status !== "complete" || !["quick", "default", "full"].includes(mode)) return null;
   const failingEntries = groupsAssessment.entries.filter(({ parsed }) => parsed?.failedWaves > 0);
-  const targetEntries = failingEntries.length > 0
-    ? failingEntries
-    : mode === "quick" ? [] : groupsAssessment.entries;
+  let targetEntries;
+  let targetPolicy;
+  if (mode === "full") {
+    targetEntries = groupsAssessment.entries;
+    targetPolicy = "all-group-cpus";
+  } else if (failingEntries.length > 0) {
+    targetEntries = failingEntries;
+    targetPolicy = "failed-groups";
+  } else if (mode === "quick") {
+    targetEntries = [];
+    targetPolicy = "quick-skip";
+  } else {
+    targetEntries = groupsAssessment.entries;
+    targetPolicy = "all-group-cpus";
+  }
   const ranges = [];
   for (const entry of targetEntries) {
     const parsed = parseCanonicalCpuList(entry.cpus);
     if (!parsed || ranges.length + parsed.ranges.length > 65536) return null;
     ranges.push(...parsed.ranges);
   }
-  const skipped = failingEntries.length === 0 && mode === "quick";
+  const skipped = targetPolicy === "quick-skip";
   if (!skipped && ranges.length === 0) return null;
   return {
-    targetPolicy: failingEntries.length > 0 ? "failed-groups" : skipped ? "quick-skip" : "all-group-cpus",
+    targetPolicy,
     targetCpus: compressCpuRanges(ranges),
     groupPlanDigest: groupsAssessment.meta.PLAN_DIGEST,
     skipped,

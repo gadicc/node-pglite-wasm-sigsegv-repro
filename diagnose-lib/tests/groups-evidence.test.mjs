@@ -101,9 +101,21 @@ test("individual targets come from validated failed waves, including summary-onl
   assert.equal(result.status, "complete");
   assert.equal(result.entries[1].parsed.failedWaves, 1);
   assert.equal(result.entries[1].parsed.failures.length, 0);
+  assert.deepEqual(deriveIndividualTargetPolicy(result, "default"), {
+    targetPolicy: "failed-groups",
+    targetCpus: "4-7",
+    groupPlanDigest: groupsPlanDigest(plan),
+    skipped: false,
+  });
   assert.deepEqual(deriveIndividualTargetPolicy(result, "quick"), {
     targetPolicy: "failed-groups",
     targetCpus: "4-7",
+    groupPlanDigest: groupsPlanDigest(plan),
+    skipped: false,
+  });
+  assert.deepEqual(deriveIndividualTargetPolicy(result, "full"), {
+    targetPolicy: "all-group-cpus",
+    targetCpus: "0-7",
     groupPlanDigest: groupsPlanDigest(plan),
     skipped: false,
   });
@@ -119,6 +131,85 @@ test("individual targets come from validated failed waves, including summary-onl
     skipped: true,
   });
   assert.equal(deriveIndividualTargetPolicy(clean, "default").targetCpus, "0-7");
+  assert.deepEqual(deriveIndividualTargetPolicy(clean, "full"), {
+    targetPolicy: "all-group-cpus",
+    targetCpus: "0-7",
+    groupPlanDigest: groupsPlanDigest(plan),
+    skipped: false,
+  });
+});
+
+test("full-mode target union deduplicates overlapping stored group ranges", () => {
+  const dir = bundle();
+  const overlappingPlan = [
+    plan[0],
+    ["ecores", "ecore", "4-7", "-", "4", "5", "logs/groups/ecores.log", "group-ecores"],
+    plan[1],
+  ];
+  writeFileSync(path.join(dir, "results", "groups.tsv"), rowsText([
+    [...overlappingPlan[0], "0"],
+    [...overlappingPlan[1], "1"],
+    [...overlappingPlan[2], "1"],
+  ]));
+  writeFileSync(path.join(dir, "results", "groups.meta"), [
+    "VERSION=1",
+    "EXPECTED_ROWS=3",
+    "GROUP_WAVES=5",
+    `PLAN_DIGEST=${groupsPlanDigest(overlappingPlan)}`,
+    "COMPLETED=1",
+    "",
+  ].join("\n"));
+  copyFileSync(path.join(fixtures, "repro-fail.log"), path.join(dir, "logs", "groups", "ecores.log"));
+  const result = assessGroupsEvidence(dir, {
+    expectedGroupWaves: 5,
+    expectedPlanRows: overlappingPlan,
+  });
+  assert.equal(result.status, "complete");
+  assert.deepEqual(deriveIndividualTargetPolicy(result, "full"), {
+    targetPolicy: "all-group-cpus",
+    targetCpus: "0-7",
+    groupPlanDigest: groupsPlanDigest(overlappingPlan),
+    skipped: false,
+  });
+  assert.equal(deriveIndividualTargetPolicy(result, "default").targetCpus, "4-7");
+});
+
+test("collector binds full-mode individual evidence to every stored group-plan CPU", () => {
+  const dir = bundle();
+  writeFileSync(
+    path.join(dir, "results", "meta.env"),
+    "MODE=full\nBASELINE_CHILDREN=4\nBASELINE_WAVES=5\nGROUP_WAVES=5\nINDIVIDUAL_RUNS=2\nGDB_MAX_RUNS=2\nSKIP_GDB=1\nCPU_TARGET=auto\n",
+  );
+  writeFileSync(path.join(dir, "state", "phase-individual.done"), "");
+  const individualRows = (cpus) => `${cpus.flatMap((cpu) => [
+    `${cpu}\t1\t0\t1`,
+    `${cpu}\t2\t${cpu === 7 ? 139 : 0}\t1`,
+  ]).join("\n")}\n`;
+  const individualMeta = (targets, policy) => [
+    "VERSION=2",
+    `TARGET_CPUS=${targets}`,
+    "RUNS_PER_CPU=2",
+    `TARGET_POLICY=${policy}`,
+    `GROUP_PLAN_DIGEST=${groupsPlanDigest(plan)}`,
+    "SKIPPED=0",
+    "COMPLETED=1",
+    "",
+  ].join("\n");
+
+  writeFileSync(path.join(dir, "results", "individual.tsv"), individualRows([0, 1, 2, 3, 4, 5, 6, 7]));
+  writeFileSync(path.join(dir, "results", "individual.meta"), individualMeta("0-7", "all-group-cpus"));
+  const complete = collect(dir);
+  assert.equal(complete.groupsStatus.status, "complete");
+  assert.equal(complete.individualStatus.status, "complete");
+  assert.deepEqual(complete.individual.map(({ cpu }) => cpu), [0, 1, 2, 3, 4, 5, 6, 7]);
+
+  writeFileSync(path.join(dir, "results", "individual.tsv"), individualRows([4, 5, 6, 7]));
+  writeFileSync(path.join(dir, "results", "individual.meta"), individualMeta("4-7", "failed-groups"));
+  const stale = collect(dir);
+  assert.equal(stale.individualStatus.status, "invalid");
+  assert.match(stale.individualStatus.reasons.join("; "), /does not match/);
+  assert.equal(stale.individual, undefined);
+  assert.equal(stale.worstCpu, null);
 });
 
 test("collector rejects individual evidence from a different group target policy", () => {

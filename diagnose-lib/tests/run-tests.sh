@@ -2746,6 +2746,72 @@ check_eq "groups validates its exact plan envelope before publishing completion"
   groups_evidence_is_complete
 ) > /dev/null 2>&1
 check_eq "completed groups envelope validates on resume" "0" "$?"
+
+full_runner_target="$(
+ (
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$GROUPS_RUNNER" STATE_DIR="$GROUPS_RUNNER/state" GROUP_WAVES=5 MODE=full
+  GROUP_NAME=(pcores ecluster-64) GROUP_KIND=(pcore ecluster)
+  GROUP_CPUS=(0-3 16-19) GROUP_CLUSTER=(- 64)
+  if compute_individual_targets; then
+    result="$INDIVIDUAL_TARGET_CPUS|$INDIVIDUAL_TARGET_POLICY|$INDIVIDUAL_GROUP_PLAN_DIGEST"
+  else
+    result="unexpected-skip"
+  fi
+  redo_marker_temp_cleanup
+  printf '%s\n' "$result"
+ ) 2> /dev/null
+)"
+IFS='|' read -r full_runner_cpus full_runner_policy full_runner_digest <<< "$full_runner_target"
+check_eq "full-mode runner targets every validated stored-plan CPU after a group failure" \
+  "0-3,16-19|all-group-cpus|1" \
+  "$full_runner_cpus|$full_runner_policy|$([[ "$full_runner_digest" =~ ^[a-f0-9]{64}$ ]] && echo 1 || echo 0)"
+
+FULL_TARGET_RESUME="$TMP/full-target-resume"
+mkdir -p "$FULL_TARGET_RESUME/results"
+for cpu in 16 17 18 19; do printf '%s\t1\t0\t1\n' "$cpu"; done > "$FULL_TARGET_RESUME/results/individual.tsv"
+cat > "$FULL_TARGET_RESUME/results/individual.meta" << EOF
+VERSION=2
+TARGET_CPUS=16-19
+RUNS_PER_CPU=1
+TARGET_POLICY=failed-groups
+GROUP_PLAN_DIGEST=$full_runner_digest
+SKIPPED=0
+COMPLETED=1
+EOF
+full_stale_resume="$(
+ (
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$FULL_TARGET_RESUME" INDIVIDUAL_RUNS=1
+  INDIVIDUAL_TARGET_CPUS=0-3,16-19 INDIVIDUAL_TARGET_POLICY=all-group-cpus
+  INDIVIDUAL_GROUP_PLAN_DIGEST="$full_runner_digest"
+  self_consistent=0 compatible=0
+  individual_phase_result_is_complete && self_consistent=1
+  individual_phase_matches_expected_targets 1 && compatible=1
+  printf '%s|%s\n' "$self_consistent" "$compatible"
+ ) 2> /dev/null
+)"
+check_eq "full-mode resume rejects self-consistent failed-group-only evidence" "1|0" "$full_stale_resume"
+
+for cpu in 0 1 2 3 16 17 18 19; do printf '%s\t1\t0\t1\n' "$cpu"; done > "$FULL_TARGET_RESUME/results/individual.tsv"
+sed -i 's/^TARGET_CPUS=.*/TARGET_CPUS=0-3,16-19/; s/^TARGET_POLICY=.*/TARGET_POLICY=all-group-cpus/' \
+  "$FULL_TARGET_RESUME/results/individual.meta"
+full_current_resume="$(
+ (
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$FULL_TARGET_RESUME" INDIVIDUAL_RUNS=1
+  INDIVIDUAL_TARGET_CPUS=0-3,16-19 INDIVIDUAL_TARGET_POLICY=all-group-cpus
+  INDIVIDUAL_GROUP_PLAN_DIGEST="$full_runner_digest"
+  self_consistent=0 compatible=0
+  individual_phase_result_is_complete && self_consistent=1
+  individual_phase_matches_expected_targets 1 && compatible=1
+  printf '%s|%s\n' "$self_consistent" "$compatible"
+ ) 2> /dev/null
+)"
+check_eq "full-mode resume accepts complete all-plan evidence" "1|1" "$full_current_resume"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"

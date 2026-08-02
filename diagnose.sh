@@ -1857,8 +1857,9 @@ phase_groups() {
 }
 
 # ------------------------------------------------------------------
-# CPUs of groups that observed failures, or the validated stored group-plan
-# CPU union when nothing failed (default/full), or nobody (quick, skip).
+# Full mode tests the validated stored group-plan CPU union. Default tests CPUs
+# from failed groups, with the full stored union as its no-failure fallback;
+# quick tests failed-group CPUs or records an explicit no-failure skip.
 INDIVIDUAL_TARGET_CPUS=""
 INDIVIDUAL_TARGET_POLICY=""
 INDIVIDUAL_GROUP_PLAN_DIGEST=""
