@@ -354,6 +354,10 @@ bash "$REPO_ROOT/single.sh" abc > /dev/null 2>&1
 check_eq "single.sh rejects non-numeric cpu (rc=2)" "2" "$?"
 bash "$REPO_ROOT/single.sh" 0 0 > /dev/null 2>&1
 check_eq "single.sh rejects zero runs (rc=2)" "2" "$?"
+bash "$REPO_ROOT/single.sh" 01 1 > /dev/null 2>&1
+check_eq "single.sh rejects non-canonical CPU ids (rc=2)" "2" "$?"
+bash "$REPO_ROOT/single.sh" 0 1 "" 01 > /dev/null 2>&1
+check_eq "single.sh rejects non-canonical top-up ids (rc=2)" "2" "$?"
 
 echo "== capture-fault.sh exit codes =="
 bash "$REPO_ROOT/capture-fault.sh" > /dev/null 2>&1
@@ -612,6 +616,7 @@ echo "== --redo phase handling =="
 RB="$TMP/redo-bundle"
 mkdir -p "$RB"/{results,state,logs/individual}
 printf '19\t1\t139\t2\n19\t2\t0\t2\n' > "$RB/results/individual.tsv"
+printf 'VERSION=1\nTARGET_CPUS=19\nRUNS_PER_CPU=2\nSKIPPED=0\nCOMPLETED=1\n' > "$RB/results/individual.meta"
 touch "$RB/state/phase-individual.done" "$RB/state/phase-baseline.done"
 printf 'MODE=quick\nINDIVIDUAL_RUNS=20\nCOMPLETED_PHASES=baseline,individual\n' > "$RB/results/meta.env"
 (
@@ -629,6 +634,7 @@ redo_ok=0
 [[ ! -f "$RB/results/individual.tsv" ]] &&
   [[ ! -f "$RB/state/phase-individual.done" ]] &&
   [[ -f "$redo_stash/individual/results/individual.tsv" ]] &&
+  [[ -f "$redo_stash/individual/results/individual.meta" ]] &&
   grep -q '^COMPLETED_PHASES=baseline$' "$RB/results/meta.env" && redo_ok=1
 check_eq "--redo individual stashes data, clears marker" "1" "$redo_ok"
 
@@ -1047,35 +1053,135 @@ printf '19\t1\t0\t2\n19\t2\t139\t2\n' > "$INDIVIDUAL_VALID"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
-  individual_cpu_result_is_complete "$INDIVIDUAL_VALID" 19 0 2 1
+  individual_rows_are_valid "$INDIVIDUAL_VALID" 19 2 1 &&
+    individual_cpu_batch_matches_wrapper "$INDIVIDUAL_VALID" 19 0 2 1
 )
 check_eq "complete clean/SIGSEGV individual result is accepted" "0" "$?"
 printf '19\t2\t1\t0\n' >> "$INDIVIDUAL_VALID"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
-  individual_cpu_result_is_complete "$INDIVIDUAL_VALID" 19 0 3 1
+  individual_rows_are_valid "$INDIVIDUAL_VALID" 19 3 1
 ) > /dev/null 2>&1
 check_eq "launcher exit is rejected as individual evidence" "1" "$([[ $? -ne 0 ]] && echo 1 || echo 0)"
+printf '19\t1\t0\t2\n19\t3\t139\t2\n' > "$INDIVIDUAL_VALID"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
-  individual_cpu_result_is_complete "$INDIVIDUAL_VALID" 19 0 4 1
+  individual_rows_are_valid "$INDIVIDUAL_VALID" 19 3 0
 ) > /dev/null 2>&1
-check_eq "individual row deficit is rejected" "1" "$([[ $? -ne 0 ]] && echo 1 || echo 0)"
+check_eq "individual run-id gaps are rejected" "1" "$([[ $? -ne 0 ]] && echo 1 || echo 0)"
+printf '19\t1\t0\t2\n20\t1\t0\t2\n' > "$INDIVIDUAL_VALID"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  individual_rows_are_valid "$INDIVIDUAL_VALID" 19 2 0
+) > /dev/null 2>&1
+check_eq "individual rows outside the target CPU set are rejected" "1" "$([[ $? -ne 0 ]] && echo 1 || echo 0)"
+printf '19\t01\t0\t2\n' > "$INDIVIDUAL_VALID"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  individual_rows_are_valid "$INDIVIDUAL_VALID" 19 2 0
+) > /dev/null 2>&1
+check_eq "individual rows require four canonical numeric fields" "1" "$([[ $? -ne 0 ]] && echo 1 || echo 0)"
+printf '19\t1\t0\t2\textra\n' > "$INDIVIDUAL_VALID"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  individual_rows_are_valid "$INDIVIDUAL_VALID" 19 2 0
+) > /dev/null 2>&1
+check_eq "individual rows reject extra TSV fields" "1" "$([[ $? -ne 0 ]] && echo 1 || echo 0)"
+
+INDIVIDUAL_TOPUP="$TMP/individual-topup"
+mkdir -p "$INDIVIDUAL_TOPUP/bin"
+cat > "$INDIVIDUAL_TOPUP/bin/taskset" << 'EOF'
+#!/usr/bin/env bash
+shift 2
+exec "$@"
+EOF
+cat > "$INDIVIDUAL_TOPUP/bin/node" << 'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$INDIVIDUAL_TOPUP/bin/taskset" "$INDIVIDUAL_TOPUP/bin/node"
+PATH="$INDIVIDUAL_TOPUP/bin:$PATH" bash "$REPO_ROOT/single.sh" 19 2 "$INDIVIDUAL_TOPUP/results.tsv" 3 > /dev/null 2>&1
+check_eq "single.sh top-up records continuing run ids" $'19\t3\t0\t0\n19\t4\t0\t0' \
+  "$(cat "$INDIVIDUAL_TOPUP/results.tsv")"
+
+INDIVIDUAL_LEGACY="$TMP/individual-invalid-legacy"
+mkdir -p "$INDIVIDUAL_LEGACY"/{results,state}
+printf '19\t1\t0\t2\n19\t1\t139\t2\n' > "$INDIVIDUAL_LEGACY/results/individual.tsv"
+cp "$INDIVIDUAL_LEGACY/results/individual.tsv" "$INDIVIDUAL_LEGACY/before.tsv"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$INDIVIDUAL_LEGACY"
+  STATE_DIR="$INDIVIDUAL_LEGACY/state"
+  META_FILE="$INDIVIDUAL_LEGACY/results/meta.env"
+  INDIVIDUAL_TARGET_CPUS=19
+  INDIVIDUAL_RUNS=2
+  phase_individual
+) > /dev/null 2>&1
+legacy_individual_rc=$?
+check_eq "invalid legacy individual rows are preserved and require redo" "1" \
+  "$([[ $legacy_individual_rc -ne 0 && ! -e "$INDIVIDUAL_LEGACY/results/individual.meta" ]] && cmp -s "$INDIVIDUAL_LEGACY/before.tsv" "$INDIVIDUAL_LEGACY/results/individual.tsv" && echo 1 || echo 0)"
+
+INDIVIDUAL_COMPLETE="$TMP/individual-complete"
+mkdir -p "$INDIVIDUAL_COMPLETE"/{results,state}
+printf '19\t1\t0\t2\n19\t2\t139\t2\n' > "$INDIVIDUAL_COMPLETE/results/individual.tsv"
+printf 'COMPLETED_PHASES=\n' > "$INDIVIDUAL_COMPLETE/results/meta.env"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$INDIVIDUAL_COMPLETE"
+  STATE_DIR="$INDIVIDUAL_COMPLETE/state"
+  META_FILE="$INDIVIDUAL_COMPLETE/results/meta.env"
+  INDIVIDUAL_TARGET_CPUS=19
+  INDIVIDUAL_RUNS=2
+  phase_individual
+) > /dev/null 2>&1
+check_eq "individual phase validates all rows and publishes completion metadata" "1" \
+  "$([[ $? -eq 0 && -f "$INDIVIDUAL_COMPLETE/state/phase-individual.done" ]] && grep -q '^COMPLETED=1$' "$INDIVIDUAL_COMPLETE/results/individual.meta" && echo 1 || echo 0)"
+
+INDIVIDUAL_SKIPPED="$TMP/individual-skipped"
+mkdir -p "$INDIVIDUAL_SKIPPED"/{results,state}
+printf 'COMPLETED_PHASES=\n' > "$INDIVIDUAL_SKIPPED/results/meta.env"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$INDIVIDUAL_SKIPPED"
+  STATE_DIR="$INDIVIDUAL_SKIPPED/state"
+  META_FILE="$INDIVIDUAL_SKIPPED/results/meta.env"
+  INDIVIDUAL_RUNS=5
+  phase_individual_skipped
+) > /dev/null 2>&1
+skipped_individual_rc=$?
+check_eq "skipped individual phase publishes explicit terminal metadata" "1" \
+  "$([[ $skipped_individual_rc -eq 0 && -f "$INDIVIDUAL_SKIPPED/state/phase-individual.done" && ! -s "$INDIVIDUAL_SKIPPED/results/individual.tsv" ]] && grep -q '^SKIPPED=1$' "$INDIVIDUAL_SKIPPED/results/individual.meta" && grep -q '^COMPLETED=1$' "$INDIVIDUAL_SKIPPED/results/individual.meta" && echo 1 || echo 0)"
 
 # worst_cpu must rank by the SIGSEGV endpoint only: CPU 3 fails every run
 # with a launcher-style exit 1, CPU 4 has one real SIGSEGV.
 WORST_CPU_DIR="$TMP/worst-cpu-bundle"
-mkdir -p "$WORST_CPU_DIR/results"
+mkdir -p "$WORST_CPU_DIR"/{results,state}
 printf '3\t1\t1\t2\n3\t2\t1\t2\n4\t1\t139\t2\n4\t2\t0\t2\n' > "$WORST_CPU_DIR/results/individual.tsv"
+printf 'VERSION=1\nTARGET_CPUS=3-4\nRUNS_PER_CPU=2\nSKIPPED=0\nCOMPLETED=1\n' > "$WORST_CPU_DIR/results/individual.meta"
+touch "$WORST_CPU_DIR/state/phase-individual.done"
 worst_cpu_out="$(
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
   OUT_DIR="$WORST_CPU_DIR"
   worst_cpu
 )"
-check_eq "worst_cpu counts only SIGSEGV exits" "4" "$worst_cpu_out"
+check_eq "worst_cpu rejects an invalid completed individual phase" "" "$worst_cpu_out"
+printf '3\t1\t0\t2\n3\t2\t0\t2\n4\t1\t139\t2\n4\t2\t0\t2\n' > "$WORST_CPU_DIR/results/individual.tsv"
+worst_cpu_out="$(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$WORST_CPU_DIR"
+  worst_cpu
+)"
+check_eq "worst_cpu ranks only a fully validated individual phase" "4" "$worst_cpu_out"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
@@ -1270,7 +1376,7 @@ fi
 echo "== end-to-end collect + report on synthetic bundle =="
 B="$TMP/bundle"
 mkdir -p "$B"/{results,logs/baseline,logs/groups,env,freq,gdb,state}
-touch "$B/state/phase-frequency.done" "$B/state/phase-gdb.done"
+touch "$B/state/phase-individual.done" "$B/state/phase-frequency.done" "$B/state/phase-gdb.done"
 
 cat > "$B/results/meta.env" << EOF
 MODE=default
@@ -1317,8 +1423,7 @@ pcores	pcore	0-7	-	4	5	logs/groups/pcores.log	group-pcores	0
 ecluster-64	ecluster	16-19	64	4	5	logs/groups/ecluster-64.log	group-ecluster-64	1
 EOF
 
-# CPU 8: 20 clean runs; CPU 19: 6 SIGSEGV in 20 runs plus one launch error
-# (rc 126) that must be excluded from the run counts as an invalid run.
+# CPU 8: 20 clean runs; CPU 19: 6 SIGSEGV in 20 runs.
 : > "$B/results/individual.tsv"
 for i in $(seq 1 20); do
   printf '8\t%s\t0\t2\n' "$i" >> "$B/results/individual.tsv"
@@ -1330,7 +1435,13 @@ for i in $(seq 1 20); do
     printf '19\t%s\t0\t2\n' "$i" >> "$B/results/individual.tsv"
   fi
 done
-printf '19\t21\t126\t0\n' >> "$B/results/individual.tsv"
+cat > "$B/results/individual.meta" << EOF
+VERSION=1
+TARGET_CPUS=8,19
+RUNS_PER_CPU=20
+SKIPPED=0
+COMPLETED=1
+EOF
 
 # Leg B also carries one launch-error row (rc 126): excluded from the valid
 # runs the frequency inference is based on.
@@ -1397,7 +1508,7 @@ check("baseline other failures", r.baseline.otherFailureCount === 1);
 check("baseline invocations", r.baseline.totalChildInvocations === 20);
 check("worst cpu is 19", r.worstCpu === 19);
 check("individual tally", r.individual.length === 2 && r.individual[1].sigsegv === 6 && r.individual[0].failures === 0);
-check("individual invalid runs excluded", r.individual[1].runs === 20 && r.individual[1].invalidRuns.length === 1 && r.individual[1].invalidRuns[0].rc === 126);
+check("individual phase completion status", r.individualStatus.status === "complete" && r.individual[1].runs === 20);
 check("gdb signature match", r.gdb.status === "captured" && r.gdb.captures.length === 1 && r.gdb.captures[0].matchesKnownSignature === true);
 check("gdb capture file trimmed", r.gdb.captures[0].mappings === undefined);
 check("freq ab restored + legs", r.frequencyAb.restored === true && r.frequencyAb.legs.length === 3);

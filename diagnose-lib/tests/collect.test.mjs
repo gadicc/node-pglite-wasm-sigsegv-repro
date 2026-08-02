@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
+  assessIndividual,
   assessFrequencyAb,
   collect,
   collectFreqAb,
@@ -222,10 +223,49 @@ test("collect: terminal GDB metadata distinguishes no-fault from failure", () =>
   assert.equal(failed.gdb.status, "failed");
 });
 
-test("collect: worstCpu ranks by SIGSEGV, ignoring non-SIGSEGV exits", () => {
+test("assessIndividual: exact completion and partial prefixes have explicit status", () => {
+  const meta = { VERSION: "1", TARGET_CPUS: "3-4", RUNS_PER_CPU: "2", SKIPPED: "0", COMPLETED: "1" };
+  const complete = assessIndividual([
+    ["3", "1", "0", "2"], ["3", "2", "0", "2"],
+    ["4", "1", "139", "2"], ["4", "2", "0", "2"],
+  ], meta, true);
+  assert.equal(complete.status, "complete");
+  assert.equal(complete.acceptedRows.length, 4);
+
+  const partial = assessIndividual(
+    [["3", "1", "0", "2"], ["4", "1", "139", "2"]],
+    { ...meta, COMPLETED: "0" },
+    false,
+  );
+  assert.equal(partial.status, "incomplete");
+  assert.equal(partial.acceptedRows.length, 2);
+  assert.match(partial.reasons.join("; "), /every expected/);
+
+  const skipped = assessIndividual([], {
+    VERSION: "1", TARGET_CPUS: "", RUNS_PER_CPU: "5", SKIPPED: "1", COMPLETED: "1",
+    SKIP_REASON: "no-failing-group-in-quick-mode",
+  }, true);
+  assert.equal(skipped.status, "skipped");
+});
+
+test("assessIndividual: malformed, foreign, and non-contiguous rows are invalid", () => {
+  const result = assessIndividual([
+    ["3", "1", "0", "2"],
+    ["3", "3", "139", "2"],
+    ["5", "1", "0", "2"],
+    ["4", "01", "0", "2"],
+    ["4", "1", "126", "0"],
+  ], { VERSION: "1", TARGET_CPUS: "3-4", RUNS_PER_CPU: "2", SKIPPED: "0", COMPLETED: "1" }, true);
+  assert.equal(result.status, "invalid");
+  assert.deepEqual(result.acceptedRows, []);
+  assert.match(result.reasons.join("; "), /malformed, non-target, non-SIGSEGV, duplicate, or non-contiguous/);
+});
+
+test("collect: invalid individual evidence cannot select worstCpu", () => {
   const dir = mkdtempSync(path.join(tmpdir(), "collect-test-"));
   tmpDirs.push(dir);
   mkdirSync(path.join(dir, "results"));
+  mkdirSync(path.join(dir, "state"));
   // CPU 3 "fails" every run with a launcher-style exit 1; CPU 4 has one real
   // SIGSEGV. Only CPU 4 may be ranked worst.
   writeFileSync(
@@ -233,13 +273,31 @@ test("collect: worstCpu ranks by SIGSEGV, ignoring non-SIGSEGV exits", () => {
     "3\t1\t1\t2\n3\t2\t1\t2\n3\t3\t1\t2\n3\t4\t1\t2\n" +
       "4\t1\t139\t2\n4\t2\t0\t2\n4\t3\t0\t2\n4\t4\t0\t2\n",
   );
+  writeFileSync(
+    path.join(dir, "results", "individual.meta"),
+    "VERSION=1\nTARGET_CPUS=3-4\nRUNS_PER_CPU=4\nSKIPPED=0\nCOMPLETED=1\n",
+  );
+  writeFileSync(path.join(dir, "state", "phase-individual.done"), "");
   const r = collect(dir);
-  assert.equal(r.worstCpu, 4);
-  const cpu3 = r.individual.find((c) => c.cpu === 3);
-  assert.equal(cpu3.runs, 0);
-  assert.equal(cpu3.failures, 0);
-  assert.equal(cpu3.invalidRuns.length, 4);
+  assert.equal(r.individualStatus.status, "invalid");
+  assert.equal(r.worstCpu, null);
+  assert.equal(r.individual.find((c) => c.cpu === 3), undefined);
   const cpu4 = r.individual.find((c) => c.cpu === 4);
   assert.equal(cpu4.runs, 4);
   assert.equal(cpu4.sigsegv, 1);
+});
+
+test("collect: complete individual evidence selects worstCpu", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "collect-test-"));
+  tmpDirs.push(dir);
+  mkdirSync(path.join(dir, "results"));
+  mkdirSync(path.join(dir, "state"));
+  writeFileSync(path.join(dir, "results", "individual.tsv"),
+    "3\t1\t0\t2\n3\t2\t0\t2\n4\t1\t139\t2\n4\t2\t0\t2\n");
+  writeFileSync(path.join(dir, "results", "individual.meta"),
+    "VERSION=1\nTARGET_CPUS=3-4\nRUNS_PER_CPU=2\nSKIPPED=0\nCOMPLETED=1\n");
+  writeFileSync(path.join(dir, "state", "phase-individual.done"), "");
+  const r = collect(dir);
+  assert.equal(r.individualStatus.status, "complete");
+  assert.equal(r.worstCpu, 4);
 });

@@ -8,6 +8,7 @@
 //   results/baseline.meta      baseline parameters (KEY=VALUE)
 //   results/groups.tsv         one group per line
 //   results/individual.tsv     cpu, run, rc, elapsed
+//   results/individual.meta    target CPUs, runs per CPU, skip/completion state
 //   results/frequency-ab.tsv   leg, run, rc, elapsed
 //   results/frequency-ab.meta  leg configuration + restore status
 //   results/gdb.meta           gdb phase parameters
@@ -37,6 +38,34 @@ function readTsv(file) {
     .split("\n")
     .filter((l) => l.trim() && !l.startsWith("#"))
     .map((l) => l.split("\t"));
+}
+
+function readExactTsv(file) {
+  if (!existsSync(file)) return [];
+  const text = readFileSync(file, "utf8");
+  if (text === "") return [];
+  const lines = text.split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  return lines.map((line) => line.split("\t"));
+}
+
+function readIndividualMeta(file) {
+  if (!existsSync(file)) return { present: false, values: {}, errors: [] };
+  const values = {};
+  const errors = [];
+  const allowed = new Set(["VERSION", "TARGET_CPUS", "RUNS_PER_CPU", "SKIPPED", "COMPLETED", "SKIP_REASON"]);
+  const text = readFileSync(file, "utf8");
+  const lines = text.split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  for (const line of lines) {
+    const match = line.match(/^([A-Z_]+)=(.*)$/);
+    if (!match || !allowed.has(match[1]) || Object.hasOwn(values, match[1])) {
+      errors.push("individual metadata contains a malformed, duplicate, or unknown field");
+      continue;
+    }
+    values[match[1]] = match[2];
+  }
+  return { present: true, values, errors };
 }
 
 function num(v) {
@@ -171,6 +200,31 @@ function cpuSetFromList(list) {
   return set;
 }
 
+function parseCanonicalCpuList(list) {
+  if (typeof list !== "string" || list === "") return null;
+  const set = new Set();
+  let previous = -1;
+  let firstPart = true;
+  for (const part of list.split(",")) {
+    const match = part.match(/^(0|[1-9][0-9]*)(?:-(0|[1-9][0-9]*))?$/);
+    if (!match) return null;
+    const first = Number(match[1]);
+    const last = match[2] === undefined ? first : Number(match[2]);
+    if (!Number.isSafeInteger(first) || !Number.isSafeInteger(last) || first > 65535 || last > 65535 ||
+        first > last || (match[2] !== undefined && first === last) || (!firstPart && first <= previous + 1)) return null;
+    for (let cpu = first; cpu <= last; cpu += 1) set.add(cpu);
+    previous = last;
+    firstPart = false;
+  }
+  return set;
+}
+
+function canonicalUint(value) {
+  if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value)) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
 const SIGNAL_NAMES = {
   4: "SIGILL",
   6: "SIGABRT",
@@ -222,6 +276,116 @@ export function collectIndividual(rows) {
     addRunOutcome(byCpu.get(cpu), runS, rcS, elapsedS);
   }
   return [...byCpu.values()].sort((a, b) => a.cpu - b.cpu);
+}
+
+export function assessIndividual(rows, meta, phaseDone, metaState = {}) {
+  const present = metaState.present ?? Object.keys(meta).length > 0;
+  const reasons = [...(metaState.errors ?? [])];
+  let invalid = reasons.length > 0;
+  const hasArtifacts = rows.length > 0 || present || phaseDone;
+  if (!hasArtifacts) return { status: "not-run", reasons: [], targetCpus: [], runsPerCpu: null, acceptedRows: [] };
+
+  const required = ["VERSION", "TARGET_CPUS", "RUNS_PER_CPU", "SKIPPED", "COMPLETED"];
+  if (!present || required.some((key) => !Object.hasOwn(meta, key))) {
+    reasons.push("individual metadata is missing required fields");
+    invalid = true;
+  }
+  if (meta.VERSION !== "1") {
+    reasons.push("individual metadata version is missing or unsupported");
+    invalid = true;
+  }
+  const runsPerCpu = canonicalUint(meta.RUNS_PER_CPU);
+  if (runsPerCpu === null || runsPerCpu < 1) {
+    reasons.push("RUNS_PER_CPU is missing or invalid");
+    invalid = true;
+  }
+  const skipped = meta.SKIPPED === "1" ? true : meta.SKIPPED === "0" ? false : null;
+  const completed = meta.COMPLETED === "1" ? true : meta.COMPLETED === "0" ? false : null;
+  if (skipped === null || completed === null) {
+    reasons.push("individual skip/completion flags are missing or invalid");
+    invalid = true;
+  }
+
+  const targetSet = parseCanonicalCpuList(meta.TARGET_CPUS);
+  if (skipped === true) {
+    if (meta.TARGET_CPUS !== "" || completed !== true || !meta.SKIP_REASON) {
+      reasons.push("skipped individual metadata is inconsistent");
+      invalid = true;
+    }
+  } else if (!targetSet || targetSet.size === 0 || meta.SKIP_REASON !== undefined) {
+    reasons.push("individual target CPU metadata is missing or invalid");
+    invalid = true;
+  }
+
+  const acceptedRows = [];
+  const ambiguousCpus = new Set();
+  const nextRun = new Map();
+  let invalidRows = false;
+  for (const row of rows) {
+    if (row.length !== 4) {
+      const rowCpu = canonicalUint(row[0]);
+      if (rowCpu !== null && (!targetSet || targetSet.has(rowCpu))) ambiguousCpus.add(rowCpu);
+      invalidRows = true;
+      continue;
+    }
+    const [cpuS, runS, rcS, elapsedS] = row;
+    const cpu = canonicalUint(cpuS);
+    const run = canonicalUint(runS);
+    const rc = canonicalUint(rcS);
+    const elapsed = canonicalUint(elapsedS);
+    if (cpu === null || (targetSet && !targetSet.has(cpu))) {
+      invalidRows = true;
+      continue;
+    }
+    if (run === null || rc === null || elapsed === null || run < 1 ||
+        (runsPerCpu !== null && run > runsPerCpu)) {
+      ambiguousCpus.add(cpu);
+      invalidRows = true;
+      continue;
+    }
+    const expectedRun = nextRun.get(cpu) ?? 1;
+    if (run !== expectedRun) {
+      ambiguousCpus.add(cpu);
+      invalidRows = true;
+      continue;
+    }
+    nextRun.set(cpu, expectedRun + 1);
+    if (rc !== 0 && rc !== 139) {
+      invalidRows = true;
+      continue;
+    }
+    acceptedRows.push(row);
+  }
+  if (invalidRows) {
+    reasons.push("individual results contain a malformed, non-target, non-SIGSEGV, duplicate, or non-contiguous row");
+    invalid = true;
+  }
+
+  if (skipped === true) {
+    if (rows.length > 0) {
+      reasons.push("skipped individual phase contains result rows");
+      invalid = true;
+    }
+  } else if (targetSet && runsPerCpu !== null) {
+    const missing = [...targetSet].some((cpu) => (nextRun.get(cpu) ?? 1) !== runsPerCpu + 1);
+    if (missing) reasons.push("individual results do not contain every expected per-CPU run");
+  }
+  if (!phaseDone) reasons.push("phase completion marker is missing");
+  if (completed === false) reasons.push("individual metadata is not marked complete");
+
+  let status = "incomplete";
+  if (invalid) status = "invalid";
+  else if (skipped === true && phaseDone && completed === true && rows.length === 0) status = "skipped";
+  else if (skipped === false && phaseDone && completed === true && reasons.length === 0) status = "complete";
+  const unambiguousRows = acceptedRows.filter((row) => !ambiguousCpus.has(Number(row[0])));
+  return {
+    status,
+    reasons: [...new Set(reasons)],
+    targetCpus: targetSet ? [...targetSet] : [],
+    runsPerCpu,
+    acceptedRows: unambiguousRows,
+    skipReason: meta.SKIP_REASON ?? null,
+  };
 }
 
 export function collectFreqAb(outDir, rows, meta) {
@@ -428,18 +592,23 @@ export function collect(outDir) {
   }
 
   // --- individual ---
-  const individualRows = readTsv(path.join(resultsDir, "individual.tsv"));
-  if (individualRows.length > 0) {
-    results.individual = collectIndividual(individualRows);
-    // Rank by the SIGSEGV endpoint over valid runs (ties: more SIGSEGVs,
-    // then lower CPU number); invalid runs are already excluded from `runs`.
-    const worst = results.individual
-      .filter((r) => r.runs > 0)
+  const individualRows = readExactTsv(path.join(resultsDir, "individual.tsv"));
+  const individualMetaState = readIndividualMeta(path.join(resultsDir, "individual.meta"));
+  const individualAssessment = assessIndividual(
+    individualRows,
+    individualMetaState.values,
+    existsSync(path.join(outDir, "state", "phase-individual.done")),
+    individualMetaState,
+  );
+  const { acceptedRows, ...individualStatus } = individualAssessment;
+  results.individualStatus = individualStatus;
+  if (acceptedRows.length > 0) results.individual = collectIndividual(acceptedRows);
+  if (individualStatus.status === "complete") {
+    const worst = (results.individual ?? [])
+      .filter((row) => row.sigsegv > 0)
       .sort((a, b) => b.sigsegv / b.runs - a.sigsegv / a.runs || b.sigsegv - a.sigsegv || a.cpu - b.cpu)[0];
     results.worstCpu = worst ? worst.cpu : null;
-  } else {
-    results.worstCpu = null;
-  }
+  } else results.worstCpu = null;
 
   // --- frequency A/B/A ---
   const freqAbRows = readTsv(path.join(resultsDir, "frequency-ab.tsv"));

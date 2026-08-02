@@ -221,7 +221,19 @@ export function renderReport(results) {
   // ------------------------------------------------------------------
   L.push("## Phase 4: individual CPU isolation");
   L.push("");
-  if (r.individual?.length) {
+  const individualStatus = r.individualStatus?.status ?? "not-run";
+  const individualComplete = individualStatus === "complete";
+  if (individualStatus === "skipped") {
+    L.push(`Skipped${r.individualStatus?.skipReason ? `: ${r.individualStatus.skipReason}.` : "."}`);
+    L.push("");
+  } else if (r.individual?.length) {
+    if (!individualComplete) {
+      L.push(`**Individual-phase status: ${individualStatus}.** Only unambiguous`);
+      L.push("canonical prefix rows are shown descriptively below. They are excluded");
+      L.push("from worst-CPU selection and CPU-localization conclusions.");
+      for (const reason of r.individualStatus?.reasons ?? []) L.push(`- ${reason}`);
+      L.push("");
+    }
     L.push("One child process pinned to one logical CPU per run. CPU batches");
     L.push("run sequentially, so localization is descriptive/exploratory and");
     L.push("may be confounded by time or thermal drift.");
@@ -232,7 +244,7 @@ export function renderReport(results) {
     L.push("| --- | --- | --- | --- | --- |");
     for (const c of r.individual) {
       const notes = [];
-      if (c.cpu === r.worstCpu && c.failures > 0) notes.push("highest observed rate");
+      if (individualComplete && c.cpu === r.worstCpu && c.failures > 0) notes.push("highest observed rate");
       if (c.invalidRuns?.length > 0) notes.push(`${c.invalidRuns.length} invalid run(s) excluded (non-SIGSEGV exits)`);
       if (c.failedRuns?.length) {
         notes.push(`failed runs: ${c.failedRuns.map((f) => `#${f.run} (${f.signal})`).join(", ")}`);
@@ -241,6 +253,12 @@ export function renderReport(results) {
         `| ${c.cpu} | ${c.runs} | ${c.failures} | ${statsCell(c.failures, c.runs)} | ${notes.join("; ") || "—"} |`,
       );
     }
+    L.push("");
+  } else if (individualStatus === "invalid" || individualStatus === "incomplete") {
+    L.push(`**Individual-phase status: ${individualStatus}.** No unambiguous result`);
+    L.push("prefix was available; evidence is excluded from statistics, worst-CPU");
+    L.push("selection, and CPU-localization conclusions.");
+    for (const reason of r.individualStatus?.reasons ?? []) L.push(`- ${reason}`);
     L.push("");
   } else {
     L.push("Not run (or no data collected).\n");
@@ -414,7 +432,9 @@ function renderConclusions(r) {
   // 2. Localization to CPUs / groups. Individual CPU batches run in fixed,
   // sequential order, so CPU labels are not exchangeable with respect to
   // temporal/thermal drift. Keep this descriptive; do not attach a p-value.
-  const testedCpus = (r.individual ?? []).filter((c) => c.runs > 0);
+  const testedCpus = r.individualStatus?.status === "complete"
+    ? (r.individual ?? []).filter((c) => c.runs > 0)
+    : [];
   const failingCpus = testedCpus.filter((c) => c.sigsegv > 0);
   const cleanCpus = testedCpus.filter((c) => c.sigsegv === 0);
   if (failingCpus.length > 0) {

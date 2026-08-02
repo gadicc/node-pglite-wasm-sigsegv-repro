@@ -433,7 +433,7 @@ redo_path_is_allowed() {
   local phase="$1" path="$2" suffix
   redo_relative_path_is_safe "$path" || return 1
   case "$phase:$path" in
-    baseline:results/baseline.meta|baseline:logs/baseline|baseline:freq/baseline.samples|baseline:freq/baseline.method|groups:results/groups.tsv|groups:logs/groups|individual:results/individual.tsv|individual:logs/individual|gdb:results/gdb.meta|gdb:gdb|gdb:logs/gdb|frequency:results/frequency-ab.tsv|frequency:results/frequency-ab.meta|frequency:results/frequency-cap.tsv|frequency:results/frequency-cap.meta) return 0 ;;
+    baseline:results/baseline.meta|baseline:logs/baseline|baseline:freq/baseline.samples|baseline:freq/baseline.method|groups:results/groups.tsv|groups:logs/groups|individual:results/individual.tsv|individual:results/individual.meta|individual:logs/individual|gdb:results/gdb.meta|gdb:gdb|gdb:logs/gdb|frequency:results/frequency-ab.tsv|frequency:results/frequency-ab.meta|frequency:results/frequency-cap.tsv|frequency:results/frequency-cap.meta) return 0 ;;
   esac
   if [[ "$phase" == groups && "$path" == freq/group-* ]]; then
     suffix="${path#freq/group-}"
@@ -634,7 +634,7 @@ apply_redo_plan() {
       case "$phase" in
         baseline) paths=(results/baseline.meta logs/baseline freq/baseline.samples freq/baseline.method) ;;
         groups) paths=(results/groups.tsv logs/groups) ;;
-        individual) paths=(results/individual.tsv logs/individual) ;;
+        individual) paths=(results/individual.tsv results/individual.meta logs/individual) ;;
         frequency) paths=(results/frequency-ab.tsv results/frequency-ab.meta results/frequency-cap.tsv results/frequency-cap.meta) ;;
         gdb) paths=(results/gdb.meta gdb logs/gdb) ;;
         *) diag_die "--redo: unsupported phase '$phase'" ;;
@@ -1167,8 +1167,21 @@ compute_individual_targets() {
 
 phase_individual() {
   local tsv="$OUT_DIR/results/individual.tsv"
+  local meta="$OUT_DIR/results/individual.meta"
+  if [[ -e "$tsv" || -L "$tsv" ]]; then
+    individual_rows_are_valid "$tsv" "$INDIVIDUAL_TARGET_CPUS" "$INDIVIDUAL_RUNS" 0 ||
+      diag_die "existing individual.tsv is not a valid resumable prefix; preserve it and use --redo individual"
+  else
+    : > "$tsv"
+  fi
+  if [[ -e "$meta" || -L "$meta" ]]; then
+    individual_meta_read "$meta" &&
+      [[ "$INDIVIDUAL_META_SKIPPED" == 0 && "$INDIVIDUAL_META_TARGET_CPUS" == "$INDIVIDUAL_TARGET_CPUS" &&
+        "$INDIVIDUAL_META_RUNS" == "$INDIVIDUAL_RUNS" ]] ||
+      diag_die "existing individual.meta does not match this resumable phase; preserve it and use --redo individual"
+  fi
+  individual_meta_write "$INDIVIDUAL_TARGET_CPUS" "$INDIVIDUAL_RUNS" 0 0
   mkdir -p "$OUT_DIR/logs/individual"
-  touch "$tsv"
   local -a cpus=()
   mapfile -t cpus < <(cpu_list_sorted "$INDIVIDUAL_TARGET_CPUS")
   local total=${#cpus[@]} idx=0 cpu existing deficit wrapper_rc
@@ -1176,7 +1189,7 @@ phase_individual() {
     idx=$((idx + 1))
     # Intra-phase resume: skip CPUs already fully recorded; top up CPUs
     # with partial records by running only the deficit.
-    existing="$(awk -F'\t' -v c="$cpu" '$1==c {n++} END {print n+0}' "$tsv")"
+    existing="$(individual_cpu_row_count "$tsv" "$cpu")"
     if ((existing >= INDIVIDUAL_RUNS)); then
       diag_log "cpu $cpu [$idx/$total]: already recorded ($existing runs), skipping"
       continue
@@ -1188,38 +1201,173 @@ phase_individual() {
       diag_log "cpu $cpu [$idx/$total]: $INDIVIDUAL_RUNS runs"
     fi
     set +e
-    diag_log_cmd bash single.sh "$cpu" "$deficit" "$tsv"
-    bash single.sh "$cpu" "$deficit" "$tsv" 2>&1 |
+    diag_log_cmd bash single.sh "$cpu" "$deficit" "$tsv" "$((existing + 1))"
+    bash single.sh "$cpu" "$deficit" "$tsv" "$((existing + 1))" 2>&1 |
       tee -a "$OUT_DIR/logs/individual/cpu-${cpu}.log" | tail -1
     wrapper_rc=${PIPESTATUS[0]}
     set -e
-    individual_cpu_result_is_complete "$tsv" "$cpu" "$existing" "$INDIVIDUAL_RUNS" "$wrapper_rc" ||
+    individual_rows_are_valid "$tsv" "$INDIVIDUAL_TARGET_CPUS" "$INDIVIDUAL_RUNS" 0 &&
+      individual_cpu_batch_matches_wrapper "$tsv" "$cpu" "$existing" "$INDIVIDUAL_RUNS" "$wrapper_rc" ||
       diag_die "cpu $cpu did not produce $deficit valid clean/SIGSEGV result(s) (wrapper rc=$wrapper_rc); phase remains resumable"
   done
+  individual_rows_are_valid "$tsv" "$INDIVIDUAL_TARGET_CPUS" "$INDIVIDUAL_RUNS" 1 ||
+    diag_die "individual results are incomplete or invalid; preserve them and use --redo individual if they cannot be resumed"
+  individual_meta_write "$INDIVIDUAL_TARGET_CPUS" "$INDIVIDUAL_RUNS" 0 1
   mark_done individual
 }
 
-individual_cpu_result_is_complete() {
-  local tsv="$1" cpu="$2" before="$3" expected_total="$4" wrapper_rc="$5"
-  [[ "$wrapper_rc" == "0" || "$wrapper_rc" == "1" ]] || return 1
-  awk -F'\t' -v cpu="$cpu" -v before="$before" -v expected="$expected_total" -v wrapper="$wrapper_rc" '
-    $1 == cpu {
-      count++
-      if ($3 != 0 && $3 != 139) invalid++
-      if (count > before && $3 == 139) new_sigsegv++
+individual_cpulist_is_canonical() {
+  local list="$1" part lo hi previous=-1 first=1
+  local -a parts=()
+  [[ -n "$list" ]] || return 1
+  IFS=',' read -ra parts <<< "$list"
+  for part in "${parts[@]}"; do
+    if [[ "$part" =~ ^(0|[1-9][0-9]*)-([1-9][0-9]*)$ ]]; then
+      lo="${BASH_REMATCH[1]}"; hi="${BASH_REMATCH[2]}"
+      ((lo < hi)) || return 1
+    elif [[ "$part" =~ ^(0|[1-9][0-9]*)$ ]]; then
+      lo="${BASH_REMATCH[1]}"; hi="$lo"
+    else
+      return 1
+    fi
+    ((hi <= 65535)) || return 1
+    if ((first == 0)); then ((lo > previous + 1)) || return 1; fi
+    first=0
+    previous="$hi"
+  done
+}
+
+# Validate the entire file before using any row for resume or completion.
+# Each target CPU must contain the exact ordered prefix 1..N, never more than
+# the configured total; require_complete=1 additionally requires N=total.
+individual_rows_are_valid() {
+  local tsv="$1" targets="$2" expected_total="$3" require_complete="$4" target_csv
+  [[ -f "$tsv" && ! -L "$tsv" ]] || return 1
+  [[ "$expected_total" =~ ^[1-9][0-9]*$ && "$require_complete" =~ ^[01]$ ]] || return 1
+  individual_cpulist_is_canonical "$targets" || return 1
+  target_csv="$(cpu_list_sorted "$targets" | paste -sd, -)"
+  awk -F'\t' -v targets="$target_csv" -v expected="$expected_total" -v complete="$require_complete" '
+    function uint(s) { return s ~ /^(0|[1-9][0-9]*)$/ }
+    BEGIN {
+      n = split(targets, target, ",")
+      for (i = 1; i <= n; i++) allowed[target[i]] = 1
+    }
+    {
+      if (NF != 4 || !uint($1) || !uint($2) || !uint($3) || !uint($4) ||
+          !($1 in allowed) || ($3 != "0" && $3 != "139")) bad = 1
+      else {
+        count[$1]++
+        if (($2 + 0) != count[$1] || count[$1] > expected) bad = 1
+      }
     }
     END {
-      wrapper_ok = (wrapper == 0 && new_sigsegv == 0) || (wrapper == 1 && new_sigsegv > 0)
-      exit (count == expected && invalid == 0 && wrapper_ok) ? 0 : 1
+      if (complete) for (cpu in allowed) if ((count[cpu] + 0) != expected) bad = 1
+      exit bad ? 1 : 0
     }
   ' "$tsv"
 }
 
+individual_cpu_row_count() {
+  local tsv="$1" cpu="$2"
+  awk -F'\t' -v cpu="$cpu" '$1 == cpu { count++ } END { print count + 0 }' "$tsv"
+}
+
+individual_cpu_batch_matches_wrapper() {
+  local tsv="$1" cpu="$2" before="$3" expected_total="$4" wrapper_rc="$5"
+  [[ "$wrapper_rc" == "0" || "$wrapper_rc" == "1" ]] || return 1
+  awk -F'\t' -v cpu="$cpu" -v before="$before" -v expected="$expected_total" -v wrapper="$wrapper_rc" '
+    $1 == cpu && $2 > before { count++; if ($3 == 139) new_sigsegv++ }
+    END {
+      wrapper_ok = (wrapper == 0 && new_sigsegv == 0) || (wrapper == 1 && new_sigsegv > 0)
+      exit (count == expected - before && wrapper_ok) ? 0 : 1
+    }
+  ' "$tsv"
+}
+
+INDIVIDUAL_META_TARGET_CPUS=""
+INDIVIDUAL_META_RUNS=""
+INDIVIDUAL_META_SKIPPED=""
+INDIVIDUAL_META_COMPLETED=""
+INDIVIDUAL_META_SKIP_REASON=""
+
+individual_meta_read() {
+  local file="$1" line key value
+  local -A seen=()
+  INDIVIDUAL_META_TARGET_CPUS=""
+  INDIVIDUAL_META_RUNS=""
+  INDIVIDUAL_META_SKIPPED=""
+  INDIVIDUAL_META_COMPLETED=""
+  INDIVIDUAL_META_SKIP_REASON=""
+  [[ -f "$file" && ! -L "$file" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^([A-Z_]+)=(.*)$ ]] || return 1
+    key="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"
+    [[ -z "${seen[$key]:-}" ]] || return 1
+    seen[$key]=1
+    case "$key" in
+      VERSION) [[ "$value" == 1 ]] || return 1 ;;
+      TARGET_CPUS) INDIVIDUAL_META_TARGET_CPUS="$value" ;;
+      RUNS_PER_CPU) INDIVIDUAL_META_RUNS="$value" ;;
+      SKIPPED) INDIVIDUAL_META_SKIPPED="$value" ;;
+      COMPLETED) INDIVIDUAL_META_COMPLETED="$value" ;;
+      SKIP_REASON) INDIVIDUAL_META_SKIP_REASON="$value" ;;
+      *) return 1 ;;
+    esac
+  done < "$file"
+  [[ -n "${seen[VERSION]:-}" && -n "${seen[TARGET_CPUS]:-}" && -n "${seen[RUNS_PER_CPU]:-}" &&
+    -n "${seen[SKIPPED]:-}" && -n "${seen[COMPLETED]:-}" ]] || return 1
+  [[ "$INDIVIDUAL_META_RUNS" =~ ^[1-9][0-9]*$ && "$INDIVIDUAL_META_SKIPPED" =~ ^[01]$ &&
+    "$INDIVIDUAL_META_COMPLETED" =~ ^[01]$ ]] || return 1
+  if [[ "$INDIVIDUAL_META_SKIPPED" == 1 ]]; then
+    [[ -z "$INDIVIDUAL_META_TARGET_CPUS" && "$INDIVIDUAL_META_COMPLETED" == 1 &&
+      -n "$INDIVIDUAL_META_SKIP_REASON" ]] || return 1
+  else
+    [[ -z "$INDIVIDUAL_META_SKIP_REASON" ]] || return 1
+    individual_cpulist_is_canonical "$INDIVIDUAL_META_TARGET_CPUS" || return 1
+  fi
+}
+
+individual_meta_write() {
+  local targets="$1" runs="$2" skipped="$3" completed="$4" reason="${5:-}" tmp
+  tmp="$(mktemp "$OUT_DIR/results/.individual.meta.XXXXXX")" || diag_die "cannot create individual metadata"
+  {
+    printf 'VERSION=1\nTARGET_CPUS=%s\nRUNS_PER_CPU=%s\n' "$targets" "$runs"
+    printf 'SKIPPED=%s\nCOMPLETED=%s\n' "$skipped" "$completed"
+    [[ -z "$reason" ]] || printf 'SKIP_REASON=%s\n' "$reason"
+  } > "$tmp" || diag_die "cannot write individual metadata"
+  mv -T -- "$tmp" "$OUT_DIR/results/individual.meta" || diag_die "cannot publish individual metadata"
+}
+
+individual_phase_result_is_complete() {
+  local meta="$OUT_DIR/results/individual.meta" tsv="$OUT_DIR/results/individual.tsv"
+  individual_meta_read "$meta" && [[ "$INDIVIDUAL_META_COMPLETED" == 1 ]] || return 1
+  if [[ "$INDIVIDUAL_META_SKIPPED" == 1 ]]; then
+    [[ ! -s "$tsv" ]]
+  else
+    individual_rows_are_valid "$tsv" "$INDIVIDUAL_META_TARGET_CPUS" "$INDIVIDUAL_META_RUNS" 1
+  fi
+}
+
+phase_individual_skipped() {
+  local tsv="$OUT_DIR/results/individual.tsv" meta="$OUT_DIR/results/individual.meta"
+  [[ ! -e "$meta" && ! -L "$meta" ]] ||
+    diag_die "existing individual metadata conflicts with a skipped phase; preserve it and use --redo individual"
+  if [[ -e "$tsv" || -L "$tsv" ]]; then
+    [[ -f "$tsv" && ! -L "$tsv" && ! -s "$tsv" ]] ||
+      diag_die "existing individual results conflict with a skipped phase; preserve them and use --redo individual"
+  else
+    : > "$tsv"
+  fi
+  individual_meta_write "" "$INDIVIDUAL_RUNS" 1 1 no-failing-group-in-quick-mode
+  mark_done individual
+}
+
 # ------------------------------------------------------------------
-# Worst CPU from individual.tsv (highest SIGSEGV rate over valid runs, ties:
-# more SIGSEGVs). Only rc 0 (clean) and rc 139 (SIGSEGV) are valid runs;
-# every other exit is excluded, aligning old-bundle resumes with collect.mjs.
+# Worst CPU from a fully validated individual phase (highest SIGSEGV rate,
+# ties: more SIGSEGVs, then lower CPU id).
 worst_cpu() {
+  individual_phase_result_is_complete || return 0
+  [[ "$INDIVIDUAL_META_SKIPPED" == 0 ]] || return 0
   awk -F'\t' '
     { rc=$3; if (rc!=0 && rc!=139) next; n[$1]++; if (rc==139) f[$1]++ }
     END {
@@ -1612,6 +1760,8 @@ main() {
 
   # ---- phase 4 ----
   if phase_is_done individual; then
+    individual_phase_result_is_complete ||
+      diag_die "completed individual phase has missing or invalid evidence; preserve it and resume with --redo individual"
     diag_log "phase 4/7 individual: already done, skipping (resume)"
   else
     if compute_individual_targets; then
@@ -1619,7 +1769,7 @@ main() {
       phase_individual
     else
       diag_log "phase 4/7: no failing group in quick mode; skipping individual tests"
-      mark_done individual
+      phase_individual_skipped
     fi
   fi
 

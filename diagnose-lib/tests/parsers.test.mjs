@@ -228,10 +228,34 @@ test("renderReport: clean heterogeneous phases do not get a pooled rate bound", 
       unclassifiedFailureCount: 0,
     }],
     individual: [{ cpu: 0, runs: 30, failures: 0, sigsegv: 0, invalidRuns: [], failedRuns: [] }],
+    individualStatus: { status: "complete", reasons: [] },
   });
   assert.match(md, /No pooled rate bound is valid/);
   assert.match(md, /phase-, group-, and CPU-specific bounds/);
   assert.doesNotMatch(md, /pooled per-run rate/);
+});
+
+test("renderReport: incomplete individual prefixes are descriptive but cannot localize", () => {
+  const md = renderReport({
+    collectedAt: "2026-08-02T00:00:00.000Z",
+    config: {},
+    environment: {},
+    worstCpu: null,
+    individualStatus: {
+      status: "incomplete",
+      reasons: ["phase completion marker is missing"],
+    },
+    individual: [
+      { cpu: 3, runs: 1, failures: 0, sigsegv: 0, invalidRuns: [], failedRuns: [] },
+      { cpu: 4, runs: 1, failures: 1, sigsegv: 1, invalidRuns: [], failedRuns: [{ run: 1, signal: "SIGSEGV" }] },
+    ],
+  });
+  assert.match(md, /Individual-phase status: incomplete/);
+  assert.match(md, /Only unambiguous/);
+  assert.match(md, /excluded\s+from worst-CPU selection and CPU-localization conclusions/);
+  assert.match(md, /\| 4 \| 1 \| 1 \|/);
+  assert.doesNotMatch(md, /\*\*CPU localization\*\*: failures observed/);
+  assert.doesNotMatch(md, /highest observed rate/);
 });
 
 test("renderReport: incomplete frequency artifacts are excluded from conclusions", () => {
