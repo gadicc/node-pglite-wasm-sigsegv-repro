@@ -250,6 +250,28 @@ else
   ok "root-checks.sh non-root guard [skipped while tests run as root]"
 fi
 
+ROOT_GUARD="$TMP/root-checks-guard"
+mkdir -p "$ROOT_GUARD/bundle/env" "$ROOT_GUARD/redirect"
+ln -s "$ROOT_GUARD/redirect" "$ROOT_GUARD/bundle/env/root"
+(
+  ROOT_CHECKS_SOURCE_ONLY=1
+  source "$REPO_ROOT/root-checks.sh"
+  root_checks_prepare_out_dir "$ROOT_GUARD/bundle"
+) > /dev/null 2>&1
+check_eq "root-checks rejects symlinked output directory" "1" "$([[ $? -ne 0 ]] && echo 1 || echo 0)"
+rm "$ROOT_GUARD/bundle/env/root"
+mkdir "$ROOT_GUARD/bundle/env/root"
+printf 'safe\n' > "$ROOT_GUARD/victim"
+ln -s "$ROOT_GUARD/victim" "$ROOT_GUARD/bundle/env/root/cctk.txt"
+(
+  ROOT_CHECKS_SOURCE_ONLY=1
+  source "$REPO_ROOT/root-checks.sh"
+  root_checks_validate_destinations "$ROOT_GUARD/bundle/env/root" cctk.txt
+) > /dev/null 2>&1
+root_file_guard_rc=$?
+check_eq "root-checks rejects symlinked output file" "1" \
+  "$([[ $root_file_guard_rc -ne 0 && "$(cat "$ROOT_GUARD/victim")" == safe ]] && echo 1 || echo 0)"
+
 echo "== --redo phase handling =="
 RB="$TMP/redo-bundle"
 mkdir -p "$RB"/{results,state,logs/individual}

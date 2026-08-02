@@ -35,22 +35,89 @@ usage() {
   exit 2
 }
 
-[[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && usage
-bundle="${1:-}"
-[[ -n "$bundle" && -d "$bundle" ]] || usage
+root_checks_prepare_out_dir() {
+  local bundle="$1" env_dir="$1/env" out_dir="$1/env/root"
+  [[ -d "$bundle" && ! -L "$bundle" ]] || {
+    echo "error: bundle must be a real directory, not a symlink: $bundle" >&2
+    return 1
+  }
+  if [[ -e "$env_dir" || -L "$env_dir" ]]; then
+    [[ -d "$env_dir" && ! -L "$env_dir" ]] || {
+      echo "error: refusing unsafe env path: $env_dir" >&2
+      return 1
+    }
+  else
+    mkdir -- "$env_dir" || return 1
+  fi
+  if [[ -e "$out_dir" || -L "$out_dir" ]]; then
+    [[ -d "$out_dir" && ! -L "$out_dir" ]] || {
+      echo "error: refusing unsafe privileged output path: $out_dir" >&2
+      return 1
+    }
+  else
+    mkdir -- "$out_dir" || return 1
+  fi
+}
 
-if ((EUID != 0)); then
-  echo "error: this script performs privileged reads; run it with sudo." >&2
-  echo "       sudo $0 $bundle" >&2
-  exit 4
-fi
+root_checks_validate_files() {
+  local out_dir="$1" name target
+  shift
+  [[ -d "$out_dir" ]] || return 1
+  for name in "$@"; do
+    target="$out_dir/$name"
+    [[ ! -L "$target" ]] || return 1
+    [[ ! -e "$target" || -f "$target" ]] || return 1
+  done
+}
 
-out_dir="$bundle/env/root"
-mkdir -p "$out_dir"
+root_checks_validate_destinations() {
+  local out_dir="$1"
+  shift
+  [[ -d "$out_dir" && ! -L "$out_dir" ]] || return 1
+  root_checks_validate_files "$out_dir" "$@"
+}
+
+root_checks_main() {
+  [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && usage
+  local bundle="${1:-}"
+  [[ -n "$bundle" && -d "$bundle" && ! -L "$bundle" ]] || usage
+
+  if ((EUID != 0)); then
+    echo "error: this script performs privileged reads; run it with sudo." >&2
+    echo "       sudo $0 $bundle" >&2
+    exit 4
+  fi
+
+  bundle="$(cd -- "$bundle" && pwd -P)"
+  root_checks_prepare_out_dir "$bundle" || exit 1
+  local out_dir="$bundle/env/root"
+  local out_fd anchored_out
+  exec {out_fd}< "$out_dir" || exit 1
+  anchored_out="/proc/self/fd/$out_fd"
+  local -a output_names=(
+    kernel-warnings.txt intel-undervolt.txt cctk.txt turbostat.txt root-checks.meta
+  )
+  root_checks_validate_destinations "$out_dir" "${output_names[@]}" || {
+    echo "error: refusing symlink or non-file privileged output destination under $out_dir" >&2
+    exit 1
+  }
+
+  # Collect outside the user-owned bundle. Only completed regular files are
+  # moved into destinations that are revalidated immediately before use.
+  local stage_dir
+  stage_dir="$(mktemp -d /tmp/root-checks.XXXXXX)" || exit 1
+  cleanup_stage() {
+    local name
+    for name in "${output_names[@]}"; do rm -f -- "$stage_dir/$name"; done
+    rmdir -- "$stage_dir" 2> /dev/null || true
+  }
+  trap cleanup_stage EXIT
+  trap 'cleanup_stage; exit 130' INT
+  trap 'cleanup_stage; exit 143' TERM
 
 # cctk read-only allowlist (bare-property queries only). Labels are used
 # for the report; values are the exact cctk property names.
-CCTK_ALLOWLIST=(
+local -a CCTK_ALLOWLIST=(
   "TurboMode"        # turbo
   "IntelTME"         # TME
   "IntelSagv"        # System Agent Geyserville
@@ -61,13 +128,13 @@ CCTK_ALLOWLIST=(
   "SpeedShift"       # Intel SpeedShift (HWP)
 )
 
-echo "[root-checks] writing privileged reads to $out_dir"
+echo "[root-checks] staging privileged reads for $out_dir"
 
 # 1. kernel warnings -------------------------------------------------------
 {
   echo "# source: dmesg (as root, $(date -Is))"
   dmesg | grep -iE 'mce|machine check|edac|thermal|tme|mktme|microcode' || true
-} > "$out_dir/kernel-warnings.txt"
+} > "$stage_dir/kernel-warnings.txt"
 
 # 2. intel-undervolt -------------------------------------------------------
 {
@@ -81,7 +148,7 @@ echo "[root-checks] writing privileged reads to $out_dir"
   else
     echo "intel-undervolt not installed"
   fi
-} > "$out_dir/intel-undervolt.txt"
+} > "$stage_dir/intel-undervolt.txt"
 
 # 3. cctk allowlist --------------------------------------------------------
 {
@@ -97,7 +164,7 @@ echo "[root-checks] writing privileged reads to $out_dir"
   else
     echo "cctk not installed"
   fi
-} > "$out_dir/cctk.txt"
+} > "$stage_dir/cctk.txt"
 
 # 4. turbostat sample ------------------------------------------------------
 {
@@ -107,17 +174,44 @@ echo "[root-checks] writing privileged reads to $out_dir"
   else
     echo "turbostat not installed"
   fi
-} > "$out_dir/turbostat.txt"
+} > "$stage_dir/turbostat.txt"
 
 {
   echo "date=$(date -Is)"
   echo "host_bundle=$bundle"
-} > "$out_dir/root-checks.meta"
+} > "$stage_dir/root-checks.meta"
 
-# Hand ownership back to the invoking user so the bundle stays writable.
-if [[ -n "${SUDO_USER:-}" ]]; then
-  chown -R "$SUDO_USER":"$(id -gn "$SUDO_USER")" "$out_dir" 2> /dev/null || true
-fi
+[[ -d "$out_dir" && ! -L "$out_dir" && "$out_dir" -ef "$anchored_out" ]] || {
+  echo "error: privileged output directory changed during collection; refusing placement" >&2
+  exit 1
+}
+root_checks_validate_files "$anchored_out" "${output_names[@]}" || {
+  echo "error: privileged output destinations changed during collection; refusing placement" >&2
+  exit 1
+}
+local name target
+for name in "${output_names[@]}"; do
+  chmod 0644 "$stage_dir/$name"
+  if [[ -n "${SUDO_USER:-}" ]]; then
+    chown "$SUDO_USER":"$(id -gn "$SUDO_USER")" "$stage_dir/$name" 2> /dev/null || true
+  fi
+done
+for name in "${output_names[@]}"; do
+  target="$anchored_out/$name"
+  root_checks_validate_files "$anchored_out" "$name" || {
+    echo "error: unsafe destination appeared before placing $name" >&2
+    exit 1
+  }
+  mv -fT -- "$stage_dir/$name" "$target"
+done
 
+exec {out_fd}<&-
+trap - EXIT INT TERM
+cleanup_stage
 echo "[root-checks] done. Regenerate the report with:"
 echo "  ./diagnose.sh --resume \"$bundle\" --yes"
+}
+
+if [[ "${ROOT_CHECKS_SOURCE_ONLY:-}" != "1" ]]; then
+  root_checks_main "$@"
+fi
