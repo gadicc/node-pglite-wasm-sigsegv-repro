@@ -172,6 +172,16 @@ derived_outputs_present() {
   done
 }
 
+derived_transaction_temps_absent() {
+  local bundle="$1" name
+  for name in \
+    .results.json.pending .report.md.pending .manifest.txt.pending \
+    .privacy-review.pending .privacy-inventory-before.pending \
+    .privacy-inventory-after.pending; do
+    [[ ! -e "$bundle/$name" && ! -L "$bundle/$name" ]] || return 1
+  done
+}
+
 seal_root_checks_fixture() {
   local directory="$1" generation="${2:-abcdef0123456789abcdef0123456789}"
   local kernel_sha undervolt_sha cctk_sha turbostat_sha
@@ -4038,7 +4048,8 @@ ln -s "$PRIVACY_COMMAND_FAIL/bin/grep" "$PRIVACY_FD_FAIL/bin/grep"
     write_privacy_review > /dev/null 2>&1 && exit 1
   done
   after_fds="$(find /proc/self/fd -mindepth 1 -maxdepth 1 -printf x | wc -c)"
-  [[ "$after_fds" == "$before_fds" && -z "$PRIVACY_REVIEW_FD" ]]
+  [[ "$after_fds" == "$before_fds" && -z "$PRIVACY_REVIEW_FD" &&
+    -z "$PRIVACY_INVENTORY_BEFORE_FD" && -z "$PRIVACY_INVENTORY_AFTER_FD" ]]
 ) > /dev/null 2>&1
 check_eq "repeated privacy scan failures close their candidate descriptor" "0" "$?"
 
@@ -4670,6 +4681,501 @@ grep -q $'^status\t' "$B/privacy-review.txt"
 check_eq "finalization writes privacy review" "0" "$?"
 (cd "$B" && sha256sum -c manifest.txt) > /dev/null 2>&1
 check_eq "end-to-end bundle manifest verifies" "0" "$?"
+
+echo "== derived-output generation transaction =="
+NODE_CANDIDATE_ROOT="$TMP/node-candidate-outputs"
+NODE_CANDIDATE_BUNDLE="$NODE_CANDIDATE_ROOT/bundle"
+mkdir -p "$NODE_CANDIDATE_ROOT"
+cp -a "$B" "$NODE_CANDIDATE_BUNDLE"
+printf 'old final results\n' > "$NODE_CANDIDATE_BUNDLE/results.json"
+printf 'old final report\n' > "$NODE_CANDIDATE_BUNDLE/report.md"
+node "$LIB/collect.mjs" "$NODE_CANDIDATE_BUNDLE" \
+  "$NODE_CANDIDATE_BUNDLE/.explicit-results" > /dev/null
+check_eq "collector writes only its explicit exclusive candidate" "1" \
+  "$([[ "$(cat "$NODE_CANDIDATE_BUNDLE/results.json")" == 'old final results' && -s "$NODE_CANDIDATE_BUNDLE/.explicit-results" ]] && echo 1 || echo 0)"
+node "$LIB/report.mjs" "$NODE_CANDIDATE_BUNDLE" \
+  "$NODE_CANDIDATE_BUNDLE/.explicit-results" \
+  "$NODE_CANDIDATE_BUNDLE/.explicit-report" > /dev/null
+check_eq "report reads the candidate generation and leaves the old final untouched" "1" \
+  "$([[ "$(cat "$NODE_CANDIDATE_BUNDLE/report.md")" == 'old final report' ]] && grep -q 'Diagnostic report' "$NODE_CANDIDATE_BUNDLE/.explicit-report" && echo 1 || echo 0)"
+
+NODE_EARLY_BUNDLE="$NODE_CANDIDATE_ROOT/early-bundle"
+mkdir -p "$NODE_EARLY_BUNDLE"
+ln -s "$NODE_CANDIDATE_ROOT/missing-results" "$NODE_EARLY_BUNDLE/results"
+node "$LIB/collect.mjs" "$NODE_EARLY_BUNDLE" \
+  "$NODE_EARLY_BUNDLE/.explicit-results" > /dev/null
+check_eq "collector early unsafe-results branch honors the explicit candidate" "1" \
+  "$([[ -s "$NODE_EARLY_BUNDLE/.explicit-results" && ! -e "$NODE_EARLY_BUNDLE/results.json" ]] && echo 1 || echo 0)"
+
+printf 'do not follow\n' > "$NODE_CANDIDATE_ROOT/victim"
+ln -s "$NODE_CANDIDATE_ROOT/victim" "$NODE_CANDIDATE_BUNDLE/.blocked-results"
+timeout --signal=TERM --kill-after=1 3 node "$LIB/collect.mjs" \
+  "$NODE_CANDIDATE_BUNDLE" "$NODE_CANDIDATE_BUNDLE/.blocked-results" \
+  > /dev/null 2>&1
+node_symlink_candidate_rc=$?
+mkfifo "$NODE_CANDIDATE_BUNDLE/.blocked-report"
+timeout --signal=TERM --kill-after=1 3 node "$LIB/report.mjs" \
+  "$NODE_CANDIDATE_BUNDLE" "$NODE_CANDIDATE_BUNDLE/.explicit-results" \
+  "$NODE_CANDIDATE_BUNDLE/.blocked-report" > /dev/null 2>&1
+node_fifo_candidate_rc=$?
+check_eq "exclusive Node outputs reject symlink and FIFO candidates without blocking" "1" \
+  "$([[ $node_symlink_candidate_rc -ne 0 && $node_fifo_candidate_rc -ne 0 && "$(cat "$NODE_CANDIDATE_ROOT/victim")" == 'do not follow' && -p "$NODE_CANDIDATE_BUNDLE/.blocked-report" ]] && echo 1 || echo 0)"
+node "$LIB/collect.mjs" "$NODE_CANDIDATE_BUNDLE" "" > /dev/null 2>&1
+empty_collect_output_rc=$?
+node "$LIB/report.mjs" "$NODE_CANDIDATE_BUNDLE" "" \
+  "$NODE_CANDIDATE_BUNDLE/.empty-input-report" > /dev/null 2>&1
+empty_report_input_rc=$?
+check_eq "explicit Node path forms reject empty paths instead of falling back to finals" "1" \
+  "$([[ $empty_collect_output_rc -eq 2 && $empty_report_input_rc -eq 2 && ! -e "$NODE_CANDIDATE_BUNDLE/.empty-input-report" ]] && echo 1 || echo 0)"
+
+CHECKPOINT_ROOT="$TMP/finalization-checkpoints"
+mkdir -p "$CHECKPOINT_ROOT"
+for checkpoint in generation-opened results-published report-published privacy-published manifest-published; do
+  checkpoint_case="$CHECKPOINT_ROOT/$checkpoint"
+  checkpoint_bundle="$checkpoint_case/bundle"
+  mkdir -p "$checkpoint_case"
+  cp -a "$B" "$checkpoint_bundle"
+  timeout --signal=TERM --kill-after=1 15 bash -c '
+    DIAG_SOURCE_ONLY=1
+    source "$1/diagnose.sh"
+    OUT_DIR="$2"
+    DIAG_BUNDLE_ROOT="$2"
+    DIAG_REPO_ROOT="$1"
+    META_FILE="$2/results/meta.env"
+    STATE_DIR="$2/state"
+    DIAG_LOG_FILE="$2/run.log"
+    fail_checkpoint="$3"
+    finalization_checkpoint() { [[ "$1" != "$fail_checkpoint" ]]; }
+    if finalize_report; then exit 0; else exit $?; fi
+  ' _ "$REPO_ROOT" "$checkpoint_bundle" "$checkpoint" \
+    > "$checkpoint_case/output" 2>&1
+  checkpoint_rc=$?
+  check_eq "checkpoint failure revokes readiness and cleans candidates: $checkpoint" "1" \
+    "$([[ $checkpoint_rc -ne 0 && ! -e "$checkpoint_bundle/manifest.txt" ]] && derived_transaction_temps_absent "$checkpoint_bundle" && ! grep -q 'done\. Bundle' "$checkpoint_case/output" && echo 1 || echo 0)"
+done
+
+for checkpoint in results-published report-published; do
+  checkpoint_bundle="$CHECKPOINT_ROOT/$checkpoint/bundle"
+  retry_sentinel="2099-12-31T23:59:${checkpoint:0:2}+00:00"
+  sed -i "s|^START_ISO=.*|START_ISO=$retry_sentinel|" \
+    "$checkpoint_bundle/results/meta.env"
+  timeout --signal=TERM --kill-after=1 15 bash -c '
+    DIAG_SOURCE_ONLY=1
+    source "$1/diagnose.sh"
+    OUT_DIR="$2"
+    DIAG_BUNDLE_ROOT="$2"
+    DIAG_REPO_ROOT="$1"
+    META_FILE="$2/results/meta.env"
+    STATE_DIR="$2/state"
+    DIAG_LOG_FILE="$2/run.log"
+    finalize_report
+  ' _ "$REPO_ROOT" "$checkpoint_bundle" > /dev/null 2>&1
+  checkpoint_retry_rc=$?
+  (cd "$checkpoint_bundle" && sha256sum -c manifest.txt) > /dev/null 2>&1
+  checkpoint_retry_manifest_rc=$?
+  node -e '
+    const fs = require("fs");
+    const result = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    process.exit(result.config.startedAt === process.argv[2] ? 0 : 1);
+  ' "$checkpoint_bundle/results.json" "$retry_sentinel"
+  checkpoint_retry_results_rc=$?
+  check_eq "partial publication prefix converges on retry: $checkpoint" "1" \
+    "$([[ $checkpoint_retry_rc -eq 0 && $checkpoint_retry_manifest_rc -eq 0 && $checkpoint_retry_results_rc -eq 0 ]] && grep -Fq "$retry_sentinel" "$checkpoint_bundle/report.md" && derived_transaction_temps_absent "$checkpoint_bundle" && echo 1 || echo 0)"
+done
+
+PAYLOAD_FAILURE_ROOT="$TMP/derived-payload-failures"
+mkdir -p "$PAYLOAD_FAILURE_ROOT"
+for failure_kind in results-sync results-rename report-sync report-rename; do
+  failure_case="$PAYLOAD_FAILURE_ROOT/$failure_kind"
+  failure_bundle="$failure_case/bundle"
+  mkdir -p "$failure_case"
+  cp -a "$B" "$failure_bundle"
+  target_name="${failure_kind%%-*}"
+  target_path="$failure_bundle/$target_name.$([[ "$target_name" == results ]] && echo json || echo md)"
+  target_before="$(sha256sum "$target_path")"
+  timeout --signal=TERM --kill-after=1 15 bash -c '
+    DIAG_SOURCE_ONLY=1
+    source "$1/diagnose.sh"
+    OUT_DIR="$2"
+    DIAG_BUNDLE_ROOT="$2"
+    DIAG_REPO_ROOT="$1"
+    META_FILE="$2/results/meta.env"
+    STATE_DIR="$2/state"
+    DIAG_LOG_FILE="$2/run.log"
+    failure_kind="$3"
+    target_name="${failure_kind%%-*}"
+    target_extension=json
+    [[ "$target_name" == report ]] && target_extension=md
+    if [[ "$failure_kind" == *-sync ]]; then
+      sync() {
+        if [[ "${*: -1}" == "$OUT_DIR/.$target_name.$target_extension.pending" ]]; then return 73; fi
+        command sync "$@"
+      }
+    else
+      node() {
+        if [[ "${1:-}" == -e && "${*: -1}" == "$OUT_DIR/$target_name.$target_extension" ]]; then return 73; fi
+        command node "$@"
+      }
+    fi
+    if finalize_report; then exit 0; else exit $?; fi
+  ' _ "$REPO_ROOT" "$failure_bundle" "$failure_kind" \
+    > "$failure_case/output" 2>&1
+  payload_failure_rc=$?
+  target_after="$(sha256sum "$target_path")"
+  check_eq "$failure_kind preserves its old final behind absent readiness" "1" \
+    "$([[ $payload_failure_rc -ne 0 && "$target_after" == "$target_before" && ! -e "$failure_bundle/manifest.txt" ]] && derived_transaction_temps_absent "$failure_bundle" && echo 1 || echo 0)"
+done
+
+MANIFEST_COMMAND_FAILURE_ROOT="$TMP/manifest-command-failures"
+mkdir -p "$MANIFEST_COMMAND_FAILURE_ROOT"
+for failure_kind in find sort hash chmod candidate-sync rename final-sync; do
+  failure_case="$MANIFEST_COMMAND_FAILURE_ROOT/$failure_kind"
+  failure_bundle="$failure_case/bundle"
+  mkdir -p "$failure_case/bin"
+  cp -a "$B" "$failure_bundle"
+  if [[ "$failure_kind" == hash ]]; then
+    printf '%s\n' '#!/usr/bin/env bash' 'exit 73' > "$failure_case/bin/sha256sum"
+    chmod +x "$failure_case/bin/sha256sum"
+  fi
+  timeout --signal=TERM --kill-after=1 15 bash -c '
+    DIAG_SOURCE_ONLY=1
+    source "$1/diagnose.sh"
+    OUT_DIR="$2"
+    DIAG_BUNDLE_ROOT="$2"
+    DIAG_REPO_ROOT="$1"
+    META_FILE="$2/results/meta.env"
+    STATE_DIR="$2/state"
+    DIAG_LOG_FILE="$2/run.log"
+    failure_kind="$3"
+    failure_once="$4"
+    if [[ "$failure_kind" == hash ]]; then
+      PATH="$5:$PATH"
+      hash -r
+    fi
+    case "$failure_kind" in
+      find)
+        find() {
+          if [[ "$PWD" == "$OUT_DIR" && "${1:-}" == . ]]; then return 73; fi
+          command find "$@"
+        }
+        ;;
+      sort)
+        sort() {
+          if [[ "$PWD" == "$OUT_DIR" ]]; then return 73; fi
+          command sort "$@"
+        }
+        ;;
+      chmod)
+        chmod() {
+          if [[ "${*: -1}" == "$OUT_DIR/.manifest.txt.pending" ]]; then return 73; fi
+          command chmod "$@"
+        }
+        ;;
+      candidate-sync)
+        sync() {
+          if [[ "${*: -1}" == "$OUT_DIR/.manifest.txt.pending" ]]; then return 73; fi
+          command sync "$@"
+        }
+        ;;
+      rename)
+        node() {
+          if [[ "${1:-}" == -e && "${*: -1}" == "$OUT_DIR/manifest.txt" ]]; then return 73; fi
+          command node "$@"
+        }
+        ;;
+      final-sync)
+        sync() {
+          if [[ "${*: -1}" == "$OUT_DIR" && -f "$OUT_DIR/manifest.txt" && ! -e "$failure_once" ]]; then
+            : > "$failure_once"
+            return 73
+          fi
+          command sync "$@"
+        }
+        ;;
+    esac
+    if finalize_report; then exit 0; else exit $?; fi
+  ' _ "$REPO_ROOT" "$failure_bundle" "$failure_kind" "$failure_case/failed-once" \
+    "$failure_case/bin" \
+    > "$failure_case/output" 2>&1
+  manifest_command_failure_rc=$?
+  check_eq "manifest $failure_kind failure leaves no readiness token or candidate" "1" \
+    "$([[ $manifest_command_failure_rc -ne 0 && ! -e "$failure_bundle/manifest.txt" ]] && derived_transaction_temps_absent "$failure_bundle" && echo 1 || echo 0)"
+done
+
+MANIFEST_FD_ROOT="$TMP/manifest-fd-reuse"
+mkdir -p "$MANIFEST_FD_ROOT/bundle"
+printf 'manifest payload\n' > "$MANIFEST_FD_ROOT/bundle/payload.txt"
+manifest_fd_result="$(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$MANIFEST_FD_ROOT/bundle"
+  DIAG_LOG_FILE=""
+  sort() {
+    if [[ "$PWD" == "$OUT_DIR" ]]; then return 73; fi
+    command sort "$@"
+  }
+  before_fds="$(find /proc/self/fd -mindepth 1 -maxdepth 1 -printf x | wc -c)"
+  failures=0
+  for _ in 1 2 3 4; do
+    if write_manifest; then
+      failures=99
+      break
+    fi
+    derived_generation_abort || failures=98
+    [[ -z "$DERIVED_MANIFEST_FD" ]] || failures=97
+    failures=$((failures + 1))
+  done
+  after_fds="$(find /proc/self/fd -mindepth 1 -maxdepth 1 -printf x | wc -c)"
+  printf '%s:%s:%s:%s\n' "$failures" "$before_fds" "$after_fds" \
+    "$([[ -z "$DERIVED_MANIFEST_FD" ]] && echo closed || echo open)"
+)"
+manifest_fd_failures="${manifest_fd_result%%:*}"
+manifest_fd_tail="${manifest_fd_result#*:}"
+manifest_fd_before="${manifest_fd_tail%%:*}"
+manifest_fd_tail="${manifest_fd_tail#*:}"
+manifest_fd_after="${manifest_fd_tail%%:*}"
+manifest_fd_state="${manifest_fd_tail##*:}"
+check_eq "repeated post-open manifest failures do not leak a descriptor" "1" \
+  "$([[ "$manifest_fd_failures" == 4 && "$manifest_fd_before" == "$manifest_fd_after" && "$manifest_fd_state" == closed ]] && derived_transaction_temps_absent "$MANIFEST_FD_ROOT/bundle" && echo 1 || echo 0)"
+
+UNSAFE_FINAL_ROOT="$TMP/unsafe-derived-finals"
+mkdir -p "$UNSAFE_FINAL_ROOT"
+for unsafe_kind in directory fifo; do
+  unsafe_case="$UNSAFE_FINAL_ROOT/$unsafe_kind"
+  unsafe_bundle="$unsafe_case/bundle"
+  mkdir -p "$unsafe_case"
+  cp -a "$B" "$unsafe_bundle"
+  rm -f "$unsafe_bundle/report.md"
+  if [[ "$unsafe_kind" == directory ]]; then
+    mkdir "$unsafe_bundle/report.md"
+  else
+    mkfifo "$unsafe_bundle/report.md"
+  fi
+  timeout --signal=TERM --kill-after=1 15 bash -c '
+    DIAG_SOURCE_ONLY=1
+    source "$1/diagnose.sh"
+    OUT_DIR="$2"
+    DIAG_BUNDLE_ROOT="$2"
+    DIAG_REPO_ROOT="$1"
+    META_FILE="$2/results/meta.env"
+    STATE_DIR="$2/state"
+    DIAG_LOG_FILE="$2/run.log"
+    if finalize_report; then exit 0; else exit $?; fi
+  ' _ "$REPO_ROOT" "$unsafe_bundle" > "$unsafe_case/output" 2>&1
+  unsafe_final_rc=$?
+  check_eq "unsafe $unsafe_kind final destination fails before candidate generation" "1" \
+    "$([[ $unsafe_final_rc -ne 0 && ! -e "$unsafe_bundle/manifest.txt" ]] && [[ "$unsafe_kind" == directory && -d "$unsafe_bundle/report.md" || "$unsafe_kind" == fifo && -p "$unsafe_bundle/report.md" ]] && derived_transaction_temps_absent "$unsafe_bundle" && echo 1 || echo 0)"
+done
+
+SYMLINK_FINAL_ROOT="$TMP/symlink-derived-final"
+SYMLINK_FINAL_BUNDLE="$SYMLINK_FINAL_ROOT/bundle"
+mkdir -p "$SYMLINK_FINAL_ROOT"
+cp -a "$B" "$SYMLINK_FINAL_BUNDLE"
+printf 'external report victim\n' > "$SYMLINK_FINAL_ROOT/victim"
+rm -f "$SYMLINK_FINAL_BUNDLE/report.md"
+ln -s "$SYMLINK_FINAL_ROOT/victim" "$SYMLINK_FINAL_BUNDLE/report.md"
+timeout --signal=TERM --kill-after=1 15 bash -c '
+  DIAG_SOURCE_ONLY=1
+  source "$1/diagnose.sh"
+  OUT_DIR="$2"
+  DIAG_BUNDLE_ROOT="$2"
+  DIAG_REPO_ROOT="$1"
+  META_FILE="$2/results/meta.env"
+  STATE_DIR="$2/state"
+  DIAG_LOG_FILE="$2/run.log"
+  finalize_report
+' _ "$REPO_ROOT" "$SYMLINK_FINAL_BUNDLE" > /dev/null 2>&1
+symlink_final_rc=$?
+(cd "$SYMLINK_FINAL_BUNDLE" && sha256sum -c manifest.txt) > /dev/null 2>&1
+symlink_final_manifest_rc=$?
+check_eq "validated final symlink is replaced without following its victim" "1" \
+  "$([[ $symlink_final_rc -eq 0 && $symlink_final_manifest_rc -eq 0 && -f "$SYMLINK_FINAL_BUNDLE/report.md" && ! -L "$SYMLINK_FINAL_BUNDLE/report.md" && "$(cat "$SYMLINK_FINAL_ROOT/victim")" == 'external report victim' ]] && echo 1 || echo 0)"
+
+SIGNAL_CHECKPOINT_ROOT="$TMP/finalization-signals"
+mkdir -p "$SIGNAL_CHECKPOINT_ROOT"
+for signal_case in generation-opened:TERM results-published:INT manifest-published:TERM; do
+  signal_checkpoint="${signal_case%%:*}"
+  signal_name="${signal_case#*:}"
+  signal_root="$SIGNAL_CHECKPOINT_ROOT/${signal_checkpoint}-${signal_name}"
+  signal_bundle="$signal_root/bundle"
+  mkdir -p "$signal_root"
+  cp -a "$B" "$signal_bundle"
+  timeout --signal=KILL 20 bash -c '
+    DIAG_SOURCE_ONLY=1
+    source "$1/diagnose.sh"
+    OUT_DIR="$2"
+    DIAG_BUNDLE_ROOT="$2"
+    DIAG_REPO_ROOT="$1"
+    META_FILE="$2/results/meta.env"
+    STATE_DIR="$2/state"
+    DIAG_LOG_FILE="$2/run.log"
+    signal_checkpoint="$3"
+    signal_name="$4"
+    signal_once="$5"
+    trap "on_interrupt SIGTERM" TERM
+    trap "on_interrupt SIGINT" INT
+    finalization_checkpoint() {
+      if [[ "$1" == "$signal_checkpoint" && ! -e "$signal_once" ]]; then
+        : > "$signal_once"
+        kill -s "$signal_name" "$BASHPID"
+      fi
+    }
+    finalize_report
+  ' _ "$REPO_ROOT" "$signal_bundle" "$signal_checkpoint" "$signal_name" \
+    "$signal_root/fired" > "$signal_root/output" 2>&1
+  signal_checkpoint_rc=$?
+  if [[ -f "$signal_bundle/manifest.txt" ]]; then
+    (cd "$signal_bundle" && sha256sum -c manifest.txt) > /dev/null 2>&1
+    signal_manifest_rc=$?
+  else
+    signal_manifest_rc=1
+  fi
+  expected_signal_rc=143
+  [[ "$signal_name" == INT ]] && expected_signal_rc=130
+  check_eq "handled $signal_name at $signal_checkpoint leaves one verified partial generation" "1" \
+    "$([[ $signal_checkpoint_rc -eq $expected_signal_rc && $signal_manifest_rc -eq 0 ]] && derived_transaction_temps_absent "$signal_bundle" && ! grep -q 'done\. Bundle' "$signal_root/output" && echo 1 || echo 0)"
+done
+
+SIGNAL_PARTIAL_FAIL_ROOT="$TMP/finalization-signal-partial-failure"
+SIGNAL_PARTIAL_FAIL_BUNDLE="$SIGNAL_PARTIAL_FAIL_ROOT/bundle"
+mkdir -p "$SIGNAL_PARTIAL_FAIL_ROOT"
+cp -a "$B" "$SIGNAL_PARTIAL_FAIL_BUNDLE"
+timeout --signal=KILL 20 bash -c '
+  DIAG_SOURCE_ONLY=1
+  source "$1/diagnose.sh"
+  OUT_DIR="$2"
+  DIAG_BUNDLE_ROOT="$2"
+  DIAG_REPO_ROOT="$1"
+  META_FILE="$2/results/meta.env"
+  STATE_DIR="$2/state"
+  DIAG_LOG_FILE="$2/run.log"
+  fired="$3"
+  trap "on_interrupt SIGTERM" TERM
+  finalization_checkpoint() {
+    if [[ "$1" == results-published && ! -e "$fired" ]]; then
+      : > "$fired"
+      kill -TERM "$BASHPID"
+      return 0
+    fi
+    [[ ! -e "$fired" || "$1" != generation-opened ]]
+  }
+  finalize_report
+' _ "$REPO_ROOT" "$SIGNAL_PARTIAL_FAIL_BUNDLE" "$SIGNAL_PARTIAL_FAIL_ROOT/fired" \
+  > "$SIGNAL_PARTIAL_FAIL_ROOT/output" 2>&1
+signal_partial_fail_rc=$?
+check_eq "failed best-effort signal finalization leaves readiness absent and candidates closed" "1" \
+  "$([[ $signal_partial_fail_rc -eq 143 && ! -e "$SIGNAL_PARTIAL_FAIL_BUNDLE/manifest.txt" ]] && derived_transaction_temps_absent "$SIGNAL_PARTIAL_FAIL_BUNDLE" && echo 1 || echo 0)"
+
+SIGKILL_RECOVERY_ROOT="$TMP/derived-sigkill-recovery"
+SIGKILL_RECOVERY_BUNDLE="$SIGKILL_RECOVERY_ROOT/bundle"
+mkdir -p "$SIGKILL_RECOVERY_ROOT"
+cp -a "$B" "$SIGKILL_RECOVERY_BUNDLE"
+printf 'unrelated review sibling\n' > "$SIGKILL_RECOVERY_BUNDLE.privacy-review.backup"
+printf 'unrelated inventory sibling\n' > "$SIGKILL_RECOVERY_BUNDLE.privacy-inventory-before.abc123"
+printf 'ordinary in-bundle sentinel 11111111-2222-3333-4444-555555555555\n' \
+  > "$SIGKILL_RECOVERY_BUNDLE/.privacy-review.backup"
+printf 'ordinary in-bundle inventory near-match\n' \
+  > "$SIGKILL_RECOVERY_BUNDLE/.privacy-inventory-before.abc123"
+timeout --signal=KILL 5 bash -c '
+  DIAG_SOURCE_ONLY=1
+  source "$1/diagnose.sh"
+  OUT_DIR="$2"
+  DIAG_BUNDLE_ROOT="$2"
+  DIAG_REPO_ROOT="$1"
+  META_FILE="$2/results/meta.env"
+  STATE_DIR="$2/state"
+  DIAG_LOG_FILE="$2/run.log"
+  finalization_checkpoint() {
+    [[ "$1" != results-published ]] || kill -KILL "$BASHPID"
+  }
+  finalize_report
+' _ "$REPO_ROOT" "$SIGKILL_RECOVERY_BUNDLE" > /dev/null 2>&1
+sigkill_generation_rc=$?
+timeout --signal=TERM --kill-after=1 15 bash -c '
+  DIAG_SOURCE_ONLY=1
+  source "$1/diagnose.sh"
+  OUT_DIR="$2"
+  DIAG_BUNDLE_ROOT="$2"
+  DIAG_REPO_ROOT="$1"
+  META_FILE="$2/results/meta.env"
+  STATE_DIR="$2/state"
+  DIAG_LOG_FILE="$2/run.log"
+  derived_run_open
+  finalize_report
+' _ "$REPO_ROOT" "$SIGKILL_RECOVERY_BUNDLE" \
+  > "$SIGKILL_RECOVERY_ROOT/resume.output" 2>&1
+sigkill_resume_rc=$?
+(cd "$SIGKILL_RECOVERY_BUNDLE" && sha256sum -c manifest.txt) > /dev/null 2>&1
+sigkill_resume_manifest_rc=$?
+check_eq "resume cleans validated SIGKILL-stranded candidates and publishes one generation" "1" \
+  "$([[ $sigkill_generation_rc -eq 137 && $sigkill_resume_rc -eq 0 && $sigkill_resume_manifest_rc -eq 0 && "$(cat "$SIGKILL_RECOVERY_BUNDLE.privacy-review.backup")" == 'unrelated review sibling' && "$(cat "$SIGKILL_RECOVERY_BUNDLE.privacy-inventory-before.abc123")" == 'unrelated inventory sibling' && "$(cat "$SIGKILL_RECOVERY_BUNDLE/.privacy-inventory-before.abc123")" == 'ordinary in-bundle inventory near-match' ]] && grep -Fxq $'uuid-shape\t.privacy-review.backup' "$SIGKILL_RECOVERY_BUNDLE/privacy-review.txt" && grep -Fq '  ./.privacy-review.backup' "$SIGKILL_RECOVERY_BUNDLE/manifest.txt" && grep -Fq '  ./.privacy-inventory-before.abc123' "$SIGKILL_RECOVERY_BUNDLE/manifest.txt" && derived_transaction_temps_absent "$SIGKILL_RECOVERY_BUNDLE" && echo 1 || echo 0)"
+
+EARLY_REVOKE_ROOT="$TMP/early-readiness-revoke"
+EARLY_REVOKE_BUNDLE="$EARLY_REVOKE_ROOT/bundle"
+mkdir -p "$EARLY_REVOKE_ROOT"
+cp -a "$B" "$EARLY_REVOKE_BUNDLE"
+mkdir "$EARLY_REVOKE_BUNDLE/.results.json.pending"
+early_revoke_before="$(sha256sum "$EARLY_REVOKE_BUNDLE/results/meta.env" "$EARLY_REVOKE_BUNDLE/run.log")"
+timeout --signal=TERM --kill-after=1 15 \
+  "$REPO_ROOT/diagnose.sh" --resume "$EARLY_REVOKE_BUNDLE" --yes \
+  > "$EARLY_REVOKE_ROOT/output" 2>&1
+early_revoke_rc=$?
+early_revoke_after="$(sha256sum "$EARLY_REVOKE_BUNDLE/results/meta.env" "$EARLY_REVOKE_BUNDLE/run.log")"
+check_eq "actual resume revokes readiness before logs, metadata, or candidate recovery failure" "1" \
+  "$([[ $early_revoke_rc -ne 0 && ! -e "$EARLY_REVOKE_BUNDLE/manifest.txt" && ! -e "$EARLY_REVOKE_BUNDLE/commands.log" && -d "$EARLY_REVOKE_BUNDLE/.results.json.pending" && "$early_revoke_after" == "$early_revoke_before" ]] && echo 1 || echo 0)"
+
+REVOKE_SYNC_ROOT="$TMP/readiness-revoke-sync-failure"
+REVOKE_SYNC_BUNDLE="$REVOKE_SYNC_ROOT/bundle"
+mkdir -p "$REVOKE_SYNC_ROOT"
+cp -a "$B" "$REVOKE_SYNC_BUNDLE"
+revoke_sync_before="$(sha256sum "$REVOKE_SYNC_BUNDLE/results/meta.env" "$REVOKE_SYNC_BUNDLE/run.log")"
+timeout --signal=TERM --kill-after=1 5 bash -c '
+  DIAG_SOURCE_ONLY=1
+  source "$1/diagnose.sh"
+  OUT_DIR="$2"
+  DIAG_LOG_FILE=""
+  sync() {
+    if [[ "${*: -1}" == "$OUT_DIR" ]]; then return 73; fi
+    command sync "$@"
+  }
+  if derived_run_open; then exit 0; else exit $?; fi
+' _ "$REPO_ROOT" "$REVOKE_SYNC_BUNDLE" > "$REVOKE_SYNC_ROOT/output" 2>&1
+revoke_sync_rc=$?
+revoke_sync_after="$(sha256sum "$REVOKE_SYNC_BUNDLE/results/meta.env" "$REVOKE_SYNC_BUNDLE/run.log")"
+check_eq "initial readiness revoke sync failure stops before metadata or log mutation" "1" \
+  "$([[ $revoke_sync_rc -ne 0 && ! -e "$REVOKE_SYNC_BUNDLE/manifest.txt" && "$revoke_sync_after" == "$revoke_sync_before" ]] && echo 1 || echo 0)"
+
+LEGACY_REDO_ROOT="$TMP/legacy-redo-manifest-recovery"
+LEGACY_REDO_BUNDLE="$LEGACY_REDO_ROOT/bundle"
+mkdir -p "$LEGACY_REDO_BUNDLE/state"
+printf 'old readiness token\n' > "$LEGACY_REDO_BUNDLE/manifest.txt"
+cat > "$LEGACY_REDO_BUNDLE/state/redo.pending" << 'EOF'
+VERSION	1
+TXN	redo-20260802T120000-ABC123
+PHASE	gdb
+DERIVED	-	manifest.txt
+EOF
+legacy_redo_result="$(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$LEGACY_REDO_BUNDLE"
+  STATE_DIR="$LEGACY_REDO_BUNDLE/state"
+  redo_transaction_validate "$STATE_DIR/redo.pending" &&
+    redo_transaction_pairs_are_recoverable
+  before_rc=$?
+  derived_run_open
+  revoke_rc=$?
+  redo_transaction_validate "$STATE_DIR/redo.pending" &&
+    redo_transaction_pairs_are_recoverable
+  after_rc=$?
+  printf '%s:%s:%s:%s\n' "$before_rc" "$revoke_rc" "$after_rc" \
+    "$([[ ! -e "$OUT_DIR/manifest.txt" ]] && echo absent || echo present)"
+)"
+check_eq "early revocation remains compatible with legacy redo manifest records" \
+  "0:0:0:absent" "$legacy_redo_result"
+
+check_eq "successful manifest publication closes its descriptor and all candidates" "1" \
+  "$(derived_transaction_temps_absent "$B" && echo 1 || echo 0)"
 
 if ((EUID != 0)); then
   FINALIZER_LOCK_ROOT="$TMP/finalizer-writer-lock"

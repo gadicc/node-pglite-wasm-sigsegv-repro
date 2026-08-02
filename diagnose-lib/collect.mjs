@@ -1,7 +1,7 @@
 // collect.mjs - merge raw phase outputs beneath a diagnostics directory
 // into a single machine-readable results.json.
 //
-// Usage: node collect.mjs <out-dir>
+// Usage: node collect.mjs <out-dir> [output-path]
 //
 // Reads (all optional; missing pieces are simply absent from the output):
 //   results/meta.env           run configuration
@@ -762,7 +762,17 @@ export function assessGdb(
   return { status: "incomplete", reason: "GDB metadata has no terminal exit code" };
 }
 
-export function collect(outDir) {
+function writeCollectedResults(outputFile, results, exclusiveOutput) {
+  writeFileSync(
+    outputFile,
+    `${JSON.stringify(results, null, 2)}\n`,
+    exclusiveOutput ? { flag: "wx", mode: 0o600 } : undefined,
+  );
+}
+
+export function collect(outDir, options = {}) {
+  const outputFile = options.outputFile ?? path.join(outDir, "results.json");
+  const exclusiveOutput = options.exclusiveOutput === true;
   const runMetaState = readStoredRunMetadata(outDir);
   const meta = runMetaState.values;
   const preflightAssessment = runMetaState.bundleRootSafe
@@ -852,10 +862,7 @@ export function collect(outDir) {
   }
   if (!runMetaState.resultsDirSafe) {
     if (runMetaState.bundleRootSafe) {
-      writeFileSync(
-        path.join(outDir, "results.json"),
-        `${JSON.stringify(results, null, 2)}\n`,
-      );
+      writeCollectedResults(outputFile, results, exclusiveOutput);
     }
     return results;
   }
@@ -990,19 +997,21 @@ export function collect(outDir) {
     };
   }
 
-  writeFileSync(
-    path.join(outDir, "results.json"),
-    `${JSON.stringify(results, null, 2)}\n`,
-  );
+  writeCollectedResults(outputFile, results, exclusiveOutput);
   return results;
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   const outDir = process.argv[2];
-  if (!outDir) {
-    console.error("usage: node collect.mjs <out-dir>");
+  const explicitOutput = process.argv[3];
+  const hasExplicitOutput = process.argv.length === 4;
+  if (!outDir || (process.argv.length !== 3 && !hasExplicitOutput) ||
+    (hasExplicitOutput && !explicitOutput)) {
+    console.error("usage: node collect.mjs <out-dir> [output-path]");
     process.exit(2);
   }
-  collect(outDir);
-  console.log("wrote results.json");
+  collect(outDir, hasExplicitOutput
+    ? { outputFile: explicitOutput, exclusiveOutput: true }
+    : undefined);
+  console.log(`wrote ${hasExplicitOutput ? "explicit results output" : "results.json"}`);
 }

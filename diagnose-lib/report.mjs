@@ -1,6 +1,6 @@
 // report.mjs - render results.json into report.md.
 //
-// Usage: node report.mjs <out-dir>
+// Usage: node report.mjs <out-dir> [results-input output-path]
 //
 // Every conclusion is derived from the counts in results.json at render
 // time. Nothing about the repository's previously documented findings is
@@ -874,23 +874,35 @@ function renderConclusions(r) {
   return C;
 }
 
-export function writeReport(outDir) {
-  const resultsFile = path.join(outDir, "results.json");
+export function writeReport(outDir, options = {}) {
+  const resultsFile = options.resultsFile ?? path.join(outDir, "results.json");
+  const outputFile = options.outputFile ?? path.join(outDir, "report.md");
+  const exclusiveOutput = options.exclusiveOutput === true;
   if (!existsSync(resultsFile)) {
     throw new Error(`${resultsFile} not found; run collect.mjs first`);
   }
   const results = JSON.parse(readFileSync(resultsFile, "utf8"));
   const md = renderReport(results);
-  writeFileSync(path.join(outDir, "report.md"), md);
+  writeFileSync(
+    outputFile,
+    md,
+    exclusiveOutput ? { flag: "wx", mode: 0o600 } : undefined,
+  );
   return md;
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   const outDir = process.argv[2];
-  if (!outDir) {
-    console.error("usage: node report.mjs <out-dir>");
+  const resultsFile = process.argv[3];
+  const outputFile = process.argv[4];
+  const hasExplicitPaths = process.argv.length === 5;
+  if (!outDir || (process.argv.length !== 3 && !hasExplicitPaths) ||
+    (hasExplicitPaths && (!resultsFile || !outputFile))) {
+    console.error("usage: node report.mjs <out-dir> [results-input output-path]");
     process.exit(2);
   }
-  writeReport(outDir);
-  console.log("wrote report.md");
+  writeReport(outDir, hasExplicitPaths
+    ? { resultsFile, outputFile, exclusiveOutput: true }
+    : undefined);
+  console.log(`wrote ${hasExplicitPaths ? "explicit report output" : "report.md"}`);
 }

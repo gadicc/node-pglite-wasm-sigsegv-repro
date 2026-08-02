@@ -72,6 +72,18 @@ PRIVACY_REVIEW_TEMP=""
 PRIVACY_INVENTORY_BEFORE=""
 PRIVACY_INVENTORY_AFTER=""
 PRIVACY_REVIEW_FD=""
+PRIVACY_INVENTORY_BEFORE_FD=""
+PRIVACY_INVENTORY_AFTER_FD=""
+DERIVED_RESULTS_CANDIDATE=""
+DERIVED_REPORT_CANDIDATE=""
+DERIVED_MANIFEST_CANDIDATE=""
+DERIVED_MANIFEST_FD=""
+DERIVED_RESULTS_DEST_STATE=""
+DERIVED_REPORT_DEST_STATE=""
+DERIVED_PRIVACY_DEST_STATE=""
+DERIVED_MANIFEST_DEST_STATE=""
+DERIVED_FINALIZATION_ERROR=""
+DERIVED_FINALIZATION_COMPLETE=0
 GROUP_PLAN_DIGEST=""
 CPU_TARGET="auto"
 WORST_CPU_OVERRIDE=""
@@ -1061,6 +1073,17 @@ redo_destination_parent_is_safe_readonly() {
   done
 }
 
+redo_transaction_pair_is_recoverable() {
+  local index="$1" source_exists="$2" dest_exists="$3"
+  ((source_exists + dest_exists == 1)) && return 0
+  # Older redo markers could record the top-level readiness token. Every
+  # actual run now revokes that regenerable token before redo recovery, so a
+  # retry can legitimately find neither the source nor an archived copy.
+  [[ "$source_exists" == 0 && "$dest_exists" == 0 &&
+    "${REDO_TXN_OWNERS[$index]}" == derived &&
+    "${REDO_TXN_PATHS[$index]}" == manifest.txt ]]
+}
+
 # Validate the complete pending move set without creating archive directories.
 # main calls this before consent-adjacent logging or mkdir can mutate a resumed
 # bundle; execution repeats it to close the gap between reconciliation and use.
@@ -1083,7 +1106,7 @@ redo_transaction_pairs_are_recoverable() {
     dest_exists=0
     [[ -e "$source" || -L "$source" ]] && source_exists=1
     [[ -e "$dest" || -L "$dest" ]] && dest_exists=1
-    ((source_exists + dest_exists == 1)) || return 1
+    redo_transaction_pair_is_recoverable "$i" "$source_exists" "$dest_exists" || return 1
   done
 }
 
@@ -1122,7 +1145,7 @@ redo_transaction_execute() {
     local source_exists=0 dest_exists=0
     [[ -e "$source" || -L "$source" ]] && source_exists=1
     [[ -e "$dest" || -L "$dest" ]] && dest_exists=1
-    ((source_exists + dest_exists == 1)) ||
+    redo_transaction_pair_is_recoverable "$i" "$source_exists" "$dest_exists" ||
       diag_die "pending redo has conflicting or missing source/archive state for ${REDO_TXN_PATHS[$i]}"
   done
 
@@ -1150,6 +1173,8 @@ redo_transaction_execute() {
       mv -T -- "$source" "$dest" || diag_die "pending redo could not archive ${REDO_TXN_PATHS[$i]}"
     elif ((source_exists == 0 && dest_exists == 1)); then
       : # already moved before an interruption
+    elif redo_transaction_pair_is_recoverable "$i" "$source_exists" "$dest_exists"; then
+      : # legacy manifest token was revoked before redo recovery
     else
       diag_die "pending redo has conflicting or missing source/archive state for ${REDO_TXN_PATHS[$i]}"
     fi
@@ -2473,85 +2498,287 @@ phase_gdb_dispatch() {
 }
 
 # ------------------------------------------------------------------
-privacy_review_temp_cleanup() {
-  local cleanup_rc=0
-  if [[ -n "$PRIVACY_REVIEW_FD" ]]; then
-    if exec {PRIVACY_REVIEW_FD}>&- 2> /dev/null; then
-      PRIVACY_REVIEW_FD=""
+finalization_checkpoint() {
+  return 0
+}
+
+derived_manifest_revoke() {
+  local manifest="$OUT_DIR/manifest.txt"
+  [[ -d "$OUT_DIR" && ! -L "$OUT_DIR" ]] || return 1
+  if [[ -e "$manifest" || -L "$manifest" ]]; then
+    [[ -f "$manifest" || -L "$manifest" ]] || return 1
+    rm -f -- "$manifest" > /dev/null 2>&1 || return 1
+    [[ ! -e "$manifest" && ! -L "$manifest" ]] || return 1
+  fi
+  # Always checkpoint the directory, including an absent/idempotent retry
+  # after a prior unlink whose directory sync failed.
+  sync -f "$OUT_DIR" > /dev/null 2>&1
+}
+
+derived_owned_single_regular() {
+  local path="$1" metadata owner links
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  metadata="$(stat -c '%u:%h' -- "$path" 2> /dev/null)" || return 1
+  [[ "$metadata" =~ ^([0-9]+):([0-9]+)$ ]] || return 1
+  owner="${BASH_REMATCH[1]}"
+  links="${BASH_REMATCH[2]}"
+  [[ "$owner" == "$EUID" && "$links" == 1 ]]
+}
+
+derived_remove_validated_candidates() {
+  local sync_dir="$1"
+  shift
+  local path removed=0
+  for path in "$@"; do
+    [[ -e "$path" || -L "$path" ]] || continue
+    derived_owned_single_regular "$path" || return 1
+  done
+  for path in "$@"; do
+    [[ -e "$path" || -L "$path" ]] || continue
+    rm -f -- "$path" > /dev/null 2>&1 || return 1
+    [[ ! -e "$path" && ! -L "$path" ]] || return 1
+    removed=1
+  done
+  ((removed == 0)) || sync -f "$sync_dir" > /dev/null 2>&1
+}
+
+derived_fixed_candidates_cleanup_stranded() {
+  derived_remove_validated_candidates "$OUT_DIR" \
+    "$OUT_DIR/.results.json.pending" \
+    "$OUT_DIR/.report.md.pending" \
+    "$OUT_DIR/.manifest.txt.pending" \
+    "$OUT_DIR/.privacy-review.pending" \
+    "$OUT_DIR/.privacy-inventory-before.pending" \
+    "$OUT_DIR/.privacy-inventory-after.pending"
+}
+
+derived_recover_stranded_candidates() {
+  derived_fixed_candidates_cleanup_stranded
+}
+
+derived_paths_init() {
+  DERIVED_RESULTS_CANDIDATE="$OUT_DIR/.results.json.pending"
+  DERIVED_REPORT_CANDIDATE="$OUT_DIR/.report.md.pending"
+  DERIVED_MANIFEST_CANDIDATE="$OUT_DIR/.manifest.txt.pending"
+}
+
+derived_destination_state() {
+  local path="$1" state
+  if [[ ! -e "$path" && ! -L "$path" ]]; then
+    printf 'absent\n'
+    return 0
+  fi
+  [[ -f "$path" || -L "$path" ]] || return 1
+  state="$(stat -c '%d:%i:%f:%h:%s:%y:%z' -- "$path" 2> /dev/null)" || return 1
+  [[ -n "$state" ]] || return 1
+  printf '%s\n' "$state"
+}
+
+derived_destination_matches() {
+  local path="$1" expected="$2" actual
+  if [[ "$expected" == absent ]]; then
+    [[ ! -e "$path" && ! -L "$path" ]]
+    return
+  fi
+  [[ -f "$path" || -L "$path" ]] || return 1
+  actual="$(stat -c '%d:%i:%f:%h:%s:%y:%z' -- "$path" 2> /dev/null)" || return 1
+  [[ "$actual" == "$expected" ]]
+}
+
+derived_run_open() {
+  DERIVED_FINALIZATION_COMPLETE=0
+  derived_manifest_revoke || return 1
+  derived_recover_stranded_candidates || return 1
+}
+
+derived_generation_begin() {
+  DERIVED_FINALIZATION_COMPLETE=0
+  DERIVED_FINALIZATION_ERROR=""
+  derived_manifest_revoke || return 1
+  derived_recover_stranded_candidates || return 1
+  derived_paths_init
+  DERIVED_RESULTS_DEST_STATE="$(derived_destination_state "$OUT_DIR/results.json")" || return 1
+  DERIVED_REPORT_DEST_STATE="$(derived_destination_state "$OUT_DIR/report.md")" || return 1
+  DERIVED_PRIVACY_DEST_STATE="$(derived_destination_state "$OUT_DIR/privacy-review.txt")" || return 1
+  DERIVED_MANIFEST_DEST_STATE="$(derived_destination_state "$OUT_DIR/manifest.txt")" || return 1
+  [[ "$DERIVED_MANIFEST_DEST_STATE" == absent ]] || return 1
+  finalization_checkpoint generation-opened
+}
+
+derived_candidate_same_device() {
+  local candidate="$1" bundle_device candidate_device
+  bundle_device="$(stat -c '%d' -- "$OUT_DIR" 2> /dev/null)" || return 1
+  candidate_device="$(stat -c '%d' -- "$candidate" 2> /dev/null)" || return 1
+  [[ "$bundle_device" =~ ^[0-9]+$ && "$candidate_device" == "$bundle_device" ]]
+}
+
+derived_publish_candidate() {
+  local candidate_name="$1" destination="$2" expected_state="$3"
+  local -n candidate_ref="$candidate_name"
+  local candidate="$candidate_ref"
+  [[ -n "$candidate" ]] || return 1
+  derived_owned_single_regular "$candidate" || return 1
+  derived_candidate_same_device "$candidate" || return 1
+  chmod 0644 "$candidate" > /dev/null 2>&1 || return 1
+  sync -f "$candidate" > /dev/null 2>&1 || return 1
+  derived_destination_matches "$destination" "$expected_state" || return 1
+  node -e '
+    const fs = require("fs");
+    if (process.argv.length !== 3) process.exit(2);
+    fs.renameSync(process.argv[1], process.argv[2]);
+  ' -- "$candidate" "$destination" > /dev/null 2>&1 || return 1
+  candidate_ref=""
+  [[ -f "$destination" && ! -L "$destination" ]] || return 1
+  sync -f "$OUT_DIR" > /dev/null 2>&1
+}
+
+derived_candidate_cleanup_tracked() {
+  local cleanup_rc=0 removed=0 candidate_name candidate
+  local -a candidate_names=(
+    DERIVED_RESULTS_CANDIDATE DERIVED_REPORT_CANDIDATE DERIVED_MANIFEST_CANDIDATE
+  )
+  if [[ -n "$DERIVED_MANIFEST_FD" ]]; then
+    if { exec {DERIVED_MANIFEST_FD}>&-; } 2> /dev/null; then
+      DERIVED_MANIFEST_FD=""
     else
       cleanup_rc=1
     fi
   fi
-  if [[ -n "$PRIVACY_REVIEW_TEMP" ]]; then
-    case "$PRIVACY_REVIEW_TEMP" in
-      "${OUT_DIR:-}".privacy-review.*)
-        if rm -f -- "$PRIVACY_REVIEW_TEMP" 2> /dev/null; then
-          PRIVACY_REVIEW_TEMP=""
-        else
-          cleanup_rc=1
-        fi
-        ;;
+  for candidate_name in "${candidate_names[@]}"; do
+    local -n candidate_ref="$candidate_name"
+    candidate="$candidate_ref"
+    [[ -n "$candidate" ]] || continue
+    case "$candidate_name:$candidate" in
+      DERIVED_RESULTS_CANDIDATE:"$OUT_DIR/.results.json.pending" | \
+        DERIVED_REPORT_CANDIDATE:"$OUT_DIR/.report.md.pending" | \
+        DERIVED_MANIFEST_CANDIDATE:"$OUT_DIR/.manifest.txt.pending") ;;
+      *) cleanup_rc=1; continue ;;
     esac
-  fi
-  if [[ -n "$PRIVACY_INVENTORY_BEFORE" ]]; then
-    case "$PRIVACY_INVENTORY_BEFORE" in
-      "${OUT_DIR:-}".privacy-inventory-before.*)
-        if rm -f -- "$PRIVACY_INVENTORY_BEFORE" 2> /dev/null; then
-          PRIVACY_INVENTORY_BEFORE=""
-        else
-          cleanup_rc=1
-        fi
-        ;;
-    esac
-  fi
-  if [[ -n "$PRIVACY_INVENTORY_AFTER" ]]; then
-    case "$PRIVACY_INVENTORY_AFTER" in
-      "${OUT_DIR:-}".privacy-inventory-after.*)
-        if rm -f -- "$PRIVACY_INVENTORY_AFTER" 2> /dev/null; then
-          PRIVACY_INVENTORY_AFTER=""
-        else
-          cleanup_rc=1
-        fi
-        ;;
-    esac
+    if [[ ! -e "$candidate" && ! -L "$candidate" ]]; then
+      candidate_ref=""
+      continue
+    fi
+    if derived_owned_single_regular "$candidate" &&
+      rm -f -- "$candidate" > /dev/null 2>&1 &&
+      [[ ! -e "$candidate" && ! -L "$candidate" ]]; then
+      candidate_ref=""
+      removed=1
+    else
+      cleanup_rc=1
+    fi
+  done
+  if ((removed == 1)); then
+    sync -f "$OUT_DIR" > /dev/null 2>&1 || cleanup_rc=1
   fi
   return "$cleanup_rc"
 }
 
-privacy_manifest_invalidate() {
-  local manifest="$OUT_DIR/manifest.txt"
-  if [[ -e "$manifest" || -L "$manifest" ]]; then
-    [[ -f "$manifest" || -L "$manifest" ]] || {
-      echo "error: unsafe stale manifest destination" >&2
-      return 1
-    }
-    rm -f -- "$manifest" || {
-      echo "error: could not invalidate stale manifest before privacy scan" >&2
-      return 1
-    }
-    [[ ! -e "$manifest" && ! -L "$manifest" ]] || {
-      echo "error: stale manifest remains after privacy invalidation" >&2
-      return 1
-    }
+derived_generation_abort() {
+  local abort_rc=0
+  derived_manifest_revoke || abort_rc=1
+  if ((abort_rc == 0)); then
+    derived_candidate_cleanup_tracked || abort_rc=1
+    privacy_review_temp_cleanup || abort_rc=1
   fi
-  # Always synchronize, including an abort retry after an earlier directory
-  # sync error, so a failed scan cannot leave stale authority durable on disk.
-  sync -f "$OUT_DIR" > /dev/null 2>&1 || {
+  DERIVED_FINALIZATION_COMPLETE=0
+  return "$abort_rc"
+}
+
+privacy_review_temp_cleanup() {
+  local cleanup_rc=0 fd_name path_name path
+  local -a fd_names=(
+    PRIVACY_REVIEW_FD PRIVACY_INVENTORY_BEFORE_FD PRIVACY_INVENTORY_AFTER_FD
+  )
+  local -a path_names=(
+    PRIVACY_REVIEW_TEMP PRIVACY_INVENTORY_BEFORE PRIVACY_INVENTORY_AFTER
+  )
+  for fd_name in "${fd_names[@]}"; do
+    local -n fd_ref="$fd_name"
+    [[ -n "$fd_ref" ]] || continue
+    if { exec {fd_ref}>&-; } 2> /dev/null; then
+      fd_ref=""
+    else
+      cleanup_rc=1
+    fi
+  done
+  for path_name in "${path_names[@]}"; do
+    local -n path_ref="$path_name"
+    path="$path_ref"
+    [[ -n "$path" ]] || continue
+    case "$path_name:$path" in
+      PRIVACY_REVIEW_TEMP:"${OUT_DIR:-}/.privacy-review.pending" | \
+        PRIVACY_INVENTORY_BEFORE:"${OUT_DIR:-}/.privacy-inventory-before.pending" | \
+        PRIVACY_INVENTORY_AFTER:"${OUT_DIR:-}/.privacy-inventory-after.pending") ;;
+      *) cleanup_rc=1; continue ;;
+    esac
+  done
+  if ((cleanup_rc == 0)); then
+    derived_remove_validated_candidates "$OUT_DIR" \
+      "$OUT_DIR/.privacy-review.pending" \
+      "$OUT_DIR/.privacy-inventory-before.pending" \
+      "$OUT_DIR/.privacy-inventory-after.pending" || cleanup_rc=1
+  fi
+  if ((cleanup_rc == 0)); then
+    PRIVACY_REVIEW_TEMP=""
+    PRIVACY_INVENTORY_BEFORE=""
+    PRIVACY_INVENTORY_AFTER=""
+  fi
+  return "$cleanup_rc"
+}
+
+privacy_candidate_open() {
+  local path_name="$1" fd_name="$2" expected="$3"
+  local fd="" open_rc=0 noclobber_was_set=0 saved_umask
+  local -n path_ref="$path_name" fd_ref="$fd_name"
+  [[ -z "$path_ref" && -z "$fd_ref" && ! -e "$expected" && ! -L "$expected" ]] || return 1
+  saved_umask="$(umask)" || return 1
+  [[ "$saved_umask" =~ ^[0-7]{3,4}$ ]] || return 1
+  umask 077 || return 1
+  [[ -o noclobber ]] && noclobber_was_set=1 || set -o noclobber
+  if { exec {fd}> "$expected"; } 2> /dev/null; then
+    :
+  else
+    open_rc=1
+  fi
+  ((noclobber_was_set == 1)) || set +o noclobber
+  if ! umask "$saved_umask"; then
+    [[ -z "$fd" ]] || { exec {fd}>&-; } 2> /dev/null || true
+    return 1
+  fi
+  ((open_rc == 0)) || return 1
+  path_ref="$expected"
+  fd_ref="$fd"
+  derived_owned_single_regular "$expected"
+}
+
+privacy_candidate_close() {
+  local fd_name="$1"
+  local -n fd_ref="$fd_name"
+  [[ -n "$fd_ref" ]] || return 0
+  { exec {fd_ref}>&-; } 2> /dev/null || return 1
+  fd_ref=""
+}
+
+privacy_manifest_invalidate() {
+  derived_manifest_revoke || {
     echo "error: could not synchronize stale manifest invalidation" >&2
     return 1
   }
 }
 
 privacy_inventory_build() {
-  local destination="$1"
-  if ! LC_ALL=C find "$OUT_DIR" -mindepth 1 -print0 2> /dev/null |
-    LC_ALL=C sort -z > "$destination" 2> /dev/null; then
+  local output_fd="$1"
+  if ! LC_ALL=C find "$OUT_DIR" -mindepth 1 \
+    ! -path "$OUT_DIR/.privacy-review.pending" \
+    ! -path "$OUT_DIR/.privacy-inventory-before.pending" \
+    ! -path "$OUT_DIR/.privacy-inventory-after.pending" -print0 2> /dev/null |
+    LC_ALL=C sort -z >&"$output_fd" 2> /dev/null; then
     echo "error: could not enumerate the complete privacy inventory" >&2
     return 1
   fi
 }
 
-privacy_sibling_temps_share_device() {
+privacy_candidates_share_device() {
   local bundle_device temp_device tmp
   bundle_device="$(stat -c '%d' -- "$OUT_DIR" 2> /dev/null)" || {
     echo "error: could not validate privacy publication filesystem" >&2
@@ -2563,7 +2790,7 @@ privacy_sibling_temps_share_device() {
   }
   for tmp in "$PRIVACY_REVIEW_TEMP" "$PRIVACY_INVENTORY_BEFORE" \
     "$PRIVACY_INVENTORY_AFTER"; do
-    [[ -n "$tmp" && -f "$tmp" && ! -L "$tmp" ]] || {
+    [[ -n "$tmp" ]] && derived_owned_single_regular "$tmp" || {
       echo "error: unsafe privacy publication candidate" >&2
       return 1
     }
@@ -2650,7 +2877,7 @@ privacy_review_abort() {
 }
 
 write_privacy_review() {
-  local review="$OUT_DIR/privacy-review.txt" review_state="absent"
+  local review="$OUT_DIR/privacy-review.txt" review_state="${1:-}"
   local file rel fingerprint probe_rc found=0 scan_failed=0 review_fd=""
   local -A stats_before=() stats_after=()
 
@@ -2661,44 +2888,41 @@ write_privacy_review() {
   }
 
   # Revoke the previous derived generation before any privacy failure can be
-  # mistaken for a complete finalization. The wider results/report transaction
-  # remains deliberately outside this scoped change.
+  # mistaken for a complete finalization.
   privacy_manifest_invalidate || return 1
 
-  if [[ -e "$review" || -L "$review" ]]; then
-    [[ -f "$review" || -L "$review" ]] || {
-      privacy_review_abort
-      return 1
-    }
-    review_state="$(stat -c '%d:%i:%f:%h:%s:%y:%z' -- "$review" 2> /dev/null)" || {
+  if [[ -z "$review_state" ]]; then
+    review_state="$(derived_destination_state "$review")" || {
       privacy_review_abort
       return 1
     }
   fi
 
-  PRIVACY_INVENTORY_BEFORE="$(mktemp "${OUT_DIR}.privacy-inventory-before.XXXXXX")" || {
+  privacy_candidate_open PRIVACY_INVENTORY_BEFORE PRIVACY_INVENTORY_BEFORE_FD \
+    "$OUT_DIR/.privacy-inventory-before.pending" || {
     privacy_review_abort
     return 1
   }
-  PRIVACY_INVENTORY_AFTER="$(mktemp "${OUT_DIR}.privacy-inventory-after.XXXXXX")" || {
+  privacy_candidate_open PRIVACY_INVENTORY_AFTER PRIVACY_INVENTORY_AFTER_FD \
+    "$OUT_DIR/.privacy-inventory-after.pending" || {
     privacy_review_abort
     return 1
   }
-  PRIVACY_REVIEW_TEMP="$(mktemp "${OUT_DIR}.privacy-review.XXXXXX")" || {
+  privacy_candidate_open PRIVACY_REVIEW_TEMP PRIVACY_REVIEW_FD \
+    "$OUT_DIR/.privacy-review.pending" || {
     privacy_review_abort
     return 1
   }
-  chmod 0600 "$PRIVACY_INVENTORY_BEFORE" "$PRIVACY_INVENTORY_AFTER" \
-    "$PRIVACY_REVIEW_TEMP" || {
-    privacy_review_abort
-    return 1
-  }
-  privacy_sibling_temps_share_device || {
+  privacy_candidates_share_device || {
     privacy_review_abort
     return 1
   }
 
-  privacy_inventory_build "$PRIVACY_INVENTORY_BEFORE" || {
+  privacy_inventory_build "$PRIVACY_INVENTORY_BEFORE_FD" || {
+    privacy_review_abort
+    return 1
+  }
+  privacy_candidate_close PRIVACY_INVENTORY_BEFORE_FD || {
     privacy_review_abort
     return 1
   }
@@ -2707,11 +2931,7 @@ write_privacy_review() {
     return 1
   }
 
-  if ! exec {review_fd}>> "$PRIVACY_REVIEW_TEMP"; then
-    privacy_review_abort
-    return 1
-  fi
-  PRIVACY_REVIEW_FD="$review_fd"
+  review_fd="$PRIVACY_REVIEW_FD"
   if ! printf '# Automated privacy sentinel scan\n' >&"$review_fd" ||
     ! printf '# Matches list only category and relative file; inspect raw files before sharing.\n' >&"$review_fd"; then
     privacy_review_abort
@@ -2781,14 +3001,17 @@ write_privacy_review() {
       return 1
     }
   fi
-  if ! exec {review_fd}>&-; then
+  if ! privacy_candidate_close PRIVACY_REVIEW_FD; then
     privacy_review_abort
     return 1
   fi
   review_fd=""
-  PRIVACY_REVIEW_FD=""
 
-  privacy_inventory_build "$PRIVACY_INVENTORY_AFTER" || {
+  privacy_inventory_build "$PRIVACY_INVENTORY_AFTER_FD" || {
+    privacy_review_abort
+    return 1
+  }
+  privacy_candidate_close PRIVACY_INVENTORY_AFTER_FD || {
     privacy_review_abort
     return 1
   }
@@ -2835,7 +3058,7 @@ write_privacy_review() {
     privacy_review_abort
     return 1
   }
-  privacy_sibling_temps_share_device || {
+  privacy_candidates_share_device || {
     privacy_review_abort
     return 1
   }
@@ -2860,30 +3083,62 @@ write_privacy_review() {
   }
 }
 
-write_manifest() {
-  # The hash pass must be the last filesystem write into the bundle: emit
-  # the log line first, because diag_log appends to run.log, which is
-  # itself hashed below.
-  diag_log "writing manifest: $OUT_DIR/manifest.txt"
-  local tmp
-  # Keep the candidate beside (not inside) the bundle: it must not hash
-  # itself, and the final same-filesystem rename must be atomic.
-  tmp="$(mktemp "${OUT_DIR}.manifest.XXXXXX")" || return 1
-  if ! (
-    cd "$OUT_DIR"
-    find . -type f ! -path './manifest.txt' -print0 |
-      sort -z |
-      xargs -0 sha256sum
-  ) > "$tmp"; then
-    rm -f -- "$tmp"
+derived_manifest_candidate_open() {
+  local fd="" open_rc=0 noclobber_was_set=0 saved_umask
+  [[ "$DERIVED_MANIFEST_CANDIDATE" == "$OUT_DIR/.manifest.txt.pending" &&
+    ! -e "$DERIVED_MANIFEST_CANDIDATE" && ! -L "$DERIVED_MANIFEST_CANDIDATE" ]] || return 1
+  saved_umask="$(umask)" || return 1
+  [[ "$saved_umask" =~ ^[0-7]{3,4}$ ]] || return 1
+  umask 077 || return 1
+  [[ -o noclobber ]] && noclobber_was_set=1 || set -o noclobber
+  if { exec {fd}> "$DERIVED_MANIFEST_CANDIDATE"; } 2> /dev/null; then
+    :
+  else
+    open_rc=1
+  fi
+  ((noclobber_was_set == 1)) || set +o noclobber
+  if ! umask "$saved_umask"; then
+    [[ -z "$fd" ]] || { exec {fd}>&-; } 2> /dev/null || true
     return 1
   fi
-  chmod 0644 "$tmp" || {
-    rm -f -- "$tmp"
+  ((open_rc == 0)) || return 1
+  DERIVED_MANIFEST_FD="$fd"
+  derived_owned_single_regular "$DERIVED_MANIFEST_CANDIDATE"
+}
+
+derived_manifest_candidate_close() {
+  [[ -n "$DERIVED_MANIFEST_FD" ]] || return 0
+  { exec {DERIVED_MANIFEST_FD}>&-; } 2> /dev/null || return 1
+  DERIVED_MANIFEST_FD=""
+}
+
+write_manifest() {
+  if [[ -z "$DERIVED_MANIFEST_CANDIDATE" ]]; then
+    [[ ! -e "$OUT_DIR/manifest.txt" && ! -L "$OUT_DIR/manifest.txt" ]] || return 1
+    derived_fixed_candidates_cleanup_stranded || return 1
+    derived_paths_init
+    DERIVED_MANIFEST_DEST_STATE=absent
+  fi
+  derived_manifest_candidate_open || return 1
+  if ! (
+    cd "$OUT_DIR" || exit 1
+    LC_ALL=C find . -type f \
+      ! -path './manifest.txt' \
+      ! -path './.manifest.txt.pending' -print0 |
+      LC_ALL=C sort -z |
+      xargs -0 sha256sum
+  ) >&"$DERIVED_MANIFEST_FD" 2> /dev/null; then
+    derived_manifest_candidate_close || true
     return 1
-  }
-  mv -fT -- "$tmp" "$OUT_DIR/manifest.txt" || {
-    rm -f -- "$tmp"
+  fi
+  derived_manifest_candidate_close || return 1
+  if ! derived_publish_candidate DERIVED_MANIFEST_CANDIDATE \
+    "$OUT_DIR/manifest.txt" "$DERIVED_MANIFEST_DEST_STATE"; then
+    derived_manifest_revoke || true
+    return 1
+  fi
+  [[ -f "$OUT_DIR/manifest.txt" && ! -L "$OUT_DIR/manifest.txt" ]] || {
+    derived_manifest_revoke || true
     return 1
   }
 }
@@ -2897,29 +3152,122 @@ persist_session_end() {
   fi
 }
 
+finalization_fail() {
+  DERIVED_FINALIZATION_ERROR="$1"
+  if ! derived_generation_abort; then
+    DIAG_LOG_FILE=""
+  fi
+  if [[ -e "$OUT_DIR/manifest.txt" || -L "$OUT_DIR/manifest.txt" ]]; then
+    DIAG_LOG_FILE=""
+  fi
+  return 1
+}
+
 finalize_report() {
-  persist_session_end
-  sync_meta_completed
-  node "$LIB/collect.mjs" "$OUT_DIR" || diag_die "collect.mjs failed; results.json may be stale"
-  node "$LIB/report.mjs" "$OUT_DIR" || diag_die "report.mjs failed; report.md may be stale"
-  write_privacy_review || diag_die "privacy sentinel scan failed"
-  write_manifest || diag_die "manifest generation failed"
+  derived_generation_begin || {
+    finalization_fail "cannot open a safe derived-output generation"
+    return 1
+  }
+  persist_session_end || {
+    finalization_fail "cannot persist the diagnostic end time"
+    return 1
+  }
+  sync_meta_completed || {
+    finalization_fail "cannot persist completed phase metadata"
+    return 1
+  }
+  diag_log "finalizing results, report, privacy review, and manifest" || {
+    finalization_fail "cannot record finalization progress"
+    return 1
+  }
+
+  node "$LIB/collect.mjs" "$OUT_DIR" "$DERIVED_RESULTS_CANDIDATE" \
+    > /dev/null 2>&1 || {
+    finalization_fail "collect.mjs failed before results publication"
+    return 1
+  }
+  derived_owned_single_regular "$DERIVED_RESULTS_CANDIDATE" &&
+    derived_candidate_same_device "$DERIVED_RESULTS_CANDIDATE" || {
+    finalization_fail "collect.mjs produced an unsafe results candidate"
+    return 1
+  }
+  node "$LIB/report.mjs" "$OUT_DIR" "$DERIVED_RESULTS_CANDIDATE" \
+    "$DERIVED_REPORT_CANDIDATE" > /dev/null 2>&1 || {
+    finalization_fail "report.mjs failed before report publication"
+    return 1
+  }
+  derived_owned_single_regular "$DERIVED_REPORT_CANDIDATE" &&
+    derived_candidate_same_device "$DERIVED_REPORT_CANDIDATE" || {
+    finalization_fail "report.mjs produced an unsafe report candidate"
+    return 1
+  }
+
+  derived_publish_candidate DERIVED_RESULTS_CANDIDATE "$OUT_DIR/results.json" \
+    "$DERIVED_RESULTS_DEST_STATE" || {
+    finalization_fail "results publication failed"
+    return 1
+  }
+  finalization_checkpoint results-published || {
+    finalization_fail "results publication checkpoint failed"
+    return 1
+  }
+  derived_publish_candidate DERIVED_REPORT_CANDIDATE "$OUT_DIR/report.md" \
+    "$DERIVED_REPORT_DEST_STATE" || {
+    finalization_fail "report publication failed"
+    return 1
+  }
+  finalization_checkpoint report-published || {
+    finalization_fail "report publication checkpoint failed"
+    return 1
+  }
+
+  # No bundled log or metadata write may occur after this point. The privacy
+  # review and manifest therefore describe the exact generation that follows.
+  DIAG_LOG_FILE=""
+  write_privacy_review "$DERIVED_PRIVACY_DEST_STATE" || {
+    finalization_fail "privacy sentinel scan failed"
+    return 1
+  }
+  finalization_checkpoint privacy-published || {
+    finalization_fail "privacy publication checkpoint failed"
+    return 1
+  }
+  write_manifest || {
+    finalization_fail "manifest generation failed"
+    return 1
+  }
+  if ! finalization_checkpoint manifest-published; then
+    derived_manifest_revoke || true
+    finalization_fail "manifest publication checkpoint failed"
+    return 1
+  fi
+  DERIVED_FINALIZATION_COMPLETE=1
 }
 
 complete_diagnostic() {
-  # Bundle logging must stop before write_manifest hashes run.log. Emit only
-  # a non-success progress line first, then print success to the terminal
-  # after every finalization step has completed.
-  diag_log "finalizing report and manifest"
-  finalize_report
+  # Success is terminal-only and follows the durable readiness token.
+  if ! finalize_report; then
+    diag_die "${DERIVED_FINALIZATION_ERROR:-derived finalization failed}"
+  fi
   printf '[%s] done. Bundle: %s\n' "$(date '+%H:%M:%S')" "$OUT_DIR"
   printf '[%s] report: %s/report.md\n' "$(date '+%H:%M:%S')" "$OUT_DIR"
 }
 
 diagnose_cleanup_exit() {
-  local rc="$1"
+  local rc="$1" artifact_safe=1
   trap - EXIT INT TERM
-  redo_marker_temp_cleanup
+  if [[ -n "$OUT_DIR" && -d "$OUT_DIR" ]] &&
+    ((rc != 0 || DERIVED_FINALIZATION_COMPLETE == 0)); then
+    if derived_manifest_revoke; then
+      derived_candidate_cleanup_tracked || rc=1
+      privacy_review_temp_cleanup || rc=1
+    else
+      DIAG_LOG_FILE=""
+      artifact_safe=0
+      rc=1
+    fi
+  fi
+  ((artifact_safe == 0)) || redo_marker_temp_cleanup
   diag_process_group_stop
   diag_freq_sampler_stop
   # Children inherit the lock descriptor intentionally. Reap all writers
@@ -2929,22 +3277,36 @@ diagnose_cleanup_exit() {
 }
 
 on_interrupt() {
-  local sig="$1"
+  local sig="$1" signal_rc=143
+  [[ "$sig" == SIGINT ]] && signal_rc=130
   trap - EXIT INT TERM
+  # The readiness token is the first possible bundle mutation. If it cannot
+  # be revoked durably, stop processes with terminal-only diagnostics and do
+  # not touch metadata, logs, or pending artifacts behind that token.
+  if ! derived_manifest_revoke; then
+    DIAG_LOG_FILE=""
+    diag_process_group_stop 2> /dev/null || true
+    diag_freq_sampler_stop 2> /dev/null || true
+    diag_bundle_lock_release 2> /dev/null || true
+    echo "error: could not revoke diagnostic readiness after $sig" >&2
+    exit "$signal_rc"
+  fi
+  derived_candidate_cleanup_tracked 2> /dev/null || true
+  privacy_review_temp_cleanup 2> /dev/null || true
   redo_marker_temp_cleanup
   meta_set INTERRUPTED 1 2> /dev/null || true
   diag_process_group_stop 2> /dev/null || true
   diag_freq_sampler_stop 2> /dev/null || true
   if [[ -e "$STATE_DIR/redo.pending" || -L "$STATE_DIR/redo.pending" ]]; then
     diag_warn "received $sig while redo archival is pending; skipping a misleading partial report (resume this bundle to recover)"
-    if [[ "$sig" == "SIGINT" ]]; then exit 130; else exit 143; fi
+    exit "$signal_rc"
   fi
   diag_warn "received $sig - stopping frequency sampling and writing a partial report"
   # Best effort: a failed partial report must not mask the interrupt, so
   # the subshell contains diag_die's exit and the failure is swallowed.
   ( finalize_report ) 2> /dev/null || true
   diag_bundle_lock_release 2> /dev/null || true
-  if [[ "$sig" == "SIGINT" ]]; then exit 130; else exit 143; fi
+  exit "$signal_rc"
 }
 
 # ---------------------------------------------------------------------------
@@ -3109,6 +3471,14 @@ main() {
     if find "$OUT_DIR" -mindepth 1 -print -quit | grep -q .; then
       diag_die "output directory '$OUT_DIR' became non-empty before initialization; use --resume to continue that bundle"
     fi
+  fi
+  # From this point onward the run may mutate commands, metadata, redo state,
+  # logs, and phase evidence. Revoke the sole readiness token first while
+  # bundled logging is still disabled, then recover only validated stranded
+  # candidates from a prior killed finalization.
+  if ! derived_run_open; then
+    DIAG_LOG_FILE=""
+    diag_die "cannot revoke diagnostic readiness or recover derived candidates"
   fi
   mkdir -p "$OUT_DIR"/{results,logs/individual,state,env,freq,gdb}
   DIAG_BUNDLE_ROOT="$OUT_DIR"

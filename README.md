@@ -191,6 +191,15 @@ Everything lands in a timestamped bundle, `diagnostics/<UTC timestamp>/`
   and MAC-shaped values; a flag means review the raw file, not that it is unsafe
 - `manifest.txt` — file names and SHA-256 checksums
 
+`manifest.txt` is the bundle's sole readiness token. Treat `results.json`,
+`report.md`, and `privacy-review.txt` as one authoritative generation only when
+the manifest is present and `sha256sum -c manifest.txt` succeeds from inside
+the bundle. Every real run or resume revokes that token before changing logs,
+metadata, phase evidence, or derived outputs. An interruption can therefore
+leave useful old/new files behind an absent manifest, but those files are not a
+completed generation; rerunning `diagnose.sh --resume ... --yes` cleans any
+validated finalization candidates and regenerates the complete set.
+
 Phases mark completion under `state/`; an interrupted run (SIGINT/SIGTERM
 writes a partial report first) can be resumed without discarding finished
 work — including partially completed per-CPU tables, which are topped up
