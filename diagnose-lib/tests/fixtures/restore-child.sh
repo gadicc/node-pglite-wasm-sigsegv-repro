@@ -18,6 +18,7 @@ export DIAG_SUDO=""
 # shellcheck source=../../common.sh
 source "$repo_root/diagnose-lib/common.sh"
 
+diag_restore_rules_set "$fake_file" '^[01]$'
 diag_restore_save "$fake_file"
 diag_register_restore_trap
 diag_sysfs_write "$fake_file" 1

@@ -20,6 +20,7 @@ source "$repo_root/diagnose-lib/common.sh"
 diag_freq_sampler_start() { :; }
 diag_freq_sampler_stop() { :; }
 
+diag_restore_rules_set "$fake_file" '^[01]$'
 diag_restore_save "$fake_file"
 diag_register_cleanup_traps
 diag_sysfs_write "$fake_file" 1

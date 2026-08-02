@@ -128,6 +128,7 @@ printf '%s\toriginal\n' "$RESTORE_FAIL_DIR/value" > "$RESTORE_FAIL_DIR/restore.t
 (
   DIAG_RESTORE_FILE="$RESTORE_FAIL_DIR/restore.tsv"
   DIAG_RESTORE_ARMED=1
+  diag_restore_rules_set "$RESTORE_FAIL_DIR/value" '^original$'
   diag_sysfs_write() { return 1; }
   diag_restore_now
 ) > /dev/null 2>&1
@@ -139,6 +140,7 @@ printf 'changed\n' > "$RESTORE_FAIL_DIR/value"
 (
   DIAG_RESTORE_FILE="$RESTORE_FAIL_DIR/restore.tsv"
   DIAG_RESTORE_ARMED=1
+  diag_restore_rules_set "$RESTORE_FAIL_DIR/value" '^original$'
   diag_sysfs_write() { return 0; }
   diag_restore_now
 ) > /dev/null 2>&1
@@ -154,6 +156,7 @@ printf '%s\toriginal\n' "$RECOVER_DIR/value" > "$RECOVER_DIR/restore.tsv"
   DIAG_RESTORE_FILE="$RECOVER_DIR/restore.tsv"
   DIAG_RESTORE_ARMED=0
   DIAG_SUDO=""
+  diag_restore_rules_set "$RECOVER_DIR/value" '^original$'
   diag_recover_pending_restore
 ) > /dev/null 2>&1
 recover_rc=$?
@@ -229,6 +232,103 @@ else
   symlink_ledger_rc=$?
 fi
 check_eq "restore ledger rejects symlinks" "1" "$([[ $symlink_ledger_rc -ne 0 ]] && echo 1 || echo 0)"
+
+SNAPSHOT_DIR="$TMP/restore-snapshot"
+mkdir -p "$SNAPSHOT_DIR"
+printf 'changed\n' > "$SNAPSHOT_DIR/allowed"
+printf 'safe\n' > "$SNAPSHOT_DIR/victim"
+printf '%s\toriginal\n%s\tpwned\n' \
+  "$SNAPSHOT_DIR/allowed" "$SNAPSHOT_DIR/victim" > "$SNAPSHOT_DIR/restore.tsv"
+(
+  DIAG_RESTORE_FILE="$SNAPSHOT_DIR/restore.tsv"
+  DIAG_RESTORE_ARMED=1
+  diag_restore_rules_set "$SNAPSHOT_DIR/allowed" '^original$'
+  diag_sysfs_write() { touch "$SNAPSHOT_DIR/write-attempted"; return 0; }
+  diag_restore_now
+) > /dev/null 2>&1
+snapshot_guard_rc=$?
+check_eq "restore validates the complete snapshot before its first write" "1" \
+  "$([[ $snapshot_guard_rc -ne 0 && ! -e "$SNAPSHOT_DIR/write-attempted" && "$(cat "$SNAPSHOT_DIR/victim")" == safe && -s "$SNAPSHOT_DIR/restore.tsv" ]] && echo 1 || echo 0)"
+
+PRIVATE_STATE_DIR="$TMP/private-restore-state"
+test_uid="$(id -u)"
+test_gid="$(id -g)"
+diag_restore_private_dir_prepare "$PRIVATE_STATE_DIR" "$test_uid" "$test_gid"
+check_eq "restore state directory is private and correctly owned" \
+  "$test_uid:$test_gid:700" "$(stat -Lc '%u:%g:%a' "$PRIVATE_STATE_DIR")"
+chmod 0755 "$PRIVATE_STATE_DIR"
+if diag_restore_private_dir_prepare "$PRIVATE_STATE_DIR" "$test_uid" "$test_gid"; then
+  unsafe_state_dir_rc=0
+else
+  unsafe_state_dir_rc=$?
+fi
+check_eq "restore state directory rejects unsafe mode" "1" \
+  "$([[ $unsafe_state_dir_rc -ne 0 ]] && echo 1 || echo 0)"
+chmod 0700 "$PRIVATE_STATE_DIR"
+diag_restore_private_file_prepare "$PRIVATE_STATE_DIR/restore.tsv" "$test_uid" "$test_gid"
+check_eq "restore state file is private, owned, and singly linked" \
+  "$test_uid:$test_gid:600:1" "$(stat -Lc '%u:%g:%a:%h' "$PRIVATE_STATE_DIR/restore.tsv")"
+ln "$PRIVATE_STATE_DIR/restore.tsv" "$PRIVATE_STATE_DIR/restore-hardlink.tsv"
+if diag_restore_private_file_is_safe "$PRIVATE_STATE_DIR/restore.tsv" "$test_uid" "$test_gid"; then
+  hardlink_state_rc=0
+else
+  hardlink_state_rc=$?
+fi
+check_eq "restore state file rejects additional hard links" "1" \
+  "$([[ $hardlink_state_rc -ne 0 ]] && echo 1 || echo 0)"
+rm "$PRIVATE_STATE_DIR/restore-hardlink.tsv"
+
+diag_restore_lock_acquire "$PRIVATE_STATE_DIR/active.lock" "$test_uid" "$test_gid"
+bash -c '
+  source "$1"
+  diag_restore_lock_acquire "$2" "$3" "$4"
+' _ "$LIB/common.sh" "$PRIVATE_STATE_DIR/active.lock" "$test_uid" "$test_gid" > /dev/null 2>&1
+concurrent_lock_rc=$?
+check_eq "per-user restore lock refuses a concurrent experiment" "1" \
+  "$([[ $concurrent_lock_rc -ne 0 ]] && echo 1 || echo 0)"
+diag_restore_lock_release
+
+printf 'malformed\n' > "$PRIVATE_STATE_DIR/active.lock"
+chmod 0600 "$PRIVATE_STATE_DIR/active.lock"
+if diag_restore_lock_acquire "$PRIVATE_STATE_DIR/active.lock" "$test_uid" "$test_gid" 2> /dev/null; then
+  malformed_lock_rc=0
+else
+  malformed_lock_rc=$?
+fi
+check_eq "malformed restore lock fails closed" "1" \
+  "$([[ $malformed_lock_rc -ne 0 ]] && echo 1 || echo 0)"
+rm "$PRIVATE_STATE_DIR/active.lock"
+
+stale_ready="$PRIVATE_STATE_DIR/stale-ready"
+stale_fifo="$PRIVATE_STATE_DIR/stale-fifo"
+mkfifo "$stale_fifo"
+bash -c '
+  set -u
+  source "$1"
+  diag_restore_lock_acquire "$2" "$3" "$4"
+  printf "ready\n" > "$5"
+  exec {block_fd}<> "$6"
+  read -r -u "$block_fd" _
+' _ "$LIB/common.sh" "$PRIVATE_STATE_DIR/active.lock" "$test_uid" "$test_gid" \
+  "$stale_ready" "$stale_fifo" > /dev/null 2>&1 &
+stale_owner_pid=$!
+stale_ready_seen=0
+for _ in {1..100}; do
+  if [[ -s "$stale_ready" ]]; then
+    stale_ready_seen=1
+    break
+  fi
+  sleep 0.01
+done
+kill -KILL "$stale_owner_pid" 2> /dev/null || true
+wait "$stale_owner_pid" 2> /dev/null || true
+diag_restore_lock_acquire "$PRIVATE_STATE_DIR/active.lock" "$test_uid" "$test_gid"
+stale_recovery_rc=$?
+diag_restore_lock_release
+check_eq "dead experiment lock is reclaimed for SIGKILL recovery" "1" \
+  "$([[ $stale_ready_seen -eq 1 && $stale_recovery_rc -eq 0 ]] && echo 1 || echo 0)"
+rm -f "$stale_fifo"
+
 (
   diag_require_not_symlink "$LEDGER_GUARD_DIR/restore.tsv.symlink"
 ) > /dev/null 2>&1

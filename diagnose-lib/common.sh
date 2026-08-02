@@ -197,21 +197,219 @@ diag_sysfs_write() {
 # ---------------------------------------------------------------------------
 # Runtime-settings restore (frequency phase safety net)
 # ---------------------------------------------------------------------------
-# Saved settings live in a state file with one "path<TAB>value" pair per
-# line, so restoration works even after SIGKILL of a parent shell cannot be
-# handled -- but for INT/TERM/EXIT we restore from the same file.
-# DIAG_RESTORE_FILE must point at the state file.
+# Saved settings live in a private state file with one "path<TAB>value" pair
+# per line, so restoration works even after SIGKILL of a parent shell cannot
+# be handled. Privileged callers must put that file in a root-owned directory,
+# hold a per-user experiment lock, and configure an explicit restore allowlist.
+# Every restore validates the exact in-memory snapshot before its first write.
 
 : "${DIAG_RESTORE_FILE:=}"
 DIAG_RESTORE_ARMED=0
+declare -a DIAG_RESTORE_RULES=()
+DIAG_RESTORE_LOCK_FILE=""
+DIAG_RESTORE_LOCK_TOKEN=""
+
+diag_restore_private_dir_prepare() {
+  # usage: diag_restore_private_dir_prepare <dir> <owner-uid> <owner-gid>
+  local dir="$1" owner_uid="$2" owner_gid="$3"
+  diag_is_uint "$owner_uid" && diag_is_uint "$owner_gid" || return 1
+  if [[ ! -e "$dir" && ! -L "$dir" ]]; then
+    mkdir -m 0700 -- "$dir" || return 1
+  fi
+  [[ -d "$dir" && ! -L "$dir" ]] || return 1
+  [[ "$(stat -Lc '%u:%g:%a' -- "$dir" 2> /dev/null)" == "$owner_uid:$owner_gid:700" ]]
+}
+
+diag_restore_private_file_is_safe() {
+  # usage: diag_restore_private_file_is_safe <file> <owner-uid> <owner-gid>
+  local file="$1" owner_uid="$2" owner_gid="$3"
+  diag_is_uint "$owner_uid" && diag_is_uint "$owner_gid" || return 1
+  [[ -f "$file" && ! -L "$file" ]] || return 1
+  [[ "$(stat -Lc '%u:%g:%a:%h' -- "$file" 2> /dev/null)" == "$owner_uid:$owner_gid:600:1" ]]
+}
+
+diag_restore_private_file_prepare() {
+  # Parent directories must already be private and trusted.
+  local file="$1" owner_uid="$2" owner_gid="$3"
+  if [[ ! -e "$file" && ! -L "$file" ]]; then
+    (umask 077; : > "$file") || return 1
+  fi
+  diag_restore_private_file_is_safe "$file" "$owner_uid" "$owner_gid"
+}
+
+diag_process_start_ticks() {
+  local pid="$1" stat_line rest ticks
+  local -a fields=()
+  diag_is_uint "$pid" || return 1
+  IFS= read -r stat_line 2> /dev/null < "/proc/$pid/stat" || return 1
+  rest="${stat_line##*) }"
+  read -ra fields <<< "$rest"
+  ((${#fields[@]} >= 20)) || return 1
+  ticks="${fields[19]}"
+  diag_is_uint "$ticks" || return 1
+  printf '%s\n' "$ticks"
+}
+
+diag_restore_lock_owner_is_live() {
+  local lock_file="$1" pid ticks extra current_ticks
+  # Status: 0 live owner, 1 valid but dead/reused owner, 2 malformed record.
+  IFS=' ' read -r pid ticks extra < "$lock_file" || return 2
+  diag_is_uint "$pid" && diag_is_uint "$ticks" && [[ -z "$extra" ]] || return 2
+  current_ticks="$(diag_process_start_ticks "$pid")" || return 1
+  [[ "$current_ticks" == "$ticks" ]]
+}
+
+diag_restore_lock_acquire() {
+  # The short-lived flock serializes stale-lock recovery. The durable active
+  # record contains this shell's PID and process start time; unlike an open FD,
+  # it is not inherited by workload children and can be reclaimed after
+  # SIGKILL without weakening live-run concurrency refusal.
+  local lock_file="$1" owner_uid="$2" owner_gid="$3"
+  [[ -z "$DIAG_RESTORE_LOCK_FILE" ]] || return 1
+  local guard_file="${lock_file}.guard" guard_fd="" tmp="" start_ticks
+  local owner_pid="$BASHPID"
+  diag_restore_private_file_prepare "$guard_file" "$owner_uid" "$owner_gid" || return 1
+  exec {guard_fd}>> "$guard_file" || return 1
+  if ! flock -n "$guard_fd"; then
+    exec {guard_fd}>&-
+    diag_warn "another restore-lock operation is in progress; refusing to race it"
+    return 1
+  fi
+
+  if [[ -e "$lock_file" || -L "$lock_file" ]]; then
+    if ! diag_restore_private_file_is_safe "$lock_file" "$owner_uid" "$owner_gid"; then
+      exec {guard_fd}>&-
+      diag_warn "restore lock has unsafe ownership, mode, type, or link count"
+      return 1
+    fi
+    local owner_status=0
+    diag_restore_lock_owner_is_live "$lock_file" || owner_status=$?
+    case "$owner_status" in
+      0)
+        exec {guard_fd}>&-
+        diag_warn "another frequency experiment is already active for this invoking user"
+        return 1
+        ;;
+      1) ;; # stale PID/start-time pair; reclaim below
+      *)
+        exec {guard_fd}>&-
+        diag_warn "restore lock owner record is malformed; refusing recovery"
+        return 1
+        ;;
+    esac
+    rm -f -- "$lock_file" || {
+      exec {guard_fd}>&-
+      return 1
+    }
+  fi
+
+  start_ticks="$(diag_process_start_ticks "$owner_pid")" || {
+    exec {guard_fd}>&-
+    return 1
+  }
+  tmp="$(mktemp "${lock_file}.tmp.XXXXXX")" || {
+    exec {guard_fd}>&-
+    return 1
+  }
+  chmod 0600 "$tmp" || {
+    rm -f -- "$tmp"
+    exec {guard_fd}>&-
+    return 1
+  }
+  printf '%s %s\n' "$owner_pid" "$start_ticks" > "$tmp" || {
+    rm -f -- "$tmp"
+    exec {guard_fd}>&-
+    return 1
+  }
+  if ! mv -fT -- "$tmp" "$lock_file"; then
+    rm -f -- "$tmp"
+    exec {guard_fd}>&-
+    return 1
+  fi
+  if ! diag_restore_private_file_is_safe "$lock_file" "$owner_uid" "$owner_gid"; then
+    rm -f -- "$lock_file"
+    exec {guard_fd}>&-
+    return 1
+  fi
+  DIAG_RESTORE_LOCK_FILE="$lock_file"
+  DIAG_RESTORE_LOCK_TOKEN="$owner_pid $start_ticks"
+  exec {guard_fd}>&-
+}
+
+diag_restore_lock_release() {
+  [[ -n "$DIAG_RESTORE_LOCK_FILE" ]] || return 0
+  local actual=""
+  if [[ -f "$DIAG_RESTORE_LOCK_FILE" && ! -L "$DIAG_RESTORE_LOCK_FILE" ]]; then
+    IFS= read -r actual < "$DIAG_RESTORE_LOCK_FILE" || true
+  fi
+  if [[ "$actual" != "$DIAG_RESTORE_LOCK_TOKEN" ]]; then
+    diag_warn "restore lock ownership changed; refusing to remove it"
+    return 1
+  fi
+  rm -f -- "$DIAG_RESTORE_LOCK_FILE" || return 1
+  DIAG_RESTORE_LOCK_FILE=""
+  DIAG_RESTORE_LOCK_TOKEN=""
+}
+
+diag_restore_rules_set() {
+  (($# > 0 && $# % 2 == 0)) || return 1
+  local -a rules=("$@")
+  local i
+  for ((i = 0; i < ${#rules[@]}; i += 2)); do
+    [[ -n "${rules[$i]}" && -n "${rules[$((i + 1))]}" ]] || return 1
+  done
+  DIAG_RESTORE_RULES=("${rules[@]}")
+}
+
+diag_restore_entries_are_valid() {
+  # usage: diag_restore_entries_are_valid <array-name> <allowed-path> <value-regex> ...
+  local entries_name="$1"
+  shift
+  (($# > 0 && $# % 2 == 0)) || return 1
+  local -a rules=("$@")
+  local -n entries_ref="$entries_name"
+  ((${#entries_ref[@]} > 0)) || return 1
+
+  local line path value allowed pattern matched
+  declare -A seen=()
+  local i rule_i
+  for ((i = 0; i < ${#entries_ref[@]}; i++)); do
+    line="${entries_ref[$i]}"
+    [[ "$line" == *$'\t'* ]] || return 1
+    path="${line%%$'\t'*}"
+    value="${line#*$'\t'}"
+    [[ -n "$path" && -n "$value" && "$value" != *$'\t'* && -z "${seen[$path]:-}" ]] || return 1
+    seen[$path]=1
+    matched=0
+    for ((rule_i = 0; rule_i < ${#rules[@]}; rule_i += 2)); do
+      allowed="${rules[$rule_i]}"
+      pattern="${rules[$((rule_i + 1))]}"
+      if [[ "$path" == "$allowed" && "$value" =~ $pattern ]]; then
+        matched=1
+        break
+      fi
+    done
+    ((matched == 1)) || return 1
+  done
+}
 
 diag_restore_save() {
   # usage: diag_restore_save <path>   -- records current value for restore
   local path="$1"
   [[ -n "$DIAG_RESTORE_FILE" ]] || diag_die "DIAG_RESTORE_FILE is not set"
+  ((${#DIAG_RESTORE_RULES[@]} > 0)) || diag_die "restore allowlist is not configured"
+  [[ ! -L "$DIAG_RESTORE_FILE" && ( ! -e "$DIAG_RESTORE_FILE" || -f "$DIAG_RESTORE_FILE" ) ]] ||
+    diag_die "restore ledger is not a safe regular file"
   [[ -r "$path" ]] || diag_die "cannot read $path to save it"
   local value
   value="$(cat "$path")"
+  local -a candidate=()
+  if [[ -s "$DIAG_RESTORE_FILE" ]]; then
+    mapfile -t candidate < "$DIAG_RESTORE_FILE" || diag_die "cannot read restore ledger"
+  fi
+  candidate+=("$path"$'\t'"$value")
+  diag_restore_entries_are_valid candidate "${DIAG_RESTORE_RULES[@]}" ||
+    diag_die "refusing to save a non-allowlisted or malformed restore entry"
   printf '%s\t%s\n' "$path" "$value" >> "$DIAG_RESTORE_FILE"
   DIAG_RESTORE_ARMED=1
 }
@@ -221,15 +419,27 @@ diag_restore_now() {
   # read back exactly. A failed restore remains durable for the next recovery
   # attempt instead of being silently discarded.
   # A nonempty path alone is never authority to restore: callers must arm the
-  # ledger by saving state or by explicitly validating pending recovery.
+  # ledger, and this function validates its own immutable snapshot before any
+  # write rather than trusting an earlier check of a mutable file.
   ((DIAG_RESTORE_ARMED == 1)) || return 0
-  [[ -n "$DIAG_RESTORE_FILE" && -s "$DIAG_RESTORE_FILE" ]] || {
-    DIAG_RESTORE_ARMED=0
-    return 0
+  ((${#DIAG_RESTORE_RULES[@]} > 0)) || {
+    diag_warn "restore allowlist is not configured; refusing restore"
+    return 1
+  }
+  [[ -n "$DIAG_RESTORE_FILE" && -s "$DIAG_RESTORE_FILE" && -f "$DIAG_RESTORE_FILE" && ! -L "$DIAG_RESTORE_FILE" ]] || {
+    diag_warn "armed restore ledger is missing, empty, or unsafe"
+    return 1
   }
 
   local -a entries=() failed=()
-  mapfile -t entries < "$DIAG_RESTORE_FILE"
+  mapfile -t entries < "$DIAG_RESTORE_FILE" || {
+    diag_warn "could not read armed restore ledger"
+    return 1
+  }
+  if ! diag_restore_entries_are_valid entries "${DIAG_RESTORE_RULES[@]}"; then
+    diag_warn "restore ledger snapshot is malformed or outside the trusted allowlist"
+    return 1
+  fi
   local i line path value actual
   local restore_failed=0
   for ((i = ${#entries[@]} - 1; i >= 0; i--)); do
@@ -291,28 +501,10 @@ diag_restore_ledger_is_valid() {
   shift
   (($# > 0 && $# % 2 == 0)) || return 1
   [[ -f "$ledger" && ! -L "$ledger" ]] || return 1
-
-  local path value extra allowed pattern matched validated_rows=0
-  declare -A seen=()
-  while IFS=$'\t' read -r path value extra ||
-    [[ -n "${path:-}${value:-}${extra:-}" ]]; do
-    [[ -n "$path" && -n "$value" && -z "$extra" && -z "${seen[$path]:-}" ]] || return 1
-    seen[$path]=1
-    validated_rows=$((validated_rows + 1))
-    matched=0
-    local -a rules=("$@")
-    local i
-    for ((i = 0; i < ${#rules[@]}; i += 2)); do
-      allowed="${rules[$i]}"
-      pattern="${rules[$((i + 1))]}"
-      if [[ "$path" == "$allowed" && "$value" =~ $pattern ]]; then
-        matched=1
-        break
-      fi
-    done
-    ((matched == 1)) || return 1
-  done < "$ledger"
-  [[ ! -s "$ledger" || $validated_rows -gt 0 ]]
+  [[ -s "$ledger" ]] || return 0
+  local -a entries=()
+  mapfile -t entries < "$ledger" || return 1
+  diag_restore_entries_are_valid entries "$@"
 }
 
 diag_require_not_symlink() {
@@ -338,6 +530,9 @@ diag_cleanup_exit() {
   else
     cleanup_rc=$?
   fi
+  if ! diag_restore_lock_release; then
+    cleanup_rc=1
+  fi
   ((rc == 0 && cleanup_rc != 0)) && rc=1
   exit "$rc"
 }
@@ -347,6 +542,7 @@ diag_cleanup_signal() {
   trap - EXIT INT TERM
   diag_warn "received $name"
   diag_cleanup_now || true
+  diag_restore_lock_release || true
   exit "$rc"
 }
 

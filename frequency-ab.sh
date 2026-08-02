@@ -10,6 +10,8 @@
 # state restored). The original intel_pstate/no_turbo value (and, with
 # --cap, the CPU's scaling_max_freq) is saved first and restored on normal
 # exit, failure, SIGINT, or SIGTERM; the restore is verified and recorded.
+# SIGKILL recovery state lives under a root-owned /run directory, never in
+# the user-owned diagnostics bundle.
 # Workload legs run as the invoking user (via runuser) when possible.
 # Results land in the bundle (results/frequency-ab.tsv|.meta); regenerate
 # the report afterwards with:
@@ -76,7 +78,7 @@ if ((EUID != 0)); then
   exit 4
 fi
 
-for dep in node setsid taskset; do
+for dep in flock node setsid stat taskset; do
   command -v "$dep" > /dev/null 2>&1 || diag_die "missing required command: $dep"
 done
 
@@ -92,7 +94,6 @@ declare -a protected_bundle_paths=(
   "$BUNDLE/results" "$BUNDLE/freq" "$BUNDLE/state" "$BUNDLE/commands.log"
   "$BUNDLE/results/frequency-ab.tsv" "$BUNDLE/results/frequency-ab.meta"
   "$BUNDLE/results/frequency-cap.tsv" "$BUNDLE/results/frequency-cap.meta"
-  "$BUNDLE/state/restore-frequency-ab.tsv"
 )
 for tag in A1 B A2 cap; do
   protected_bundle_paths+=(
@@ -105,24 +106,63 @@ diag_require_not_symlink "${protected_bundle_paths[@]}"
 mkdir -p "$BUNDLE/results" "$BUNDLE/freq" "$BUNDLE/state"
 DIAG_BUNDLE_ROOT="$BUNDLE"
 DIAG_REPO_ROOT="$SCRIPT_DIR"
-DIAG_RESTORE_FILE="$BUNDLE/state/restore-frequency-ab.tsv"
 DIAG_FREQ_DIR="$BUNDLE/freq"
 DIAG_COMMANDS_LOG="$BUNDLE/commands.log"
 
+INVOKING_UID=0
+if [[ -n "${SUDO_UID:-}" ]]; then
+  diag_require_uint "SUDO_UID" "$SUDO_UID"
+  INVOKING_UID="$SUDO_UID"
+fi
+if [[ -n "${SUDO_USER:-}" ]]; then
+  resolved_sudo_uid="$(id -u "$SUDO_USER" 2> /dev/null)" ||
+    diag_die "cannot resolve invoking user '$SUDO_USER'"
+  if [[ -n "${SUDO_UID:-}" && "$resolved_sudo_uid" != "$INVOKING_UID" ]]; then
+    diag_die "SUDO_USER and SUDO_UID identify different invoking users"
+  fi
+  INVOKING_UID="$resolved_sudo_uid"
+fi
+
+# Runtime settings reset on reboot, so /run provides durable-enough SIGKILL
+# recovery without placing privileged write authority in the user-owned
+# bundle. One active experiment is allowed per invoking UID.
+RESTORE_STATE_BASE="/run/node-pglite-wasm-sigsegv-repro"
+RESTORE_STATE_DIR="$RESTORE_STATE_BASE/uid-$INVOKING_UID"
+diag_restore_private_dir_prepare "$RESTORE_STATE_BASE" 0 0 ||
+  diag_die "secure restore-state base must be a root-owned mode-0700 directory"
+diag_restore_private_dir_prepare "$RESTORE_STATE_DIR" 0 0 ||
+  diag_die "per-user restore-state directory must be root-owned and mode 0700"
+diag_restore_lock_acquire "$RESTORE_STATE_DIR/active.lock" 0 0 ||
+  diag_die "cannot acquire the per-user frequency experiment lock"
+
+DIAG_RESTORE_FILE="$RESTORE_STATE_DIR/restore.tsv"
 diag_register_cleanup_traps
+diag_restore_private_file_prepare "$DIAG_RESTORE_FILE" 0 0 ||
+  diag_die "secure restore ledger must be a root-owned mode-0600 regular file with one link"
+
+# Enumerate exact trusted sysfs destinations. Including every current policy
+# lets a later invocation recover a killed cap experiment even when it was
+# launched with a different CPU argument.
+declare -a restore_rules=("$NO_TURBO_PATH" '^[01]$')
+for restore_path in /sys/devices/system/cpu/cpufreq/policy*/scaling_max_freq; do
+  [[ -f "$restore_path" ]] || continue
+  restore_path="$(readlink -f "$restore_path")"
+  restore_rules+=("$restore_path" '^[0-9]+$')
+done
+diag_restore_rules_set "${restore_rules[@]}" ||
+  diag_die "could not configure the trusted restore allowlist"
 
 # SIGKILL cannot run a trap. Recover any durable ledger left by a previous
 # killed invocation before replacing output files or saving new state.
-if [[ -s "$DIAG_RESTORE_FILE" ]]; then
-  declare -a restore_rules=("$NO_TURBO_PATH" '^[01]$')
-  if [[ -n "$POLICY" ]]; then
-    restore_rules+=("$POLICY/scaling_max_freq" '^[0-9]+$')
-  fi
-  diag_restore_ledger_is_valid "$DIAG_RESTORE_FILE" "${restore_rules[@]}" ||
-    diag_die "pending restore ledger is malformed or names a non-allowlisted setting; refusing privileged recovery"
-fi
 diag_recover_pending_restore ||
   diag_die "refusing to start while a previous settings restore is pending"
+
+# Older versions placed restore authority in the bundle. It is intentionally
+# never trusted or migrated by this privileged script.
+LEGACY_RESTORE_FILE="$BUNDLE/state/restore-frequency-ab.tsv"
+if [[ -L "$LEGACY_RESTORE_FILE" || -s "$LEGACY_RESTORE_FILE" ]]; then
+  diag_die "legacy bundle restore state cannot be trusted; inspect and remove it manually before continuing"
+fi
 
 # Run workload legs as the invoking user when we can.
 declare -a AS_USER=()
@@ -169,7 +209,7 @@ for leg in A1 B A2; do
   diag_run_single_runs "$TSV" "$leg" "$CPU" "$RUNS" "${AS_USER[@]}"
 done
 
-diag_restore_now || diag_die "no_turbo restore failed; pending recovery is recorded in $DIAG_RESTORE_FILE"
+diag_restore_now || diag_die "no_turbo restore failed; secure recovery state was retained"
 now="$(cat "$NO_TURBO_PATH")"
 printf 'RESTORED=%s\n' "$([[ "$now" == "$SAVED_NO_TURBO" ]] && echo 1 || echo 0)" >> "$META"
 [[ "$now" == "$SAVED_NO_TURBO" ]] || diag_warn "no_turbo restore verification FAILED (now $now)"
@@ -192,7 +232,7 @@ if [[ -n "$CAP_KHZ" && -n "$POLICY" ]]; then
   diag_run_single_runs "$TSV" "cap" "$CPU" "$RUNS" "${AS_USER[@]}"
   grep -P '^cap\t' "$TSV" > "$BUNDLE/results/frequency-cap.tsv" || true
   sed -i '/^cap\t/d' "$TSV"
-  diag_restore_now || diag_die "scaling_max_freq restore failed; pending recovery is recorded in $DIAG_RESTORE_FILE"
+  diag_restore_now || diag_die "scaling_max_freq restore failed; secure recovery state was retained"
   now="$(cat "$smax_path")"
   printf 'RESTORED=%s\n' "$([[ "$now" == "$saved_smax" ]] && echo 1 || echo 0)" >> "$BUNDLE/results/frequency-cap.meta"
   [[ "$now" == "$saved_smax" ]] || diag_warn "scaling_max_freq restore verification FAILED"
