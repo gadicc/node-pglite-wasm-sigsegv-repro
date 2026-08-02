@@ -50,6 +50,66 @@ for tag in A1 B A2 cap; do
   relative_files+=("freq/freq-ab-${tag}.samples" "freq/freq-ab-${tag}.method")
 done
 
+declare -a cap_relative_files=(
+  results/frequency-cap.tsv
+  results/frequency-cap.meta
+  freq/freq-ab-cap.samples
+  freq/freq-ab-cap.method
+)
+
+publish_control="$stage/publish-control.meta"
+cap_cleanup_authorized=0
+if [[ -e "$publish_control" || -L "$publish_control" ]]; then
+  [[ -f "$publish_control" && ! -L "$publish_control" ]] || {
+    echo "error: unsafe frequency publication control" >&2
+    exit 1
+  }
+  [[ "$(stat -Lc '%u:%a:%h:%s' -- "$publish_control" 2> /dev/null)" == "$EUID:600:1:70" ]] || {
+    echo "error: frequency publication control has unsafe ownership, mode, links, or size" >&2
+    exit 1
+  }
+  declare -a control_lines=()
+  mapfile -t control_lines < "$publish_control" || {
+    echo "error: could not read frequency publication control" >&2
+    exit 1
+  }
+  [[ ${#control_lines[@]} -eq 3 && "${control_lines[0]}" == "VERSION=1" &&
+    "${control_lines[1]}" =~ ^GENERATION=[0-9a-f]{32}$ &&
+    "${control_lines[2]}" =~ ^CAP_REQUESTED=([01])$ ]] || {
+    echo "error: malformed frequency publication control" >&2
+    exit 1
+  }
+  control_generation="${control_lines[1]#GENERATION=}"
+  control_cap_requested="${control_lines[2]#CAP_REQUESTED=}"
+  control_expected_sha="$(
+    printf 'VERSION=1\nGENERATION=%s\nCAP_REQUESTED=%s\n' \
+      "$control_generation" "$control_cap_requested" | sha256sum
+  )" || {
+    echo "error: could not hash canonical frequency publication control" >&2
+    exit 1
+  }
+  control_actual_sha="$(sha256sum -- "$publish_control")" || {
+    echo "error: could not hash frequency publication control" >&2
+    exit 1
+  }
+  control_expected_sha="${control_expected_sha%% *}"
+  control_actual_sha="${control_actual_sha%% *}"
+  [[ "$control_expected_sha" =~ ^[0-9a-f]{64}$ &&
+    "$control_actual_sha" == "$control_expected_sha" ]] || {
+    echo "error: frequency publication control is not canonical byte-for-byte" >&2
+    exit 1
+  }
+  if [[ "$control_cap_requested" == 0 ]]; then
+    cap_cleanup_authorized=1
+    for rel in "${cap_relative_files[@]}"; do
+      [[ ! -e "$stage/$rel" && ! -L "$stage/$rel" ]] || {
+        echo "error: no-cap publication control conflicts with staged cap artifacts" >&2
+        exit 1
+      }
+    done
+  fi
+fi
+
 declare -a present_files=()
 for rel in "${relative_files[@]}"; do
   source_file="$stage/$rel"
@@ -69,6 +129,17 @@ for rel in "${relative_files[@]}"; do
   }
   present_files+=("$rel")
 done
+
+if ((cap_cleanup_authorized == 1)); then
+  for rel in "${cap_relative_files[@]}"; do
+    destination="$bundle/$rel"
+    [[ ! -e "$destination" && ! -L "$destination" ]] && continue
+    [[ -f "$destination" || -L "$destination" ]] || {
+      echo "error: stale cap destination is not safely removable: $rel" >&2
+      exit 1
+    }
+  done
+fi
 
 staged_commands="$stage/commands.log"
 [[ -f "$staged_commands" && ! -L "$staged_commands" ]] || {
@@ -112,6 +183,25 @@ fi
   exit 1
 }
 
+if ((cap_cleanup_authorized == 1)); then
+  cap_deletions_completed=0
+  for rel in "${cap_relative_files[@]}"; do
+    destination="$bundle/$rel"
+    had_destination=0
+    [[ -e "$destination" || -L "$destination" ]] && had_destination=1
+    rm -f -- "$destination"
+    if ((had_destination == 1)); then
+      ((cap_deletions_completed += 1))
+      # Test-only crash injection proves the durable control authorizes an
+      # idempotent retry after only part of the stale cap set was removed.
+      if [[ "${DIAG_TEST_FREQUENCY_PUBLISH_KILL_AFTER_FIRST_CAP_DELETE:-0}" == "1" &&
+        $cap_deletions_completed -eq 1 ]]; then
+        kill -KILL "$BASHPID"
+      fi
+    fi
+  done
+fi
+
 commands_tmp="$(mktemp "$bundle/.frequency-commands.XXXXXX")"
 cleanup_tmp() {
   [[ -z "${commands_tmp:-}" ]] || rm -f -- "$commands_tmp"
@@ -138,5 +228,6 @@ done
 mv -fT -- "$commands_tmp" "$commands_destination"
 commands_tmp=""
 rm -f -- "$staged_commands"
+[[ ! -e "$publish_control" && ! -L "$publish_control" ]] || rm -f -- "$publish_control"
 rmdir -- "$stage/results" "$stage/freq" "$stage"
 trap - EXIT INT TERM

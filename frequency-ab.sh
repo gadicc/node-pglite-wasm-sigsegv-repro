@@ -38,6 +38,7 @@ FREQUENCY_STAGE_DIR=""
 FREQUENCY_STAGE_RECORD=""
 FREQUENCY_OUTPUTS_PUBLISHED=0
 FREQUENCY_OUTPUT_CLEANUP_ARMED=0
+FREQUENCY_PUBLISH_CONTROL_NAME="publish-control.meta"
 INVOKING_UID=""
 INVOKING_GID=""
 FREQUENCY_STATE_UID=""
@@ -66,6 +67,34 @@ frequency_stage_record_write() {
     return 1
   }
   diag_restore_private_file_is_safe "$FREQUENCY_STAGE_RECORD" "$FREQUENCY_STATE_UID" "$FREQUENCY_STATE_GID"
+}
+
+frequency_publish_control_write() {
+  local path="$1" generation="$2" cap_requested="$3" tmp
+  frequency_generation_is_valid "$generation" || return 1
+  [[ "$cap_requested" == 0 || "$cap_requested" == 1 ]] || return 1
+  tmp="$(mktemp "${path}.tmp.XXXXXX")" || return 1
+  chmod 0600 "$tmp" || {
+    rm -f -- "$tmp"
+    return 1
+  }
+  {
+    printf 'VERSION=1\n'
+    printf 'GENERATION=%s\n' "$generation"
+    printf 'CAP_REQUESTED=%s\n' "$cap_requested"
+  } > "$tmp" || {
+    rm -f -- "$tmp"
+    return 1
+  }
+  sync -f "$tmp" || {
+    rm -f -- "$tmp"
+    return 1
+  }
+  mv -fT -- "$tmp" "$path" || {
+    rm -f -- "$tmp"
+    return 1
+  }
+  sync -f "$(dirname -- "$path")"
 }
 
 frequency_stage_record_read() {
@@ -116,6 +145,7 @@ frequency_publish_outputs() {
 
   local -a staged_files=(commands.log)
   local -a candidates=(
+    "$FREQUENCY_PUBLISH_CONTROL_NAME"
     results/frequency-ab.tsv
     results/frequency-ab.meta
     results/frequency-cap.tsv
@@ -378,7 +408,7 @@ if ((EUID != 0)); then
   exit 4
 fi
 
-for dep in flock node runuser setsid sha256sum stat taskset; do
+for dep in flock node runuser setsid sha256sum stat sync taskset; do
   command -v "$dep" > /dev/null 2>&1 || diag_die "missing required command: $dep"
 done
 
@@ -530,6 +560,9 @@ DIAG_COMMANDS_LOG="$FREQUENCY_STAGE_DIR/commands.log"
 : > "$DIAG_COMMANDS_LOG"
 chmod 0600 "$DIAG_COMMANDS_LOG"
 printf '# frequency-ab %s\n' "$(date -Is)" > "$DIAG_COMMANDS_LOG"
+frequency_publish_control_write \
+  "$FREQUENCY_STAGE_DIR/$FREQUENCY_PUBLISH_CONTROL_NAME" "$FREQUENCY_GENERATION" "$CAP_REQUESTED" ||
+  diag_die "could not durably record the frequency publication inventory"
 frequency_stage_record_write "$BUNDLE" ||
   diag_die "could not durably record the frequency output staging transaction"
 

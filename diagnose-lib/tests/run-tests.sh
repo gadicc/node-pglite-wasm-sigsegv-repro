@@ -73,6 +73,21 @@ COMPLETED=1
 EOF
 }
 
+prepare_frequency_publish_stage() {
+  local stage="$1" cap_requested="$2"
+  mkdir -p "$stage/results" "$stage/freq"
+  chmod 0700 "$stage" "$stage/results" "$stage/freq"
+  printf 'new A/B/A evidence\n' > "$stage/results/frequency-ab.tsv"
+  printf 'new command\n' > "$stage/commands.log"
+  {
+    printf 'VERSION=1\n'
+    printf 'GENERATION=0123456789abcdef0123456789abcdef\n'
+    printf 'CAP_REQUESTED=%s\n' "$cap_requested"
+  } > "$stage/publish-control.meta"
+  chmod 0600 "$stage/results/frequency-ab.tsv" "$stage/commands.log" \
+    "$stage/publish-control.meta"
+}
+
 # Shared real/alternate CPU fixtures for persisted selection-policy tests.
 TEST_ONLINE_CPUS="$(sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' /proc/self/status)"
 TEST_ONLINE_CPU="$(diag_cpulist_expand "$TEST_ONLINE_CPUS" | head -1)"
@@ -813,6 +828,15 @@ check_eq "frequency applicability refusal creates and publishes no new stage" "0
     ! -e "$FREQUENCY_INITIAL/absent-cap-stage" ]]
 ) > /dev/null 2>&1
 check_eq "frequency --cap target refusal creates and publishes no new stage" "0" "$?"
+(
+  FREQUENCY_AB_SOURCE_ONLY=1
+  source "$REPO_ROOT/frequency-ab.sh"
+  control="$FREQUENCY_INITIAL/publish-control.meta"
+  frequency_publish_control_write "$control" 0123456789abcdef0123456789abcdef 0
+  [[ "$(stat -Lc '%a:%h' "$control")" == "600:1" ]] &&
+    [[ "$(cat "$control")" == $'VERSION=1\nGENERATION=0123456789abcdef0123456789abcdef\nCAP_REQUESTED=0' ]]
+) > /dev/null 2>&1
+check_eq "frequency producer writes a strict private publication control" "0" "$?"
 if ((EUID != 0)); then
   (cd "$REPO_ROOT" && bash ./frequency-ab.sh 19 1 "$TMP") > /dev/null 2>&1
   check_eq "frequency-ab.sh refuses non-root (rc=4)" "4" "$?"
@@ -853,6 +877,114 @@ if ((EUID != 0)); then
     [[ ! -e "$PUBLISH_BUNDLE/state/phase-frequency.done" ]] &&
     [[ ! -e "$PUBLISH_STAGE" ]] && publish_safe=1
   check_eq "frequency publisher replaces a raced symlink and invalidates the old marker" "1" "$publish_safe"
+
+  NO_CAP_BUNDLE="$TMP/frequency-no-cap-bundle"
+  NO_CAP_STAGE="$TMP/frequency-no-cap-stage"
+  mkdir -p "$NO_CAP_BUNDLE/results" "$NO_CAP_BUNDLE/freq" "$NO_CAP_BUNDLE/state"
+  prepare_frequency_publish_stage "$NO_CAP_STAGE" 0
+  printf 'old cap rows\n' > "$NO_CAP_BUNDLE/results/frequency-cap.tsv"
+  printf 'old cap meta\n' > "$NO_CAP_BUNDLE/results/frequency-cap.meta"
+  printf 'old cap method\n' > "$NO_CAP_BUNDLE/freq/freq-ab-cap.method"
+  printf 'safe stale-cap victim\n' > "$TMP/frequency-stale-cap-victim"
+  ln -s "$TMP/frequency-stale-cap-victim" "$NO_CAP_BUNDLE/freq/freq-ab-cap.samples"
+  printf 'keep me\n' > "$NO_CAP_BUNDLE/results/unrelated.txt"
+  touch "$NO_CAP_BUNDLE/state/phase-frequency.done"
+  bash "$LIB/publish-frequency-output.sh" "$NO_CAP_STAGE" "$NO_CAP_BUNDLE" > /dev/null 2>&1
+  no_cap_publish_rc=$?
+  check_eq "explicit no-cap publication removes only stale cap artifacts" "1" \
+    "$([[ $no_cap_publish_rc -eq 0 && ! -e "$NO_CAP_BUNDLE/results/frequency-cap.tsv" && ! -e "$NO_CAP_BUNDLE/results/frequency-cap.meta" && ! -e "$NO_CAP_BUNDLE/freq/freq-ab-cap.samples" && ! -e "$NO_CAP_BUNDLE/freq/freq-ab-cap.method" && "$(cat "$TMP/frequency-stale-cap-victim")" == "safe stale-cap victim" && "$(cat "$NO_CAP_BUNDLE/results/unrelated.txt")" == "keep me" && ! -e "$NO_CAP_BUNDLE/state/phase-frequency.done" && ! -e "$NO_CAP_STAGE" ]] && echo 1 || echo 0)"
+
+  PRESERVE_CAP_BUNDLE="$TMP/frequency-preserve-cap-bundle"
+  mkdir -p "$PRESERVE_CAP_BUNDLE/results" "$PRESERVE_CAP_BUNDLE/freq"
+  printf 'old cap rows\n' > "$PRESERVE_CAP_BUNDLE/results/frequency-cap.tsv"
+  CAP_REQUESTED_STAGE="$TMP/frequency-cap-requested-stage"
+  prepare_frequency_publish_stage "$CAP_REQUESTED_STAGE" 1
+  bash "$LIB/publish-frequency-output.sh" "$CAP_REQUESTED_STAGE" "$PRESERVE_CAP_BUNDLE" > /dev/null 2>&1
+  cap_requested_publish_rc=$?
+  LEGACY_STAGE="$TMP/frequency-legacy-publish-stage"
+  prepare_frequency_publish_stage "$LEGACY_STAGE" 0
+  rm -f "$LEGACY_STAGE/publish-control.meta"
+  bash "$LIB/publish-frequency-output.sh" "$LEGACY_STAGE" "$PRESERVE_CAP_BUNDLE" > /dev/null 2>&1
+  legacy_publish_rc=$?
+  check_eq "cap-requested and legacy stages never delete absent cap artifacts" "1" \
+    "$([[ $cap_requested_publish_rc -eq 0 && $legacy_publish_rc -eq 0 && "$(cat "$PRESERVE_CAP_BUNDLE/results/frequency-cap.tsv")" == "old cap rows" ]] && echo 1 || echo 0)"
+
+  UNSAFE_CAP_BUNDLE="$TMP/frequency-unsafe-cap-bundle"
+  UNSAFE_CAP_STAGE="$TMP/frequency-unsafe-cap-stage"
+  mkdir -p "$UNSAFE_CAP_BUNDLE/results/frequency-cap.tsv" "$UNSAFE_CAP_BUNDLE/freq" \
+    "$UNSAFE_CAP_BUNDLE/state"
+  prepare_frequency_publish_stage "$UNSAFE_CAP_STAGE" 0
+  printf 'old A/B/A evidence\n' > "$UNSAFE_CAP_BUNDLE/results/frequency-ab.tsv"
+  touch "$UNSAFE_CAP_BUNDLE/state/phase-frequency.done"
+  bash "$LIB/publish-frequency-output.sh" "$UNSAFE_CAP_STAGE" "$UNSAFE_CAP_BUNDLE" > /dev/null 2>&1
+  unsafe_cap_publish_rc=$?
+  check_eq "unsafe stale cap destination aborts before marker or evidence mutation" "1" \
+    "$([[ $unsafe_cap_publish_rc -ne 0 && -f "$UNSAFE_CAP_BUNDLE/state/phase-frequency.done" && "$(cat "$UNSAFE_CAP_BUNDLE/results/frequency-ab.tsv")" == "old A/B/A evidence" && -f "$UNSAFE_CAP_STAGE/results/frequency-ab.tsv" && -d "$UNSAFE_CAP_BUNDLE/results/frequency-cap.tsv" ]] && echo 1 || echo 0)"
+
+  MALFORMED_CONTROL_BUNDLE="$TMP/frequency-malformed-control-bundle"
+  MALFORMED_CONTROL_STAGE="$TMP/frequency-malformed-control-stage"
+  mkdir -p "$MALFORMED_CONTROL_BUNDLE/results" "$MALFORMED_CONTROL_BUNDLE/freq" \
+    "$MALFORMED_CONTROL_BUNDLE/state"
+  prepare_frequency_publish_stage "$MALFORMED_CONTROL_STAGE" 0
+  printf 'CAP_REQUESTED=0\n' >> "$MALFORMED_CONTROL_STAGE/publish-control.meta"
+  touch "$MALFORMED_CONTROL_BUNDLE/state/phase-frequency.done"
+  bash "$LIB/publish-frequency-output.sh" "$MALFORMED_CONTROL_STAGE" "$MALFORMED_CONTROL_BUNDLE" > /dev/null 2>&1
+  malformed_control_rc=$?
+  check_eq "malformed publication control fails before marker invalidation" "1" \
+    "$([[ $malformed_control_rc -ne 0 && -f "$MALFORMED_CONTROL_BUNDLE/state/phase-frequency.done" && -f "$MALFORMED_CONTROL_STAGE/results/frequency-ab.tsv" ]] && echo 1 || echo 0)"
+
+  UNTERMINATED_CONTROL_BUNDLE="$TMP/frequency-unterminated-control-bundle"
+  UNTERMINATED_CONTROL_STAGE="$TMP/frequency-unterminated-control-stage"
+  mkdir -p "$UNTERMINATED_CONTROL_BUNDLE/results" "$UNTERMINATED_CONTROL_BUNDLE/freq" \
+    "$UNTERMINATED_CONTROL_BUNDLE/state"
+  prepare_frequency_publish_stage "$UNTERMINATED_CONTROL_STAGE" 0
+  printf 'VERSION=1\nGENERATION=0123456789abcdef0123456789abcdef\nCAP_REQUESTED=0' \
+    > "$UNTERMINATED_CONTROL_STAGE/publish-control.meta"
+  touch "$UNTERMINATED_CONTROL_BUNDLE/state/phase-frequency.done"
+  bash "$LIB/publish-frequency-output.sh" \
+    "$UNTERMINATED_CONTROL_STAGE" "$UNTERMINATED_CONTROL_BUNDLE" > /dev/null 2>&1
+  unterminated_control_rc=$?
+  check_eq "unterminated publication control fails bounded preflight" "1" \
+    "$([[ $unterminated_control_rc -ne 0 && -f "$UNTERMINATED_CONTROL_BUNDLE/state/phase-frequency.done" && -f "$UNTERMINATED_CONTROL_STAGE/results/frequency-ab.tsv" ]] && echo 1 || echo 0)"
+  printf 'VERSION=1\nGENERATION=0123456789abcdef0123456789abcdef\nCAP_REQUESTED=0\0' \
+    > "$UNTERMINATED_CONTROL_STAGE/publish-control.meta"
+  bash "$LIB/publish-frequency-output.sh" \
+    "$UNTERMINATED_CONTROL_STAGE" "$UNTERMINATED_CONTROL_BUNDLE" > /dev/null 2>&1
+  nul_control_rc=$?
+  check_eq "NUL-terminated 70-byte publication control fails canonical preflight" "1" \
+    "$([[ $nul_control_rc -ne 0 && "$(stat -Lc '%s' "$UNTERMINATED_CONTROL_STAGE/publish-control.meta")" == 70 && -f "$UNTERMINATED_CONTROL_BUNDLE/state/phase-frequency.done" && -f "$UNTERMINATED_CONTROL_STAGE/results/frequency-ab.tsv" ]] && echo 1 || echo 0)"
+
+  CAP_DELETE_BUNDLE="$TMP/frequency-cap-delete-retry-bundle"
+  CAP_DELETE_STAGE="$TMP/frequency-cap-delete-retry-stage"
+  mkdir -p "$CAP_DELETE_BUNDLE/results" "$CAP_DELETE_BUNDLE/freq" "$CAP_DELETE_BUNDLE/state"
+  prepare_frequency_publish_stage "$CAP_DELETE_STAGE" 0
+  for cap_file in results/frequency-cap.tsv results/frequency-cap.meta \
+    freq/freq-ab-cap.samples freq/freq-ab-cap.method; do
+    printf 'stale cap\n' > "$CAP_DELETE_BUNDLE/$cap_file"
+  done
+  touch "$CAP_DELETE_BUNDLE/state/phase-frequency.done"
+  DIAG_TEST_FREQUENCY_PUBLISH_KILL_AFTER_FIRST_CAP_DELETE=1 \
+    bash "$LIB/publish-frequency-output.sh" "$CAP_DELETE_STAGE" "$CAP_DELETE_BUNDLE" \
+    > /dev/null 2>&1
+  cap_delete_kill_rc=$?
+  cap_files_after_kill=0
+  for cap_file in results/frequency-cap.tsv results/frequency-cap.meta \
+    freq/freq-ab-cap.samples freq/freq-ab-cap.method; do
+    [[ -e "$CAP_DELETE_BUNDLE/$cap_file" || -L "$CAP_DELETE_BUNDLE/$cap_file" ]] &&
+      cap_files_after_kill=$((cap_files_after_kill + 1))
+  done
+  control_survived=0
+  [[ -f "$CAP_DELETE_STAGE/publish-control.meta" ]] && control_survived=1
+  bash "$LIB/publish-frequency-output.sh" "$CAP_DELETE_STAGE" "$CAP_DELETE_BUNDLE" > /dev/null 2>&1
+  cap_delete_retry_rc=$?
+  cap_files_after_retry=0
+  for cap_file in results/frequency-cap.tsv results/frequency-cap.meta \
+    freq/freq-ab-cap.samples freq/freq-ab-cap.method; do
+    [[ -e "$CAP_DELETE_BUNDLE/$cap_file" || -L "$CAP_DELETE_BUNDLE/$cap_file" ]] &&
+      cap_files_after_retry=$((cap_files_after_retry + 1))
+  done
+  check_eq "SIGKILL after one stale cap deletion retries from durable control" "1" \
+    "$([[ $cap_delete_kill_rc -ne 0 && $cap_files_after_kill -eq 3 && $control_survived -eq 1 && ! -e "$CAP_DELETE_BUNDLE/state/phase-frequency.done" && $cap_delete_retry_rc -eq 0 && $cap_files_after_retry -eq 0 && ! -e "$CAP_DELETE_STAGE" ]] && echo 1 || echo 0)"
 
   COMMAND_LINK_BUNDLE="$TMP/frequency-command-link-bundle"
   COMMAND_LINK_STAGE="$TMP/frequency-command-link-stage"
