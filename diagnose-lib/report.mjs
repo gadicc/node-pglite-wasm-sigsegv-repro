@@ -315,11 +315,11 @@ export function renderReport(results) {
     const g = r.gdb;
     L.push(`Fault captured on CPU ${g.cpu} (pinned by taskset, so the faulting CPU is known by construction).`);
     L.push("");
-    L.push("| Capture | Instruction | Intended addr | si_addr | Diff | Differing bits | Intended mapped/writable | si_addr mapped | Classification |");
+    L.push("| Capture | Instruction | Intended addr | si_addr (source) | Diff | Differing bits | Intended mapped/writable | si_addr mapped | Classification |");
     L.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
     for (const c of g.captures) {
       L.push(
-        `| \`${c.file}\` | \`${c.instruction ?? "?"}\` | ${c.intendedAddr ?? "—"} | ${c.siAddr ?? "—"} | ${c.addrDiffHex ?? "—"} | ${c.diffBits?.length ? c.diffBits.join(",") : "—"} | ${c.intendedMapped === null ? "—" : `${c.intendedMapped}/${c.intendedWritable}`} | ${c.siAddrMapped === null ? "—" : c.siAddrMapped} | ${c.classification} |`,
+        `| \`${c.file}\` | \`${c.instruction ?? "?"}\` | ${c.intendedAddr ?? "—"} | ${c.siAddr ?? "—"} (${c.siAddrSource ?? "unknown"}) | ${c.addrDiffHex ?? "—"} | ${c.diffBits?.length ? c.diffBits.join(",") : "—"} | ${c.intendedMapped === null ? "—" : `${c.intendedMapped}/${c.intendedWritable}`} | ${c.siAddrMapped === null ? "—" : c.siAddrMapped} | ${c.classification} |`,
       );
     }
     L.push("");
@@ -494,7 +494,7 @@ function renderConclusions(r) {
         parts.push(`${known.length} capture(s) match the documented pattern: mapped/writable intended address plus an unmapped fault address at intended + 2^42`);
       }
       if (unverified.length > 0) {
-        parts.push(`${unverified.length} capture(s) match the +2^42 arithmetic but do not verify all mapping preconditions (intended mapped/writable and shifted address unmapped; see phase 6), so they are NOT confirmed signature matches`);
+        parts.push(`${unverified.length} capture(s) match the +2^42 arithmetic but do not verify every signature precondition (explicit si_addr provenance, intended mapped/writable, and shifted address unmapped; see phase 6), so they are NOT confirmed signature matches`);
       }
       if (manual.length > 0) {
         parts.push(`${manual.length} capture(s) need manual classification (see phase 6)`);

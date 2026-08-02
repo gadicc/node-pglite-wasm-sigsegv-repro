@@ -306,6 +306,7 @@ test("parseGdbCapture: known +2^42 signature (real transcript)", () => {
   assert.equal(r.registers.r13, "0x6720080");
   assert.equal(r.rip, "0x00007fffd7dcfc74");
   assert.equal(r.siAddr, "0x40006720240");
+  assert.equal(r.siAddrSource, "explicit");
   assert.equal(r.intendedAddr, "0x6720240");
   assert.equal(r.intendedMapped, true);
   assert.equal(r.intendedWritable, true);
@@ -355,6 +356,42 @@ test("parseGdbCapture: bit-flip arithmetic without mapping data is unverified", 
   assert.ok(r.notes.some((n) => n.includes("mapping preconditions are not verified")));
 });
 
+test("parseGdbCapture: explicit nil SI_ADDR cannot be overwritten by CR2-like values", () => {
+  const text = readFixture("gdb-known.txt").replace(
+    "SI_ADDR=0x40006720240",
+    "SI_ADDR=(nil)\n$1 = 0x40006720240\nCR2=0x40006720240",
+  );
+  const r = parseGdbCapture(text);
+  assert.equal(r.siAddr, null);
+  assert.equal(r.siAddrSource, "explicit-nil");
+  assert.equal(r.cr2, "0x40006720240");
+  assert.equal(r.cr2Source, "explicit");
+  assert.equal(r.matchesKnownArithmetic, false);
+  assert.equal(r.matchesKnownSignature, false);
+  assert.equal(r.classification, "manual");
+  assert.ok(r.notes.some((note) => note.includes("explicitly reported as nil")));
+});
+
+test("parseGdbCapture: legacy $1 fallback is retained but cannot confirm signature", () => {
+  const text = readFixture("gdb-known.txt").replace("SI_ADDR=", "$1 = ");
+  const r = parseGdbCapture(text);
+  assert.equal(r.siAddr, "0x40006720240");
+  assert.equal(r.siAddrSource, "legacy-convenience");
+  assert.equal(r.matchesKnownArithmetic, true);
+  assert.equal(r.matchesKnownSignature, false);
+  assert.equal(r.classification, "bit-flip-unverified");
+  assert.ok(r.notes.some((note) => note.includes("ambiguous legacy GDB convenience variable")));
+});
+
+test("parseGdbCapture: unrelated convenience variables are not SI_ADDR fallback", () => {
+  const text = readFixture("gdb-known.txt").replace("SI_ADDR=0x40006720240", "$2 = 0x40006720240");
+  const r = parseGdbCapture(text);
+  assert.equal(r.siAddr, null);
+  assert.equal(r.siAddrSource, null);
+  assert.equal(r.matchesKnownArithmetic, false);
+  assert.equal(r.matchesKnownSignature, false);
+});
+
 test("parseGdbCapture: bit-flip into a non-writable mapping is unverified", () => {
   const text = readFixture("gdb-known.txt").replace("rw-p  [heap]", "r--p  [heap]");
   const r = parseGdbCapture(text);
@@ -393,7 +430,7 @@ test("parseGdbCapture: mapped shifted address is not a confirmed signature", () 
 
 test("parseGdbCapture: arithmetic mismatch stays manual", () => {
   // si_addr = intended + 0x100 (single differing bit 8, not the signature).
-  const text = readFixture("gdb-known.txt").replace("$1 = 0x40006720240", "$1 = 0x6720340");
+  const text = readFixture("gdb-known.txt").replace("SI_ADDR=0x40006720240", "SI_ADDR=0x6720340");
   const r = parseGdbCapture(text);
   assert.equal(r.knownInstruction, true);
   assert.equal(r.intendedMapped, true);

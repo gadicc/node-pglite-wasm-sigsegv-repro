@@ -46,8 +46,10 @@ export function parseGdbCapture(text) {
     instruction: null,
     registers: {},
     siAddr: null,
+    siAddrSource: null,
     cr2: null,
-    cr2Note: "not exposed by ptrace/gdb on Linux x86-64; si_addr is equivalent",
+    cr2Source: null,
+    cr2Note: null,
     threadCount: 0,
     processId: null,
     mappings: [],
@@ -67,6 +69,8 @@ export function parseGdbCapture(text) {
 
   let inMappings = false;
   let mappingHeaderSeen = false;
+  let sawInstruction = false;
+  const explicitSiAddrSeen = lines.some((line) => /^SI_ADDR=/.test(line));
 
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
@@ -101,21 +105,37 @@ export function parseGdbCapture(text) {
     if (m) {
       out.instructionRaw = m[1].trim();
       out.instruction = normalizeInstruction(m[1]);
+      sawInstruction = true;
       continue;
     }
 
     // Explicit label printed by the improved capture-fault.sh.
-    m = line.match(/^SI_ADDR=(0x[0-9a-f]+)\s*$/);
+    m = line.match(/^SI_ADDR=(0x[0-9a-fA-F]+|\(nil\))\s*$/);
     if (m) {
-      out.siAddr = m[1];
+      if (out.siAddrSource === null) {
+        out.siAddrSource = m[1] === "(nil)" ? "explicit-nil" : "explicit";
+        out.siAddr = m[1] === "(nil)" ? null : m[1].toLowerCase();
+      } else {
+        out.notes.push("duplicate SI_ADDR label ignored (first occurrence kept)");
+      }
       continue;
     }
 
-    // Backward compatible: first convenience variable holding an address
-    // (the original capture-fault.sh printed si_addr as $1).
-    m = line.match(/^\$\d+ = (0x[0-9a-f]+)\s*$/);
-    if (m && out.siAddr === null) {
-      out.siAddr = m[1];
+    m = line.match(/^CR2=(0x[0-9a-fA-F]+|\(nil\))\s*$/);
+    if (m) {
+      out.cr2Source = m[1] === "(nil)" ? "explicit-nil" : "explicit";
+      out.cr2 = m[1] === "(nil)" ? null : m[1].toLowerCase();
+      continue;
+    }
+
+    // Backward compatibility for the original capture script, which printed
+    // si_addr as GDB's first convenience variable. This source is ambiguous
+    // with other `p` commands, so it is retained for arithmetic/manual review
+    // but can never confirm the known signature.
+    m = line.match(/^\$1 = (0x[0-9a-fA-F]+)\s*$/);
+    if (m && !explicitSiAddrSeen && sawInstruction && !inMappings && out.siAddrSource === null) {
+      out.siAddr = m[1].toLowerCase();
+      out.siAddrSource = "legacy-convenience";
       continue;
     }
 
@@ -148,6 +168,12 @@ export function parseGdbCapture(text) {
       }
       continue;
     }
+  }
+
+  if (out.cr2Source === null) {
+    out.cr2Note = "CR2 was not explicitly available in this transcript";
+  } else if (out.cr2Source === "explicit-nil") {
+    out.cr2Note = "CR2 was explicitly reported as unavailable";
   }
 
   if (!out.captured) {
@@ -207,7 +233,8 @@ export function parseGdbCapture(text) {
           if (
             out.intendedMapped === true &&
             out.intendedWritable === true &&
-            out.siAddrMapped === false
+            out.siAddrMapped === false &&
+            out.siAddrSource === "explicit"
           ) {
             out.matchesKnownSignature = true;
             out.classification = "known-signature";
@@ -221,7 +248,9 @@ export function parseGdbCapture(text) {
                   ? "intended mapping is not writable"
                   : out.siAddrMapped === true
                     ? "shifted fault address is itself mapped"
-                    : "shifted fault address mapping state is unknown";
+                    : out.siAddrMapped !== false
+                      ? "shifted fault address mapping state is unknown"
+                      : "fault address came from an ambiguous legacy GDB convenience variable";
             out.notes.push(
               `si_addr matches the +2^42 single-bit-42 arithmetic, but the mapping preconditions are not verified: ${reason}`,
             );
@@ -232,7 +261,11 @@ export function parseGdbCapture(text) {
           );
         }
       } else {
-        out.notes.push("si_addr not found in transcript");
+        out.notes.push(
+          out.siAddrSource === "explicit-nil"
+            ? "si_addr was explicitly reported as nil"
+            : "si_addr not found in transcript",
+        );
       }
       break;
     }

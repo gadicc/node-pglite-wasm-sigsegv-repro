@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Capture pristine SIGSEGV fault context from child.mjs pinned to one CPU.
 # Stops the fault before Node's trap handler runs (handle SIGSEGV stop nopass)
-# and records backtrace, registers, faulting instruction, si_addr, a CR2
-# attempt, threads, and proc mappings. Transcripts of clean runs are deleted;
+# and records backtrace, registers, faulting instruction, explicitly labelled
+# si_addr/CR2 values, threads, and proc mappings. Transcripts of clean runs are deleted;
 # transcripts of capture and runner-error runs are kept.
 #
 # Usage: ./capture-fault.sh <cpu> <max-runs> <max-captures> <out-dir>
@@ -72,7 +72,7 @@ for ((run = 1; run <= max_runs; run++)); do
       -ex "info registers" \
       -ex "x/2i \$pc" \
       -ex "printf \"SI_ADDR=%p\n\", (void*)\$_siginfo._sifields._sigfault.si_addr" \
-      -ex "p/x \$cr2" \
+      -ex "printf \"CR2=%p\n\", (void*)\$cr2" \
       -ex "info threads" \
       -ex "info proc mappings" \
       --args "$node_bin" child.mjs
