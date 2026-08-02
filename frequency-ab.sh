@@ -37,6 +37,7 @@ DIAG_RESTORE_FILE=""
 FREQUENCY_STAGE_DIR=""
 FREQUENCY_STAGE_RECORD=""
 FREQUENCY_OUTPUTS_PUBLISHED=0
+FREQUENCY_OUTPUT_CLEANUP_ARMED=0
 INVOKING_UID=""
 INVOKING_GID=""
 FREQUENCY_STATE_UID=""
@@ -223,7 +224,46 @@ frequency_recover_pending_outputs() {
   FREQUENCY_OUTPUTS_PUBLISHED=0
 }
 
+frequency_initial_no_turbo_read() {
+  local path="$1" output_name="$2"
+  local -n output_ref="$output_name"
+  local -a lines=()
+  output_ref=""
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  mapfile -t lines < "$path" || return 1
+  ((${#lines[@]} == 1)) || return 1
+  [[ "${lines[0]}" == 0 || "${lines[0]}" == 1 ]] || return 1
+  output_ref="${lines[0]}"
+}
+
+# A killed prior invocation may have left no_turbo=1 together with durable
+# restore/output state. Main calls this before any new applicability decision.
+frequency_recover_prior_state() {
+  diag_recover_pending_restore || return 10
+  frequency_recover_pending_outputs || return 11
+}
+
+frequency_validate_initial_no_turbo() {
+  local path="$1" output_name="$2"
+  local -n output_ref="$output_name"
+  output_ref=""
+  frequency_initial_no_turbo_read "$path" "$output_name" || return 12
+  [[ "$output_ref" == 0 ]] || return 13
+}
+
+frequency_not_applicable() {
+  local message="$1"
+  # No stage exists at this decision point. Clear its deterministic future
+  # path so the EXIT cleanup does not mistake deliberate refusal for lost
+  # partial evidence and try to publish it.
+  FREQUENCY_STAGE_DIR=""
+  FREQUENCY_OUTPUT_CLEANUP_ARMED=0
+  echo "error: $message" >&2
+  return 4
+}
+
 diag_cleanup_artifacts() {
+  ((FREQUENCY_OUTPUT_CLEANUP_ARMED == 1)) || return 0
   frequency_publish_outputs
 }
 
@@ -344,12 +384,37 @@ done
 diag_restore_rules_set "${restore_rules[@]}" ||
   diag_die "could not configure the trusted restore allowlist"
 
-# SIGKILL cannot run a trap. Recover any durable ledger left by a previous
-# killed invocation before replacing output files or saving new state.
-diag_recover_pending_restore ||
-  diag_die "refusing to start while a previous settings restore is pending"
-frequency_recover_pending_outputs ||
-  diag_die "refusing to start while prior frequency staging cannot be safely recovered"
+# Recovery always precedes legacy-bundle and new-experiment applicability
+# checks, because restoring settings and publishing an older durable stage are
+# required even when this invocation will refuse to start new work.
+recovery_rc=0
+frequency_recover_prior_state || recovery_rc=$?
+case "$recovery_rc" in
+  0) ;;
+  10) diag_die "refusing to start while a previous settings restore is pending" ;;
+  11) diag_die "refusing to start while prior frequency staging cannot be safely recovered" ;;
+  *) diag_die "could not recover prior frequency experiment state" ;;
+esac
+
+# Validate the recovered state before any check or mutation associated with a
+# new experiment. Refusal happens before saving a new restore entry, changing
+# a setting, or creating a new frequency result stage.
+SAVED_NO_TURBO=""
+initial_state_rc=0
+frequency_validate_initial_no_turbo "$NO_TURBO_PATH" SAVED_NO_TURBO ||
+  initial_state_rc=$?
+case "$initial_state_rc" in
+  0) ;;
+  12)
+    frequency_not_applicable \
+      "intel_pstate/no_turbo must contain exactly 0 or 1; A/B/A is not applicable." || exit $?
+    ;;
+  13)
+    frequency_not_applicable \
+      "intel_pstate/no_turbo is already 1; A/B/A needs turbo-on A1/A2 conditions." || exit $?
+    ;;
+  *) diag_die "could not validate the initial intel_pstate/no_turbo state" ;;
+esac
 
 # Older versions placed restore authority in the bundle. It is intentionally
 # never trusted or migrated by this privileged script.
@@ -377,6 +442,7 @@ mkdir -m 0700 -- "$FREQUENCY_STAGE_DIR" ||
 [[ "$(stat -Lc '%u:%g:%a' -- "$FREQUENCY_STAGE_DIR" 2> /dev/null)" == "0:0:700" ]] ||
   diag_die "frequency output staging directory is not root-owned and mode 0700"
 mkdir -m 0700 -- "$FREQUENCY_STAGE_DIR/results" "$FREQUENCY_STAGE_DIR/freq"
+FREQUENCY_OUTPUT_CLEANUP_ARMED=1
 DIAG_FREQ_DIR="$FREQUENCY_STAGE_DIR/freq"
 DIAG_COMMANDS_LOG="$FREQUENCY_STAGE_DIR/commands.log"
 : > "$DIAG_COMMANDS_LOG"
@@ -392,7 +458,6 @@ META="$FREQUENCY_STAGE_DIR/results/frequency-ab.meta"
 : > "$TSV"
 chmod 0600 "$TSV"
 
-SAVED_NO_TURBO="$(cat "$NO_TURBO_PATH")"
 diag_restore_save "$NO_TURBO_PATH"
 diag_log "saved no_turbo=$SAVED_NO_TURBO (restored on exit/interrupt)"
 

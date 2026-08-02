@@ -591,6 +591,96 @@ bash "$REPO_ROOT/frequency-ab.sh" > /dev/null 2>&1
 check_eq "frequency-ab.sh usage error (rc=2)" "2" "$?"
 bash "$REPO_ROOT/root-checks.sh" > /dev/null 2>&1
 check_eq "root-checks.sh usage error (rc=2)" "2" "$?"
+
+FREQUENCY_INITIAL="$TMP/frequency-initial-state"
+mkdir -p "$FREQUENCY_INITIAL"
+(
+  FREQUENCY_AB_SOURCE_ONLY=1
+  source "$REPO_ROOT/frequency-ab.sh"
+  printf '0\n' > "$FREQUENCY_INITIAL/no-turbo"
+  value=""
+  frequency_initial_no_turbo_read "$FREQUENCY_INITIAL/no-turbo" value
+  [[ "$value" == 0 ]]
+) > /dev/null 2>&1
+check_eq "frequency A/B/A accepts canonical initial no_turbo=0" "0" "$?"
+
+frequency_initial_invalid=1
+for value in 01 '0 ' 2 ''; do
+  printf '%s\n' "$value" > "$FREQUENCY_INITIAL/no-turbo"
+  (
+    FREQUENCY_AB_SOURCE_ONLY=1
+    source "$REPO_ROOT/frequency-ab.sh"
+    parsed=""
+    frequency_initial_no_turbo_read "$FREQUENCY_INITIAL/no-turbo" parsed
+  ) > /dev/null 2>&1 && frequency_initial_invalid=0
+done
+printf '0\n\n' > "$FREQUENCY_INITIAL/no-turbo"
+(
+  FREQUENCY_AB_SOURCE_ONLY=1
+  source "$REPO_ROOT/frequency-ab.sh"
+  parsed=""
+  frequency_initial_no_turbo_read "$FREQUENCY_INITIAL/no-turbo" parsed
+) > /dev/null 2>&1 && frequency_initial_invalid=0
+(
+  FREQUENCY_AB_SOURCE_ONLY=1
+  source "$REPO_ROOT/frequency-ab.sh"
+  parsed=""
+  frequency_initial_no_turbo_read "$FREQUENCY_INITIAL/missing" parsed
+) > /dev/null 2>&1 && frequency_initial_invalid=0
+printf '0\n' > "$FREQUENCY_INITIAL/no-turbo-target"
+ln -s "$FREQUENCY_INITIAL/no-turbo-target" "$FREQUENCY_INITIAL/no-turbo-link"
+(
+  FREQUENCY_AB_SOURCE_ONLY=1
+  source "$REPO_ROOT/frequency-ab.sh"
+  parsed=""
+  frequency_initial_no_turbo_read "$FREQUENCY_INITIAL/no-turbo-link" parsed
+) > /dev/null 2>&1 && frequency_initial_invalid=0
+check_eq "frequency A/B/A rejects noncanonical or unsafe initial no_turbo sources" "1" "$frequency_initial_invalid"
+
+printf '1\n' > "$FREQUENCY_INITIAL/no-turbo"
+(
+  FREQUENCY_AB_SOURCE_ONLY=1
+  source "$REPO_ROOT/frequency-ab.sh"
+  recovery_order=""
+  diag_recover_pending_restore() {
+    recovery_order="${recovery_order}restore,"
+    printf '0\n' > "$FREQUENCY_INITIAL/no-turbo"
+  }
+  frequency_recover_pending_outputs() { recovery_order="${recovery_order}stage,"; }
+  parsed=""
+  frequency_recover_prior_state
+  frequency_validate_initial_no_turbo "$FREQUENCY_INITIAL/no-turbo" parsed
+  [[ "$recovery_order" == "restore,stage," && "$parsed" == 0 ]]
+) > /dev/null 2>&1
+check_eq "frequency applicability is evaluated after durable recovery" "0" "$?"
+
+printf '1\n' > "$FREQUENCY_INITIAL/no-turbo"
+(
+  FREQUENCY_AB_SOURCE_ONLY=1
+  source "$REPO_ROOT/frequency-ab.sh"
+  diag_recover_pending_restore() { :; }
+  frequency_recover_pending_outputs() { :; }
+  parsed=""
+  frequency_recover_prior_state
+  frequency_validate_initial_no_turbo "$FREQUENCY_INITIAL/no-turbo" parsed
+) > /dev/null 2>&1
+check_eq "frequency A/B/A refuses an already disabled-turbo initial state" "13" "$?"
+
+(
+  FREQUENCY_AB_SOURCE_ONLY=1
+  source "$REPO_ROOT/frequency-ab.sh"
+  FREQUENCY_STAGE_DIR="$FREQUENCY_INITIAL/absent-new-stage"
+  FREQUENCY_OUTPUT_CLEANUP_ARMED=0
+  refusal_rc=0
+  frequency_not_applicable "test refusal" > /dev/null 2>&1 || refusal_rc=$?
+  publisher_called=0
+  frequency_publish_outputs() { publisher_called=1; }
+  diag_cleanup_artifacts > "$FREQUENCY_INITIAL/refusal-cleanup-output" 2>&1
+  cleanup_output="$(cat "$FREQUENCY_INITIAL/refusal-cleanup-output")"
+  [[ "$refusal_rc" == 4 && -z "$FREQUENCY_STAGE_DIR" && -z "$cleanup_output" &&
+    "$publisher_called" == 0 && ! -e "$FREQUENCY_INITIAL/absent-new-stage" ]]
+) > /dev/null 2>&1
+check_eq "frequency applicability refusal creates and publishes no new stage" "0" "$?"
 if ((EUID != 0)); then
   (cd "$REPO_ROOT" && bash ./frequency-ab.sh 19 1 "$TMP") > /dev/null 2>&1
   check_eq "frequency-ab.sh refuses non-root (rc=4)" "4" "$?"
