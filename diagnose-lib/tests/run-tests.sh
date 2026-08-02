@@ -1046,7 +1046,8 @@ check_eq "privacy scan flags files without copying sentinel values" "1" \
 
 echo "== manifest covers the final bundled log lines =="
 MB="$TMP/manifest-bundle"
-mkdir -p "$MB"
+mkdir -p "$MB/nested"
+printf 'nested historical manifest\n' > "$MB/nested/manifest.txt"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
@@ -1061,8 +1062,29 @@ mkdir -p "$MB"
 check_eq "write_manifest succeeds after the final bundled log lines" "0" "$?"
 check_eq "bundle log redacts local roots" "1" \
   "$([[ "$(grep -Fc "$MB" "$MB/run.log")" == 0 && "$(grep -Fc "$REPO_ROOT" "$MB/run.log")" == 0 && "$(grep -Fc '<bundle>' "$MB/run.log")" -gt 0 ]] && echo 1 || echo 0)"
+grep -q '  \./nested/manifest\.txt$' "$MB/manifest.txt"
+check_eq "manifest excludes only its own top-level output" "0" "$?"
 (cd "$MB" && sha256sum -c manifest.txt) > /dev/null 2>&1
 check_eq "manifest verifies immediately after the run" "0" "$?"
+
+MANIFEST_FAIL_BUNDLE="$TMP/manifest-failure-bundle"
+MANIFEST_FAIL_BIN="$TMP/manifest-failure-bin"
+mkdir -p "$MANIFEST_FAIL_BUNDLE" "$MANIFEST_FAIL_BIN"
+printf 'payload\n' > "$MANIFEST_FAIL_BUNDLE/payload.txt"
+printf 'previous manifest\n' > "$MANIFEST_FAIL_BUNDLE/manifest.txt"
+printf '#!/usr/bin/env bash\nexit 7\n' > "$MANIFEST_FAIL_BIN/sha256sum"
+chmod +x "$MANIFEST_FAIL_BIN/sha256sum"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$MANIFEST_FAIL_BUNDLE"
+  DIAG_LOG_FILE=""
+  PATH="$MANIFEST_FAIL_BIN:$PATH"
+  write_manifest
+) > /dev/null 2>&1
+manifest_failure_rc=$?
+check_eq "failed hash pass preserves the previous manifest atomically" "1" \
+  "$([[ $manifest_failure_rc -ne 0 && "$(cat "$MANIFEST_FAIL_BUNDLE/manifest.txt")" == 'previous manifest' ]] && ! compgen -G "${MANIFEST_FAIL_BUNDLE}.manifest.*" > /dev/null && echo 1 || echo 0)"
 
 echo "== node unit tests (stats, parsers) =="
 if (cd "$LIB" && node --test 'tests/*.test.mjs') > "$TMP/node-tests.log" 2>&1; then

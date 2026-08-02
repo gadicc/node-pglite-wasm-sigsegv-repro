@@ -1173,12 +1173,27 @@ write_manifest() {
   # the log line first, because diag_log appends to run.log, which is
   # itself hashed below.
   diag_log "writing manifest: $OUT_DIR/manifest.txt"
-  (
+  local tmp
+  # Keep the candidate beside (not inside) the bundle: it must not hash
+  # itself, and the final same-filesystem rename must be atomic.
+  tmp="$(mktemp "${OUT_DIR}.manifest.XXXXXX")" || return 1
+  if ! (
     cd "$OUT_DIR"
-    find . -type f ! -name manifest.txt -print0 |
+    find . -type f ! -path './manifest.txt' -print0 |
       sort -z |
-      xargs -0 sha256sum > manifest.txt
-  )
+      xargs -0 sha256sum
+  ) > "$tmp"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  chmod 0644 "$tmp" || {
+    rm -f -- "$tmp"
+    return 1
+  }
+  mv -fT -- "$tmp" "$OUT_DIR/manifest.txt" || {
+    rm -f -- "$tmp"
+    return 1
+  }
 }
 
 persist_session_end() {
