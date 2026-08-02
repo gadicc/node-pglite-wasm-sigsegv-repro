@@ -212,6 +212,32 @@ test("renderReport: incomplete frequency artifacts are excluded from conclusions
   assert.doesNotMatch(md, /Frequency dependence was not tested \(requires/);
 });
 
+test("renderReport: discordant A legs cannot support a pooled suppression claim", () => {
+  const leg = (name, failures, noTurbo) => ({
+    leg: name,
+    runs: 20,
+    failures,
+    sigsegv: failures,
+    invalidRuns: [],
+    noTurbo,
+  });
+  const md = renderReport({
+    collectedAt: "2026-08-02T00:00:00.000Z",
+    config: {},
+    environment: {},
+    frequencyAb: {
+      cpu: 19,
+      restored: true,
+      legs: [leg("A1", 20, 0), leg("B", 0, 1), leg("A2", 0, 0)],
+    },
+  });
+  assert.match(md, /turbo-on legs disagree/);
+  assert.match(md, /reversal failed/);
+  assert.match(md, /no pooled suppression inference/);
+  assert.doesNotMatch(md, /Lower frequency suppressed/);
+  assert.doesNotMatch(md, /Fisher exact test on their pooled/);
+});
+
 test("renderReport: GDB failure is not described as a clean bounded run", () => {
   const md = renderReport({
     collectedAt: "2026-08-02T00:00:00.000Z",

@@ -250,6 +250,13 @@ export function assessFrequencyAb(rows, meta, phaseDone) {
   if (!phaseDone) reasons.push("phase completion marker is missing");
   if (meta.COMPLETED !== "1") reasons.push("frequency metadata is not marked complete");
   if (meta.RESTORED !== "1") reasons.push("frequency settings are not verified as restored");
+  if (
+    meta.LEG_A1_NO_TURBO !== "0" ||
+    meta.LEG_B_NO_TURBO !== "1" ||
+    meta.LEG_A2_NO_TURBO !== "0"
+  ) {
+    reasons.push("A1/B/A2 frequency modes are missing or inconsistent");
+  }
 
   const runs = Number(meta.RUNS_PER_LEG);
   if (!/^\d+$/.test(meta.RUNS_PER_LEG ?? "") || !Number.isSafeInteger(runs) || runs < 1) {

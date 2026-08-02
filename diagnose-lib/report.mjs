@@ -54,6 +54,34 @@ function statsCell(failures, n) {
   return `${failures}/${n} = ${pct(failures / n)} ${ci(failures, n)}`;
 }
 
+function analyzeFrequencyAb(fa) {
+  const a1 = fa.legs.find((leg) => leg.leg === "A1");
+  const b = fa.legs.find((leg) => leg.leg === "B");
+  const a2 = fa.legs.find((leg) => leg.leg === "A2");
+  if (!a1 || !b || !a2) return null;
+  const a1F = a1.sigsegv;
+  const a2F = a2.sigsegv;
+  const bF = b.sigsegv;
+  const aF = a1F + a2F;
+  const aN = a1.runs + a2.runs;
+  const bN = b.runs;
+  const invalid = fa.legs.reduce((sum, leg) => sum + (leg.invalidRuns?.length ?? 0), 0);
+  return {
+    a1,
+    b,
+    a2,
+    a1F,
+    a2F,
+    bF,
+    aF,
+    aN,
+    bN,
+    invalid,
+    bothAReproduced: a1F > 0 && a2F > 0,
+    aLegsDiscordant: (a1F > 0) !== (a2F > 0),
+  };
+}
+
 export function renderReport(results) {
   const r = results;
   const L = [];
@@ -235,21 +263,21 @@ export function renderReport(results) {
       );
     }
     L.push("");
-    const aLegs = fa.legs.filter((l) => l.noTurbo === 0);
-    const bLegs = fa.legs.filter((l) => l.noTurbo === 1);
-    const aF = aLegs.reduce((s, l) => s + l.sigsegv, 0);
-    const aN = aLegs.reduce((s, l) => s + l.runs, 0);
-    const bF = bLegs.reduce((s, l) => s + l.sigsegv, 0);
-    const bN = bLegs.reduce((s, l) => s + l.runs, 0);
-    const invalid = fa.legs.reduce((s, l) => s + (l.invalidRuns?.length ?? 0), 0);
-    if (aN > 0 && bN > 0) {
-      const p = fisherExact2x2(aF, aN - aF, bF, bN - bF);
-      L.push(`Fisher exact test on SIGSEGV counts over valid runs, turbo-on legs (${aF}/${aN}) vs turbo-off leg (${bF}/${bN}): two-sided p = ${p.toExponential(2)}.${invalid > 0 ? ` ${invalid} invalid run(s) excluded (non-SIGSEGV exits).` : ""}`);
-      if (bF === 0 && aF > 0) {
-        const assumed = aF / aN;
+    const fx = analyzeFrequencyAb(fa);
+    if (fx?.aLegsDiscordant) {
+      L.push(`The turbo-on legs disagree (A1 ${fx.a1F}/${fx.a1.runs}, A2 ${fx.a2F}/${fx.a2.runs}). This is compatible with temporal drift or an order effect, so the pooled turbo-on contrast is omitted and no suppression claim is made.`);
+      L.push("");
+    } else if (fx?.bothAReproduced && fx.aN > 0 && fx.bN > 0) {
+      const p = fisherExact2x2(fx.aF, fx.aN - fx.aF, fx.bF, fx.bN - fx.bF);
+      L.push(`Both turbo-on legs reproduced (A1 ${fx.a1F}/${fx.a1.runs}, A2 ${fx.a2F}/${fx.a2.runs}). Fisher exact test on their pooled SIGSEGV counts (${fx.aF}/${fx.aN}) vs turbo-off (${fx.bF}/${fx.bN}): two-sided p = ${p.toExponential(2)}.${fx.invalid > 0 ? ` ${fx.invalid} invalid run(s) excluded (non-SIGSEGV exits).` : ""}`);
+      if (fx.bF === 0) {
+        const assumed = fx.aF / fx.aN;
         L.push(``);
-        L.push(`Separately, *assuming a fixed per-run baseline rate equal to the pooled turbo-on rate* (${pct(assumed)}), the probability of observing 0/${bN} under turbo-off is ${binomZeroProbability(bN, assumed).toExponential(2)} (binomial, assumption stated, not a confidence statement).`);
+        L.push(`Separately, *assuming a fixed per-run baseline rate equal to the pooled turbo-on rate* (${pct(assumed)}), the probability of observing 0/${fx.bN} under turbo-off is ${binomZeroProbability(fx.bN, assumed).toExponential(2)} (binomial, assumption stated, not a confidence statement).`);
       }
+      L.push("");
+    } else if (fx && fx.a1F === 0 && fx.a2F === 0) {
+      L.push(`Neither turbo-on leg reproduced (A1 0/${fx.a1.runs}, A2 0/${fx.a2.runs}); the A/B/A experiment cannot establish suppression.${fx.bF > 0 ? ` The turbo-off leg itself had ${fx.bF}/${fx.bN} SIGSEGV.` : ""}`);
       L.push("");
     }
   } else if (r.frequencyAbStatus?.status === "incomplete") {
@@ -426,24 +454,24 @@ function renderConclusions(r) {
   // are invalid runs and never enter the test.
   if (r.frequencyAb) {
     const fa = r.frequencyAb;
-    const aLegs = fa.legs.filter((l) => l.noTurbo === 0);
-    const bLegs = fa.legs.filter((l) => l.noTurbo === 1);
-    const aF = aLegs.reduce((s, l) => s + l.sigsegv, 0);
-    const aN = aLegs.reduce((s, l) => s + l.runs, 0);
-    const bF = bLegs.reduce((s, l) => s + l.sigsegv, 0);
-    const bN = bLegs.reduce((s, l) => s + l.runs, 0);
-    const invalid = fa.legs.reduce((s, l) => s + (l.invalidRuns?.length ?? 0), 0);
-    const invalidNote = invalid > 0 ? ` ${invalid} invalid run(s) excluded (non-SIGSEGV exits).` : "";
-    if (aN > 0 && bN > 0) {
-      const p = fisherExact2x2(aF, aN - aF, bF, bN - bF);
-      if (aF > 0 && bF === 0 && p < 0.05) {
-        C.push(`- **Frequency dependence**: turbo-on legs produced SIGSEGV in ${aF}/${aN} valid runs while the turbo-off leg was clean (0/${bN}); Fisher exact p = ${p.toExponential(2)}. Lower frequency suppressed the failure in this session, consistent with a frequency/voltage margin rather than hard logic.${invalidNote}`);
-      } else if (aF === 0 && bF === 0) {
-        C.push(`- Frequency A/B/A: no failures in any leg; the test is uninformative for frequency dependence (the defect did not reproduce at baseline during the legs).${invalidNote}`);
-      } else if (bF > 0) {
-        C.push(`- Frequency A/B/A: SIGSEGV occurred even with turbo disabled (${bF}/${bN} vs ${aF}/${aN} valid runs with turbo on; Fisher exact p = ${p.toExponential(2)}). Downclocking alone did not suppress the failure in this session.${invalidNote}`);
+    const fx = analyzeFrequencyAb(fa);
+    if (fx) {
+      const invalidNote = fx.invalid > 0 ? ` ${fx.invalid} invalid run(s) excluded (non-SIGSEGV exits).` : "";
+      if (fx.aLegsDiscordant) {
+        C.push(`- Frequency A/B/A is **inconclusive because the reversal failed**: A1 produced ${fx.a1F}/${fx.a1.runs} SIGSEGV while A2 produced ${fx.a2F}/${fx.a2.runs}. Temporal drift or order confounding cannot be separated from a frequency effect, so no pooled suppression inference is reported.${invalidNote}`);
+      } else if (fx.bothAReproduced && fx.aN > 0 && fx.bN > 0) {
+        const p = fisherExact2x2(fx.aF, fx.aN - fx.aF, fx.bF, fx.bN - fx.bF);
+        if (fx.bF === 0 && p < 0.05) {
+          C.push(`- **Frequency dependence**: both turbo-on legs reproduced (A1 ${fx.a1F}/${fx.a1.runs}, A2 ${fx.a2F}/${fx.a2.runs}) while turbo-off was clean (0/${fx.bN}); pooled Fisher exact p = ${p.toExponential(2)}. The reversible pattern supports suppression at lower frequency in this session, consistent with a frequency/voltage margin rather than hard logic.${invalidNote}`);
+        } else if (fx.bF > 0) {
+          C.push(`- Frequency A/B/A: both turbo-on legs reproduced, but SIGSEGV also occurred with turbo disabled (${fx.bF}/${fx.bN} vs ${fx.aF}/${fx.aN} pooled turbo-on; Fisher exact p = ${p.toExponential(2)}). Downclocking did not fully suppress the failure in this session.${invalidNote}`);
+        } else {
+          C.push(`- Frequency A/B/A showed a reversible pattern (A1 ${fx.a1F}/${fx.a1.runs}, turbo-off 0/${fx.bN}, A2 ${fx.a2F}/${fx.a2.runs}), but the pooled Fisher exact p = ${p.toExponential(2)} is inconclusive at this sample size.${invalidNote}`);
+        }
+      } else if (fx.a1F === 0 && fx.a2F === 0 && fx.bF === 0) {
+        C.push(`- Frequency A/B/A: no failures in any leg; the test is uninformative for frequency dependence (the defect did not reproduce in either turbo-on leg).${invalidNote}`);
       } else {
-        C.push(`- Frequency A/B/A: turbo-on ${aF}/${aN}, turbo-off ${bF}/${bN} (SIGSEGV over valid runs); Fisher exact p = ${p.toExponential(2)} — inconclusive at this sample size.${invalidNote}`);
+        C.push(`- Frequency A/B/A: neither turbo-on leg reproduced, while turbo-off produced ${fx.bF}/${fx.bN} SIGSEGV; this does not support suppression at lower frequency.${invalidNote}`);
       }
     }
   } else if (r.frequencyAbStatus?.status === "incomplete") {

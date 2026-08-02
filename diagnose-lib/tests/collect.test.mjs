@@ -146,6 +146,7 @@ test("assessFrequencyAb: requires completion, restoration, marker, and exact row
   assert.match(partial.reasons.join("; "), /completion marker/);
   assert.match(partial.reasons.join("; "), /not marked complete/);
   assert.match(partial.reasons.join("; "), /not verified as restored/);
+  assert.match(partial.reasons.join("; "), /frequency modes/);
   assert.match(partial.reasons.join("; "), /every expected/);
 
   const complete = assessFrequencyAb(
@@ -154,7 +155,14 @@ test("assessFrequencyAb: requires completion, restoration, marker, and exact row
       ["B", "1", "0", "3"],
       ["A2", "1", "0", "2"],
     ],
-    { RUNS_PER_LEG: "1", RESTORED: "1", COMPLETED: "1" },
+    {
+      RUNS_PER_LEG: "1",
+      RESTORED: "1",
+      COMPLETED: "1",
+      LEG_A1_NO_TURBO: "0",
+      LEG_B_NO_TURBO: "1",
+      LEG_A2_NO_TURBO: "0",
+    },
     true,
   );
   assert.deepEqual(complete, { status: "complete", reasons: [] });
