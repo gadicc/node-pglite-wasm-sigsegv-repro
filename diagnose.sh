@@ -645,13 +645,28 @@ repro_result_is_complete() {
 # Sanitization helpers. The bundle is meant to be shareable, so identifying
 # values are redacted before they reach the env/ files.
 
-# Replace UUID-shaped values (root=UUID=..., rd.luks.uuid=..., ...) and
-# PARTUUID= values with a fixed placeholder. Detection tokens such as
-# tme=off do not match these patterns and must survive untouched.
-diag_redact_cmdline() {
-  sed -E \
-    -e 's/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/<redacted>/g' \
-    -e 's/(PARTUUID=)[^ ]+/\1<redacted>/g'
+# Retain only kernel parameters relevant to CPU/frequency behavior. A
+# denylist cannot anticipate identifiers or credentials carried by arbitrary
+# boot parameters (BOOTIF, machine IDs, network config, disk keys, etc.).
+diag_sanitize_cmdline() {
+  awk '
+    BEGIN {
+      split("tme mktme mem_encrypt intel_pstate amd_pstate intel_idle.max_cstate processor.max_cstate cpufreq.default_governor idle mitigations nosmt maxcpus nr_cpus nohz nohz_full isolcpus rcu_nocbs", names, " ")
+      for (i in names) allowed[names[i]]=1
+    }
+    {
+      for (i=1; i<=NF; i++) {
+        token=$i
+        key=token
+        sub(/=.*/, "", key)
+        if (!allowed[key]) continue
+        if (token !~ /^[A-Za-z0-9_.-]+(=[A-Za-z0-9_,:+.^-]+)?$/) continue
+        if (wrote++) printf " "
+        printf "%s", token
+      }
+    }
+    END { if (wrote) printf "\n" }
+  '
 }
 
 # Substitute a leading $HOME prefix so paths under the user's home directory
@@ -711,10 +726,10 @@ phase_preflight() {
     fi
   done
 
-  # Kernel command line, redacted: it commonly carries root=/resume= UUIDs,
-  # rd.luks.uuid= LUKS UUIDs and PARTUUID= values. The tme=off detection
-  # below reads tokens this redaction does not touch.
-  diag_run cat /proc/cmdline | diag_redact_cmdline > "$env_dir/cmdline.txt"
+  # Kernel command line, allowlisted: arbitrary boot parameters can carry
+  # stable identifiers or credentials, so only CPU/frequency-relevant tokens
+  # are retained. The tme=off detection below reads an allowlisted token.
+  diag_run cat /proc/cmdline | diag_sanitize_cmdline > "$env_dir/cmdline.txt"
   diag_run cat /sys/devices/system/cpu/online > "$env_dir/online.txt" 2> /dev/null || true
 
   # Per-CPU topology table.
@@ -772,8 +787,8 @@ phase_preflight() {
   local dmesg_out=""
   if dmesg_out="$(dmesg 2> /dev/null)" && [[ -n "$dmesg_out" ]]; then
     printf '# source: dmesg (unprivileged)\n' >> "$kw"
-  elif dmesg_out="$(journalctl -k -b --no-pager 2> /dev/null)" && [[ -n "$dmesg_out" ]]; then
-    printf '# source: journalctl -k -b (unprivileged)\n' >> "$kw"
+  elif dmesg_out="$(journalctl -k -b --no-pager -o cat 2> /dev/null)" && [[ -n "$dmesg_out" ]]; then
+    printf '# source: journalctl -k -b -o cat (unprivileged; prefix/hostname omitted)\n' >> "$kw"
   else
     printf '# kernel log unavailable unprivileged; run: sudo ./root-checks.sh <bundle>\n' >> "$kw"
     dmesg_out=""

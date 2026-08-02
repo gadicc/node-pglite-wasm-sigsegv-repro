@@ -75,7 +75,10 @@ stepping, microcode, address sizes, topology (P/E cores, clusters, shared
 L2, cpufreq policies), cpufreq state, `intel_pstate/no_turbo`, power
 source, and relevant kernel warnings (MCE/EDAC/thermal/TME/microcode) from
 unprivileged sources. Service tags, serial numbers, UUIDs, MAC addresses,
-and BIOS passwords are never collected.
+and BIOS passwords are never collected. Kernel-command-line collection uses
+an explicit CPU/frequency allowlist (rather than trying to denylist every
+possible identifier), and journal excerpts use message-only output without
+timestamp/hostname prefixes.
 
 ### Privileged companion scripts (manual, reviewable)
 
