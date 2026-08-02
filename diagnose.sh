@@ -1199,6 +1199,16 @@ finalize_report() {
   write_manifest || diag_die "manifest generation failed"
 }
 
+complete_diagnostic() {
+  # Bundle logging must stop before write_manifest hashes run.log. Emit only
+  # a non-success progress line first, then print success to the terminal
+  # after every finalization step has completed.
+  diag_log "finalizing report and manifest"
+  finalize_report
+  printf '[%s] done. Bundle: %s\n' "$(date '+%H:%M:%S')" "$OUT_DIR"
+  printf '[%s] report: %s/report.md\n' "$(date '+%H:%M:%S')" "$OUT_DIR"
+}
+
 diagnose_cleanup_exit() {
   local rc="$1"
   trap - EXIT INT TERM
@@ -1461,11 +1471,7 @@ main() {
   # A run that reaches here completed fully; clear any interrupted flag
   # left over from a previous, interrupted attempt on this bundle.
   meta_set INTERRUPTED 0
-  # Log the closing pointers before finalizing: the manifest hashes
-  # run.log, so nothing may be logged into the bundle after write_manifest.
-  diag_log "done. Bundle: $OUT_DIR"
-  diag_log "report: $OUT_DIR/report.md"
-  finalize_report
+  complete_diagnostic
 }
 
 # Allow tests to source this file for individual functions without running.

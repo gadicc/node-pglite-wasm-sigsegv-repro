@@ -708,7 +708,7 @@ printf 'path=%s/private token=550e8400-e29b-41d4-a716-446655440000\n' "$HOME" > 
 check_eq "privacy scan flags files without copying sentinel values" "1" \
   "$([[ "$(grep -c $'^known-home-path\traw/tool.txt$' "$PRIVACY_BUNDLE/privacy-review.txt")" == 1 && "$(grep -c $'^uuid-shape\traw/tool.txt$' "$PRIVACY_BUNDLE/privacy-review.txt")" == 1 && "$(grep -c '550e8400' "$PRIVACY_BUNDLE/privacy-review.txt")" == 0 ]] && echo 1 || echo 0)"
 
-echo "== manifest covers the final log lines =="
+echo "== manifest covers the final bundled log lines =="
 MB="$TMP/manifest-bundle"
 mkdir -p "$MB"
 (
@@ -719,11 +719,10 @@ mkdir -p "$MB"
   DIAG_REPO_ROOT="$REPO_ROOT"
   DIAG_LOG_FILE="$MB/run.log"
   # Reproduce the real ordering: every log line precedes the hash pass.
-  diag_log "done. Bundle: $OUT_DIR"
-  diag_log "report: $OUT_DIR/report.md"
+  diag_log "finalizing report and manifest for $OUT_DIR"
   write_manifest
 ) > /dev/null 2>&1
-check_eq "write_manifest succeeds after the final log lines" "0" "$?"
+check_eq "write_manifest succeeds after the final bundled log lines" "0" "$?"
 check_eq "bundle log redacts local roots" "1" \
   "$([[ "$(grep -Fc "$MB" "$MB/run.log")" == 0 && "$(grep -Fc "$REPO_ROOT" "$MB/run.log")" == 0 && "$(grep -Fc '<bundle>' "$MB/run.log")" -gt 0 ]] && echo 1 || echo 0)"
 (cd "$MB" && sha256sum -c manifest.txt) > /dev/null 2>&1
@@ -944,21 +943,26 @@ check_eq "truncated run conclusion counts recovered invocations" "0" "$?"
 
 echo "== finalization failure handling =="
 # collect.mjs cannot write results.json into a missing bundle directory.
+FINALIZE_FAIL_LOG="$TMP/finalize-fail.log"
+FINALIZE_FAIL_OUTPUT="$TMP/finalize-fail.output"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
   OUT_DIR="$TMP/finalize-missing-bundle"
   META_FILE="$TMP/finalize-fail.meta"
   STATE_DIR="$TMP/finalize-fail-state"
+  DIAG_LOG_FILE="$FINALIZE_FAIL_LOG"
   mkdir -p "$STATE_DIR"
-  finalize_report
-) > /dev/null 2>&1
+  complete_diagnostic
+) > "$FINALIZE_FAIL_OUTPUT" 2>&1
 finalize_fail_rc=$?
 check_eq "finalization aborts nonzero when collect.mjs fails" "1" "$([[ $finalize_fail_rc -ne 0 ]] && echo 1 || echo 0)"
+check_eq "failed finalization never reports completion" "0" "$([[ ! -e "$FINALIZE_FAIL_LOG" || "$(grep -c 'done\. Bundle' "$FINALIZE_FAIL_LOG")" == 0 ]] && [[ "$(grep -c 'done\. Bundle' "$FINALIZE_FAIL_OUTPUT")" == 0 ]] && echo 0 || echo 1)"
 
 # The happy path on the synthetic bundle above still succeeds, and the
-# manifest it leaves behind verifies (all log lines precede the hash pass).
+# manifest it leaves behind verifies (success is terminal-only and follows it).
 touch "$B/state"/phase-{preflight,baseline,groups,individual,frequency,gdb}.done
+FINALIZE_OK_OUTPUT="$TMP/finalize-ok.output"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
@@ -968,9 +972,12 @@ touch "$B/state"/phase-{preflight,baseline,groups,individual,frequency,gdb}.done
   META_FILE="$B/results/meta.env"
   STATE_DIR="$B/state"
   DIAG_LOG_FILE="$B/run.log"
-  finalize_report
-) > /dev/null 2>&1
+  complete_diagnostic
+) > "$FINALIZE_OK_OUTPUT" 2>&1
 check_eq "finalization succeeds on a complete bundle" "0" "$?"
+grep -q 'done\. Bundle' "$FINALIZE_OK_OUTPUT"
+check_eq "successful finalization reports completion afterward" "0" "$?"
+check_eq "success claim is not appended after the manifest hash pass" "0" "$([[ "$(grep -c 'done\. Bundle' "$B/run.log")" == 0 ]] && echo 0 || echo 1)"
 grep -q $'^status\t' "$B/privacy-review.txt"
 check_eq "finalization writes privacy review" "0" "$?"
 (cd "$B" && sha256sum -c manifest.txt) > /dev/null 2>&1
