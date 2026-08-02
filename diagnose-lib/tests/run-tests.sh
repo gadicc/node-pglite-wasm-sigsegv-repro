@@ -36,6 +36,69 @@ check_eq() {
 # shellcheck source=../common.sh
 source "$LIB/common.sh"
 
+write_preflight_fixture() {
+  local bundle="$1" generation="${2:-0123456789abcdef0123456789abcdef}"
+  local -a files=(
+    cmdline.txt cpuinfo-extra.txt cpufreq.txt cctk.txt date.txt dependencies.txt
+    dmi.txt kernel-warnings.txt lscpu.txt node.txt online.txt os-release.txt
+    power.txt summary.env topology.tsv uname.txt undervolt.txt
+  )
+  local name file_digest manifest_digest
+  mkdir -p "$bundle"/{env,results,state}
+  for name in "${files[@]}"; do
+    [[ "$name" == summary.env ]] && continue
+    [[ -e "$bundle/env/$name" ]] || printf '%s\n' "$name" > "$bundle/env/$name"
+  done
+  if [[ ! -e "$bundle/env/summary.env" ]]; then
+    cat > "$bundle/env/summary.env" << EOF
+DISTRO=TestOS
+KERNEL=Linux 6.0-test
+CMDLINE=
+NODE_VERSION=v25.2.1
+V8_VERSION=14.1-test
+PGLITE_VERSION=0.3.0
+CPU_MODEL=Test CPU
+CPU_STEPPING=1
+CPU_MICROCODE=0x123
+CPU_ADDRESS_SIZES=46 bits physical, 48 bits virtual
+CPU_LOGICAL=2
+ONLINE_CPUS=0-1
+KERNEL_ONLINE_CPUS=0-1
+ALLOWED_CPUS=0-1
+P_CORES=0
+E_CORES=1
+DMI_PRODUCT=Test Product
+DMI_BOARD=Test Board
+BIOS_VERSION=1.0
+BIOS_DATE=01/01/2026
+CPUFREQ_DRIVER=intel_pstate
+GOVERNOR=powersave
+EPP=balance_performance
+NO_TURBO=0
+TME_STATE=unknown
+POWER_SOURCE=AC
+UNDERVOLT_STATE=not installed
+CCTK_STATE=not installed
+MISSING_OPTIONAL=none
+EOF
+  fi
+  printf 'start_iso=2026-08-02T00:00:00+00:00\nstart_epoch=1785686400\n' > "$bundle/env/date.txt"
+  : > "$bundle/env/preflight.manifest"
+  for name in "${files[@]}"; do
+    file_digest="$(sha256sum "$bundle/env/$name" | awk '{print $1}')"
+    printf '%s\t%s\n' "$file_digest" "$name" >> "$bundle/env/preflight.manifest"
+  done
+  manifest_digest="$(sha256sum "$bundle/env/preflight.manifest" | awk '{print $1}')"
+  cat > "$bundle/results/preflight.meta" << EOF
+VERSION=1
+GENERATION=$generation
+COLLECTED_EPOCH=1785686400
+INVENTORY_SHA256=$manifest_digest
+COMPLETED=1
+EOF
+  : > "$bundle/state/phase-preflight.done"
+}
+
 write_frequency_ab_fixture_meta() {
   local bundle="$1" cpu="$2" runs="$3"
   local generation=0123456789abcdef0123456789abcdef
@@ -1176,6 +1239,160 @@ else
 fi
 
 echo "== --redo phase handling =="
+preflight_redo_plan="$(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  REDO_PHASES=preflight
+  build_redo_plan
+  printf '%s\n' "${REDO_PLAN[*]}"
+)"
+check_eq "--redo preflight expands to the complete downstream closure" \
+  "preflight baseline groups individual frequency gdb" "$preflight_redo_plan"
+
+preflight_pending_closure_ok=1
+for missing_phase in baseline groups individual frequency gdb; do
+  PREFLIGHT_BAD_PENDING="$TMP/preflight-bad-pending-$missing_phase"
+  mkdir -p "$PREFLIGHT_BAD_PENDING"/{results,state}
+  cat > "$PREFLIGHT_BAD_PENDING/results/meta.env" << EOF
+MODE=quick
+BASELINE_CHILDREN=8
+BASELINE_WAVES=10
+GROUP_WAVES=10
+INDIVIDUAL_RUNS=5
+GDB_MAX_RUNS=6
+SKIP_GDB=0
+CPU_TARGET=auto
+COMPLETED_PHASES=
+EOF
+  {
+    printf 'VERSION\t1\n'
+    printf 'TXN\tredo-20260802T000000-%s\n' "$missing_phase"
+    printf 'PHASE\tpreflight\n'
+    for pending_phase in baseline groups individual frequency gdb; do
+      [[ "$pending_phase" == "$missing_phase" ]] || printf 'PHASE\t%s\n' "$pending_phase"
+    done
+  } > "$PREFLIGHT_BAD_PENDING/state/redo.pending"
+  "$REPO_ROOT/diagnose.sh" --resume "$PREFLIGHT_BAD_PENDING" --dry-run --yes \
+    > "$PREFLIGHT_BAD_PENDING/resume.output" 2>&1
+  pending_closure_rc=$?
+  if [[ $pending_closure_rc -eq 0 || ! -f "$PREFLIGHT_BAD_PENDING/state/redo.pending" ]] ||
+    ! grep -q 'pending redo transaction is malformed' "$PREFLIGHT_BAD_PENDING/resume.output"; then
+    preflight_pending_closure_ok=0
+  fi
+done
+check_eq "pending preflight redo rejects every incomplete downstream closure" "1" "$preflight_pending_closure_ok"
+
+PREFLIGHT_REDO="$TMP/redo-preflight-bundle"
+mkdir -p "$PREFLIGHT_REDO"/{env/root,results,state}
+printf 'old summary\n' > "$PREFLIGHT_REDO/env/summary.env"
+printf 'old manifest\n' > "$PREFLIGHT_REDO/env/preflight.manifest"
+printf 'stranded manifest temp\n' > "$PREFLIGHT_REDO/env/.preflight.manifest.stranded"
+printf 'stranded metadata temp\n' > "$PREFLIGHT_REDO/results/.preflight.meta.stranded"
+printf 'old root evidence\n' > "$PREFLIGHT_REDO/env/root/cctk.txt"
+printf 'old preflight metadata\n' > "$PREFLIGHT_REDO/results/preflight.meta"
+for phase in preflight baseline groups individual frequency gdb; do
+  : > "$PREFLIGHT_REDO/state/phase-$phase.done"
+done
+cat > "$PREFLIGHT_REDO/results/meta.env" << EOF
+MODE=quick
+BASELINE_CHILDREN=8
+BASELINE_WAVES=10
+GROUP_WAVES=10
+INDIVIDUAL_RUNS=5
+GDB_MAX_RUNS=6
+SKIP_GDB=0
+CPU_TARGET=auto
+COMPLETED_PHASES=preflight,baseline,groups,individual,frequency,gdb
+EOF
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$PREFLIGHT_REDO"
+  STATE_DIR="$PREFLIGHT_REDO/state"
+  META_FILE="$PREFLIGHT_REDO/results/meta.env"
+  REDO_PHASES=preflight
+  build_redo_plan
+  apply_redo_plan
+) > /dev/null 2>&1
+preflight_redo_rc=$?
+preflight_redo_stash="$(find "$PREFLIGHT_REDO/state/superseded" -mindepth 1 -maxdepth 1 -type d -name 'redo-*' -print -quit)"
+preflight_redo_ok=0
+[[ $preflight_redo_rc -eq 0 ]] &&
+  [[ "$(cat "$preflight_redo_stash/preflight/env/summary.env")" == "old summary" ]] &&
+  [[ "$(cat "$preflight_redo_stash/preflight/env/root/cctk.txt")" == "old root evidence" ]] &&
+  [[ "$(cat "$preflight_redo_stash/preflight/results/preflight.meta")" == "old preflight metadata" ]] &&
+  [[ "$(cat "$preflight_redo_stash/preflight/env/.preflight.manifest.stranded")" == "stranded manifest temp" ]] &&
+  [[ "$(cat "$preflight_redo_stash/preflight/results/.preflight.meta.stranded")" == "stranded metadata temp" ]] &&
+  [[ ! -e "$PREFLIGHT_REDO/env/summary.env" && ! -e "$PREFLIGHT_REDO/env/root" ]] &&
+  [[ "$(find "$PREFLIGHT_REDO/state" -maxdepth 1 -name 'phase-*.done' | wc -l)" -eq 0 ]] &&
+  grep -q '^COMPLETED_PHASES=$' "$PREFLIGHT_REDO/results/meta.env" && preflight_redo_ok=1
+check_eq "--redo preflight archives environment/root evidence and clears the full closure" "1" "$preflight_redo_ok"
+
+PREFLIGHT_PARTIAL="$TMP/preflight-partial-resume"
+mkdir -p "$PREFLIGHT_PARTIAL"/{env,results,state}
+printf 'partial snapshot\n' > "$PREFLIGHT_PARTIAL/env/summary.env"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$PREFLIGHT_PARTIAL"
+  preflight_prepare_fresh_targets
+) > /dev/null 2>&1
+preflight_partial_rc=$?
+check_eq "partial preflight evidence is preserved and refuses an implicit overwrite" "1" \
+  "$([[ $preflight_partial_rc -ne 0 && "$(cat "$PREFLIGHT_PARTIAL/env/summary.env")" == "partial snapshot" ]] && echo 1 || echo 0)"
+
+PREFLIGHT_PRODUCED="$TMP/preflight-produced"
+mkdir -p "$PREFLIGHT_PRODUCED"/{env,results,state}
+cat > "$PREFLIGHT_PRODUCED/results/meta.env" << EOF
+MODE=quick
+BASELINE_CHILDREN=8
+BASELINE_WAVES=10
+GROUP_WAVES=10
+INDIVIDUAL_RUNS=5
+GDB_MAX_RUNS=6
+SKIP_GDB=0
+CPU_TARGET=auto
+COMPLETED_PHASES=
+EOF
+(
+  cd "$REPO_ROOT"
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$PREFLIGHT_PRODUCED"
+  STATE_DIR="$PREFLIGHT_PRODUCED/state"
+  META_FILE="$PREFLIGHT_PRODUCED/results/meta.env"
+  DIAG_LOG_FILE=""
+  DIAG_COMMANDS_LOG="$PREFLIGHT_PRODUCED/commands.log"
+  discover_topology
+  phase_preflight
+) > /dev/null 2>&1
+preflight_produced_rc=$?
+node "$LIB/preflight-evidence.mjs" --validate-complete "$PREFLIGHT_PRODUCED" > /dev/null 2>&1
+preflight_produced_validate_rc=$?
+check_eq "preflight producer publishes a validator-complete zero-marker envelope" "1" \
+  "$([[ $preflight_produced_rc -eq 0 && $preflight_produced_validate_rc -eq 0 && ! -s "$PREFLIGHT_PRODUCED/state/phase-preflight.done" ]] && echo 1 || echo 0)"
+
+PREFLIGHT_INVALID_RESUME="$TMP/preflight-invalid-completed-resume"
+mkdir -p "$PREFLIGHT_INVALID_RESUME"/{env,results,state}
+cat > "$PREFLIGHT_INVALID_RESUME/results/meta.env" << EOF
+MODE=quick
+BASELINE_CHILDREN=8
+BASELINE_WAVES=10
+GROUP_WAVES=10
+INDIVIDUAL_RUNS=5
+GDB_MAX_RUNS=6
+SKIP_GDB=0
+CPU_TARGET=auto
+COMPLETED_PHASES=preflight
+EOF
+write_preflight_fixture "$PREFLIGHT_INVALID_RESUME"
+printf 'tampered after publication\n' >> "$PREFLIGHT_INVALID_RESUME/env/cpufreq.txt"
+"$REPO_ROOT/diagnose.sh" --resume "$PREFLIGHT_INVALID_RESUME" --yes \
+  > "$PREFLIGHT_INVALID_RESUME/resume.output" 2>&1
+preflight_invalid_resume_rc=$?
+check_eq "main resume rejects invalid marked-complete preflight evidence before skipping" "1" \
+  "$([[ $preflight_invalid_resume_rc -ne 0 && -f "$PREFLIGHT_INVALID_RESUME/state/phase-preflight.done" && ! -e "$PREFLIGHT_INVALID_RESUME/state/phase-baseline.done" ]] && grep -q 'completed preflight phase has missing, stale, or invalid evidence' "$PREFLIGHT_INVALID_RESUME/resume.output" && echo 1 || echo 0)"
+
 RB="$TMP/redo-bundle"
 mkdir -p "$RB"/{results,state,logs/individual}
 printf '19\t1\t139\t2\n19\t2\t0\t2\n' > "$RB/results/individual.tsv"
@@ -2232,6 +2449,7 @@ printf '%s\t1\t139\t1\n' "$TEST_OFFLINE_CANONICAL_CPU" > "$AUTO_OFFLINE_RB/resul
   groups_meta_publish 1
   rm -f -- "$GROUP_PLAN_TEMP"
 ) > /dev/null 2>&1
+write_preflight_fixture "$AUTO_OFFLINE_RB"
 touch "$AUTO_OFFLINE_RB/state"/phase-{preflight,baseline,groups,individual}.done
 auto_offline_output="$("$REPO_ROOT/diagnose.sh" --resume "$AUTO_OFFLINE_RB" --yes 2>&1)"
 auto_offline_rc=$?
@@ -2263,6 +2481,22 @@ touch "$META_TEMP_CLEANUP/results/.meta.env.interrupted"
 )
 check_eq "interruption cleanup removes a tracked atomic metadata temp" "1" \
   "$([[ ! -e "$META_TEMP_CLEANUP/results/.meta.env.interrupted" ]] && echo 1 || echo 0)"
+
+PREFLIGHT_TEMP_CLEANUP="$TMP/preflight-temp-cleanup"
+mkdir -p "$PREFLIGHT_TEMP_CLEANUP"/{env,results,state}
+printf 'manifest temp\n' > "$PREFLIGHT_TEMP_CLEANUP/env/.preflight.manifest.interrupted"
+printf 'metadata temp\n' > "$PREFLIGHT_TEMP_CLEANUP/results/.preflight.meta.interrupted"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$PREFLIGHT_TEMP_CLEANUP"
+  STATE_DIR="$PREFLIGHT_TEMP_CLEANUP/state"
+  PREFLIGHT_MANIFEST_TEMP="$PREFLIGHT_TEMP_CLEANUP/env/.preflight.manifest.interrupted"
+  PREFLIGHT_META_TEMP="$PREFLIGHT_TEMP_CLEANUP/results/.preflight.meta.interrupted"
+  redo_marker_temp_cleanup
+)
+check_eq "interruption cleanup removes tracked preflight envelope temps" "1" \
+  "$([[ ! -e "$PREFLIGHT_TEMP_CLEANUP/env/.preflight.manifest.interrupted" && ! -e "$PREFLIGHT_TEMP_CLEANUP/results/.preflight.meta.interrupted" ]] && echo 1 || echo 0)"
 
 CRAFTED_REDO_RB="$TMP/redo-crafted-marker-bundle"
 mkdir -p "$CRAFTED_REDO_RB"/{results,state}
@@ -3303,15 +3537,35 @@ EOF
 cat > "$B/env/summary.env" << EOF
 DISTRO=TestOS
 KERNEL=6.0.0-test
+CMDLINE=tme=off
 NODE_VERSION=v25.2.1
 V8_VERSION=14.1.146.11-node.14
+PGLITE_VERSION=0.3.0
 CPU_MODEL=Test CPU
+CPU_STEPPING=1
+CPU_MICROCODE=0x123
+CPU_ADDRESS_SIZES=46 bits physical, 48 bits virtual
+CPU_LOGICAL=24
 ONLINE_CPUS=0-23
+KERNEL_ONLINE_CPUS=0-23
+ALLOWED_CPUS=0-23
+P_CORES=0-7
+E_CORES=8-23
+DMI_PRODUCT=Test Product
+DMI_BOARD=Test Board
+BIOS_VERSION=1.0
+BIOS_DATE=01/01/2026
+CPUFREQ_DRIVER=intel_pstate
+GOVERNOR=powersave
+EPP=balance_performance
+NO_TURBO=0
 TME_STATE=disabled (tme=off on kernel command line)
 POWER_SOURCE=battery
-NO_TURBO=0
+UNDERVOLT_STATE=not installed
+CCTK_STATE=not installed
 MISSING_OPTIONAL=turbostat
 EOF
+write_preflight_fixture "$B"
 
 cp "$FIX/repro-fail.log" "$B/logs/baseline/run1.log"
 cat > "$B/results/baseline.meta" << EOF

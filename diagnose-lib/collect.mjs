@@ -24,16 +24,7 @@ import { parseGdbCapture } from "./parse-gdb.mjs";
 import { assessBaselineEvidence } from "./baseline-evidence.mjs";
 import { assessGroupsEvidence, deriveIndividualTargetPolicy } from "./groups-evidence.mjs";
 import { inspectFrequencyEvidence, readBoundFrequencyArtifact } from "./frequency-evidence.mjs";
-
-function readKeyValues(file) {
-  const out = {};
-  if (!existsSync(file)) return out;
-  for (const line of readFileSync(file, "utf8").split("\n")) {
-    const m = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
-    if (m) out[m[1]] = m[2];
-  }
-  return out;
-}
+import { assessPreflightEvidence } from "./preflight-evidence.mjs";
 
 const RUN_CONFIG_KEYS = new Set([
   "MODE", "BASELINE_CHILDREN", "BASELINE_WAVES", "GROUP_WAVES",
@@ -773,9 +764,9 @@ export function assessGdb(
 export function collect(outDir) {
   const runMetaState = readStoredRunMetadata(outDir);
   const meta = runMetaState.values;
-  const envSummary = runMetaState.bundleRootSafe
-    ? readKeyValues(path.join(outDir, "env", "summary.env"))
-    : {};
+  const preflightAssessment = runMetaState.bundleRootSafe
+    ? assessPreflightEvidence(outDir)
+    : { status: "invalid", reasons: ["bundle root cannot authorize preflight evidence"], generation: null };
   const resultsDir = path.join(outDir, "results");
 
   const results = {
@@ -807,8 +798,15 @@ export function collect(outDir) {
       status: runMetaState.status,
       reasons: runMetaState.reasons,
     },
-    environment: envSummary,
+    preflightStatus: {
+      status: preflightAssessment.status,
+      reasons: preflightAssessment.reasons,
+      generation: preflightAssessment.generation,
+    },
   };
+  if (preflightAssessment.status === "complete") {
+    results.environment = preflightAssessment.environment;
+  }
 
   // Optional privileged reads produced by a manual `sudo ./root-checks.sh
   // <bundle>` run (kept separate from diagnose.sh, which never elevates).

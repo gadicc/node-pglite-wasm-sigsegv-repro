@@ -705,6 +705,7 @@ test("renderReport: preflight environment snapshots never create causal rule-out
   const md = renderReport({
     collectedAt: "2026-08-02T00:00:00.000Z",
     config: {},
+    preflightStatus: { status: "complete", reasons: [] },
     environment: {
       TME_STATE: "disabled (tme=off on kernel command line)",
       POWER_SOURCE: "battery",
@@ -737,6 +738,35 @@ test("renderReport: preflight environment snapshots never create causal rule-out
   assert.doesNotMatch(md, /External power delivery is not required/);
   assert.doesNotMatch(md, /failure reproduced even though intel_pstate\/no_turbo/);
   assert.doesNotMatch(md, /- Undervolting state:/);
+});
+
+test("renderReport: invalid preflight snapshots are explained and excluded", () => {
+  const md = renderReport({
+    collectedAt: "2026-08-02T00:00:00.000Z",
+    config: {},
+    preflightStatus: {
+      status: "invalid",
+      reasons: ["preflight digest mismatch for summary.env"],
+    },
+    // Even a crafted/stale JSON object cannot make invalid environment values
+    // visible as if they came from an accepted snapshot.
+    environment: { CPU_MODEL: "STALE MODEL", POWER_SOURCE: "battery" },
+  });
+  assert.match(md, /Preflight snapshot was excluded as invalid or incomplete/);
+  assert.match(md, /preflight digest mismatch for summary\.env/);
+  assert.doesNotMatch(md, /STALE MODEL/);
+  assert.doesNotMatch(md, /Power source at preflight \| battery/);
+});
+
+test("renderReport: environment without an explicit complete preflight status is excluded", () => {
+  const md = renderReport({
+    collectedAt: "2026-08-02T00:00:00.000Z",
+    config: {},
+    environment: { CPU_MODEL: "UNTRUSTED MODEL", POWER_SOURCE: "battery" },
+  });
+  assert.match(md, /Preflight snapshot was not collected/);
+  assert.doesNotMatch(md, /UNTRUSTED MODEL/);
+  assert.doesNotMatch(md, /Power source at preflight \| battery/);
 });
 
 test("renderReport: clean heterogeneous phases do not get a pooled rate bound", () => {

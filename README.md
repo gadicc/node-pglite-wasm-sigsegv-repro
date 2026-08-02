@@ -190,6 +190,12 @@ by running only the missing runs:
 ./diagnose.sh --resume diagnostics/2026-08-01T084335Z --yes
 ```
 
+The preflight snapshot has a fixed artifact inventory, per-file SHA-256
+manifest, generation identifier, strict summary schema, and zero-byte
+completion marker. Completed preflight evidence is revalidated before a
+resume can use it; partial or changed files are preserved and require
+`--redo preflight` rather than being overwritten.
+
 Before a completed baseline is skipped, its fixed metadata/log envelope is
 validated against the stored child/wave configuration and completion marker.
 Missing, malformed, mismatched, or unsafe file types are preserved and require
@@ -204,6 +210,12 @@ deleted:
 ./diagnose.sh --resume diagnostics/2026-08-01T084335Z \
   --redo individual --individual-runs 50 --yes
 ```
+
+Redoing preflight invalidates and repeats the complete downstream phase
+closure (`baseline`, `groups`, `individual`, `frequency`, and `gdb`). Its
+archive includes the fixed environment snapshot and `env/root/`, so manual
+privileged reads from an older preflight generation cannot survive as current
+evidence.
 
 GDB capture attempts are not combined across resumes. Before phase 6 runs or
 writes any terminal skip result, a prior incomplete attempt (metadata, capture,

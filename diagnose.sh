@@ -64,6 +64,8 @@ REDO_RECOVERED_PENDING=0
 META_UPDATE_TEMP=""
 GROUP_PLAN_TEMP=""
 GROUP_META_TEMP=""
+PREFLIGHT_MANIFEST_TEMP=""
+PREFLIGHT_META_TEMP=""
 GROUP_PLAN_DIGEST=""
 CPU_TARGET="auto"
 WORST_CPU_OVERRIDE=""
@@ -82,6 +84,11 @@ REQUIRED_COMMANDS=(
   awk basename bash cat cut date dirname find grep head mkdir mktemp mv node
   nproc paste readlink rm sed setsid sha256sum sleep sort sync tail taskset tee timeout
   touch tr uniq wc xargs
+)
+PREFLIGHT_ARTIFACTS=(
+  cmdline.txt cpuinfo-extra.txt cpufreq.txt cctk.txt date.txt dependencies.txt
+  dmi.txt kernel-warnings.txt lscpu.txt node.txt online.txt os-release.txt
+  power.txt summary.env topology.tsv uname.txt undervolt.txt
 )
 
 usage() {
@@ -102,8 +109,9 @@ Options:
                         (also regenerates the report, e.g. after running
                         root-checks.sh or frequency-ab.sh manually)
   --redo PHASES         with --resume: re-run phase(s) from scratch
-                        (comma-separated: baseline,groups,individual,gdb,
-                        frequency). Old data is preserved under
+                        (comma-separated: preflight,baseline,groups,individual,
+                        gdb,frequency). Redoing preflight also redoes every
+                        later phase. Old data is preserved under
                         state/superseded/, never deleted.
   --out-dir DIR         output directory (default: diagnostics/<UTC timestamp>)
   --skip-gdb            skip the GDB capture phase
@@ -366,7 +374,12 @@ meta_set() {
 }
 
 mark_done() {
-  touch "$STATE_DIR/phase-$1.done"
+  if [[ "$1" == preflight ]]; then
+    (set -o noclobber; : > "$STATE_DIR/phase-preflight.done") 2> /dev/null ||
+      diag_die "cannot create a fresh preflight completion marker"
+  else
+    touch "$STATE_DIR/phase-$1.done"
+  fi
   SESSION_DID_WORK=1
   sync_meta_completed
 }
@@ -627,15 +640,25 @@ build_redo_plan() {
   IFS=',' read -ra requested <<< "$REDO_PHASES"
   for phase in "${requested[@]}"; do
     case "$phase" in
-      baseline | groups | individual | gdb | frequency) ;;
+      preflight | baseline | groups | individual | gdb | frequency) ;;
       *)
-        diag_die "--redo: unknown or unsupported phase '$phase' (supported: baseline,groups,individual,gdb,frequency)"
+        diag_die "--redo: unknown or unsupported phase '$phase' (supported: preflight,baseline,groups,individual,gdb,frequency)"
         ;;
     esac
     [[ -z "${seen[$phase]:-}" ]] || diag_die "--redo phase '$phase' was listed more than once"
     seen[$phase]=1
     wanted[$phase]=1
   done
+
+  # A fresh environment snapshot cannot remain attached to retained workload
+  # evidence. Redoing preflight therefore invalidates every later phase.
+  if [[ -n "${wanted[preflight]:-}" ]]; then
+    wanted[baseline]=1
+    wanted[groups]=1
+    wanted[individual]=1
+    wanted[frequency]=1
+    wanted[gdb]=1
+  fi
 
   # Group results choose the CPUs tested individually; individual results in
   # turn choose the CPU used by the manual frequency and GDB phases. Repeating
@@ -650,13 +673,13 @@ build_redo_plan() {
 
   # Always execute the closure in dependency order, independent of the order
   # used on the command line.
-  for phase in baseline groups individual frequency gdb; do
+  for phase in preflight baseline groups individual frequency gdb; do
     [[ -n "${wanted[$phase]:-}" ]] && REDO_PLAN+=("$phase")
   done
 }
 
 redo_phase_supported() {
-  case "$1" in baseline | groups | individual | frequency | gdb) return 0 ;; esac
+  case "$1" in preflight | baseline | groups | individual | frequency | gdb) return 0 ;; esac
   return 1
 }
 
@@ -672,7 +695,7 @@ redo_path_is_allowed() {
   local phase="$1" path="$2" suffix
   redo_relative_path_is_safe "$path" || return 1
   case "$phase:$path" in
-    baseline:results/baseline.meta|baseline:logs/baseline|baseline:freq/baseline.samples|baseline:freq/baseline.method|groups:results/groups.tsv|groups:results/groups.meta|groups:logs/groups|individual:results/individual.tsv|individual:results/individual.meta|individual:logs/individual|gdb:results/gdb.meta|gdb:gdb|gdb:logs/gdb|frequency:results/frequency-ab.tsv|frequency:results/frequency-ab.meta|frequency:results/frequency-cap.tsv|frequency:results/frequency-cap.meta) return 0 ;;
+    preflight:results/preflight.meta|preflight:env/preflight.manifest|preflight:env/cmdline.txt|preflight:env/cpuinfo-extra.txt|preflight:env/cpufreq.txt|preflight:env/cctk.txt|preflight:env/date.txt|preflight:env/dependencies.txt|preflight:env/dmi.txt|preflight:env/kernel-warnings.txt|preflight:env/lscpu.txt|preflight:env/node.txt|preflight:env/online.txt|preflight:env/os-release.txt|preflight:env/power.txt|preflight:env/summary.env|preflight:env/topology.tsv|preflight:env/uname.txt|preflight:env/undervolt.txt|preflight:env/root|baseline:results/baseline.meta|baseline:logs/baseline|baseline:freq/baseline.samples|baseline:freq/baseline.method|groups:results/groups.tsv|groups:results/groups.meta|groups:logs/groups|individual:results/individual.tsv|individual:results/individual.meta|individual:logs/individual|gdb:results/gdb.meta|gdb:gdb|gdb:logs/gdb|frequency:results/frequency-ab.tsv|frequency:results/frequency-ab.meta|frequency:results/frequency-cap.tsv|frequency:results/frequency-cap.meta) return 0 ;;
   esac
   if [[ "$phase" == groups && "$path" == freq/group-* ]]; then
     suffix="${path#freq/group-}"
@@ -681,6 +704,16 @@ redo_path_is_allowed() {
   fi
   if [[ "$phase" == frequency && "$path" == freq/freq-ab-* ]]; then
     suffix="${path#freq/freq-ab-}"
+    [[ -n "$suffix" && "$suffix" != */* ]]
+    return
+  fi
+  if [[ "$phase" == preflight && "$path" == env/.preflight.manifest.* ]]; then
+    suffix="${path#env/.preflight.manifest.}"
+    [[ -n "$suffix" && "$suffix" != */* ]]
+    return
+  fi
+  if [[ "$phase" == preflight && "$path" == results/.preflight.meta.* ]]; then
+    suffix="${path#results/.preflight.meta.}"
     [[ -n "$suffix" && "$suffix" != */* ]]
     return
   fi
@@ -767,7 +800,7 @@ redo_transaction_validate() {
         fi
         [[ "$line" == "PHASE"$'\t'"$owner" ]] || return 1
         redo_phase_supported "$owner" && [[ -z "${phases[$owner]:-}" ]] || return 1
-        case "$owner" in baseline) rank=1 ;; groups) rank=2 ;; individual) rank=3 ;; frequency) rank=4 ;; gdb) rank=5 ;; esac
+        case "$owner" in preflight) rank=1 ;; baseline) rank=2 ;; groups) rank=3 ;; individual) rank=4 ;; frequency) rank=5 ;; gdb) rank=6 ;; esac
         ((rank > last_rank)) || return 1
         last_rank=$rank
         phases[$owner]=1
@@ -819,6 +852,11 @@ redo_transaction_validate() {
   fi
   if [[ -n "${phases[individual]:-}" ]]; then
     [[ -n "${phases[frequency]:-}" && -n "${phases[gdb]:-}" ]] || return 1
+  fi
+  if [[ -n "${phases[preflight]:-}" ]]; then
+    [[ -n "${phases[baseline]:-}" && -n "${phases[groups]:-}" &&
+      -n "${phases[individual]:-}" && -n "${phases[frequency]:-}" &&
+      -n "${phases[gdb]:-}" ]] || return 1
   fi
   REDO_TXN_VERSION="$version"
   REDO_TXN_ID="$txn"
@@ -1177,6 +1215,14 @@ apply_redo_plan() {
     for phase in "${REDO_PLAN[@]}"; do
       local -a paths=()
       case "$phase" in
+        preflight)
+          paths=(results/preflight.meta env/preflight.manifest)
+          local preflight_name
+          for preflight_name in "${PREFLIGHT_ARTIFACTS[@]}"; do
+            paths+=("env/$preflight_name")
+          done
+          paths+=(env/root)
+          ;;
         baseline) paths=(results/baseline.meta logs/baseline freq/baseline.samples freq/baseline.method) ;;
         groups) paths=(results/groups.tsv results/groups.meta logs/groups) ;;
         individual) paths=(results/individual.tsv results/individual.meta logs/individual) ;;
@@ -1190,6 +1236,10 @@ apply_redo_plan() {
         done
       elif [[ "$phase" == frequency ]]; then
         for artifact in "$OUT_DIR"/freq/freq-ab-*; do
+          [[ -e "$artifact" || -L "$artifact" ]] && paths+=("${artifact#"$OUT_DIR"/}")
+        done
+      elif [[ "$phase" == preflight ]]; then
+        for artifact in "$OUT_DIR"/env/.preflight.manifest.* "$OUT_DIR"/results/.preflight.meta.*; do
           [[ -e "$artifact" || -L "$artifact" ]] && paths+=("${artifact#"$OUT_DIR"/}")
         done
       fi
@@ -1225,6 +1275,14 @@ redo_marker_temp_cleanup() {
   if [[ -n "$GROUP_META_TEMP" ]]; then
     case "$GROUP_META_TEMP" in "${OUT_DIR:-}/results"/.groups.meta.*) rm -f -- "$GROUP_META_TEMP" ;; esac
     GROUP_META_TEMP=""
+  fi
+  if [[ -n "$PREFLIGHT_MANIFEST_TEMP" ]]; then
+    case "$PREFLIGHT_MANIFEST_TEMP" in "${OUT_DIR:-}/env"/.preflight.manifest.*) rm -f -- "$PREFLIGHT_MANIFEST_TEMP" ;; esac
+    PREFLIGHT_MANIFEST_TEMP=""
+  fi
+  if [[ -n "$PREFLIGHT_META_TEMP" ]]; then
+    case "$PREFLIGHT_META_TEMP" in "${OUT_DIR:-}/results"/.preflight.meta.*) rm -f -- "$PREFLIGHT_META_TEMP" ;; esac
+    PREFLIGHT_META_TEMP=""
   fi
 }
 
@@ -1568,8 +1626,63 @@ diag_redact_home_prefix() {
 }
 
 # ------------------------------------------------------------------
+preflight_evidence_is_complete() {
+  local mode="${1:---validate-complete}"
+  node "$LIB/preflight-evidence.mjs" "$mode" "$OUT_DIR"
+}
+
+preflight_prepare_fresh_targets() {
+  preflight_evidence_is_complete --check-fresh ||
+    diag_die "existing or unsafe preflight evidence conflicts with a fresh phase; preserve it and resume with --redo preflight"
+}
+
+preflight_publish_envelope() {
+  local env_dir="$1" manifest="$env_dir/preflight.manifest"
+  local meta="$OUT_DIR/results/preflight.meta" manifest_tmp meta_tmp
+  local name digest generation collected_epoch inventory_digest
+
+  manifest_tmp="$(mktemp "$env_dir/.preflight.manifest.XXXXXX")" ||
+    diag_die "cannot prepare preflight manifest"
+  PREFLIGHT_MANIFEST_TEMP="$manifest_tmp"
+  for name in "${PREFLIGHT_ARTIFACTS[@]}"; do
+    digest="$(sha256sum "$env_dir/$name" | awk '{print $1}')" ||
+      diag_die "cannot hash preflight artifact $name"
+    printf '%s\t%s\n' "$digest" "$name" >> "$manifest_tmp" ||
+      diag_die "cannot write preflight manifest"
+  done
+  chmod 0644 "$manifest_tmp" || diag_die "cannot protect preflight manifest"
+  sync -f "$manifest_tmp" || diag_die "cannot synchronize preflight manifest"
+  mv -T -- "$manifest_tmp" "$manifest" || diag_die "cannot publish preflight manifest"
+  PREFLIGHT_MANIFEST_TEMP=""
+  sync -f "$env_dir" || diag_die "cannot synchronize preflight environment directory"
+
+  generation="$(node -e 'process.stdout.write(require("node:crypto").randomBytes(16).toString("hex"))')" ||
+    diag_die "cannot generate preflight evidence generation"
+  [[ "$generation" =~ ^[0-9a-f]{32}$ ]] || diag_die "generated invalid preflight generation"
+  collected_epoch="$(sed -n 's/^start_epoch=//p' "$env_dir/date.txt")"
+  inventory_digest="$(sha256sum "$manifest" | awk '{print $1}')" ||
+    diag_die "cannot hash preflight manifest"
+  meta_tmp="$(mktemp "$OUT_DIR/results/.preflight.meta.XXXXXX")" ||
+    diag_die "cannot prepare preflight metadata"
+  PREFLIGHT_META_TEMP="$meta_tmp"
+  {
+    printf 'VERSION=1\n'
+    printf 'GENERATION=%s\n' "$generation"
+    printf 'COLLECTED_EPOCH=%s\n' "$collected_epoch"
+    printf 'INVENTORY_SHA256=%s\n' "$inventory_digest"
+    printf 'COMPLETED=1\n'
+  } > "$meta_tmp" || diag_die "cannot write preflight metadata"
+  chmod 0644 "$meta_tmp" || diag_die "cannot protect preflight metadata"
+  sync -f "$meta_tmp" || diag_die "cannot synchronize preflight metadata"
+  mv -T -- "$meta_tmp" "$meta" || diag_die "cannot publish preflight metadata"
+  PREFLIGHT_META_TEMP=""
+  sync -f "$OUT_DIR/results" || diag_die "cannot synchronize preflight metadata directory"
+}
+
+# ------------------------------------------------------------------
 phase_preflight() {
   local env_dir="$OUT_DIR/env"
+  preflight_prepare_fresh_targets
   mkdir -p "$env_dir"
 
   {
@@ -1797,7 +1910,12 @@ phase_preflight() {
     printf 'MISSING_OPTIONAL=%s\n' "${missing_opt[*]:-none}"
   } > "$env_dir/summary.env"
 
+  preflight_publish_envelope "$env_dir"
+  preflight_evidence_is_complete --validate-before-mark ||
+    diag_die "preflight did not produce a valid complete evidence envelope; preserve it and resume with --redo preflight"
   mark_done preflight
+  preflight_evidence_is_complete --validate-complete ||
+    diag_die "preflight completion metadata is invalid; preserve it and resume with --redo preflight"
   diag_log "preflight complete: $env_dir"
 }
 
@@ -2661,6 +2779,8 @@ main() {
 
   # ---- phase 1 ----
   if phase_is_done preflight; then
+    preflight_evidence_is_complete --validate-complete ||
+      diag_die "completed preflight phase has missing, stale, or invalid evidence; preserve it and resume with --redo preflight"
     diag_log "phase 1/7 preflight: already done, skipping (resume)"
   else
     diag_log "phase 1/7: preflight and environment collection"

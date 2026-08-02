@@ -231,7 +231,9 @@ function analyzeFrequencyAb(fa) {
 export function renderReport(results) {
   const r = results;
   const L = [];
-  const env = r.environment ?? {};
+  const suppliedEnv = r.environment ?? {};
+  const preflightStatus = r.preflightStatus?.status ?? "not-run";
+  const env = preflightStatus === "complete" ? suppliedEnv : {};
   const durationSec =
     r.config?.endEpoch && r.config?.startEpoch
       ? r.config.endEpoch - r.config.startEpoch
@@ -254,6 +256,12 @@ export function renderReport(results) {
   // ------------------------------------------------------------------
   L.push("## Environment (sanitized)");
   L.push("");
+  if (preflightStatus !== "complete") {
+    const reasons = r.preflightStatus?.reasons ?? [];
+    L.push(`**Preflight snapshot ${preflightStatus === "not-run" ? "was not collected" : "was excluded as invalid or incomplete"}.**`);
+    if (reasons.length > 0) L.push(`Validation: ${reasons.map(esc).join("; ")}.`);
+    L.push("");
+  }
   L.push("Preflight intentionally excludes service tags, serial numbers, UUIDs,");
   L.push("and MAC addresses. Raw GDB and third-party tool output can still contain");
   L.push("local paths or unexpected identifiers; review `privacy-review.txt` and");
