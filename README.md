@@ -215,8 +215,12 @@ an outcome-defined grouping); the frequency legs get an exact
 comparison on SIGSEGV counts over valid runs plus, separately labelled, the
 binomial probability of the
 clean leg *under an assumed fixed baseline rate*. Wave failures are kept
-distinct from individual child-process failures. The conclusions section
-states only what this run supports: whether the problem reproduced,
+distinct from individual child-process failures. Baseline and group logs are
+also reconciled against their stored child/wave configuration and exit status;
+malformed, duplicated, missing, or contradictory structure is retained only as
+descriptive evidence and cannot support a clean conclusion or rate bound. The
+conclusions section states only what this run supports: whether the problem
+reproduced,
 whether it localized to particular CPUs or topology groups, whether lower
 frequency suppressed it, whether the GDB fault matches the documented
 `intended + 2^42` signature, which hypotheses the collected configuration

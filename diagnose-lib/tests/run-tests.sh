@@ -2037,21 +2037,39 @@ check_eq "missing required command aborts preflight" "1" "$([[ $missing_required
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
-  repro_result_is_complete "$FIX/repro-clean.log" 3 0
+  repro_result_is_complete "$FIX/repro-clean.log" 2 3 0
 )
 check_eq "complete repro footer is accepted" "0" "$?"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
-  repro_result_is_complete "$FIX/repro-clean.log" 4 0
+  repro_result_is_complete "$FIX/repro-clean.log" 2 4 0
 ) > /dev/null 2>&1
 check_eq "truncated repro output is not phase-complete" "1" "$([[ $? -ne 0 ]] && echo 1 || echo 0)"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
-  repro_result_is_complete "$FIX/repro-clean.log" 3 2
+  repro_result_is_complete "$FIX/repro-clean.log" 2 3 2
 ) > /dev/null 2>&1
 check_eq "unexpected repro exit is not phase-complete" "1" "$([[ $? -ne 0 ]] && echo 1 || echo 0)"
+
+REPRO_FOOTER_ONLY="$TMP/repro-footer-only.log"
+printf '%s\n' \
+  'node=v25.2.1 v8=14.1 platform=linux arch=x64 children=2 waves=3' \
+  'failedWaves=0 completedWaves=3 requestedWaves=3' > "$REPRO_FOOTER_ONLY"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  repro_result_is_complete "$REPRO_FOOTER_ONLY" 2 3 0
+) > /dev/null 2>&1
+check_eq "footer-only repro output is not phase-complete" "1" "$([[ $? -ne 0 ]] && echo 1 || echo 0)"
+
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  repro_result_is_complete "$FIX/repro-clean.log" 4 3 0
+) > /dev/null 2>&1
+check_eq "repro header must match configured children" "1" "$([[ $? -ne 0 ]] && echo 1 || echo 0)"
 
 INDIVIDUAL_VALID="$TMP/individual-valid.tsv"
 printf '19\t1\t0\t2\n19\t2\t139\t2\n' > "$INDIVIDUAL_VALID"
@@ -2646,7 +2664,7 @@ EXIT_CODE=1
 EOF
 
 cp "$FIX/repro-fail.log" "$B/logs/groups/ecluster-64.log"
-cp "$FIX/repro-clean.log" "$B/logs/groups/pcores.log"
+cp "$FIX/repro-clean-4x5.log" "$B/logs/groups/pcores.log"
 cat > "$B/results/groups.tsv" << EOF
 pcores	pcore	0-7	-	4	5	logs/groups/pcores.log	group-pcores	0
 ecluster-64	ecluster	16-19	64	4	5	logs/groups/ecluster-64.log	group-ecluster-64	1
@@ -2739,6 +2757,7 @@ check("baseline sigsegv count", r.baseline.sigsegvCount === 2);
 check("bundle path is relative", r.outDir === ".");
 check("baseline other failures", r.baseline.otherFailureCount === 1);
 check("baseline invocations", r.baseline.totalChildInvocations === 20);
+check("baseline completion structure", r.baseline.completionStatus === "complete" && r.baseline.issues.length === 0);
 check("worst cpu is 19", r.worstCpu === 19);
 check("individual tally", r.individual.length === 2 && r.individual[1].sigsegv === 6 && r.individual[0].failures === 0);
 check("individual phase completion status", r.individualStatus.status === "complete" && r.individual[1].runs === 20);
@@ -2748,11 +2767,12 @@ check("gdb capture file trimmed", r.gdb.captures[0].mappings === undefined);
 check("freq ab restored + legs", r.frequencyAb.restored === true && r.frequencyAb.legs.length === 3);
 check("freq leg B measured clock", r.frequencyAb.legs[1].frequency.avgMHz === 2100);
 check("group failure tally", r.groups.length === 2 && r.groups[1].sigsegvCount === 2 && r.groups[0].sigsegvCount === 0);
+check("group completion structure", r.groups.every((group) => group.completionStatus === "complete"));
 check("root checks merged", Boolean(r.rootChecks) && r.rootChecks["cctk.txt"].includes("IntelTME=Disabled"));
 process.exit(failures === 0 ? 0 : 1);
 EOF
 if node "$TMP/check-results.mjs" "$B/results.json"; then
-  pass=$((pass + 14))
+  pass=$((pass + 16))
 else
   fail=$((fail + 1))
 fi
@@ -2816,6 +2836,29 @@ grep -q "log truncated; partial data" "$B2/report.md"
 check_eq "report marks truncated baseline as partial" "0" "$?"
 grep -q "1 SIGSEGV(s) across 4 child-process runs" "$B2/report.md"
 check_eq "truncated run conclusion counts recovered invocations" "0" "$?"
+
+# Collector expectations are evidence: a clean-looking log whose header does
+# not match baseline.meta is structurally inconsistent and cannot become a
+# clean conclusion or rate bound.
+B3="$TMP/bundle-repro-mismatch"
+mkdir -p "$B3"/{results,logs/baseline}
+cp "$FIX/repro-clean.log" "$B3/logs/baseline/run1.log"
+cat > "$B3/results/baseline.meta" << EOF
+CHILDREN=4
+WAVES=3
+LOG=logs/baseline/run1.log
+EXIT_CODE=0
+EOF
+node "$LIB/collect.mjs" "$B3" > /dev/null
+node "$LIB/report.mjs" "$B3" > /dev/null
+node -e '
+  const r = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+  process.exit(r.baseline.completionStatus === "inconsistent" &&
+    r.baseline.issues.some((issue) => issue.code === "expected-children-mismatch") ? 0 : 1);
+' "$B3/results.json"
+check_eq "collector reconciles repro logs with baseline metadata" "0" "$?"
+grep -Eq 'No failure reproduced|0/6 \(95% upper' "$B3/report.md"
+check_eq "metadata-mismatched repro evidence cannot support clean claims" "1" "$([[ $? -ne 0 ]] && echo 1 || echo 0)"
 
 echo "== finalization failure handling =="
 # collect.mjs cannot write results.json into a missing bundle directory.

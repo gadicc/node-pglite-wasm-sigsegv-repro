@@ -627,7 +627,11 @@ export function collect(outDir) {
   if (baselineMeta.LOG) {
     const logPath = path.join(outDir, baselineMeta.LOG);
     if (existsSync(logPath)) {
-      const parsed = parseReproLog(readFileSync(logPath, "utf8"));
+      const parsed = parseReproLog(readFileSync(logPath, "utf8"), {
+        expectedChildren: num(baselineMeta.CHILDREN),
+        expectedWaves: num(baselineMeta.WAVES),
+        exitCode: num(baselineMeta.EXIT_CODE),
+      });
       results.baseline = {
         ...parsed,
         waves: undefined, // per-wave detail stays in the raw log
@@ -657,7 +661,11 @@ export function collect(outDir) {
       };
       const logPath = path.join(outDir, logRel);
       if (existsSync(logPath)) {
-        const parsed = parseReproLog(readFileSync(logPath, "utf8"));
+        const parsed = parseReproLog(readFileSync(logPath, "utf8"), {
+          expectedChildren: num(childrenS),
+          expectedWaves: num(wavesS),
+          exitCode: num(exitCodeS),
+        });
         Object.assign(entry, {
           processedWaves: parsed.processedWaves,
           completedWaves: parsed.completedWaves,
@@ -670,6 +678,10 @@ export function collect(outDir) {
           firstFailureAfterSec: parsed.firstFailureAfterSec,
           durationSec: parsed.durationSec,
           failures: parsed.failures,
+          footer: parsed.footer,
+          completionStatus: parsed.completionStatus,
+          issues: parsed.issues,
+          notes: parsed.notes,
           partial: parsed.partial,
         });
       }

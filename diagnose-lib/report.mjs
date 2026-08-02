@@ -53,6 +53,17 @@ function statsCell(failures, n) {
   return `${failures}/${n} = ${pct(failures / n)} ${ci(failures, n)}`;
 }
 
+function reproCompletionStatus(result) {
+  if (result?.completionStatus) return result.completionStatus;
+  return result?.partial ? "partial" : "complete";
+}
+
+function reproStatsCell(failures, n, status) {
+  if (!n) return "no accepted runs";
+  if (status === "complete") return statsCell(failures, n);
+  return `${failures}/${n} = ${pct(failures / n)} (descriptive only; ${status} structure)`;
+}
+
 function analyzeFrequencyAb(fa) {
   const a1 = fa.legs.find((leg) => leg.leg === "A1");
   const b = fa.legs.find((leg) => leg.leg === "B");
@@ -171,22 +182,32 @@ export function renderReport(results) {
   L.push("");
   if (r.baseline) {
     const b = r.baseline;
+    const completionStatus = reproCompletionStatus(b);
     L.push(`${b.children} concurrent children per wave, STOP_ON_FAILURE=0.`);
     L.push("");
-    if (b.partial) {
+    if (completionStatus === "partial") {
       L.push("**The baseline log has no completion footer (the run was");
       L.push("interrupted); wave counts below were recovered from per-wave");
       L.push("rows and are partial data, not a completed run.**");
       L.push("");
+    } else if (completionStatus === "inconsistent") {
+      L.push("**The baseline log is structurally inconsistent. Counts below come");
+      L.push("only from unambiguous, unique wave rows and are descriptive; they");
+      L.push("cannot support a clean conclusion or a rate bound.**");
+      for (const entry of b.issues ?? []) L.push(`- ${entry.message}`);
+      L.push("");
     }
     L.push("| Metric | Value |");
     L.push("| --- | --- |");
-    L.push(`| Waves | ${b.processedWaves ?? b.completedWaves}/${b.requestedWaves} processed, ${b.failedWaves} failed${b.partial ? " (log truncated; partial data)" : ""} |`);
+    const statusNote = completionStatus === "partial"
+      ? " (log truncated; partial data)"
+      : completionStatus === "inconsistent" ? " (structurally inconsistent; descriptive only)" : "";
+    L.push(`| Waves | ${b.processedWaves ?? b.completedWaves}/${b.requestedWaves} processed, ${b.failedWaves} failed${statusNote} |`);
     L.push(`| Child invocations | ${b.totalChildInvocations} |`);
     L.push(`| SIGSEGV | ${b.sigsegvCount} |`);
     L.push(`| Other failures | ${b.otherFailureCount} |`);
     if ((b.unclassifiedFailureCount ?? 0) > 0) L.push(`| Unclassified failures (summary only) | ${b.unclassifiedFailureCount} |`);
-    L.push(`| Child failure rate | ${statsCell(b.sigsegvCount + b.otherFailureCount + (b.unclassifiedFailureCount ?? 0), b.totalChildInvocations)} |`);
+    L.push(`| Child failure rate | ${reproStatsCell(b.sigsegvCount + b.otherFailureCount + (b.unclassifiedFailureCount ?? 0), b.totalChildInvocations, completionStatus)} |`);
     L.push(`| Time to first failure | ${fmtSec(b.firstFailureAfterSec)} |`);
     L.push(`| Duration | ${fmtSec(b.durationSec)} |`);
     L.push(`| Frequency (${b.frequency?.method ?? "n/a"}) | avg ${fmtMHz(b.frequency?.avgMHz)}, max ${fmtMHz(b.frequency?.maxMHz)} |`);
@@ -209,8 +230,15 @@ export function renderReport(results) {
     for (const g of r.groups) {
       const f = g.sigsegvCount + (g.otherFailureCount ?? 0) + (g.unclassifiedFailureCount ?? 0);
       const n = g.totalChildInvocations ?? 0;
+      const completionStatus = reproCompletionStatus(g);
+      const statusNote = completionStatus === "partial"
+        ? " (log truncated; partial data)"
+        : completionStatus === "inconsistent" ? " (structurally inconsistent; descriptive only)" : "";
+      const rate = completionStatus === "complete" && n
+        ? `${pct(f / n)} ${ci(f, n)}`
+        : n ? `${pct(f / n)} (descriptive only; ${completionStatus})` : "—";
       L.push(
-        `| ${g.name} | ${g.cpus} | ${g.children} | ${g.processedWaves ?? g.completedWaves ?? "?"}/${g.wavesRequested} processed (${g.failedWaves ?? "?"} failed)${g.partial ? " (log truncated; partial data)" : ""} | ${f}/${n}${(g.unclassifiedFailureCount ?? 0) > 0 ? ` (${g.unclassifiedFailureCount} unclassified)` : ""} | ${n ? `${pct(f / n)} ${ci(f, n)}` : "—"} | ${fmtMHz(g.frequency?.avgMHz)} / ${fmtMHz(g.frequency?.maxMHz)} |`,
+        `| ${g.name} | ${g.cpus} | ${g.children} | ${g.processedWaves ?? g.completedWaves ?? "?"}/${g.wavesRequested} processed (${g.failedWaves ?? "?"} failed)${statusNote} | ${f}/${n}${(g.unclassifiedFailureCount ?? 0) > 0 ? ` (${g.unclassifiedFailureCount} unclassified)` : ""} | ${rate} | ${fmtMHz(g.frequency?.avgMHz)} / ${fmtMHz(g.frequency?.maxMHz)} |`,
       );
     }
     L.push("");
@@ -410,17 +438,20 @@ function renderConclusions(r) {
   let totalOther = 0;
   let totalUnclassified = 0;
   let totalRuns = 0;
+  let hasIncompleteReproEvidence = false;
   if (r.baseline) {
     totalSig += r.baseline.sigsegvCount;
     totalOther += r.baseline.otherFailureCount ?? 0;
     totalUnclassified += r.baseline.unclassifiedFailureCount ?? 0;
     totalRuns += r.baseline.totalChildInvocations;
+    if (reproCompletionStatus(r.baseline) !== "complete") hasIncompleteReproEvidence = true;
   }
   for (const g of r.groups ?? []) {
     totalSig += g.sigsegvCount ?? 0;
     totalOther += g.otherFailureCount ?? 0;
     totalUnclassified += g.unclassifiedFailureCount ?? 0;
     totalRuns += g.totalChildInvocations ?? 0;
+    if (reproCompletionStatus(g) !== "complete") hasIncompleteReproEvidence = true;
   }
   for (const c of r.individual ?? []) {
     totalSig += c.sigsegv;
@@ -431,8 +462,10 @@ function renderConclusions(r) {
     C.push(`- **The problem reproduced**: ${totalSig} SIGSEGV(s) across ${totalRuns} child-process runs in this diagnostic session.${unresolved}`);
   } else if (totalOther > 0 || totalUnclassified > 0) {
     C.push(`- Workload failures occurred across ${totalRuns} child-process runs, but none were confirmed as SIGSEGV (${totalOther} classified other failure(s), ${totalUnclassified} unclassified summary-only failure(s)).`);
-  } else if (totalRuns > 0) {
+  } else if (totalRuns > 0 && !hasIncompleteReproEvidence) {
     C.push(`- **No failure reproduced** across ${totalRuns} child-process observations spanning different phases/configurations. No pooled rate bound is valid across these heterogeneous strata; use the phase-, group-, and CPU-specific bounds above. This does not rule out the defect; see Limitations.`);
+  } else if (totalRuns > 0) {
+    C.push(`- No failure was observed in ${totalRuns} accepted child-process observations, but partial or structurally inconsistent repro evidence prevents a clean non-reproduction conclusion or rate bound.`);
   } else {
     C.push("- No workload results were collected.");
   }
@@ -463,6 +496,7 @@ function renderConclusions(r) {
   const failingGroups = (r.groups ?? []).filter((g) => (g.sigsegvCount ?? 0) > 0);
   const cleanGroups = (r.groups ?? []).filter(
     (g) =>
+      reproCompletionStatus(g) === "complete" &&
       (g.sigsegvCount ?? 0) === 0 &&
       (g.otherFailureCount ?? 0) === 0 &&
       (g.unclassifiedFailureCount ?? 0) === 0 &&

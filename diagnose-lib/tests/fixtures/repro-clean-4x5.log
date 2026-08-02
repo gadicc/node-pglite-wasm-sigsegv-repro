@@ -1,0 +1,7 @@
+node=v25.2.1 v8=14.1.146.11-node.14 platform=linux arch=x64 children=4 waves=5
+wave=1 passed=4/4
+wave=2 passed=4/4
+wave=3 passed=4/4
+wave=4 passed=4/4
+wave=5 passed=4/4
+failedWaves=0 completedWaves=5 requestedWaves=5

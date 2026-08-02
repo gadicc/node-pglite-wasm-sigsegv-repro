@@ -32,6 +32,13 @@ test("parseReproLog: epoch-prefixed log with failures", () => {
   assert.equal(r.durationSec, 30);
   assert.equal(r.waves.length, 5);
   assert.equal(r.waves[3].passed, 2);
+  assert.equal(r.completionStatus, "complete");
+  assert.deepEqual(r.footer, {
+    failedWaves: 2,
+    completedWaves: 5,
+    requestedWaves: 5,
+    line: 10,
+  });
 });
 
 test("parseReproLog: clean log without timestamps", () => {
@@ -62,6 +69,7 @@ test("parseReproLog: truncated log recovers wave counts from wave rows", () => {
   assert.equal(r.unclassifiedFailureCount, 0);
   assert.equal(r.firstFailureAfterSec, 12);
   assert.equal(r.durationSec, 12);
+  assert.equal(r.completionStatus, "partial");
 });
 
 test("parseReproLog: footer-present logs are not partial", () => {
@@ -76,7 +84,8 @@ test("parseReproLog: duplicate wave rows are not double-counted", () => {
     "wave=1 passed=1/2", // duplicate row: first occurrence wins
     "wave=2 passed=1/2",
   ].join("\n"));
-  assert.equal(r.partial, true);
+  assert.equal(r.partial, false);
+  assert.equal(r.completionStatus, "inconsistent");
   assert.equal(r.completedWaves, 2);
   assert.equal(r.failedWaves, 1);
   assert.equal(r.totalChildInvocations, 4);
@@ -105,7 +114,7 @@ test("parseReproLog: wave rows disagreeing with the header are not counted", () 
     "wave=1 passed=2/2",
     "wave=2 passed=3/3", // of=3 disagrees with header children=2
   ].join("\n"));
-  assert.equal(r.partial, true);
+  assert.equal(r.completionStatus, "inconsistent");
   assert.equal(r.completedWaves, 1);
   assert.equal(r.failedWaves, 0);
   assert.equal(r.totalChildInvocations, 2);
@@ -118,11 +127,116 @@ test("parseReproLog: wave rows outside the requested range are not counted", () 
     "wave=1 passed=2/2",
     "wave=3 passed=1/2", // outside requested waves 1..2
   ].join("\n"));
-  assert.equal(r.partial, true);
+  assert.equal(r.completionStatus, "inconsistent");
   assert.equal(r.completedWaves, 1);
   assert.equal(r.failedWaves, 0);
   assert.equal(r.totalChildInvocations, 2);
   assert.ok(r.notes.some((n) => n.includes("wave=3") && n.includes("outside requested waves")));
+});
+
+test("parseReproLog: completion needs rows, not merely a plausible footer", () => {
+  const r = parseReproLog([
+    "node=v25.2.1 v8=14.1 platform=linux arch=x64 children=2 waves=3",
+    "failedWaves=0 completedWaves=3 requestedWaves=3",
+  ].join("\n"), { expectedChildren: 2, expectedWaves: 3, exitCode: 0 });
+  assert.equal(r.completionStatus, "inconsistent");
+  assert.equal(r.totalChildInvocations, 0);
+  assert.equal(r.completedWaves, 0);
+  assert.match(r.issues.map(({ code }) => code).join(" "), /footer-row-count-mismatch/);
+});
+
+test("parseReproLog: external metadata and exit status are reconciled", () => {
+  const log = readFixture("repro-clean.log");
+  assert.equal(parseReproLog(log, {
+    expectedChildren: 2,
+    expectedWaves: 3,
+    exitCode: 0,
+  }).completionStatus, "complete");
+
+  const mismatch = parseReproLog(log, {
+    expectedChildren: 3,
+    expectedWaves: 4,
+    exitCode: 1,
+  });
+  assert.equal(mismatch.completionStatus, "inconsistent");
+  assert.match(
+    mismatch.issues.map(({ code }) => code).join(" "),
+    /expected-children-mismatch.*expected-waves-mismatch.*incomplete-footer.*exit-code-mismatch/,
+  );
+});
+
+test("parseReproLog: header/footer disagreement and impossible footer are inconsistent", () => {
+  const r = parseReproLog([
+    "node=v25.2.1 v8=14.1 platform=linux arch=x64 children=2 waves=2",
+    "wave=1 passed=2/2",
+    "failedWaves=2 completedWaves=1 requestedWaves=3",
+  ].join("\n"));
+  assert.equal(r.completionStatus, "inconsistent");
+  assert.equal(r.totalChildInvocations, 2);
+  assert.match(r.issues.map(({ code }) => code).join(" "), /footer-header-mismatch.*impossible-footer/);
+});
+
+test("parseReproLog: duplicate, gap, malformed, and multiple structural records are inconsistent", () => {
+  const cases = [
+    ["duplicate header", [
+      "node=v25.2.1 v8=14.1 platform=linux arch=x64 children=1 waves=1",
+      "node=v25.2.1 v8=14.1 platform=linux arch=x64 children=1 waves=1",
+      "wave=1 passed=1/1",
+      "failedWaves=0 completedWaves=1 requestedWaves=1",
+    ]],
+    ["gap", [
+      "node=v25.2.1 v8=14.1 platform=linux arch=x64 children=1 waves=2",
+      "wave=2 passed=1/1",
+    ]],
+    ["malformed", [
+      "node=v25.2.1 v8=14.1 platform=linux arch=x64 children=1 waves=1",
+      "wave=01 passed=1/1",
+    ]],
+    ["multiple footer", [
+      "node=v25.2.1 v8=14.1 platform=linux arch=x64 children=1 waves=1",
+      "wave=1 passed=1/1",
+      "failedWaves=0 completedWaves=1 requestedWaves=1",
+      "failedWaves=0 completedWaves=1 requestedWaves=1",
+    ]],
+  ];
+  for (const [label, lines] of cases) {
+    assert.equal(parseReproLog(lines.join("\n")).completionStatus, "inconsistent", label);
+  }
+});
+
+test("parseReproLog: child detail attached to a duplicate row cannot migrate", () => {
+  const r = parseReproLog([
+    "node=v25.2.1 v8=14.1 platform=linux arch=x64 children=2 waves=2",
+    "wave=1 passed=2/2",
+    "wave=1 passed=1/2",
+    "child=1 code=null signal=SIGSEGV elapsedMs=4",
+    "wave=2 passed=2/2",
+    "failedWaves=0 completedWaves=2 requestedWaves=2",
+  ].join("\n"));
+  assert.equal(r.completionStatus, "inconsistent");
+  assert.equal(r.totalChildInvocations, 4);
+  assert.equal(r.sigsegvCount, 0);
+  assert.equal(r.failures.length, 0);
+  assert.ok(r.notes.some((note) => note.includes("rejected wave=1")));
+});
+
+test("parseReproLog: structural record order and timestamp provenance are strict", () => {
+  const footerFirst = parseReproLog([
+    "failedWaves=0 completedWaves=1 requestedWaves=1",
+    "node=v25.2.1 v8=14.1 platform=linux arch=x64 children=1 waves=1",
+    "wave=1 passed=1/1",
+  ].join("\n"));
+  assert.equal(footerFirst.completionStatus, "inconsistent");
+  assert.match(footerFirst.issues.map(({ code }) => code).join(" "), /header-order.*footer-order/);
+
+  const mixed = parseReproLog([
+    "node=v25.2.1 v8=14.1 platform=linux arch=x64 children=1 waves=1",
+    "1753950010\twave=1 passed=1/1",
+    "1753950009\tfailedWaves=0 completedWaves=1 requestedWaves=1",
+  ].join("\n"));
+  assert.equal(mixed.completionStatus, "inconsistent");
+  assert.equal(mixed.durationSec, null);
+  assert.match(mixed.issues.map(({ code }) => code).join(" "), /mixed-timestamps.*decreasing-timestamp/);
 });
 
 test("renderReport: partial baseline and group data are marked as truncated", () => {
@@ -195,6 +309,47 @@ test("renderReport: unclassified truncated failures are never called clean", () 
   assert.match(md, /Unclassified failures \(summary only\) \| 4/);
   assert.match(md, /Workload failures occurred/);
   assert.doesNotMatch(md, /No failure reproduced/);
+});
+
+test("renderReport: inconsistent clean-looking repro rows stay descriptive", () => {
+  const md = renderReport({
+    collectedAt: "2026-08-02T00:00:00.000Z",
+    config: {},
+    environment: {},
+    baseline: {
+      children: 2,
+      requestedWaves: 2,
+      processedWaves: 2,
+      completedWaves: 2,
+      failedWaves: 0,
+      totalChildInvocations: 4,
+      sigsegvCount: 0,
+      otherFailureCount: 0,
+      unclassifiedFailureCount: 0,
+      completionStatus: "inconsistent",
+      issues: [{ code: "footer-row-count-mismatch", message: "footer disagrees with rows" }],
+      log: "logs/baseline/run1.log",
+    },
+    groups: [{
+      name: "pcores",
+      cpus: "0-1",
+      children: 2,
+      wavesRequested: 2,
+      processedWaves: 2,
+      failedWaves: 0,
+      totalChildInvocations: 4,
+      sigsegvCount: 0,
+      otherFailureCount: 0,
+      unclassifiedFailureCount: 0,
+      completionStatus: "inconsistent",
+    }],
+  });
+  assert.match(md, /structurally inconsistent/);
+  assert.match(md, /descriptive only; inconsistent structure/);
+  assert.match(md, /prevents a clean non-reproduction conclusion or rate bound/);
+  assert.doesNotMatch(md, /\*\*No failure reproduced\*\*/);
+  assert.doesNotMatch(md, /clean group\(s\): pcores/);
+  assert.doesNotMatch(md, /0\/4 \(95% upper/);
 });
 
 test("renderReport: clean heterogeneous phases do not get a pooled rate bound", () => {

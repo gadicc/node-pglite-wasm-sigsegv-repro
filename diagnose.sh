@@ -1353,15 +1353,9 @@ run_gdb_logged() {
 }
 
 repro_result_is_complete() {
-  local logf="$1" expected_waves="$2" rc="$3"
-  [[ "$rc" == "0" || "$rc" == "1" ]] || return 1
-  awk -v expected="$expected_waves" '
-    {
-      sub(/^[0-9]+\t/, "")
-      if ($0 ~ "^failedWaves=[0-9]+ completedWaves=" expected " requestedWaves=" expected "$") complete=1
-    }
-    END { exit complete ? 0 : 1 }
-  ' "$logf"
+  local logf="$1" expected_children="$2" expected_waves="$3" rc="$4"
+  node "$LIB/parse-repro-log.mjs" --validate-complete \
+    "$logf" "$expected_children" "$expected_waves" "$rc"
 }
 
 # ------------------------------------------------------------------
@@ -1650,7 +1644,7 @@ phase_baseline() {
     printf 'LOG=%s\n' "$logf"
     printf 'EXIT_CODE=%s\n' "$REPRO_RC"
   } > "$OUT_DIR/results/baseline.meta"
-  repro_result_is_complete "$OUT_DIR/$logf" "$BASELINE_WAVES" "$REPRO_RC" ||
+  repro_result_is_complete "$OUT_DIR/$logf" "$BASELINE_CHILDREN" "$BASELINE_WAVES" "$REPRO_RC" ||
     diag_die "baseline did not produce a complete $BASELINE_WAVES-wave result (rc=$REPRO_RC); phase remains resumable"
   mark_done baseline
 }
@@ -1672,7 +1666,7 @@ phase_groups() {
     diag_freq_sampler_start "$freq_tag"
     run_repro_logged "$OUT_DIR/$logf" "$cpus" "$children" "$GROUP_WAVES"
     diag_freq_sampler_stop
-    repro_result_is_complete "$OUT_DIR/$logf" "$GROUP_WAVES" "$REPRO_RC" ||
+    repro_result_is_complete "$OUT_DIR/$logf" "$children" "$GROUP_WAVES" "$REPRO_RC" ||
       diag_die "group $name did not produce a complete $GROUP_WAVES-wave result (rc=$REPRO_RC); phase remains resumable"
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$name" "$kind" "$cpus" "$cluster" "$children" "$GROUP_WAVES" \
