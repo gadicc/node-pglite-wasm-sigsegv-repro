@@ -62,7 +62,7 @@ for ((run = 1; run <= max_runs; run++)); do
     printf '# capture-fault.sh cpu=%s run=%s started=%s\n' "$cpu" "$run" "$(date -Is)"
     printf '# affinity: '
     taskset -pc $$ 2>/dev/null || printf 'unknown\n'
-    timeout --signal=KILL 180 taskset -c "$cpu" gdb --batch \
+    timeout --foreground --signal=KILL 180 taskset -c "$cpu" gdb --batch \
       -ex "set pagination off" \
       -ex "set width 0" \
       -ex "set debuginfod enabled off" \

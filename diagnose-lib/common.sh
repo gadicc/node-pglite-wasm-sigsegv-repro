@@ -579,23 +579,72 @@ diag_register_restore_trap() {
 : "${DIAG_FREQ_DIR:=.}"
 DIAG_SAMPLER_PID=""
 DIAG_WORKLOAD_PID=""
+: "${DIAG_OPERATIONAL_ERROR_RC:=125}"
 
-diag_workload_stop() {
+diag_process_group_start() {
+  # Start one externally managed command in a private session. In these
+  # non-interactive scripts the background child is not already a process-
+  # group leader, so setsid preserves its PID as the new process-group ID.
+  [[ -z "$DIAG_WORKLOAD_PID" ]] || {
+    diag_warn "refusing to replace tracked process group $DIAG_WORKLOAD_PID"
+    return "$DIAG_OPERATIONAL_ERROR_RC"
+  }
+  setsid "$@" &
+  DIAG_WORKLOAD_PID=$!
+}
+
+diag_process_group_wait() {
+  [[ -n "$DIAG_WORKLOAD_PID" ]] || return "$DIAG_OPERATIONAL_ERROR_RC"
+  local pid="$DIAG_WORKLOAD_PID" rc=0 i
+  wait "$pid" || rc=$?
+  # A wrapper can exit after its direct command ends while a descendant is
+  # still alive in the private group (notably an inferior launched by a
+  # foreground timeout). Do not discard the only handle to that descendant.
+  if kill -0 -- "-$pid" 2> /dev/null; then
+    diag_warn "tracked process leader exited with descendants still running; stopping them"
+    kill -TERM -- "-$pid" 2> /dev/null || true
+    for ((i = 0; i < 40; i++)); do
+      kill -0 -- "-$pid" 2> /dev/null || break
+      sleep 0.05
+    done
+    if kill -0 -- "-$pid" 2> /dev/null; then
+      diag_warn "tracked descendants did not stop after SIGTERM; sending SIGKILL"
+      kill -KILL -- "-$pid" 2> /dev/null || true
+    fi
+  fi
+  # A signal trap may already have stopped and cleared this group.
+  [[ "$DIAG_WORKLOAD_PID" != "$pid" ]] || DIAG_WORKLOAD_PID=""
+  return "$rc"
+}
+
+diag_process_group_stop() {
   [[ -n "$DIAG_WORKLOAD_PID" ]] || return 0
-  local pid="$DIAG_WORKLOAD_PID" i
-  # diag_run_single_runs starts each workload with setsid, so the PID is also
-  # its process-group ID. Signal the entire chain (runuser/taskset/node).
+  local pid="$DIAG_WORKLOAD_PID" watchdog
+  # Signal the entire pipeline/process tree. Reap the leader concurrently
+  # with the bounded watchdog: polling only the leader mistakes a zombie for
+  # a live workload and cannot detect descendants left behind by an exited
+  # leader.
   kill -TERM -- "-$pid" 2> /dev/null || kill -TERM "$pid" 2> /dev/null || true
-  for ((i = 0; i < 40; i++)); do
-    kill -0 "$pid" 2> /dev/null || break
-    sleep 0.05
-  done
-  if kill -0 "$pid" 2> /dev/null; then
+  (
+    local i
+    for ((i = 0; i < 40; i++)); do
+      kill -0 -- "-$pid" 2> /dev/null || exit 0
+      sleep 0.05
+    done
     diag_warn "workload process group did not stop after SIGTERM; sending SIGKILL"
     kill -KILL -- "-$pid" 2> /dev/null || kill -KILL "$pid" 2> /dev/null || true
-  fi
+  ) &
+  watchdog=$!
   wait "$pid" 2> /dev/null || true
+  wait "$watchdog" 2> /dev/null || true
+  # Close the race where the leader exited just as a descendant was forked.
+  kill -KILL -- "-$pid" 2> /dev/null || true
   DIAG_WORKLOAD_PID=""
+}
+
+diag_workload_stop() {
+  # Backward-compatible name retained for cleanup callers and fixtures.
+  diag_process_group_stop
 }
 
 diag_turbostat_usable() {
@@ -661,13 +710,13 @@ diag_run_single_runs() {
   diag_freq_sampler_start "freq-ab-${leg}"
   for ((i = 1; i <= runs; i++)); do
     start=$SECONDS
-    set +e
-    setsid "$@" taskset -c "$cpu" node child.mjs > /dev/null 2>&1 &
-    DIAG_WORKLOAD_PID=$!
-    wait "$DIAG_WORKLOAD_PID"
-    rc=$?
-    DIAG_WORKLOAD_PID=""
-    set -e
+    if ! diag_process_group_start "$@" taskset -c "$cpu" node child.mjs > /dev/null 2>&1; then
+      rc="$DIAG_OPERATIONAL_ERROR_RC"
+    elif diag_process_group_wait; then
+      rc=0
+    else
+      rc=$?
+    fi
     elapsed=$((SECONDS - start))
     printf '%s\t%s\t%s\t%s\n' "$leg" "$i" "$rc" "$elapsed" >> "$tsv"
     if ((rc != 0)); then

@@ -135,6 +135,149 @@ workload_signal_gone=0
 check_eq "SIGTERM interrupts external workload and promptly restores" "1" \
   "$([[ $workload_signal_rc -eq 143 && "$(cat "$WORKLOAD_SIGNAL_DIR/no_turbo")" == 0 && $workload_signal_elapsed -le 5 && $workload_signal_gone -eq 1 ]] && echo 1 || echo 0)"
 
+echo "== tracked process groups and pipeline statuses =="
+PROCESS_GROUP_DIR="$TMP/process-group"
+mkdir -p "$PROCESS_GROUP_DIR"
+DIAG_WORKLOAD_PID=""
+diag_process_group_start bash "$FIX/process-group-child.sh" "$PROCESS_GROUP_DIR"
+process_group_leader="$DIAG_WORKLOAD_PID"
+for ((i = 0; i < 100; i++)); do
+  [[ -s "$PROCESS_GROUP_DIR/leader.pid" && -s "$PROCESS_GROUP_DIR/child.pid" ]] && break
+  sleep 0.01
+done
+process_group_child="$(cat "$PROCESS_GROUP_DIR/child.pid" 2> /dev/null || true)"
+process_group_stop_start=$SECONDS
+diag_process_group_stop
+process_group_stop_elapsed=$((SECONDS - process_group_stop_start))
+for ((i = 0; i < 40; i++)); do
+  [[ -z "$process_group_child" ]] || ! kill -0 "$process_group_child" 2> /dev/null || {
+    sleep 0.05
+    continue
+  }
+  break
+done
+process_group_clean=0
+[[ -n "$process_group_leader" && -n "$process_group_child" ]] &&
+  ! kill -0 "$process_group_leader" 2> /dev/null &&
+  ! kill -0 "$process_group_child" 2> /dev/null &&
+  [[ -z "$DIAG_WORKLOAD_PID" ]] &&
+  ((process_group_stop_elapsed <= 4)) && process_group_clean=1
+check_eq "cleanup reaps a tracked group including a TERM-resistant descendant" "1" "$process_group_clean"
+
+DIAG_WORKLOAD_PID=""
+diag_process_group_start bash -c 'exit 7'
+process_group_wait_rc=0
+diag_process_group_wait || process_group_wait_rc=$?
+check_eq "tracked wait preserves the primary exit status" "7" "$process_group_wait_rc"
+check_eq "tracked wait clears the active group" "" "$DIAG_WORKLOAD_PID"
+
+PROCESS_GROUP_EXIT_DIR="$TMP/process-group-exited-leader"
+mkdir -p "$PROCESS_GROUP_EXIT_DIR"
+DIAG_WORKLOAD_PID=""
+diag_process_group_start bash "$FIX/process-group-child.sh" "$PROCESS_GROUP_EXIT_DIR" exit
+for ((i = 0; i < 100; i++)); do
+  [[ -s "$PROCESS_GROUP_EXIT_DIR/child.pid" ]] && break
+  sleep 0.01
+done
+exited_leader_child="$(cat "$PROCESS_GROUP_EXIT_DIR/child.pid" 2> /dev/null || true)"
+exited_leader_rc=0
+diag_process_group_wait || exited_leader_rc=$?
+for ((i = 0; i < 40; i++)); do
+  [[ -z "$exited_leader_child" ]] || ! kill -0 "$exited_leader_child" 2> /dev/null || {
+    sleep 0.05
+    continue
+  }
+  break
+done
+exited_leader_clean=0
+[[ $exited_leader_rc -eq 0 && -n "$exited_leader_child" ]] &&
+  ! kill -0 "$exited_leader_child" 2> /dev/null &&
+  [[ -z "$DIAG_WORKLOAD_PID" ]] && exited_leader_clean=1
+check_eq "tracked wait drains descendants left by an exited leader" "1" "$exited_leader_clean"
+
+PIPELINE_DIR="$TMP/pipeline-status"
+mkdir -p "$PIPELINE_DIR/bin" "$PIPELINE_DIR/out"
+cat > "$PIPELINE_DIR/bin/node" << 'EOF'
+#!/usr/bin/env bash
+printf 'synthetic workload output\n'
+exit "${FAKE_NODE_RC:-0}"
+EOF
+cat > "$PIPELINE_DIR/bin/taskset" << 'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  -c) shift 2; exec "$@" ;;
+  -pc) printf 'pid %s affinity: synthetic\n' "$2"; exit 0 ;;
+  *) exit 2 ;;
+esac
+EOF
+cat > "$PIPELINE_DIR/bin/gdb" << 'EOF'
+#!/usr/bin/env bash
+printf 'Inferior 1 exited normally\n'
+EOF
+cat > "$PIPELINE_DIR/bin/timeout" << 'EOF'
+#!/usr/bin/env bash
+[[ "$1" == "--foreground" && "$2" == "--signal=KILL" ]] || exit 91
+shift 3
+exec "$@"
+EOF
+chmod +x "$PIPELINE_DIR/bin/node" "$PIPELINE_DIR/bin/taskset" \
+  "$PIPELINE_DIR/bin/gdb" "$PIPELINE_DIR/bin/timeout"
+
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  export PATH="$PIPELINE_DIR/bin:$PATH"
+  export FAKE_NODE_RC=1
+  run_repro_logged "$PIPELINE_DIR/out/repro.log" - 1 1
+  printf '%s\n' "$REPRO_RC" > "$PIPELINE_DIR/repro.rc"
+)
+check_eq "repro logging pipeline preserves the workload status" "1" "$(cat "$PIPELINE_DIR/repro.rc")"
+
+cat > "$PIPELINE_DIR/bin/awk" << 'EOF'
+#!/usr/bin/env bash
+exit 7
+EOF
+chmod +x "$PIPELINE_DIR/bin/awk"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  export PATH="$PIPELINE_DIR/bin:$PATH"
+  export FAKE_NODE_RC=0
+  run_repro_logged "$PIPELINE_DIR/out/repro-awk-fail.log" - 1 1
+  printf '%s\n' "$REPRO_RC" > "$PIPELINE_DIR/repro-awk-fail.rc"
+)
+check_eq "repro auxiliary-stage failure is operational status 125" "125" \
+  "$(cat "$PIPELINE_DIR/repro-awk-fail.rc")"
+rm "$PIPELINE_DIR/bin/awk"
+
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  export PATH="$PIPELINE_DIR/bin:$PATH"
+  export FAKE_NODE_RC=139
+  individual_rc=0
+  run_individual_logged 0 1 "$PIPELINE_DIR/out/individual.tsv" 1 \
+    "$PIPELINE_DIR/out/individual.log" || individual_rc=$?
+  individual_valid=0
+  individual_cpu_batch_matches_wrapper \
+    "$PIPELINE_DIR/out/individual.tsv" 0 0 1 "$individual_rc" && individual_valid=1
+  printf '%s|%s\n' "$individual_rc" "$individual_valid" > "$PIPELINE_DIR/individual.status"
+)
+check_eq "individual pipeline preserves SIGSEGV batch semantics" "1|1" \
+  "$(cat "$PIPELINE_DIR/individual.status")"
+
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  export PATH="$PIPELINE_DIR/bin:$PATH"
+  gdb_rc=0
+  run_gdb_logged 0 1 1 "$PIPELINE_DIR/out/gdb" "$PIPELINE_DIR/out/gdb-runner.log" || gdb_rc=$?
+  printf '%s\n' "$gdb_rc" > "$PIPELINE_DIR/gdb.rc"
+)
+check_eq "GDB logging pipeline preserves the no-fault status" "3" "$(cat "$PIPELINE_DIR/gdb.rc")"
+grep -q 'timeout --foreground --signal=KILL' "$REPO_ROOT/capture-fault.sh"
+check_eq "GDB timeout remains inside the tracked foreground group" "0" "$?"
+
 echo "== fail-closed settings restore =="
 RESTORE_FAIL_DIR="$TMP/restore-fail"
 mkdir -p "$RESTORE_FAIL_DIR"

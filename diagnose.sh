@@ -65,7 +65,7 @@ SKIP_GDB_EXPLICIT=0
 CPU_EXPLICIT=0
 REQUIRED_COMMANDS=(
   awk basename bash cat cut date dirname find grep head mkdir mktemp mv node
-  nproc paste readlink rm sed sha256sum sleep sort sync tail taskset tee timeout
+  nproc paste readlink rm sed setsid sha256sum sleep sort sync tail taskset tee timeout
   touch tr uniq wc xargs
 )
 
@@ -791,18 +791,62 @@ REPRO_RC=0
 run_repro_logged() {
   local logf="$1" cpulist="$2" children="$3" waves="$4"
   mkdir -p "$(dirname "$logf")"
-  set +e
   if [[ "$cpulist" == "-" ]]; then
     diag_log_cmd env STOP_ON_FAILURE=0 node repro.mjs "$children" "$waves"
-    env STOP_ON_FAILURE=0 node repro.mjs "$children" "$waves" 2>&1 |
-      awk '{print systime()"\t"$0}' > "$logf"
   else
     diag_log_cmd env STOP_ON_FAILURE=0 taskset -c "$cpulist" node repro.mjs "$children" "$waves"
-    env STOP_ON_FAILURE=0 taskset -c "$cpulist" node repro.mjs "$children" "$waves" 2>&1 |
-      awk '{print systime()"\t"$0}' > "$logf"
   fi
-  REPRO_RC=${PIPESTATUS[0]}
-  set -e
+  if ! diag_process_group_start bash -c '
+    logf=$1 cpulist=$2 children=$3 waves=$4 repo=$5 awk_program=$6 operational_rc=$7
+    cd "$repo" || exit "$operational_rc"
+    if [[ "$cpulist" == "-" ]]; then
+      env STOP_ON_FAILURE=0 node repro.mjs "$children" "$waves" 2>&1 |
+        awk "$awk_program" > "$logf"
+    else
+      env STOP_ON_FAILURE=0 taskset -c "$cpulist" node repro.mjs "$children" "$waves" 2>&1 |
+        awk "$awk_program" > "$logf"
+    fi
+    statuses=("${PIPESTATUS[@]}")
+    ((statuses[1] == 0)) || exit "$operational_rc"
+    exit "${statuses[0]}"
+  ' diag-repro "$logf" "$cpulist" "$children" "$waves" "$SCRIPT_DIR" \
+    '{print systime()"\t"$0}' "$DIAG_OPERATIONAL_ERROR_RC"; then
+    REPRO_RC="$DIAG_OPERATIONAL_ERROR_RC"
+  elif diag_process_group_wait; then
+    REPRO_RC=0
+  else
+    REPRO_RC=$?
+  fi
+}
+
+run_individual_logged() {
+  local cpu="$1" runs="$2" tsv="$3" first_run="$4" logf="$5"
+  diag_process_group_start bash -c '
+    repo=$1 cpu=$2 runs=$3 tsv=$4 first_run=$5 logf=$6 operational_rc=$7
+    cd "$repo" || exit "$operational_rc"
+    bash single.sh "$cpu" "$runs" "$tsv" "$first_run" 2>&1 |
+      tee -a "$logf" | tail -1
+    statuses=("${PIPESTATUS[@]}")
+    ((statuses[1] == 0 && statuses[2] == 0)) || exit "$operational_rc"
+    exit "${statuses[0]}"
+  ' diag-individual "$SCRIPT_DIR" "$cpu" "$runs" "$tsv" "$first_run" "$logf" \
+    "$DIAG_OPERATIONAL_ERROR_RC" || return "$DIAG_OPERATIONAL_ERROR_RC"
+  diag_process_group_wait
+}
+
+run_gdb_logged() {
+  local cpu="$1" max_runs="$2" max_captures="$3" out_dir="$4" logf="$5"
+  diag_process_group_start bash -c '
+    repo=$1 cpu=$2 max_runs=$3 max_captures=$4 out_dir=$5 logf=$6 operational_rc=$7
+    cd "$repo" || exit "$operational_rc"
+    bash capture-fault.sh "$cpu" "$max_runs" "$max_captures" "$out_dir" 2>&1 |
+      tee "$logf"
+    statuses=("${PIPESTATUS[@]}")
+    ((statuses[1] == 0)) || exit "$operational_rc"
+    exit "${statuses[0]}"
+  ' diag-gdb "$SCRIPT_DIR" "$cpu" "$max_runs" "$max_captures" "$out_dir" "$logf" \
+    "$DIAG_OPERATIONAL_ERROR_RC" || return "$DIAG_OPERATIONAL_ERROR_RC"
+  diag_process_group_wait
 }
 
 repro_result_is_complete() {
@@ -1200,12 +1244,10 @@ phase_individual() {
     else
       diag_log "cpu $cpu [$idx/$total]: $INDIVIDUAL_RUNS runs"
     fi
-    set +e
     diag_log_cmd bash single.sh "$cpu" "$deficit" "$tsv" "$((existing + 1))"
-    bash single.sh "$cpu" "$deficit" "$tsv" "$((existing + 1))" 2>&1 |
-      tee -a "$OUT_DIR/logs/individual/cpu-${cpu}.log" | tail -1
-    wrapper_rc=${PIPESTATUS[0]}
-    set -e
+    wrapper_rc=0
+    run_individual_logged "$cpu" "$deficit" "$tsv" "$((existing + 1))" \
+      "$OUT_DIR/logs/individual/cpu-${cpu}.log" || wrapper_rc=$?
     individual_rows_are_valid "$tsv" "$INDIVIDUAL_TARGET_CPUS" "$INDIVIDUAL_RUNS" 0 &&
       individual_cpu_batch_matches_wrapper "$tsv" "$cpu" "$existing" "$INDIVIDUAL_RUNS" "$wrapper_rc" ||
       diag_die "cpu $cpu did not produce $deficit valid clean/SIGSEGV result(s) (wrapper rc=$wrapper_rc); phase remains resumable"
@@ -1425,12 +1467,10 @@ phase_gdb() {
     printf 'MAX_RUNS=%s\n' "$GDB_MAX_RUNS"
   } > "$meta"
   mkdir -p "$OUT_DIR/logs/gdb"
-  set +e
   diag_log_cmd bash capture-fault.sh "$cpu" "$GDB_MAX_RUNS" "$GDB_MAX_CAPTURES" "$OUT_DIR/gdb"
-  bash capture-fault.sh "$cpu" "$GDB_MAX_RUNS" "$GDB_MAX_CAPTURES" "$OUT_DIR/gdb" 2>&1 |
-    tee "$OUT_DIR/logs/gdb/runner.log"
-  local rc=${PIPESTATUS[0]}
-  set -e
+  local rc=0
+  run_gdb_logged "$cpu" "$GDB_MAX_RUNS" "$GDB_MAX_CAPTURES" "$OUT_DIR/gdb" \
+    "$OUT_DIR/logs/gdb/runner.log" || rc=$?
   printf 'EXIT_CODE=%s\n' "$rc" >> "$meta"
   if ! gdb_result_is_complete "$rc"; then
     case "$rc" in
@@ -1552,14 +1592,17 @@ diagnose_cleanup_exit() {
   local rc="$1"
   trap - EXIT INT TERM
   redo_marker_temp_cleanup
+  diag_process_group_stop
   diag_freq_sampler_stop
   exit "$rc"
 }
 
 on_interrupt() {
   local sig="$1"
+  trap - EXIT INT TERM
   redo_marker_temp_cleanup
   meta_set INTERRUPTED 1 2> /dev/null || true
+  diag_process_group_stop 2> /dev/null || true
   diag_freq_sampler_stop 2> /dev/null || true
   if [[ -e "$STATE_DIR/redo.pending" || -L "$STATE_DIR/redo.pending" ]]; then
     diag_warn "received $sig while redo archival is pending; skipping a misleading partial report (resume this bundle to recover)"
