@@ -394,6 +394,105 @@ require_dependencies() {
 META_FILE=""
 STATE_DIR=""
 
+bundle_owned_real_dir() {
+  local path="$1" owner
+  [[ -d "$path" && ! -L "$path" && -r "$path" && -w "$path" && -x "$path" ]] || return 1
+  owner="$(stat -c '%u' -- "$path" 2> /dev/null)" || return 1
+  [[ "$owner" == "$EUID" ]]
+}
+
+bundle_owned_single_regular() {
+  local path="$1" metadata owner links
+  [[ -f "$path" && ! -L "$path" && -r "$path" && -w "$path" ]] || return 1
+  metadata="$(stat -c '%u:%h' -- "$path" 2> /dev/null)" || return 1
+  [[ "$metadata" =~ ^([0-9]+):([0-9]+)$ ]] || return 1
+  owner="${BASH_REMATCH[1]}"
+  links="${BASH_REMATCH[2]}"
+  [[ "$owner" == "$EUID" && "$links" == 1 ]]
+}
+
+bundle_create_empty_exclusive() {
+  local path="$1" mode="${2:-0644}"
+  [[ ! -e "$path" && ! -L "$path" ]] || return 1
+  (umask 077; set -o noclobber; : > "$path") 2> /dev/null || return 1
+  chmod "$mode" -- "$path" || return 1
+  bundle_owned_single_regular "$path"
+}
+
+bundle_prepare_dir() {
+  local relative="$1" path parent
+  path="$OUT_DIR/$relative"
+  parent="${relative%/*}"
+  if [[ "$parent" == "$relative" ]]; then
+    parent="$OUT_DIR"
+  else
+    parent="$OUT_DIR/$parent"
+  fi
+  bundle_owned_real_dir "$parent" || return 1
+  if [[ ! -e "$path" && ! -L "$path" ]]; then
+    mkdir -- "$path" || return 1
+  fi
+  bundle_owned_real_dir "$path"
+}
+
+phase_name_supported() {
+  case "$1" in preflight | baseline | groups | individual | frequency | gdb) return 0 ;; esac
+  return 1
+}
+
+phase_marker_is_valid() {
+  local phase="$1" marker metadata
+  phase_name_supported "$phase" || return 1
+  marker="$STATE_DIR/phase-$phase.done"
+  bundle_owned_single_regular "$marker" || return 1
+  metadata="$(stat -c '%s' -- "$marker" 2> /dev/null)" || return 1
+  [[ "$metadata" == 0 ]]
+}
+
+bundle_mutable_graph_validate() {
+  local relative path name current_id
+  [[ -n "$DIAG_BUNDLE_LOCK_ID" ]] ||
+    diag_die "mutable bundle validation requires the writer lock"
+  current_id="$(stat -Lc '%d:%i' -- "$OUT_DIR" 2> /dev/null)" ||
+    diag_die "cannot inspect the locked diagnostics bundle"
+  [[ "$current_id" == "$DIAG_BUNDLE_LOCK_ID" ]] ||
+    diag_die "diagnostics bundle changed after its writer lock was acquired"
+  bundle_owned_real_dir "$OUT_DIR" ||
+    diag_die "diagnostics bundle must be an owned, writable real directory"
+
+  for relative in results logs state env freq gdb logs/individual logs/gdb; do
+    path="$OUT_DIR/$relative"
+    [[ ! -e "$path" && ! -L "$path" ]] && continue
+    bundle_owned_real_dir "$path" ||
+      diag_die "mutable bundle directory '$relative' is unsafe"
+  done
+
+  bundle_owned_real_dir "$OUT_DIR/results" &&
+    bundle_owned_single_regular "$OUT_DIR/results/meta.env" ||
+    diag_die "resume directory '$OUT_DIR' is not a safe diagnostic bundle"
+  [[ ! -e "$OUT_DIR/.meta.env.initializing" &&
+    ! -L "$OUT_DIR/.meta.env.initializing" ]] ||
+    diag_die "resume bundle contains an incomplete metadata initializer"
+  [[ ! -e "$OUT_DIR/results/.meta.env.initializing" &&
+    ! -L "$OUT_DIR/results/.meta.env.initializing" ]] ||
+    diag_die "resume bundle contains a legacy incomplete metadata initializer"
+
+  for relative in results/meta.env commands.log run.log state/redo.pending; do
+    path="$OUT_DIR/$relative"
+    [[ ! -e "$path" && ! -L "$path" ]] && continue
+    bundle_owned_single_regular "$path" ||
+      diag_die "mutable bundle file '$relative' is unsafe"
+  done
+
+  for path in "$OUT_DIR"/state/phase-*.done; do
+    [[ -e "$path" || -L "$path" ]] || continue
+    name="${path##*/phase-}"
+    name="${name%.done}"
+    phase_marker_is_valid "$name" ||
+      diag_die "completion marker '${path#"$OUT_DIR"/}' is unsafe"
+  done
+}
+
 meta_set() {
   local k="$1" v="$2"
   if [[ -f "$META_FILE" ]] && grep -q "^${k}=" "$META_FILE"; then
@@ -403,31 +502,246 @@ meta_set() {
   fi
 }
 
-mark_done() {
-  if [[ "$1" == preflight ]]; then
-    (set -o noclobber; : > "$STATE_DIR/phase-preflight.done") 2> /dev/null ||
-      diag_die "cannot create a fresh preflight completion marker"
-  else
-    touch "$STATE_DIR/phase-$1.done"
+PHASE_MARKER_FD=""
+PHASE_MARKER_ID=""
+PHASE_MARKER_FD_PATH=""
+
+phase_marker_fd_close() {
+  if [[ -n "$PHASE_MARKER_FD" ]]; then
+    exec {PHASE_MARKER_FD}>&- || return 1
   fi
+  PHASE_MARKER_FD=""
+  PHASE_MARKER_ID=""
+  PHASE_MARKER_FD_PATH=""
+}
+
+phase_marker_owned_identity() {
+  local phase="$1" expected_id="$2" marker metadata
+  phase_name_supported "$phase" || return 1
+  marker="$STATE_DIR/phase-$phase.done"
+  [[ -f "$marker" && ! -L "$marker" ]] || return 1
+  metadata="$(stat -Lc '%d:%i:%u:%h:%s' -- "$marker" 2> /dev/null)" || return 1
+  [[ "$metadata" == "$expected_id:$EUID:1:0" ]]
+}
+
+phase_marker_path_matches_open_fd() {
+  local phase="$1" marker="$STATE_DIR/phase-$1.done"
+  [[ -n "$PHASE_MARKER_FD" && -n "$PHASE_MARKER_FD_PATH" ]] || return 1
+  [[ -f "$marker" && ! -L "$marker" && -O "$marker" ]] || return 1
+  [[ "$marker" -ef "$PHASE_MARKER_FD_PATH" ]]
+}
+
+phase_marker_capture_identity() {
+  stat -Lc '%d:%i' -- "$1" 2> /dev/null
+}
+
+phase_marker_open_exclusive() {
+  local phase="$1" marker="$STATE_DIR/phase-$1.done" old_umask open_rc=0
+  PHASE_MARKER_FD=""
+  PHASE_MARKER_ID=""
+  PHASE_MARKER_FD_PATH=""
+  [[ ! -e "$marker" && ! -L "$marker" ]] || return 1
+
+  # A mode-000 inode is not a valid completion marker. Keep it that way until
+  # its identity is known through the still-open descriptor, then publish its
+  # ordinary mode and validate the path-to-inode binding.
+  old_umask="$(umask)"
+  umask 0777
+  if [[ -o noclobber ]]; then
+    { exec {PHASE_MARKER_FD}> "$marker"; } 2> /dev/null || open_rc=$?
+  else
+    set -o noclobber
+    { exec {PHASE_MARKER_FD}> "$marker"; } 2> /dev/null || open_rc=$?
+    set +o noclobber
+  fi
+  umask "$old_umask"
+  ((open_rc == 0)) || return 1
+
+  PHASE_MARKER_FD_PATH="/proc/$BASHPID/fd/$PHASE_MARKER_FD"
+  PHASE_MARKER_ID="$(phase_marker_capture_identity "$PHASE_MARKER_FD_PATH")" || return 1
+  chmod 0644 -- "$PHASE_MARKER_FD_PATH" || return 1
+  phase_marker_owned_identity "$phase" "$PHASE_MARKER_ID" || return 1
+  phase_marker_is_valid "$phase"
+}
+
+mark_done() {
+  local phase="$1" marker published_id meta_before_id meta_after_id expected_meta_hash actual_meta_hash
+  phase_name_supported "$phase" || diag_die "cannot complete unknown phase '$phase'"
+  marker="$STATE_DIR/phase-$phase.done"
+  bundle_owned_real_dir "$STATE_DIR" || diag_die "phase completion state directory is unsafe"
+  [[ ! -e "$marker" && ! -L "$marker" ]] ||
+    diag_die "cannot create a fresh $phase completion marker"
+  if ! phase_marker_open_exclusive "$phase"; then
+    if [[ -n "$PHASE_MARKER_FD" ]]; then
+      phase_marker_publish_rollback "$phase" "$PHASE_MARKER_ID" ||
+        diag_die "cannot safely roll back a failed $phase completion marker creation"
+    fi
+    diag_die "cannot create a fresh $phase completion marker"
+  fi
+  if ! sync -f "$PHASE_MARKER_FD_PATH"; then
+    phase_marker_publish_rollback "$phase" "$PHASE_MARKER_ID" ||
+      diag_die "cannot safely roll back an unsynchronized $phase completion marker"
+    diag_die "cannot synchronize $phase completion marker"
+  fi
+  phase_marker_owned_identity "$phase" "$PHASE_MARKER_ID" &&
+    phase_marker_is_valid "$phase" || {
+      phase_marker_publish_rollback "$phase" "$PHASE_MARKER_ID" ||
+        diag_die "cannot safely roll back a replaced $phase completion marker"
+      diag_die "$phase completion marker changed during publication"
+    }
+  if ! sync -f "$STATE_DIR"; then
+    phase_marker_publish_rollback "$phase" "$PHASE_MARKER_ID" ||
+      diag_die "cannot safely roll back $phase completion marker after directory sync failure"
+    diag_die "cannot synchronize phase completion state directory"
+  fi
+  published_id="$PHASE_MARKER_ID"
+  if ! phase_marker_published_fd_close; then
+    phase_marker_publish_rollback "$phase" "$published_id" ||
+      diag_die "cannot safely roll back $phase completion marker after descriptor close failure"
+    diag_die "cannot close $phase completion marker"
+  fi
+  bundle_owned_single_regular "$META_FILE" || {
+    phase_marker_publish_rollback "$phase" "$published_id" ||
+      diag_die "cannot safely roll back $phase completion marker after unsafe metadata"
+    diag_die "cannot inspect safe metadata before publishing phase completion"
+  }
+  meta_before_id="$(stat -Lc '%d:%i' -- "$META_FILE" 2> /dev/null)" || {
+    phase_marker_publish_rollback "$phase" "$published_id" ||
+      diag_die "cannot safely roll back $phase completion marker after metadata inspection failure"
+    diag_die "cannot identify metadata before publishing phase completion"
+  }
+  expected_meta_hash="$(completion_metadata_expected_hash)" || {
+    phase_marker_publish_rollback "$phase" "$published_id" ||
+      diag_die "cannot safely roll back $phase completion marker after metadata projection failure"
+    diag_die "cannot project completed phase metadata"
+  }
+  phase_completion_before_meta_recheck || {
+    phase_marker_publish_rollback "$phase" "$published_id" ||
+      diag_die "cannot safely roll back $phase completion marker after metadata precheck failure"
+    diag_die "cannot complete metadata publication precheck"
+  }
+  if [[ "$(stat -Lc '%d:%i' -- "$META_FILE" 2> /dev/null)" != "$meta_before_id" ]]; then
+    phase_marker_publish_rollback "$phase" "$published_id" ||
+      diag_die "cannot safely roll back $phase completion marker after metadata changed"
+    diag_die "metadata changed while preparing phase completion publication"
+  fi
+  if ! (rewrite_meta_atomic 0 1); then
+    bundle_owned_single_regular "$META_FILE" ||
+      phase_completion_rewrite_failure_fail "$phase" "$published_id" \
+        "metadata became unsafe during phase completion publication"
+    meta_after_id="$(stat -Lc '%d:%i' -- "$META_FILE" 2> /dev/null)" ||
+      phase_completion_rewrite_failure_fail "$phase" "$published_id" \
+        "cannot identify metadata after phase completion publication failure"
+    if [[ "$meta_after_id" == "$meta_before_id" ]]; then
+      phase_marker_publish_rollback "$phase" "$published_id" ||
+        diag_die "cannot safely roll back $phase completion marker after metadata failure"
+      diag_die "cannot publish completed phase metadata"
+    fi
+    actual_meta_hash="$(sha256sum -- "$META_FILE" 2> /dev/null | awk '{print $1}')" ||
+      phase_completion_rewrite_failure_fail "$phase" "$published_id" \
+        "cannot validate renamed metadata after completion publication failure"
+    [[ -n "$actual_meta_hash" && "$actual_meta_hash" == "$expected_meta_hash" ]] ||
+      phase_completion_rewrite_failure_fail "$phase" "$published_id" \
+        "metadata was unexpectedly replaced during phase completion publication"
+    diag_die "completed phase metadata crossed its rename commit point but directory synchronization failed; retaining its matching marker"
+  fi
+  phase_completion_after_meta_rewrite ||
+    phase_completion_nominal_success_fail "$phase" "$published_id" \
+      "cannot complete metadata publication verification"
+  bundle_owned_single_regular "$META_FILE" ||
+    phase_completion_nominal_success_fail "$phase" "$published_id" \
+      "published completed phase metadata is unsafe"
+  meta_after_id="$(stat -Lc '%d:%i' -- "$META_FILE" 2> /dev/null)" ||
+    phase_completion_nominal_success_fail "$phase" "$published_id" \
+      "cannot identify published completed phase metadata"
+  if [[ "$meta_after_id" == "$meta_before_id" ]]; then
+    phase_marker_publish_rollback "$phase" "$published_id" ||
+      diag_die "cannot safely roll back $phase completion marker after metadata rename was not observed"
+    diag_die "completed phase metadata did not cross its rename commit point"
+  fi
+  actual_meta_hash="$(sha256sum -- "$META_FILE" 2> /dev/null | awk '{print $1}')" ||
+    phase_completion_nominal_success_fail "$phase" "$published_id" \
+      "cannot validate published completed phase metadata"
+  [[ -n "$actual_meta_hash" && "$actual_meta_hash" == "$expected_meta_hash" ]] ||
+    phase_completion_nominal_success_fail "$phase" "$published_id" \
+      "published completed phase metadata does not match its expected generation"
   SESSION_DID_WORK=1
-  sync_meta_completed
+}
+
+phase_marker_publish_rollback() {
+  local phase="$1" expected_id="$2" marker="$STATE_DIR/phase-$1.done" rc=0
+  bundle_owned_real_dir "$STATE_DIR" || rc=1
+  if ((rc == 0)); then
+    if [[ -n "$expected_id" ]]; then
+      phase_marker_owned_identity "$phase" "$expected_id" || rc=1
+    else
+      phase_marker_path_matches_open_fd "$phase" || rc=1
+    fi
+  fi
+  ((rc != 0)) || rm -f -- "$marker" || rc=1
+  ((rc != 0)) || [[ ! -e "$marker" && ! -L "$marker" ]] || rc=1
+  phase_marker_fd_close || rc=1
+  ((rc != 0)) || sync -f "$STATE_DIR" > /dev/null 2>&1 || rc=1
+  ((rc == 0))
+}
+
+phase_marker_published_fd_close() {
+  phase_marker_fd_close
 }
 
 phase_is_done() {
-  [[ -f "$STATE_DIR/phase-$1.done" ]]
+  local phase="$1" marker
+  phase_name_supported "$phase" || diag_die "unknown phase completion predicate '$phase'"
+  marker="$STATE_DIR/phase-$phase.done"
+  if [[ ! -e "$marker" && ! -L "$marker" ]]; then
+    return 1
+  fi
+  phase_marker_is_valid "$phase" || diag_die "$phase completion marker is unsafe"
 }
 
 sync_meta_completed() {
-  local list=""
-  local f
-  for f in "$STATE_DIR"/phase-*.done; do
-    [[ -e "$f" ]] || continue
-    f="${f##*/phase-}"
-    f="${f%.done}"
-    list="${list:+$list,}$f"
+  local list="" phase
+  for phase in preflight baseline groups individual frequency gdb; do
+    if phase_is_done "$phase"; then
+      list="${list:+$list,}$phase"
+    fi
   done
   meta_set COMPLETED_PHASES "$list"
+}
+
+completion_metadata_expected_hash() {
+  local completed line key
+  completed="$(completed_phases_value)" || return 1
+  {
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      key="${line%%=*}"
+      [[ "$key" != COMPLETED_PHASES ]] || continue
+      printf '%s\n' "$line"
+    done < "$META_FILE"
+    printf 'COMPLETED_PHASES=%s\n' "$completed"
+  } | sha256sum | awk '{print $1}'
+}
+
+phase_completion_before_meta_recheck() {
+  :
+}
+
+phase_completion_after_meta_rewrite() {
+  :
+}
+
+phase_completion_nominal_success_fail() {
+  local phase="$1" published_id="$2" message="$3"
+  phase_marker_publish_rollback "$phase" "$published_id" ||
+    diag_die "cannot safely roll back $phase completion marker after metadata verification failure"
+  diag_die "$message"
+}
+
+phase_completion_rewrite_failure_fail() {
+  local phase="$1" published_id="$2" message="$3"
+  phase_marker_publish_rollback "$phase" "$published_id" ||
+    diag_die "cannot safely roll back $phase completion marker after metadata rewrite failure"
+  diag_die "$message"
 }
 
 persist_effective_config() {
@@ -435,12 +749,11 @@ persist_effective_config() {
 }
 
 completed_phases_value() {
-  local list="" f
-  for f in "$STATE_DIR"/phase-*.done; do
-    [[ -e "$f" ]] || continue
-    f="${f##*/phase-}"
-    f="${f%.done}"
-    list="${list:+$list,}$f"
+  local list="" phase
+  for phase in preflight baseline groups individual frequency gdb; do
+    if phase_is_done "$phase"; then
+      list="${list:+$list,}$phase"
+    fi
   done
   printf '%s\n' "$list"
 }
@@ -562,7 +875,7 @@ resolve_cpu_target_policy() {
 
 cpu_target_matches_completed_phase() {
   local policy="$1" phase="$2" meta actual expected
-  [[ -f "$STATE_DIR/phase-$phase.done" ]] || return 0
+  phase_is_done "$phase" || return 0
   case "$phase" in
     frequency) meta="$OUT_DIR/results/frequency-ab.meta" ;;
     gdb) meta="$OUT_DIR/results/gdb.meta" ;;
@@ -604,7 +917,7 @@ validate_cpu_target_for_completed_phases() {
 
 require_redo_for_completed_change() {
   local phase="$1" description="$2"
-  [[ -f "$OUT_DIR/state/phase-$phase.done" ]] || return 0
+  phase_is_done "$phase" || return 0
   redo_plan_contains "$phase" && return 0
   if [[ -n "$STATE_DIR" ]] && [[ -e "$STATE_DIR/redo.pending" || -L "$STATE_DIR/redo.pending" ]] &&
     redo_transaction_has_phase "$phase"; then
@@ -651,12 +964,134 @@ validate_completed_phase_overrides() {
   validate_cpu_target_for_completed_phases "$CPU_TARGET"
 }
 
-prepare_commands_log() {
-  if [[ -n "$RESUME_DIR" && -f "$DIAG_COMMANDS_LOG" ]]; then
-    printf '\n# resumed %s\n' "$(date -Is)" >> "$DIAG_COMMANDS_LOG"
+RUN_LOG_FD=""
+RUN_LOG_FD_PATH=""
+COMMANDS_LOG_FD=""
+COMMANDS_LOG_FD_PATH=""
+
+bundle_log_before_append_open() {
+  :
+}
+
+bundle_log_after_exclusive_create() {
+  :
+}
+
+bundle_just_created_log_cleanup() {
+  local path="$1" fd_path="$2"
+  [[ -f "$path" && ! -L "$path" && -O "$path" && "$path" -ef "$fd_path" ]] ||
+    return 1
+  rm -f -- "$path"
+}
+
+bundle_append_fd_binding_is_valid() {
+  local path="$1" fd_path="$2" expected_id="$3" opened_metadata current_id
+  [[ -f "$fd_path" ]] || return 1
+  opened_metadata="$(stat -Lc '%d:%i:%u:%h' -- "$fd_path" 2> /dev/null)" || return 1
+  current_id="$(stat -Lc '%d:%i' -- "$path" 2> /dev/null)" || return 1
+  [[ "$opened_metadata" == "$expected_id:$EUID:1" && "$current_id" == "$expected_id" ]] ||
+    return 1
+  bundle_owned_single_regular "$path"
+}
+
+bundle_append_fd_open() {
+  local kind="$1" path="$2" fd_name="$3" fd_path_name="$4" create="$5"
+  local expected_id="" opened_fd="" opened_fd_path old_umask open_rc=0
+  local -n fd_out="$fd_name" fd_path_out="$fd_path_name"
+  fd_out=""
+  fd_path_out=""
+
+  if ((create == 0)); then
+    bundle_owned_single_regular "$path" || return 1
+    expected_id="$(stat -Lc '%d:%i' -- "$path" 2> /dev/null)" || return 1
+    bundle_log_before_append_open "$kind" "$path" || return 1
+    # O_RDWR does not block when a raced pathname becomes a FIFO. It performs
+    # no content write; common logging later reopens this retained inode through
+    # /proc with O_APPEND only after the complete identity check succeeds.
+    { exec {opened_fd}<> "$path"; } 2> /dev/null || return 1
+    opened_fd_path="/proc/$BASHPID/fd/$opened_fd"
   else
-    : > "$DIAG_COMMANDS_LOG"
+    [[ ! -e "$path" && ! -L "$path" ]] || return 1
+    old_umask="$(umask)"
+    umask 0777
+    if [[ -o noclobber ]]; then
+      { exec {opened_fd}> "$path"; } 2> /dev/null || open_rc=$?
+    else
+      set -o noclobber
+      { exec {opened_fd}> "$path"; } 2> /dev/null || open_rc=$?
+      set +o noclobber
+    fi
+    umask "$old_umask"
+    ((open_rc == 0)) || return 1
+    opened_fd_path="/proc/$BASHPID/fd/$opened_fd"
+    expected_id="$(stat -Lc '%d:%i' -- "$opened_fd_path" 2> /dev/null)" || {
+      bundle_just_created_log_cleanup "$path" "$opened_fd_path" || true
+      exec {opened_fd}>&-
+      return 1
+    }
+    bundle_log_after_exclusive_create "$kind" "$path" "$opened_fd_path" || {
+      bundle_just_created_log_cleanup "$path" "$opened_fd_path" || true
+      exec {opened_fd}>&-
+      return 1
+    }
+    chmod 0644 -- "$opened_fd_path" || {
+      bundle_just_created_log_cleanup "$path" "$opened_fd_path" || true
+      exec {opened_fd}>&-
+      return 1
+    }
   fi
+
+  if ! bundle_append_fd_binding_is_valid "$path" "$opened_fd_path" "$expected_id"; then
+    ((create == 0)) || bundle_just_created_log_cleanup "$path" "$opened_fd_path" || true
+    exec {opened_fd}>&-
+    return 1
+  fi
+  fd_out="$opened_fd"
+  fd_path_out="$opened_fd_path"
+}
+
+bundle_log_fds_close() {
+  local rc=0
+  DIAG_LOG_FILE=""
+  DIAG_COMMANDS_LOG=""
+  if [[ -n "$RUN_LOG_FD" ]]; then
+    exec {RUN_LOG_FD}>&- || rc=1
+  fi
+  if [[ -n "$COMMANDS_LOG_FD" ]]; then
+    exec {COMMANDS_LOG_FD}>&- || rc=1
+  fi
+  RUN_LOG_FD=""
+  RUN_LOG_FD_PATH=""
+  COMMANDS_LOG_FD=""
+  COMMANDS_LOG_FD_PATH=""
+  return "$rc"
+}
+
+prepare_commands_log() {
+  local path="$DIAG_COMMANDS_LOG" resumed=0
+  if [[ -e "$path" || -L "$path" ]]; then
+    [[ -n "$RESUME_DIR" ]] || diag_die "fresh command log destination already exists"
+    bundle_owned_single_regular "$path" ||
+      diag_die "command log destination is unsafe"
+    resumed=1
+  fi
+  bundle_append_fd_open commands "$path" COMMANDS_LOG_FD COMMANDS_LOG_FD_PATH \
+    "$((resumed == 0))" ||
+    diag_die "cannot bind the command log to its validated inode"
+  DIAG_COMMANDS_LOG="$COMMANDS_LOG_FD_PATH"
+  ((resumed == 0)) || printf '\n# resumed %s\n' "$(date -Is)" >> "$DIAG_COMMANDS_LOG"
+}
+
+prepare_run_log() {
+  local path="$1" create=0
+  if [[ -e "$path" || -L "$path" ]]; then
+    bundle_owned_single_regular "$path" || diag_die "run log destination is unsafe"
+  else
+    create=1
+  fi
+  bundle_append_fd_open run "$path" RUN_LOG_FD RUN_LOG_FD_PATH "$create" ||
+    diag_die "cannot bind the run log to its validated inode"
+  DIAG_LOG_FILE="$RUN_LOG_FD_PATH"
 }
 
 build_redo_plan() {
@@ -916,7 +1351,11 @@ redo_transaction_has_phase() {
 
 redo_changed_config_authorized_for_phase() {
   local phase="$1"
-  [[ ! -f "$STATE_DIR/phase-$phase.done" ]] || redo_transaction_has_phase "$phase"
+  if phase_is_done "$phase"; then
+    redo_transaction_has_phase "$phase"
+  else
+    return 0
+  fi
 }
 
 # A syntactically valid marker must not relabel completed evidence that it
@@ -3162,10 +3601,10 @@ persist_session_end() {
 finalization_fail() {
   DERIVED_FINALIZATION_ERROR="$1"
   if ! derived_generation_abort; then
-    DIAG_LOG_FILE=""
+    bundle_log_fds_close || true
   fi
   if [[ -e "$OUT_DIR/manifest.txt" || -L "$OUT_DIR/manifest.txt" ]]; then
-    DIAG_LOG_FILE=""
+    bundle_log_fds_close || true
   fi
   return 1
 }
@@ -3230,7 +3669,10 @@ finalize_report() {
 
   # No bundled log or metadata write may occur after this point. The privacy
   # review and manifest therefore describe the exact generation that follows.
-  DIAG_LOG_FILE=""
+  bundle_log_fds_close || {
+    finalization_fail "cannot close validated bundle log descriptors"
+    return 1
+  }
   write_privacy_review "$DERIVED_PRIVACY_DEST_STATE" || {
     finalization_fail "privacy sentinel scan failed"
     return 1
@@ -3269,7 +3711,7 @@ diagnose_cleanup_exit() {
       derived_candidate_cleanup_tracked || rc=1
       privacy_review_temp_cleanup || rc=1
     else
-      DIAG_LOG_FILE=""
+      bundle_log_fds_close || true
       artifact_safe=0
       rc=1
     fi
@@ -3277,6 +3719,7 @@ diagnose_cleanup_exit() {
   ((artifact_safe == 0)) || redo_marker_temp_cleanup
   diag_process_group_stop
   diag_freq_sampler_stop
+  bundle_log_fds_close || rc=1
   # Children inherit the lock descriptor intentionally. Reap all writers
   # before closing our final descriptor so SIGKILL cannot expose live writes.
   diag_bundle_lock_release || rc=1
@@ -3291,7 +3734,7 @@ on_interrupt() {
   # be revoked durably, stop processes with terminal-only diagnostics and do
   # not touch metadata, logs, or pending artifacts behind that token.
   if ! derived_manifest_revoke; then
-    DIAG_LOG_FILE=""
+    bundle_log_fds_close 2> /dev/null || true
     diag_process_group_stop 2> /dev/null || true
     diag_freq_sampler_stop 2> /dev/null || true
     diag_bundle_lock_release 2> /dev/null || true
@@ -3312,6 +3755,7 @@ on_interrupt() {
   # Best effort: a failed partial report must not mask the interrupt, so
   # the subshell contains diag_die's exit and the failure is swallowed.
   ( finalize_report ) 2> /dev/null || true
+  bundle_log_fds_close 2> /dev/null || true
   diag_bundle_lock_release 2> /dev/null || true
   exit "$signal_rc"
 }
@@ -3395,9 +3839,9 @@ main() {
     local resume_lock_rc=0
     diag_bundle_lock_acquire "$OUT_DIR" || resume_lock_rc=$?
     ((resume_lock_rc == 0)) || return "$resume_lock_rc"
-    [[ -d "$OUT_DIR/results" && ! -L "$OUT_DIR/results" &&
-      -f "$OUT_DIR/results/meta.env" && ! -L "$OUT_DIR/results/meta.env" ]] ||
-      diag_die "resume directory '$OUT_DIR' is not a diagnostic bundle (missing results/meta.env)"
+    META_FILE="$OUT_DIR/results/meta.env"
+    STATE_DIR="$OUT_DIR/state"
+    bundle_mutable_graph_validate
     load_stored_config "$OUT_DIR"
     # Stored values are already concrete; do not re-apply the mode preset.
   fi
@@ -3418,8 +3862,6 @@ main() {
   # Read and reconcile it before dependency checks, topology discovery,
   # consent, or any mutation of the resumed bundle.
   if [[ -n "$RESUME_DIR" ]]; then
-    META_FILE="$OUT_DIR/results/meta.env"
-    STATE_DIR="$OUT_DIR/state"
     reconcile_pending_redo_request
     # A V2 redo record owns the configuration adopted above. Re-run the full
     # validator so no future persisted field can bypass the ordinary contract.
@@ -3490,21 +3932,28 @@ main() {
     DIAG_LOG_FILE=""
     diag_die "cannot revoke diagnostic readiness or recover derived candidates"
   fi
-  mkdir -p "$OUT_DIR"/{results,logs/individual,state,env,freq,gdb}
+  local output_relative
+  for output_relative in results logs state env freq gdb logs/individual; do
+    bundle_prepare_dir "$output_relative" ||
+      diag_die "cannot prepare safe bundle directory '$output_relative'"
+  done
   DIAG_BUNDLE_ROOT="$OUT_DIR"
   DIAG_REPO_ROOT="$SCRIPT_DIR"
   META_FILE="$OUT_DIR/results/meta.env"
   STATE_DIR="$OUT_DIR/state"
   DIAG_FREQ_DIR="$OUT_DIR/freq"
-  DIAG_LOG_FILE="$OUT_DIR/run.log"
-  DIAG_COMMANDS_LOG="$OUT_DIR/commands.log"
-  prepare_commands_log
 
   trap 'diagnose_cleanup_exit $?' EXIT
   trap 'on_interrupt SIGINT' INT
   trap 'on_interrupt SIGTERM' TERM
 
-  if [[ -z "$RESUME_DIR" ]] || [[ ! -f "$META_FILE" ]]; then
+  prepare_run_log "$OUT_DIR/run.log"
+  DIAG_COMMANDS_LOG="$OUT_DIR/commands.log"
+  prepare_commands_log
+
+  if [[ -z "$RESUME_DIR" ]]; then
+    bundle_create_empty_exclusive "$META_FILE" 0644 ||
+      diag_die "cannot safely create run metadata"
     {
       printf 'MODE=%s\n' "$MODE"
       printf 'START_EPOCH=%s\n' "$(date +%s)"
@@ -3517,7 +3966,7 @@ main() {
       printf 'SKIP_GDB=%s\n' "$SKIP_GDB"
       printf 'CPU_TARGET=%s\n' "$CPU_TARGET"
       printf 'INTERRUPTED=0\n'
-    } > "$META_FILE"
+    } >> "$META_FILE"
   fi
   # Stored configuration seeds resume defaults, but explicit CLI overrides
   # describe the run that is about to execute and must be reflected in JSON.

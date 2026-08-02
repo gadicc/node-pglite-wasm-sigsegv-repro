@@ -1029,6 +1029,502 @@ check_eq "concurrent fresh writers serialize and recheck emptiness under lock" "
 ) > /dev/null 2>&1
 check_eq "privileged output guard rejects symlinks" "1" "$([[ $? -ne 0 ]] && echo 1 || echo 0)"
 
+echo "== mutable bundle path graph =="
+write_mutable_graph_fixture() {
+  local bundle="$1"
+  mkdir -p "$bundle/results"
+  cat > "$bundle/results/meta.env" << 'EOF'
+MODE=default
+START_EPOCH=1
+START_ISO=2026-01-01T00:00:00+00:00
+BASELINE_CHILDREN=16
+BASELINE_WAVES=50
+GROUP_WAVES=50
+INDIVIDUAL_RUNS=50
+GDB_MAX_RUNS=12
+SKIP_GDB=1
+CPU_TARGET=auto
+COMPLETED_PHASES=
+INTERRUPTED=0
+EOF
+  printf 'authoritative-before-resume\n' > "$bundle/manifest.txt"
+}
+
+mutable_fixed_rejected=0
+for mutable_case in commands-symlink run-symlink commands-hardlink commands-fifo; do
+  MUTABLE_ROOT="$TMP/mutable-$mutable_case"
+  MUTABLE_BUNDLE="$MUTABLE_ROOT/bundle"
+  MUTABLE_VICTIM="$MUTABLE_ROOT/victim"
+  mkdir -p "$MUTABLE_ROOT"
+  write_mutable_graph_fixture "$MUTABLE_BUNDLE"
+  printf 'victim-before-resume\n' > "$MUTABLE_VICTIM"
+  case "$mutable_case" in
+    commands-symlink) ln -s "$MUTABLE_VICTIM" "$MUTABLE_BUNDLE/commands.log" ;;
+    run-symlink) ln -s "$MUTABLE_VICTIM" "$MUTABLE_BUNDLE/run.log" ;;
+    commands-hardlink) ln "$MUTABLE_VICTIM" "$MUTABLE_BUNDLE/commands.log" ;;
+    commands-fifo) mkfifo "$MUTABLE_BUNDLE/commands.log" ;;
+  esac
+  timeout --signal=TERM --kill-after=1 5 \
+    "$REPO_ROOT/diagnose.sh" --resume "$MUTABLE_BUNDLE" --yes \
+    > "$MUTABLE_ROOT/output" 2>&1
+  mutable_rc=$?
+  if [[ $mutable_rc -eq 1 &&
+    "$(cat "$MUTABLE_BUNDLE/manifest.txt")" == authoritative-before-resume &&
+    "$(cat "$MUTABLE_VICTIM")" == victim-before-resume ]]; then
+    mutable_fixed_rejected=$((mutable_fixed_rejected + 1))
+  fi
+done
+check_eq "resume rejects unsafe fixed mutable files before readiness revocation" \
+  "4" "$mutable_fixed_rejected"
+
+log_open_race_rejected=0
+for log_kind in run commands; do
+ for log_replacement in symlink fifo; do
+  LOG_OPEN_ROOT="$TMP/log-open-race-$log_kind-$log_replacement"
+  mkdir -p "$LOG_OPEN_ROOT"
+  printf 'original log\n' > "$LOG_OPEN_ROOT/$log_kind.log"
+  printf 'victim before\n' > "$LOG_OPEN_ROOT/victim"
+  (
+    DIAG_SOURCE_ONLY=1
+    source "$REPO_ROOT/diagnose.sh"
+    RESUME_DIR="$LOG_OPEN_ROOT"
+    bundle_log_before_append_open() {
+      mv -- "$2" "$2.original"
+      if [[ "$log_replacement" == symlink ]]; then
+        ln -s "$LOG_OPEN_ROOT/victim" "$2"
+      else
+        mkfifo "$2"
+      fi
+    }
+    if [[ "$log_kind" == run ]]; then
+      prepare_run_log "$LOG_OPEN_ROOT/run.log"
+    else
+      DIAG_COMMANDS_LOG="$LOG_OPEN_ROOT/commands.log"
+      prepare_commands_log
+    fi
+  ) > /dev/null 2>&1
+  log_open_rc=$?
+  if [[ $log_open_rc -eq 1 && "$(cat "$LOG_OPEN_ROOT/victim")" == 'victim before' &&
+    "$(cat "$LOG_OPEN_ROOT/$log_kind.log.original")" == 'original log' ]]; then
+    log_open_race_rejected=$((log_open_race_rejected + 1))
+  fi
+ done
+done
+check_eq "validated log append open rejects path replacement without writing victims" \
+  "4" "$log_open_race_rejected"
+
+log_create_swap_rejected=0
+for log_kind in run commands; do
+  LOG_CREATE_ROOT="$TMP/log-create-swap-$log_kind"
+  mkdir -p "$LOG_CREATE_ROOT"
+  printf 'victim before\n' > "$LOG_CREATE_ROOT/victim"
+  victim_mode_before="$(stat -c '%a' "$LOG_CREATE_ROOT/victim")"
+  (
+    DIAG_SOURCE_ONLY=1
+    source "$REPO_ROOT/diagnose.sh"
+    bundle_log_after_exclusive_create() {
+      mv -- "$2" "$2.created"
+      ln -s "$LOG_CREATE_ROOT/victim" "$2"
+    }
+    if [[ "$log_kind" == run ]]; then
+      prepare_run_log "$LOG_CREATE_ROOT/run.log"
+    else
+      DIAG_COMMANDS_LOG="$LOG_CREATE_ROOT/commands.log"
+      prepare_commands_log
+    fi
+  ) > /dev/null 2>&1
+  log_create_rc=$?
+  victim_mode_after="$(stat -c '%a' "$LOG_CREATE_ROOT/victim")"
+  if [[ $log_create_rc -eq 1 && "$victim_mode_after" == "$victim_mode_before" &&
+    "$(cat "$LOG_CREATE_ROOT/victim")" == 'victim before' &&
+    -f "$LOG_CREATE_ROOT/$log_kind.log.created" ]]; then
+    log_create_swap_rejected=$((log_create_swap_rejected + 1))
+  fi
+done
+check_eq "exclusive log creation chmods only its retained inode after a path swap" \
+  "2" "$log_create_swap_rejected"
+
+STABLE_LOG_ROOT="$TMP/stable-log-fds"
+mkdir -p "$STABLE_LOG_ROOT"
+printf 'run original\n' > "$STABLE_LOG_ROOT/run.log"
+printf 'commands original\n' > "$STABLE_LOG_ROOT/commands.log"
+printf 'run victim\n' > "$STABLE_LOG_ROOT/run-victim"
+printf 'commands victim\n' > "$STABLE_LOG_ROOT/commands-victim"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  RESUME_DIR="$STABLE_LOG_ROOT"
+  prepare_run_log "$STABLE_LOG_ROOT/run.log"
+  DIAG_COMMANDS_LOG="$STABLE_LOG_ROOT/commands.log"
+  prepare_commands_log
+  [[ "$DIAG_LOG_FILE" =~ ^/proc/[0-9]+/fd/[0-9]+$ &&
+    "$DIAG_COMMANDS_LOG" =~ ^/proc/[0-9]+/fd/[0-9]+$ ]] || exit 1
+  run_fd="$RUN_LOG_FD"
+  commands_fd="$COMMANDS_LOG_FD"
+  mv -- "$STABLE_LOG_ROOT/run.log" "$STABLE_LOG_ROOT/run.bound"
+  mv -- "$STABLE_LOG_ROOT/commands.log" "$STABLE_LOG_ROOT/commands.bound"
+  ln -s "$STABLE_LOG_ROOT/run-victim" "$STABLE_LOG_ROOT/run.log"
+  ln -s "$STABLE_LOG_ROOT/commands-victim" "$STABLE_LOG_ROOT/commands.log"
+  diag_log "stable run append"
+  diag_log_cmd printf '%s' "stable command append"
+  bundle_log_fds_close
+  [[ -z "$DIAG_LOG_FILE" && -z "$DIAG_COMMANDS_LOG" &&
+    ! -e "/proc/$BASHPID/fd/$run_fd" && ! -e "/proc/$BASHPID/fd/$commands_fd" ]]
+) > /dev/null 2>&1
+stable_log_rc=$?
+check_eq "common logging remains inode-stable after path replacement and closes descriptors" "1" \
+  "$([[ $stable_log_rc -eq 0 && "$(cat "$STABLE_LOG_ROOT/run-victim")" == 'run victim' &&
+    "$(cat "$STABLE_LOG_ROOT/commands-victim")" == 'commands victim' ]] &&
+    grep -q 'stable run append' "$STABLE_LOG_ROOT/run.bound" &&
+    grep -q 'stable.*command.*append' "$STABLE_LOG_ROOT/commands.bound" && echo 1 || echo 0)"
+
+SPARSE_MUTABLE_BUNDLE="$TMP/sparse-mutable-bundle"
+write_mutable_graph_fixture "$SPARSE_MUTABLE_BUNDLE"
+sparse_tree_before="$(find "$SPARSE_MUTABLE_BUNDLE" -printf '%P\t%y\t%s\n' | sort)"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$SPARSE_MUTABLE_BUNDLE"
+  META_FILE="$SPARSE_MUTABLE_BUNDLE/results/meta.env"
+  STATE_DIR="$SPARSE_MUTABLE_BUNDLE/state"
+  diag_bundle_lock_acquire "$SPARSE_MUTABLE_BUNDLE"
+  bundle_mutable_graph_validate
+  diag_bundle_lock_release
+)
+sparse_graph_rc=$?
+sparse_tree_after="$(find "$SPARSE_MUTABLE_BUNDLE" -printf '%P\t%y\t%s\n' | sort)"
+check_eq "resume graph accepts absent subordinate directories without creating them" "1" \
+  "$([[ $sparse_graph_rc -eq 0 && "$sparse_tree_after" == "$sparse_tree_before" ]] && echo 1 || echo 0)"
+
+mutable_directory_rejected=0
+for mutable_relative in state logs env freq gdb logs/individual logs/gdb; do
+  mutable_slug="${mutable_relative//\//-}"
+  MUTABLE_ROOT="$TMP/mutable-directory-$mutable_slug"
+  MUTABLE_BUNDLE="$MUTABLE_ROOT/bundle"
+  MUTABLE_EXTERNAL="$MUTABLE_ROOT/external"
+  mkdir -p "$MUTABLE_EXTERNAL"
+  write_mutable_graph_fixture "$MUTABLE_BUNDLE"
+  if [[ "$mutable_relative" == logs/individual || "$mutable_relative" == logs/gdb ]]; then
+    mkdir -p "$MUTABLE_BUNDLE/logs"
+  fi
+  ln -s "$MUTABLE_EXTERNAL" "$MUTABLE_BUNDLE/$mutable_relative"
+  timeout --signal=TERM --kill-after=1 5 \
+    "$REPO_ROOT/diagnose.sh" --resume "$MUTABLE_BUNDLE" --yes \
+    > "$MUTABLE_ROOT/output" 2>&1
+  mutable_rc=$?
+  if [[ $mutable_rc -eq 1 &&
+    "$(cat "$MUTABLE_BUNDLE/manifest.txt")" == authoritative-before-resume &&
+    -z "$(find "$MUTABLE_EXTERNAL" -mindepth 1 -print -quit)" ]]; then
+    mutable_directory_rejected=$((mutable_directory_rejected + 1))
+  fi
+done
+check_eq "resume rejects symlinked mutable directories before readiness revocation" \
+  "7" "$mutable_directory_rejected"
+
+INITIALIZING_META_BUNDLE="$TMP/mutable-initializing-meta/bundle"
+write_mutable_graph_fixture "$INITIALIZING_META_BUNDLE"
+printf 'partial metadata\n' > "$INITIALIZING_META_BUNDLE/.meta.env.initializing"
+"$REPO_ROOT/diagnose.sh" --resume "$INITIALIZING_META_BUNDLE" --yes > /dev/null 2>&1
+initializing_meta_rc=$?
+check_eq "normal resume rejects a stranded fresh metadata initializer" "1" \
+  "$([[ $initializing_meta_rc -eq 1 && "$(cat "$INITIALIZING_META_BUNDLE/manifest.txt")" == authoritative-before-resume && -f "$INITIALIZING_META_BUNDLE/.meta.env.initializing" ]] && echo 1 || echo 0)"
+
+UNKNOWN_MARKER_BUNDLE="$TMP/mutable-unknown-marker/bundle"
+write_mutable_graph_fixture "$UNKNOWN_MARKER_BUNDLE"
+mkdir -p "$UNKNOWN_MARKER_BUNDLE/state"
+: > "$UNKNOWN_MARKER_BUNDLE/state/phase-unknown.done"
+"$REPO_ROOT/diagnose.sh" --resume "$UNKNOWN_MARKER_BUNDLE" --yes > /dev/null 2>&1
+unknown_marker_rc=$?
+check_eq "resume rejects unknown completion markers before readiness revocation" "1" \
+  "$([[ $unknown_marker_rc -eq 1 && "$(cat "$UNKNOWN_MARKER_BUNDLE/manifest.txt")" == authoritative-before-resume ]] && echo 1 || echo 0)"
+
+unsafe_predicate_rejected=0
+for marker_predicate in cpu-target completed-change redo-authorization; do
+  PREDICATE_ROOT="$TMP/marker-predicate-$marker_predicate"
+  mkdir -p "$PREDICATE_ROOT/bundle/results" "$PREDICATE_ROOT/bundle/state"
+  printf 'COMPLETED_PHASES=\n' > "$PREDICATE_ROOT/bundle/results/meta.env"
+  predicate_phase=individual
+  [[ "$marker_predicate" != cpu-target ]] || predicate_phase=frequency
+  ln -s "$PREDICATE_ROOT/victim" "$PREDICATE_ROOT/bundle/state/phase-$predicate_phase.done"
+  (
+    DIAG_SOURCE_ONLY=1
+    source "$REPO_ROOT/diagnose.sh"
+    OUT_DIR="$PREDICATE_ROOT/bundle"
+    STATE_DIR="$PREDICATE_ROOT/bundle/state"
+    META_FILE="$PREDICATE_ROOT/bundle/results/meta.env"
+    DIAG_LOG_FILE=""
+    case "$marker_predicate" in
+      cpu-target) cpu_target_matches_completed_phase auto frequency ;;
+      completed-change) require_redo_for_completed_change individual "test change" ;;
+      redo-authorization) redo_changed_config_authorized_for_phase individual ;;
+    esac
+  ) > /dev/null 2>&1
+  predicate_rc=$?
+  if [[ $predicate_rc -eq 1 && ! -e "$PREDICATE_ROOT/victim" &&
+    -L "$PREDICATE_ROOT/bundle/state/phase-$predicate_phase.done" ]]; then
+    unsafe_predicate_rejected=$((unsafe_predicate_rejected + 1))
+  fi
+done
+check_eq "all completion predicates reject unsafe markers" "3" \
+  "$unsafe_predicate_rejected"
+
+marker_symlink_rejected=0
+for marker_phase in individual gdb; do
+  MARKER_ROOT="$TMP/marker-$marker_phase"
+  mkdir -p "$MARKER_ROOT/bundle/results" "$MARKER_ROOT/bundle/state"
+  printf 'COMPLETED_PHASES=\n' > "$MARKER_ROOT/bundle/results/meta.env"
+  ln -s "$MARKER_ROOT/victim" "$MARKER_ROOT/bundle/state/phase-$marker_phase.done"
+  (
+    DIAG_SOURCE_ONLY=1
+    source "$REPO_ROOT/diagnose.sh"
+    OUT_DIR="$MARKER_ROOT/bundle"
+    STATE_DIR="$MARKER_ROOT/bundle/state"
+    META_FILE="$MARKER_ROOT/bundle/results/meta.env"
+    DIAG_LOG_FILE=""
+    mark_done "$marker_phase"
+  ) > /dev/null 2>&1
+  marker_rc=$?
+  if [[ $marker_rc -eq 1 && ! -e "$MARKER_ROOT/victim" &&
+    -L "$MARKER_ROOT/bundle/state/phase-$marker_phase.done" ]]; then
+    marker_symlink_rejected=$((marker_symlink_rejected + 1))
+  fi
+done
+check_eq "exclusive completion markers never follow dangling symlinks" \
+  "2" "$marker_symlink_rejected"
+
+marker_sync_rollback=0
+for sync_failure in chmod marker directory; do
+  SYNC_FAILURE_ROOT="$TMP/marker-sync-$sync_failure"
+  mkdir -p "$SYNC_FAILURE_ROOT/results" "$SYNC_FAILURE_ROOT/state"
+  printf 'COMPLETED_PHASES=\n' > "$SYNC_FAILURE_ROOT/results/meta.env"
+  (
+    DIAG_SOURCE_ONLY=1
+    source "$REPO_ROOT/diagnose.sh"
+    OUT_DIR="$SYNC_FAILURE_ROOT"
+    STATE_DIR="$SYNC_FAILURE_ROOT/state"
+    META_FILE="$SYNC_FAILURE_ROOT/results/meta.env"
+    DIAG_LOG_FILE=""
+    state_sync_failed=0
+    chmod() {
+      [[ "$sync_failure" != chmod ]] || return 1
+      command chmod "$@"
+    }
+    sync() {
+      if [[ "$sync_failure" == marker && "$2" == "$PHASE_MARKER_FD_PATH" ]]; then
+        return 1
+      fi
+      if [[ "$sync_failure" == directory && "$2" == "$STATE_DIR" && $state_sync_failed -eq 0 ]]; then
+        state_sync_failed=1
+        return 1
+      fi
+      return 0
+    }
+    mark_done individual
+  ) > /dev/null 2>&1
+  sync_failure_rc=$?
+  if [[ $sync_failure_rc -eq 1 &&
+    ! -e "$SYNC_FAILURE_ROOT/state/phase-individual.done" &&
+    ! -L "$SYNC_FAILURE_ROOT/state/phase-individual.done" &&
+    "$(cat "$SYNC_FAILURE_ROOT/results/meta.env")" == 'COMPLETED_PHASES=' ]]; then
+    marker_sync_rollback=$((marker_sync_rollback + 1))
+  fi
+done
+check_eq "completion publication rolls back marker and metadata on creation or sync failure" \
+  "3" "$marker_sync_rollback"
+
+MARKER_CLOSE_FAIL_ROOT="$TMP/marker-close-failure"
+mkdir -p "$MARKER_CLOSE_FAIL_ROOT/results" "$MARKER_CLOSE_FAIL_ROOT/state"
+printf 'COMPLETED_PHASES=\n' > "$MARKER_CLOSE_FAIL_ROOT/results/meta.env"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$MARKER_CLOSE_FAIL_ROOT"
+  STATE_DIR="$MARKER_CLOSE_FAIL_ROOT/state"
+  META_FILE="$MARKER_CLOSE_FAIL_ROOT/results/meta.env"
+  DIAG_LOG_FILE=""
+  phase_marker_published_fd_close() { return 1; }
+  mark_done individual
+) > /dev/null 2>&1
+marker_close_fail_rc=$?
+check_eq "completion descriptor close failure exact-rolls back before metadata" "1" \
+  "$([[ $marker_close_fail_rc -eq 1 && ! -e "$MARKER_CLOSE_FAIL_ROOT/state/phase-individual.done" &&
+    ! -L "$MARKER_CLOSE_FAIL_ROOT/state/phase-individual.done" &&
+    "$(cat "$MARKER_CLOSE_FAIL_ROOT/results/meta.env")" == 'COMPLETED_PHASES=' ]] && echo 1 || echo 0)"
+
+PRE_ID_MARKER_ROOT="$TMP/marker-pre-id-failure"
+mkdir -p "$PRE_ID_MARKER_ROOT/results" "$PRE_ID_MARKER_ROOT/state"
+printf 'COMPLETED_PHASES=\n' > "$PRE_ID_MARKER_ROOT/results/meta.env"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$PRE_ID_MARKER_ROOT"
+  STATE_DIR="$PRE_ID_MARKER_ROOT/state"
+  META_FILE="$PRE_ID_MARKER_ROOT/results/meta.env"
+  DIAG_LOG_FILE=""
+  phase_marker_capture_identity() { return 1; }
+  mark_done individual
+) > /dev/null 2>&1
+pre_id_marker_rc=$?
+check_eq "pre-identity failure removes the exact mode-invalid marker through its open FD" "1" \
+  "$([[ $pre_id_marker_rc -eq 1 && ! -e "$PRE_ID_MARKER_ROOT/state/phase-individual.done" &&
+    ! -L "$PRE_ID_MARKER_ROOT/state/phase-individual.done" &&
+    "$(cat "$PRE_ID_MARKER_ROOT/results/meta.env")" == 'COMPLETED_PHASES=' ]] && echo 1 || echo 0)"
+
+MARKER_META_FAIL_ROOT="$TMP/marker-metadata-failure"
+mkdir -p "$MARKER_META_FAIL_ROOT/results" "$MARKER_META_FAIL_ROOT/state"
+printf 'COMPLETED_PHASES=\n' > "$MARKER_META_FAIL_ROOT/results/meta.env"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$MARKER_META_FAIL_ROOT"
+  STATE_DIR="$MARKER_META_FAIL_ROOT/state"
+  META_FILE="$MARKER_META_FAIL_ROOT/results/meta.env"
+  DIAG_LOG_FILE=""
+  meta_config_rename() { return 1; }
+  mark_done individual
+) > /dev/null 2>&1
+marker_meta_fail_rc=$?
+check_eq "metadata publication failure rolls back the exact durable completion marker" "1" \
+  "$([[ $marker_meta_fail_rc -eq 1 && ! -e "$MARKER_META_FAIL_ROOT/state/phase-individual.done" &&
+    ! -L "$MARKER_META_FAIL_ROOT/state/phase-individual.done" &&
+    "$(cat "$MARKER_META_FAIL_ROOT/results/meta.env")" == 'COMPLETED_PHASES=' &&
+    -z "$(find "$MARKER_META_FAIL_ROOT/results" -maxdepth 1 -name '.meta.env.*' -print -quit)" ]] && echo 1 || echo 0)"
+
+META_FAILED_RENAME_TAMPER_ROOT="$TMP/marker-metadata-failed-rename-tamper"
+mkdir -p "$META_FAILED_RENAME_TAMPER_ROOT/results" "$META_FAILED_RENAME_TAMPER_ROOT/state"
+printf 'MODE=quick\nCOMPLETED_PHASES=\n' > "$META_FAILED_RENAME_TAMPER_ROOT/results/meta.env"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$META_FAILED_RENAME_TAMPER_ROOT"
+  STATE_DIR="$META_FAILED_RENAME_TAMPER_ROOT/state"
+  META_FILE="$META_FAILED_RENAME_TAMPER_ROOT/results/meta.env"
+  DIAG_LOG_FILE=""
+  meta_config_rename() {
+    mv -T -- "$1" "$2" || return 1
+    printf 'TAMPERED_AFTER_RENAME=1\n' >> "$2"
+    return 1
+  }
+  mark_done individual
+) > /dev/null 2>&1
+meta_failed_rename_tamper_rc=$?
+check_eq "failed rename with a changed mismatched metadata inode rolls back completion" "1" \
+  "$([[ $meta_failed_rename_tamper_rc -eq 1 &&
+    ! -e "$META_FAILED_RENAME_TAMPER_ROOT/state/phase-individual.done" &&
+    ! -L "$META_FAILED_RENAME_TAMPER_ROOT/state/phase-individual.done" &&
+    "$(grep -c '^COMPLETED_PHASES=individual$' "$META_FAILED_RENAME_TAMPER_ROOT/results/meta.env")" == 1 &&
+    "$(grep -c '^TAMPERED_AFTER_RENAME=1$' "$META_FAILED_RENAME_TAMPER_ROOT/results/meta.env")" == 1 ]] && echo 1 || echo 0)"
+
+META_PRE_RECHECK_ROOT="$TMP/marker-metadata-pre-recheck-replacement"
+mkdir -p "$META_PRE_RECHECK_ROOT/results" "$META_PRE_RECHECK_ROOT/state"
+printf 'MODE=quick\nCOMPLETED_PHASES=\n' > "$META_PRE_RECHECK_ROOT/results/meta.env"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$META_PRE_RECHECK_ROOT"
+  STATE_DIR="$META_PRE_RECHECK_ROOT/state"
+  META_FILE="$META_PRE_RECHECK_ROOT/results/meta.env"
+  DIAG_LOG_FILE=""
+  phase_completion_before_meta_recheck() {
+    mv -- "$META_FILE" "$META_FILE.before-replacement"
+    printf 'MODE=replaced\nCOMPLETED_PHASES=\n' > "$META_FILE"
+  }
+  mark_done individual
+) > /dev/null 2>&1
+meta_pre_recheck_rc=$?
+check_eq "pre-rewrite metadata replacement rolls back the exact completion marker" "1" \
+  "$([[ $meta_pre_recheck_rc -eq 1 && ! -e "$META_PRE_RECHECK_ROOT/state/phase-individual.done" &&
+    ! -L "$META_PRE_RECHECK_ROOT/state/phase-individual.done" &&
+    "$(sed -n 's/^MODE=//p' "$META_PRE_RECHECK_ROOT/results/meta.env")" == replaced &&
+    -f "$META_PRE_RECHECK_ROOT/results/meta.env.before-replacement" ]] && echo 1 || echo 0)"
+
+META_NO_RENAME_ROOT="$TMP/marker-metadata-success-without-rename"
+mkdir -p "$META_NO_RENAME_ROOT/results" "$META_NO_RENAME_ROOT/state"
+printf 'MODE=quick\nCOMPLETED_PHASES=\n' > "$META_NO_RENAME_ROOT/results/meta.env"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$META_NO_RENAME_ROOT"
+  STATE_DIR="$META_NO_RENAME_ROOT/state"
+  META_FILE="$META_NO_RENAME_ROOT/results/meta.env"
+  DIAG_LOG_FILE=""
+  rewrite_meta_atomic() { :; }
+  mark_done individual
+) > /dev/null 2>&1
+meta_no_rename_rc=$?
+check_eq "nominal metadata success without an inode change rolls back completion" "1" \
+  "$([[ $meta_no_rename_rc -eq 1 && ! -e "$META_NO_RENAME_ROOT/state/phase-individual.done" &&
+    "$(cat "$META_NO_RENAME_ROOT/results/meta.env")" == $'MODE=quick\nCOMPLETED_PHASES=' ]] && echo 1 || echo 0)"
+
+META_POST_REWRITE_ROOT="$TMP/marker-metadata-post-rewrite-tamper"
+mkdir -p "$META_POST_REWRITE_ROOT/results" "$META_POST_REWRITE_ROOT/state"
+printf 'MODE=quick\nCOMPLETED_PHASES=\n' > "$META_POST_REWRITE_ROOT/results/meta.env"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$META_POST_REWRITE_ROOT"
+  STATE_DIR="$META_POST_REWRITE_ROOT/state"
+  META_FILE="$META_POST_REWRITE_ROOT/results/meta.env"
+  DIAG_LOG_FILE=""
+  phase_completion_after_meta_rewrite() {
+    printf 'TAMPERED=1\n' >> "$META_FILE"
+  }
+  mark_done individual
+) > /dev/null 2>&1
+meta_post_rewrite_rc=$?
+check_eq "post-success metadata digest mismatch fails closed after the rename commit" "1" \
+  "$([[ $meta_post_rewrite_rc -eq 1 && ! -e "$META_POST_REWRITE_ROOT/state/phase-individual.done" &&
+    ! -L "$META_POST_REWRITE_ROOT/state/phase-individual.done" &&
+    "$(grep -c '^COMPLETED_PHASES=individual$' "$META_POST_REWRITE_ROOT/results/meta.env")" == 1 &&
+    "$(grep -c '^TAMPERED=1$' "$META_POST_REWRITE_ROOT/results/meta.env")" == 1 ]] && echo 1 || echo 0)"
+
+META_DIR_SYNC_FAIL_ROOT="$TMP/marker-metadata-directory-sync-failure"
+mkdir -p "$META_DIR_SYNC_FAIL_ROOT/results" "$META_DIR_SYNC_FAIL_ROOT/state"
+printf 'MODE=quick\nCOMPLETED_PHASES=\n' > "$META_DIR_SYNC_FAIL_ROOT/results/meta.env"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$META_DIR_SYNC_FAIL_ROOT"
+  STATE_DIR="$META_DIR_SYNC_FAIL_ROOT/state"
+  META_FILE="$META_DIR_SYNC_FAIL_ROOT/results/meta.env"
+  DIAG_LOG_FILE=""
+  sync() {
+    [[ "$2" != "$META_DIR_SYNC_FAIL_ROOT/results" ]]
+  }
+  mark_done individual
+) > /dev/null 2>&1
+meta_dir_sync_fail_rc=$?
+meta_dir_sync_marker="$(stat -c '%u:%h:%s' "$META_DIR_SYNC_FAIL_ROOT/state/phase-individual.done" 2> /dev/null || true)"
+check_eq "post-rename metadata directory sync failure retains a matching authoritative marker" "1" \
+  "$([[ $meta_dir_sync_fail_rc -eq 1 && "$meta_dir_sync_marker" == "$EUID:1:0" &&
+    "$(grep -c '^COMPLETED_PHASES=individual$' "$META_DIR_SYNC_FAIL_ROOT/results/meta.env")" == 1 &&
+    -z "$(find "$META_DIR_SYNC_FAIL_ROOT/results" -maxdepth 1 -name '.meta.env.*' -print -quit)" ]] && echo 1 || echo 0)"
+
+VALID_MARKER_ROOT="$TMP/valid-exclusive-marker"
+mkdir -p "$VALID_MARKER_ROOT/results" "$VALID_MARKER_ROOT/state"
+printf 'COMPLETED_PHASES=\n' > "$VALID_MARKER_ROOT/results/meta.env"
+VALID_MARKER_SYNC_TRACE="$VALID_MARKER_ROOT/sync.trace"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$VALID_MARKER_ROOT"
+  STATE_DIR="$VALID_MARKER_ROOT/state"
+  META_FILE="$VALID_MARKER_ROOT/results/meta.env"
+  DIAG_LOG_FILE=""
+  sync() {
+    printf '%s\n' "$2" >> "$VALID_MARKER_SYNC_TRACE"
+  }
+  mark_done individual
+)
+valid_marker_state="$(stat -c '%u:%h:%s' "$VALID_MARKER_ROOT/state/phase-individual.done")"
+check_eq "completion marker publication is owned, single-link, and zero-byte" "1" \
+  "$([[ "$valid_marker_state" == "$EUID:1:0" ]] && grep -qx 'COMPLETED_PHASES=individual' "$VALID_MARKER_ROOT/results/meta.env" &&
+    [[ "$(sed -n '1p' "$VALID_MARKER_SYNC_TRACE")" =~ ^/proc/[0-9]+/fd/[0-9]+$ ]] &&
+    [[ "$(sed -n '2p' "$VALID_MARKER_SYNC_TRACE")" == "$VALID_MARKER_ROOT/state" ]] &&
+    [[ "$(sed -n '3p' "$VALID_MARKER_SYNC_TRACE")" == "$VALID_MARKER_ROOT/results/".meta.env.* ]] &&
+    [[ "$(sed -n '4p' "$VALID_MARKER_SYNC_TRACE")" == "$VALID_MARKER_ROOT/results" ]] &&
+    [[ "$(wc -l < "$VALID_MARKER_SYNC_TRACE")" == 4 ]] && echo 1 || echo 0)"
+
 echo "== single.sh validation =="
 bash "$REPO_ROOT/single.sh" abc > /dev/null 2>&1
 check_eq "single.sh rejects non-numeric cpu (rc=2)" "2" "$?"
