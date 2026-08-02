@@ -50,6 +50,11 @@ DRY_RUN=0
 ASSUME_YES=0
 REDO_PHASES=""
 declare -a REDO_PLAN=()
+REDO_MARKER_TEMP=""
+REDO_TXN_ID=""
+declare -a REDO_TXN_PHASES=()
+declare -a REDO_TXN_OWNERS=()
+declare -a REDO_TXN_PATHS=()
 WORST_CPU_OVERRIDE=""
 SESSION_DID_WORK=0
 MODE_EXPLICIT=0
@@ -411,89 +416,260 @@ build_redo_plan() {
   done
 }
 
-archive_derived_outputs() {
-  local -a paths=(results.json report.md privacy-review.txt manifest.txt)
-  local -a existing=()
-  local p
-  for p in "${paths[@]}"; do
-    [[ -e "$OUT_DIR/$p" ]] && existing+=("$p")
-  done
-  ((${#existing[@]} > 0)) || return 0
+redo_phase_supported() {
+  case "$1" in baseline | groups | individual | frequency | gdb) return 0 ;; esac
+  return 1
+}
 
-  mkdir -p "$STATE_DIR/superseded"
-  local stash
-  stash="$(mktemp -d "$STATE_DIR/superseded/derived-$(date +%Y%m%dT%H%M%S)-XXXXXX")"
-  for p in "${existing[@]}"; do
-    mkdir -p "$stash/$(dirname "$p")"
-    mv "$OUT_DIR/$p" "$stash/$p"
+redo_relative_path_is_safe() {
+  local path="$1"
+  [[ -n "$path" && "$path" != /* && "$path" =~ ^[A-Za-z0-9._:/-]+$ ]] || return 1
+  [[ "$path" != "." && "$path" != ".." && "$path" != ./* &&
+    "$path" != */./* && "$path" != */. && "$path" != ../* &&
+    "$path" != */../* && "$path" != */.. && "$path" != *//* ]]
+}
+
+redo_path_is_allowed() {
+  local phase="$1" path="$2" suffix
+  redo_relative_path_is_safe "$path" || return 1
+  case "$phase:$path" in
+    baseline:results/baseline.meta|baseline:logs/baseline|baseline:freq/baseline.samples|baseline:freq/baseline.method|groups:results/groups.tsv|groups:logs/groups|individual:results/individual.tsv|individual:logs/individual|gdb:results/gdb.meta|gdb:gdb|gdb:logs/gdb|frequency:results/frequency-ab.tsv|frequency:results/frequency-ab.meta|frequency:results/frequency-cap.tsv|frequency:results/frequency-cap.meta) return 0 ;;
+  esac
+  if [[ "$phase" == groups && "$path" == freq/group-* ]]; then
+    suffix="${path#freq/group-}"
+    [[ -n "$suffix" && "$suffix" != */* ]]
+    return
+  fi
+  if [[ "$phase" == frequency && "$path" == freq/freq-ab-* ]]; then
+    suffix="${path#freq/freq-ab-}"
+    [[ -n "$suffix" && "$suffix" != */* ]]
+    return
+  fi
+  return 1
+}
+
+redo_derived_path_is_allowed() {
+  case "$1" in results.json | report.md | privacy-review.txt | manifest.txt) return 0 ;; esac
+  return 1
+}
+
+# Parse pending redo state strictly as data. Never source this user-owned file.
+redo_transaction_validate() {
+  local marker="$1" line kind owner path version="" txn="" last_rank=0 rank section=version
+  local -A phases=() records=()
+  REDO_TXN_ID=""
+  REDO_TXN_PHASES=()
+  REDO_TXN_OWNERS=()
+  REDO_TXN_PATHS=()
+  [[ -f "$marker" && ! -L "$marker" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    IFS=$'\t' read -r kind owner path <<< "$line"
+    case "$kind" in
+      VERSION)
+        [[ "$section" == version && "$line" == "VERSION"$'\t'"$owner" && "$owner" == 1 ]] || return 1
+        version=1
+        section=txn
+        ;;
+      TXN)
+        [[ "$section" == txn && "$line" == "TXN"$'\t'"$owner" &&
+          "$owner" =~ ^redo-[0-9]{8}T[0-9]{6}-[A-Za-z0-9]+$ ]] || return 1
+        txn="$owner"
+        section=phases
+        ;;
+      PHASE)
+        [[ "$section" == phases && "$line" == "PHASE"$'\t'"$owner" ]] || return 1
+        redo_phase_supported "$owner" && [[ -z "${phases[$owner]:-}" ]] || return 1
+        case "$owner" in baseline) rank=1 ;; groups) rank=2 ;; individual) rank=3 ;; frequency) rank=4 ;; gdb) rank=5 ;; esac
+        ((rank > last_rank)) || return 1
+        last_rank=$rank
+        phases[$owner]=1
+        REDO_TXN_PHASES+=("$owner")
+        ;;
+      DERIVED)
+        [[ "$section" == phases || "$section" == derived ]] || return 1
+        [[ ${#REDO_TXN_PHASES[@]} -gt 0 && "$line" == "DERIVED"$'\t'"-"$'\t'"$path" ]] || return 1
+        redo_derived_path_is_allowed "$path" && [[ -z "${records[derived:$path]:-}" ]] || return 1
+        records[derived:$path]=1
+        REDO_TXN_OWNERS+=(derived); REDO_TXN_PATHS+=("$path")
+        section=derived
+        ;;
+      ARTIFACT)
+        [[ "$section" == phases || "$section" == derived || "$section" == artifacts ]] || return 1
+        [[ ${#REDO_TXN_PHASES[@]} -gt 0 && "$line" == "ARTIFACT"$'\t'"$owner"$'\t'"$path" ]] || return 1
+        redo_phase_supported "$owner" && redo_path_is_allowed "$owner" "$path" || return 1
+        [[ -z "${records[$owner:$path]:-}" ]] || return 1
+        records[$owner:$path]=1
+        REDO_TXN_OWNERS+=("$owner"); REDO_TXN_PATHS+=("$path")
+        section=artifacts
+        ;;
+      *) return 1 ;;
+    esac
+  done < "$marker"
+  [[ "$version" == 1 && -n "$txn" && ${#REDO_TXN_PHASES[@]} -gt 0 ]] || return 1
+  local phase
+  for phase in "${REDO_TXN_OWNERS[@]}"; do
+    [[ "$phase" == derived || -n "${phases[$phase]:-}" ]] || return 1
   done
-  diag_log "--redo: generated report data preserved under ${stash#"$OUT_DIR"/}"
+  if [[ -n "${phases[groups]:-}" ]]; then
+    [[ -n "${phases[individual]:-}" && -n "${phases[frequency]:-}" && -n "${phases[gdb]:-}" ]] || return 1
+  fi
+  if [[ -n "${phases[individual]:-}" ]]; then
+    [[ -n "${phases[frequency]:-}" && -n "${phases[gdb]:-}" ]] || return 1
+  fi
+  REDO_TXN_ID="$txn"
+}
+
+redo_ensure_destination_parent() {
+  local stash="$1" relative="$2" current="$stash" part
+  local parent="${relative%/*}"
+  [[ "$parent" != "$relative" ]] || return 0
+  IFS='/' read -ra parts <<< "$parent"
+  for part in "${parts[@]}"; do
+    current="$current/$part"
+    if [[ -e "$current" || -L "$current" ]]; then
+      [[ -d "$current" && ! -L "$current" ]] || return 1
+    else
+      mkdir -- "$current" || return 1
+    fi
+  done
+}
+
+redo_source_parent_is_safe() {
+  local relative="$1" current="$OUT_DIR" part
+  local parent="${relative%/*}"
+  [[ "$parent" != "$relative" ]] || return 0
+  IFS='/' read -ra parts <<< "$parent"
+  for part in "${parts[@]}"; do
+    current="$current/$part"
+    [[ -d "$current" && ! -L "$current" ]] || return 1
+  done
+}
+
+redo_transaction_execute() {
+  local marker="$STATE_DIR/redo.pending"
+  redo_transaction_validate "$marker" || diag_die "pending redo transaction is malformed; refusing bundle mutation"
+  local superseded="$STATE_DIR/superseded"
+  if [[ -e "$superseded" || -L "$superseded" ]]; then
+    [[ -d "$superseded" && ! -L "$superseded" ]] ||
+      diag_die "pending redo archive parent is unsafe"
+  else
+    mkdir -- "$superseded" || diag_die "cannot create pending redo archive parent"
+  fi
+  local stash="$superseded/$REDO_TXN_ID" phase i source dest bucket
+  if [[ -e "$stash" || -L "$stash" ]]; then
+    [[ -d "$stash" && ! -L "$stash" ]] || diag_die "pending redo archive destination is unsafe"
+  else
+    mkdir -- "$stash" || diag_die "cannot create pending redo archive destination"
+  fi
+
+  # Validate every recorded source/archive pair before invalidating completion
+  # metadata. During recovery, exactly one side must exist for every record.
+  for ((i = 0; i < ${#REDO_TXN_PATHS[@]}; i++)); do
+    source="$OUT_DIR/${REDO_TXN_PATHS[$i]}"
+    bucket="${REDO_TXN_OWNERS[$i]}"
+    dest="$stash/$bucket/${REDO_TXN_PATHS[$i]}"
+    redo_source_parent_is_safe "${REDO_TXN_PATHS[$i]}" ||
+      diag_die "pending redo source parent is unsafe for ${REDO_TXN_PATHS[$i]}"
+    redo_ensure_destination_parent "$stash" "$bucket/${REDO_TXN_PATHS[$i]}" ||
+      diag_die "pending redo archive parent is unsafe"
+    local source_exists=0 dest_exists=0
+    [[ -e "$source" || -L "$source" ]] && source_exists=1
+    [[ -e "$dest" || -L "$dest" ]] && dest_exists=1
+    ((source_exists + dest_exists == 1)) ||
+      diag_die "pending redo has conflicting or missing source/archive state for ${REDO_TXN_PATHS[$i]}"
+  done
+
+  # Invalidate the complete dependency closure before the first evidence move.
+  for phase in "${REDO_TXN_PHASES[@]}"; do
+    rm -f -- "$STATE_DIR/phase-$phase.done" ||
+      diag_die "pending redo could not invalidate phase $phase"
+    [[ ! -e "$STATE_DIR/phase-$phase.done" && ! -L "$STATE_DIR/phase-$phase.done" ]] ||
+      diag_die "pending redo could not invalidate phase $phase"
+  done
+  sync_meta_completed || diag_die "pending redo could not synchronize completed phases"
+  SESSION_DID_WORK=1
+
+  for ((i = 0; i < ${#REDO_TXN_PATHS[@]}; i++)); do
+    source="$OUT_DIR/${REDO_TXN_PATHS[$i]}"
+    bucket="${REDO_TXN_OWNERS[$i]}"
+    dest="$stash/$bucket/${REDO_TXN_PATHS[$i]}"
+    local source_exists=0 dest_exists=0
+    [[ -e "$source" || -L "$source" ]] && source_exists=1
+    [[ -e "$dest" || -L "$dest" ]] && dest_exists=1
+    if ((source_exists == 1 && dest_exists == 0)); then
+      redo_ensure_destination_parent "$stash" "$bucket/${REDO_TXN_PATHS[$i]}" ||
+        diag_die "pending redo archive parent is unsafe"
+      mv -T -- "$source" "$dest" || diag_die "pending redo could not archive ${REDO_TXN_PATHS[$i]}"
+    elif ((source_exists == 0 && dest_exists == 1)); then
+      : # already moved before an interruption
+    else
+      diag_die "pending redo has conflicting or missing source/archive state for ${REDO_TXN_PATHS[$i]}"
+    fi
+  done
+  rm -f -- "$marker" || diag_die "pending redo completed but its transaction marker could not be removed"
+  diag_log "--redo: previous evidence preserved under ${stash#"$OUT_DIR"/}; phases ${REDO_TXN_PHASES[*]} will run fresh"
+}
+
+redo_record_if_present() {
+  local kind="$1" owner="$2" path="$3"
+  [[ -e "$OUT_DIR/$path" || -L "$OUT_DIR/$path" ]] || return 0
+  redo_source_parent_is_safe "$path" || diag_die "--redo source parent is unsafe for $path"
+  printf '%s\t%s\t%s\n' "$kind" "$owner" "$path"
 }
 
 apply_redo_plan() {
   ((${#REDO_PLAN[@]} > 0)) || return 0
-  archive_derived_outputs
-  local phase
-  for phase in "${REDO_PLAN[@]}"; do
-    redo_phase "$phase"
-  done
+  local pending="$STATE_DIR/redo.pending"
+  [[ ! -e "$pending" && ! -L "$pending" ]] || diag_die "a pending redo transaction must be recovered before starting another"
+  REDO_MARKER_TEMP="$(mktemp "$STATE_DIR/.redo.pending.XXXXXX")" || diag_die "cannot prepare redo transaction"
+  local txn="redo-$(date +%Y%m%dT%H%M%S)-${REDO_MARKER_TEMP##*.}" phase path artifact
+  {
+    printf 'VERSION\t1\nTXN\t%s\n' "$txn"
+    for phase in "${REDO_PLAN[@]}"; do printf 'PHASE\t%s\n' "$phase"; done
+    for path in results.json report.md privacy-review.txt manifest.txt; do
+      redo_record_if_present DERIVED - "$path"
+    done
+    for phase in "${REDO_PLAN[@]}"; do
+      local -a paths=()
+      case "$phase" in
+        baseline) paths=(results/baseline.meta logs/baseline freq/baseline.samples freq/baseline.method) ;;
+        groups) paths=(results/groups.tsv logs/groups) ;;
+        individual) paths=(results/individual.tsv logs/individual) ;;
+        frequency) paths=(results/frequency-ab.tsv results/frequency-ab.meta results/frequency-cap.tsv results/frequency-cap.meta) ;;
+        gdb) paths=(results/gdb.meta gdb logs/gdb) ;;
+        *) diag_die "--redo: unsupported phase '$phase'" ;;
+      esac
+      if [[ "$phase" == groups ]]; then
+        for artifact in "$OUT_DIR"/freq/group-*; do
+          [[ -e "$artifact" || -L "$artifact" ]] && paths+=("${artifact#"$OUT_DIR"/}")
+        done
+      elif [[ "$phase" == frequency ]]; then
+        for artifact in "$OUT_DIR"/freq/freq-ab-*; do
+          [[ -e "$artifact" || -L "$artifact" ]] && paths+=("${artifact#"$OUT_DIR"/}")
+        done
+      fi
+      for path in "${paths[@]}"; do redo_record_if_present ARTIFACT "$phase" "$path"; done
+    done
+  } > "$REDO_MARKER_TEMP" || diag_die "cannot write redo transaction"
+  chmod 0600 "$REDO_MARKER_TEMP" || diag_die "cannot protect redo transaction"
+  redo_transaction_validate "$REDO_MARKER_TEMP" || diag_die "generated redo transaction failed validation"
+  mv -nT -- "$REDO_MARKER_TEMP" "$pending" || diag_die "cannot publish redo transaction"
+  [[ ! -e "$REDO_MARKER_TEMP" ]] || diag_die "another redo transaction appeared concurrently"
+  REDO_MARKER_TEMP=""
+  redo_transaction_execute
 }
 
-# Move a phase's data aside (never delete) and clear its done marker so the
-# phase re-runs from scratch on this resume. Used by --redo when a phase
-# should be repeated in a single contiguous session rather than topped up.
-redo_phase() {
-  local phase="$1"
-  local -a paths=()
-  case "$phase" in
-    baseline)
-      paths=(results/baseline.meta logs/baseline
-        freq/baseline.samples freq/baseline.method)
-      ;;
-    groups) paths=(results/groups.tsv logs/groups) ;;
-    individual) paths=(results/individual.tsv logs/individual) ;;
-    gdb) paths=(results/gdb.meta gdb logs/gdb) ;;
-    frequency)
-      paths=(results/frequency-ab.tsv results/frequency-ab.meta
-        results/frequency-cap.tsv results/frequency-cap.meta)
-      ;;
-    *)
-      diag_die "--redo: unknown or unsupported phase '$phase' (supported: baseline,groups,individual,gdb,frequency)"
-      ;;
-  esac
-  local artifact
-  if [[ "$phase" == "groups" ]]; then
-    for artifact in "$OUT_DIR"/freq/group-*; do
-      [[ -e "$artifact" ]] && paths+=("${artifact#"$OUT_DIR"/}")
-    done
-  elif [[ "$phase" == "frequency" ]]; then
-    for artifact in "$OUT_DIR"/freq/freq-ab-*; do
-      [[ -e "$artifact" ]] && paths+=("${artifact#"$OUT_DIR"/}")
-    done
-  fi
-  local -a existing=()
-  local p
-  for p in "${paths[@]}"; do
-    if [[ -e "$OUT_DIR/$p" ]]; then
-      existing+=("$p")
-    fi
-  done
-  local stash=""
-  if ((${#existing[@]} > 0)); then
-    mkdir -p "$STATE_DIR/superseded"
-    stash="$(mktemp -d "$STATE_DIR/superseded/${phase}-$(date +%Y%m%dT%H%M%S)-XXXXXX")"
-    for p in "${existing[@]}"; do
-      mkdir -p "$stash/$(dirname "$p")"
-      mv "$OUT_DIR/$p" "$stash/$p"
-    done
-  fi
-  rm -f "$STATE_DIR/phase-$phase.done"
-  sync_meta_completed
-  if [[ -n "$stash" ]]; then
-    diag_log "--redo $phase: previous data preserved under ${stash#"$OUT_DIR"/}"
-  else
-    diag_log "--redo $phase: no previous data; phase will run fresh"
-  fi
+recover_pending_redo() {
+  local pending="$STATE_DIR/redo.pending"
+  [[ -e "$pending" || -L "$pending" ]] || return 0
+  diag_log "recovering interrupted redo transaction before phase execution"
+  redo_transaction_execute
+}
+
+redo_marker_temp_cleanup() {
+  [[ -n "$REDO_MARKER_TEMP" ]] || return 0
+  case "$REDO_MARKER_TEMP" in "$STATE_DIR"/.redo.pending.*) rm -f -- "$REDO_MARKER_TEMP" ;; esac
+  REDO_MARKER_TEMP=""
 }
 
 # ---------------------------------------------------------------------------
@@ -1227,15 +1403,21 @@ complete_diagnostic() {
 diagnose_cleanup_exit() {
   local rc="$1"
   trap - EXIT INT TERM
+  redo_marker_temp_cleanup
   diag_freq_sampler_stop
   exit "$rc"
 }
 
 on_interrupt() {
   local sig="$1"
-  diag_warn "received $sig - stopping frequency sampling and writing a partial report"
+  redo_marker_temp_cleanup
   meta_set INTERRUPTED 1 2> /dev/null || true
   diag_freq_sampler_stop 2> /dev/null || true
+  if [[ -e "$STATE_DIR/redo.pending" || -L "$STATE_DIR/redo.pending" ]]; then
+    diag_warn "received $sig while redo archival is pending; skipping a misleading partial report (resume this bundle to recover)"
+    if [[ "$sig" == "SIGINT" ]]; then exit 130; else exit 143; fi
+  fi
+  diag_warn "received $sig - stopping frequency sampling and writing a partial report"
   # Best effort: a failed partial report must not mask the interrupt, so
   # the subshell contains diag_die's exit and the failure is swallowed.
   ( finalize_report ) 2> /dev/null || true
@@ -1399,6 +1581,7 @@ main() {
   fi
   # Stored configuration seeds resume defaults, but explicit CLI overrides
   # describe the run that is about to execute and must be reflected in JSON.
+  recover_pending_redo
   persist_effective_config
 
   apply_redo_plan

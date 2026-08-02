@@ -621,12 +621,14 @@ printf 'MODE=quick\nINDIVIDUAL_RUNS=20\nCOMPLETED_PHASES=baseline,individual\n' 
   OUT_DIR="$RB"
   STATE_DIR="$RB/state"
   META_FILE="$RB/results/meta.env"
-  redo_phase individual
+  REDO_PLAN=(individual frequency gdb)
+  apply_redo_plan
 ) > /dev/null 2>&1
+redo_stash="$(find "$RB/state/superseded" -mindepth 1 -maxdepth 1 -type d -name 'redo-*' -print -quit)"
 redo_ok=0
 [[ ! -f "$RB/results/individual.tsv" ]] &&
   [[ ! -f "$RB/state/phase-individual.done" ]] &&
-  compgen -G "$RB/state/superseded/individual-*/results/individual.tsv" > /dev/null &&
+  [[ -f "$redo_stash/individual/results/individual.tsv" ]] &&
   grep -q '^COMPLETED_PHASES=baseline$' "$RB/results/meta.env" && redo_ok=1
 check_eq "--redo individual stashes data, clears marker" "1" "$redo_ok"
 
@@ -643,13 +645,14 @@ printf 'COMPLETED_PHASES=gdb\n' > "$GB/results/meta.env"
   OUT_DIR="$GB"
   STATE_DIR="$GB/state"
   META_FILE="$GB/results/meta.env"
-  redo_phase gdb
+  REDO_PLAN=(gdb)
+  apply_redo_plan
 ) > /dev/null 2>&1
-gdb_stash="$(find "$GB/state/superseded" -mindepth 1 -maxdepth 1 -type d -name 'gdb-*' -print -quit)"
+gdb_stash="$(find "$GB/state/superseded" -mindepth 1 -maxdepth 1 -type d -name 'redo-*' -print -quit)"
 gdb_redo_ok=0
-[[ -f "$gdb_stash/results/gdb.meta" ]] &&
-  [[ -f "$gdb_stash/gdb/cpu19-run1.txt" ]] &&
-  [[ -f "$gdb_stash/logs/gdb/runner.log" ]] &&
+[[ -f "$gdb_stash/gdb/results/gdb.meta" ]] &&
+  [[ -f "$gdb_stash/gdb/gdb/cpu19-run1.txt" ]] &&
+  [[ -f "$gdb_stash/gdb/logs/gdb/runner.log" ]] &&
   [[ ! -f "$GB/state/phase-gdb.done" ]] && gdb_redo_ok=1
 check_eq "--redo gdb preserves distinct capture and runner paths" "1" "$gdb_redo_ok"
 
@@ -667,14 +670,15 @@ printf 'COMPLETED_PHASES=frequency\n' > "$FB/results/meta.env"
   OUT_DIR="$FB"
   STATE_DIR="$FB/state"
   META_FILE="$FB/results/meta.env"
-  redo_phase frequency
+  REDO_PLAN=(frequency)
+  apply_redo_plan
 ) > /dev/null 2>&1
-frequency_stash="$(find "$FB/state/superseded" -mindepth 1 -maxdepth 1 -type d -name 'frequency-*' -print -quit)"
+frequency_stash="$(find "$FB/state/superseded" -mindepth 1 -maxdepth 1 -type d -name 'redo-*' -print -quit)"
 frequency_redo_ok=0
-[[ -f "$frequency_stash/results/frequency-ab.tsv" ]] &&
-  [[ -f "$frequency_stash/results/frequency-ab.meta" ]] &&
-  [[ "$(cat "$frequency_stash/freq/freq-ab-A1.samples")" == "old samples" ]] &&
-  [[ -f "$frequency_stash/freq/freq-ab-A1.method" ]] &&
+[[ -f "$frequency_stash/frequency/results/frequency-ab.tsv" ]] &&
+  [[ -f "$frequency_stash/frequency/results/frequency-ab.meta" ]] &&
+  [[ "$(cat "$frequency_stash/frequency/freq/freq-ab-A1.samples")" == "old samples" ]] &&
+  [[ -f "$frequency_stash/frequency/freq/freq-ab-A1.method" ]] &&
   [[ ! -e "$FB/freq/freq-ab-A1.samples" ]] && frequency_redo_ok=1
 check_eq "--redo frequency preserves raw sampler evidence" "1" "$frequency_redo_ok"
 (
@@ -683,7 +687,8 @@ check_eq "--redo frequency preserves raw sampler evidence" "1" "$frequency_redo_
   OUT_DIR="$RB"
   STATE_DIR="$RB/state"
   META_FILE="$RB/results/meta.env"
-  redo_phase bogus-phase
+  REDO_PHASES=bogus-phase
+  build_redo_plan
 ) > /dev/null 2>&1
 [[ $? -ne 0 ]]
 check_eq "--redo rejects unknown phase" "0" "$?"
@@ -744,6 +749,7 @@ printf 'COMPLETED_PHASES=baseline,groups,individual,frequency,gdb\n' > "$DEPENDE
   build_redo_plan
   apply_redo_plan
 ) > /dev/null 2>&1
+dependent_stash="$(find "$DEPENDENT_RB/state/superseded" -mindepth 1 -maxdepth 1 -type d -name 'redo-*' -print -quit)"
 dependent_redo_ok=0
 [[ -f "$DEPENDENT_RB/state/phase-baseline.done" ]] &&
   [[ ! -e "$DEPENDENT_RB/state/phase-groups.done" ]] &&
@@ -753,13 +759,169 @@ dependent_redo_ok=0
   [[ ! -e "$DEPENDENT_RB/results.json" ]] &&
   [[ ! -e "$DEPENDENT_RB/report.md" ]] &&
   [[ ! -e "$DEPENDENT_RB/manifest.txt" ]] &&
-  compgen -G "$DEPENDENT_RB/state/superseded/groups-*/results/groups.tsv" > /dev/null &&
-  compgen -G "$DEPENDENT_RB/state/superseded/individual-*/results/individual.tsv" > /dev/null &&
-  compgen -G "$DEPENDENT_RB/state/superseded/frequency-*/results/frequency-ab.tsv" > /dev/null &&
-  compgen -G "$DEPENDENT_RB/state/superseded/gdb-*/results/gdb.meta" > /dev/null &&
-  compgen -G "$DEPENDENT_RB/state/superseded/derived-*/results.json" > /dev/null &&
+  [[ -f "$dependent_stash/groups/results/groups.tsv" ]] &&
+  [[ -f "$dependent_stash/individual/results/individual.tsv" ]] &&
+  [[ -f "$dependent_stash/frequency/results/frequency-ab.tsv" ]] &&
+  [[ -f "$dependent_stash/gdb/results/gdb.meta" ]] &&
+  [[ -f "$dependent_stash/derived/results.json" ]] &&
   grep -q '^COMPLETED_PHASES=baseline$' "$DEPENDENT_RB/results/meta.env" && dependent_redo_ok=1
 check_eq "redoing groups invalidates dependent phases and reports" "1" "$dependent_redo_ok"
+
+REDO_FAIL_RB="$TMP/redo-failed-move-bundle"
+mkdir -p "$REDO_FAIL_RB"/{results,state,logs/individual}
+printf '19\t1\t139\t2\n' > "$REDO_FAIL_RB/results/individual.tsv"
+printf 'individual log\n' > "$REDO_FAIL_RB/logs/individual/cpu-19.log"
+touch "$REDO_FAIL_RB/state/phase-"{baseline,individual,frequency,gdb}.done
+printf 'COMPLETED_PHASES=baseline,individual,frequency,gdb\n' > "$REDO_FAIL_RB/results/meta.env"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$REDO_FAIL_RB"
+  STATE_DIR="$REDO_FAIL_RB/state"
+  META_FILE="$REDO_FAIL_RB/results/meta.env"
+  REDO_PLAN=(individual frequency gdb)
+  move_count=0
+  mv() {
+    move_count=$((move_count + 1))
+    ((move_count != 3)) || return 97
+    command mv "$@"
+  }
+  apply_redo_plan
+) > /dev/null 2>&1
+redo_fail_rc=$?
+redo_fail_stash="$(find "$REDO_FAIL_RB/state/superseded" -mindepth 1 -maxdepth 1 -type d -name 'redo-*' -print -quit)"
+redo_failure_ok=0
+[[ $redo_fail_rc -ne 0 ]] &&
+  [[ -f "$REDO_FAIL_RB/state/redo.pending" ]] &&
+  [[ "$(stat -c '%a' "$REDO_FAIL_RB/state/redo.pending")" == 600 ]] &&
+  [[ -f "$redo_fail_stash/individual/results/individual.tsv" ]] &&
+  [[ -f "$REDO_FAIL_RB/logs/individual/cpu-19.log" ]] &&
+  [[ ! -e "$REDO_FAIL_RB/state/phase-individual.done" ]] &&
+  [[ ! -e "$REDO_FAIL_RB/state/phase-frequency.done" ]] &&
+  [[ ! -e "$REDO_FAIL_RB/state/phase-gdb.done" ]] &&
+  grep -q '^COMPLETED_PHASES=baseline$' "$REDO_FAIL_RB/results/meta.env" && redo_failure_ok=1
+check_eq "redo move failure leaves a private recoverable transaction" "1" "$redo_failure_ok"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$REDO_FAIL_RB"
+  STATE_DIR="$REDO_FAIL_RB/state"
+  META_FILE="$REDO_FAIL_RB/results/meta.env"
+  recover_pending_redo
+) > /dev/null 2>&1
+redo_recovery_rc=$?
+redo_recovery_ok=0
+[[ $redo_recovery_rc -eq 0 ]] &&
+  [[ ! -e "$REDO_FAIL_RB/state/redo.pending" ]] &&
+  [[ ! -e "$REDO_FAIL_RB/results/individual.tsv" ]] &&
+  [[ ! -e "$REDO_FAIL_RB/logs/individual" ]] &&
+  [[ -f "$redo_fail_stash/individual/results/individual.tsv" ]] &&
+  [[ -f "$redo_fail_stash/individual/logs/individual/cpu-19.log" ]] &&
+  [[ "$(find "$REDO_FAIL_RB/state/superseded" -mindepth 1 -maxdepth 1 -type d -name 'redo-*' | wc -l)" -eq 1 ]] && redo_recovery_ok=1
+check_eq "redo recovery resumes the same transaction idempotently" "1" "$redo_recovery_ok"
+
+REDO_SIGNAL_RB="$TMP/redo-signal-bundle"
+mkdir -p "$REDO_SIGNAL_RB"/{results,state,logs/individual}
+printf '19\t1\t139\t2\n' > "$REDO_SIGNAL_RB/results/individual.tsv"
+touch "$REDO_SIGNAL_RB/state/phase-"{individual,frequency,gdb}.done
+printf 'COMPLETED_PHASES=individual,frequency,gdb\n' > "$REDO_SIGNAL_RB/results/meta.env"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$REDO_SIGNAL_RB"
+  STATE_DIR="$REDO_SIGNAL_RB/state"
+  META_FILE="$REDO_SIGNAL_RB/results/meta.env"
+  REDO_PLAN=(individual frequency gdb)
+  finalize_report() { touch "$REDO_SIGNAL_RB/finalized"; }
+  move_count=0
+  mv() {
+    move_count=$((move_count + 1))
+    if ((move_count == 2)); then
+      kill -TERM "$BASHPID"
+      return 98
+    fi
+    command mv "$@"
+  }
+  trap 'on_interrupt SIGTERM' TERM
+  apply_redo_plan
+) > /dev/null 2>&1
+redo_signal_rc=$?
+redo_signal_ok=0
+[[ $redo_signal_rc -eq 143 ]] &&
+  [[ -f "$REDO_SIGNAL_RB/state/redo.pending" ]] &&
+  [[ -f "$REDO_SIGNAL_RB/results/individual.tsv" ]] &&
+  [[ ! -e "$REDO_SIGNAL_RB/finalized" ]] &&
+  [[ ! -e "$REDO_SIGNAL_RB/state/phase-individual.done" ]] &&
+  grep -q '^INTERRUPTED=1$' "$REDO_SIGNAL_RB/results/meta.env" && redo_signal_ok=1
+check_eq "SIGTERM during redo preserves recovery state and skips partial finalization" "1" "$redo_signal_ok"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$REDO_SIGNAL_RB"
+  STATE_DIR="$REDO_SIGNAL_RB/state"
+  META_FILE="$REDO_SIGNAL_RB/results/meta.env"
+  recover_pending_redo
+) > /dev/null 2>&1
+redo_signal_recovery_rc=$?
+check_eq "redo resumes after a handled signal" "1" \
+  "$([[ $redo_signal_recovery_rc -eq 0 && ! -e "$REDO_SIGNAL_RB/state/redo.pending" && ! -e "$REDO_SIGNAL_RB/results/individual.tsv" ]] && echo 1 || echo 0)"
+
+CRAFTED_REDO_RB="$TMP/redo-crafted-marker-bundle"
+mkdir -p "$CRAFTED_REDO_RB"/{results,state}
+printf 'gdb evidence\n' > "$CRAFTED_REDO_RB/results/gdb.meta"
+touch "$CRAFTED_REDO_RB/state/phase-gdb.done"
+printf 'COMPLETED_PHASES=gdb\n' > "$CRAFTED_REDO_RB/results/meta.env"
+{
+  printf 'VERSION\t1\n'
+  printf 'TXN\tredo-20260802T000000-crafted\n'
+  printf 'PHASE\tgdb\n'
+  printf 'ARTIFACT\tgdb\t../victim\n'
+  printf 'EVIL=$(touch %s)\n' "$CRAFTED_REDO_RB/evaluated"
+} > "$CRAFTED_REDO_RB/state/redo.pending"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$CRAFTED_REDO_RB"
+  STATE_DIR="$CRAFTED_REDO_RB/state"
+  META_FILE="$CRAFTED_REDO_RB/results/meta.env"
+  recover_pending_redo
+) > /dev/null 2>&1
+crafted_redo_rc=$?
+crafted_redo_ok=0
+[[ $crafted_redo_rc -ne 0 ]] &&
+  [[ ! -e "$CRAFTED_REDO_RB/evaluated" ]] &&
+  [[ -f "$CRAFTED_REDO_RB/results/gdb.meta" ]] &&
+  [[ -f "$CRAFTED_REDO_RB/state/phase-gdb.done" ]] &&
+  [[ -f "$CRAFTED_REDO_RB/state/redo.pending" ]] &&
+  [[ ! -e "$CRAFTED_REDO_RB/state/superseded" ]] && crafted_redo_ok=1
+check_eq "crafted redo marker is data-only and fails closed" "1" "$crafted_redo_ok"
+
+CONFLICT_REDO_RB="$TMP/redo-conflicting-marker-bundle"
+conflict_txn="redo-20260802T000000-conflict"
+mkdir -p "$CONFLICT_REDO_RB"/{results,state/superseded/$conflict_txn/gdb/results}
+printf 'source evidence\n' > "$CONFLICT_REDO_RB/results/gdb.meta"
+printf 'archive evidence\n' > "$CONFLICT_REDO_RB/state/superseded/$conflict_txn/gdb/results/gdb.meta"
+touch "$CONFLICT_REDO_RB/state/phase-gdb.done"
+printf 'COMPLETED_PHASES=gdb\n' > "$CONFLICT_REDO_RB/results/meta.env"
+printf 'VERSION\t1\nTXN\t%s\nPHASE\tgdb\nARTIFACT\tgdb\tresults/gdb.meta\n' "$conflict_txn" \
+  > "$CONFLICT_REDO_RB/state/redo.pending"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$CONFLICT_REDO_RB"
+  STATE_DIR="$CONFLICT_REDO_RB/state"
+  META_FILE="$CONFLICT_REDO_RB/results/meta.env"
+  recover_pending_redo
+) > /dev/null 2>&1
+conflict_redo_rc=$?
+conflict_redo_ok=0
+[[ $conflict_redo_rc -ne 0 ]] &&
+  [[ "$(cat "$CONFLICT_REDO_RB/results/gdb.meta")" == "source evidence" ]] &&
+  [[ "$(cat "$CONFLICT_REDO_RB/state/superseded/$conflict_txn/gdb/results/gdb.meta")" == "archive evidence" ]] &&
+  [[ -f "$CONFLICT_REDO_RB/state/phase-gdb.done" ]] &&
+  grep -q '^COMPLETED_PHASES=gdb$' "$CONFLICT_REDO_RB/results/meta.env" &&
+  [[ -f "$CONFLICT_REDO_RB/state/redo.pending" ]] && conflict_redo_ok=1
+check_eq "conflicting redo source and archive fail before metadata mutation" "1" "$conflict_redo_ok"
 
 CONSENT_RB="$TMP/redo-consent-bundle"
 mkdir -p "$CONSENT_RB"/{results,state,logs/individual}
@@ -787,6 +949,17 @@ consent_redo_ok=0
   cmp -s "$CONSENT_RB/meta.before" "$CONSENT_RB/results/meta.env" &&
   [[ "$(cat "$CONSENT_RB/commands.log")" == "old command log" ]] && consent_redo_ok=1
 check_eq "redo does not mutate bundle before consent" "1" "$consent_redo_ok"
+printf 'VERSION\t1\nTXN\tredo-20260802T000000-consent\nPHASE\tindividual\nPHASE\tfrequency\nPHASE\tgdb\nARTIFACT\tindividual\tresults/individual.tsv\n' \
+  > "$CONSENT_RB/state/redo.pending"
+"$REPO_ROOT/diagnose.sh" --resume "$CONSENT_RB" > /dev/null 2>&1
+pending_consent_rc=$?
+pending_consent_ok=0
+[[ $pending_consent_rc -ne 0 ]] &&
+  [[ -f "$CONSENT_RB/state/redo.pending" ]] &&
+  [[ -f "$CONSENT_RB/results/individual.tsv" ]] &&
+  [[ -f "$CONSENT_RB/state/phase-individual.done" ]] &&
+  [[ ! -e "$CONSENT_RB/state/superseded" ]] && pending_consent_ok=1
+check_eq "pending redo recovery waits for safety consent" "1" "$pending_consent_ok"
 
 COMMAND_LOG="$TMP/commands.log"
 printf '+ original command\n' > "$COMMAND_LOG"
