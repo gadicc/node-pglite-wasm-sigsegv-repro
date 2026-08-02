@@ -325,6 +325,7 @@ export function collect(outDir) {
           firstFailureAfterSec: parsed.firstFailureAfterSec,
           durationSec: parsed.durationSec,
           failures: parsed.failures,
+          partial: parsed.partial,
         });
       }
       results.groups.push(entry);
