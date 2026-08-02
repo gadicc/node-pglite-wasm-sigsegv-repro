@@ -3225,6 +3225,15 @@ check_eq "unknown stored mode is rejected" "1" "$([[ $invalid_mode_rc -ne 0 ]] &
 ) > /dev/null 2>&1
 missing_required_rc=$?
 check_eq "missing required command aborts preflight" "1" "$([[ $missing_required_rc -ne 0 ]] && echo 1 || echo 0)"
+privacy_chmod_dependency="$(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  for command_name in "${REQUIRED_COMMANDS[@]}"; do
+    [[ "$command_name" == chmod ]] && printf 1 && exit 0
+  done
+  printf 0
+)"
+check_eq "privacy publication declares chmod as a required command" "1" "$privacy_chmod_dependency"
 
 (
   DIAG_SOURCE_ONLY=1
@@ -3781,8 +3790,12 @@ system_node_path="$(
 check_eq "node_path outside \$HOME is unchanged" "/usr/bin/node" "$system_node_path"
 
 PRIVACY_BUNDLE="$TMP/privacy-bundle"
-mkdir -p "$PRIVACY_BUNDLE/raw"
+mkdir -p "$PRIVACY_BUNDLE/raw" "$PRIVACY_BUNDLE/nested"
 printf 'path=%s/private token=550e8400-e29b-41d4-a716-446655440000\n' "$HOME" > "$PRIVACY_BUNDLE/raw/tool.txt"
+printf 'nested token 11111111-2222-3333-4444-555555555555\n' \
+  > "$PRIVACY_BUNDLE/nested/privacy-review.txt"
+printf 'nested mac aa:bb:cc:dd:ee:ff\n' > "$PRIVACY_BUNDLE/nested/manifest.txt"
+printf 'stale manifest\n' > "$PRIVACY_BUNDLE/manifest.txt"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
@@ -3791,7 +3804,269 @@ printf 'path=%s/private token=550e8400-e29b-41d4-a716-446655440000\n' "$HOME" > 
   write_privacy_review
 )
 check_eq "privacy scan flags files without copying sentinel values" "1" \
-  "$([[ "$(grep -c $'^known-home-path\traw/tool.txt$' "$PRIVACY_BUNDLE/privacy-review.txt")" == 1 && "$(grep -c $'^uuid-shape\traw/tool.txt$' "$PRIVACY_BUNDLE/privacy-review.txt")" == 1 && "$(grep -c '550e8400' "$PRIVACY_BUNDLE/privacy-review.txt")" == 0 ]] && echo 1 || echo 0)"
+  "$([[ "$(grep -c $'^known-home-path\traw/tool.txt$' "$PRIVACY_BUNDLE/privacy-review.txt")" == 1 && "$(grep -c $'^uuid-shape\traw/tool.txt$' "$PRIVACY_BUNDLE/privacy-review.txt")" == 1 && "$(grep -c $'^uuid-shape\tnested/privacy-review.txt$' "$PRIVACY_BUNDLE/privacy-review.txt")" == 1 && "$(grep -c $'^mac-shape\tnested/manifest.txt$' "$PRIVACY_BUNDLE/privacy-review.txt")" == 1 && "$(grep -c '550e8400' "$PRIVACY_BUNDLE/privacy-review.txt")" == 0 && ! -e "$PRIVACY_BUNDLE/manifest.txt" && "$(stat -c '%a' "$PRIVACY_BUNDLE/privacy-review.txt")" == 644 ]] && ! compgen -G "$PRIVACY_BUNDLE.privacy-*" > /dev/null && echo 1 || echo 0)"
+
+privacy_write_fixture() {
+  local bundle="$1" output="$2"
+  (
+    DIAG_SOURCE_ONLY=1
+    source "$REPO_ROOT/diagnose.sh"
+    OUT_DIR="$bundle"
+    SCRIPT_DIR="$REPO_ROOT"
+    write_privacy_review
+  ) > "$output" 2>&1
+}
+
+PRIVACY_LINK_DEST="$TMP/privacy-link-destination"
+mkdir -p "$PRIVACY_LINK_DEST/bundle/raw"
+printf 'clean payload\n' > "$PRIVACY_LINK_DEST/bundle/raw/data.txt"
+printf 'do not overwrite symlink victim\n' > "$PRIVACY_LINK_DEST/victim"
+ln -s "$PRIVACY_LINK_DEST/victim" "$PRIVACY_LINK_DEST/bundle/privacy-review.txt"
+printf 'stale manifest\n' > "$PRIVACY_LINK_DEST/bundle/manifest.txt"
+privacy_write_fixture "$PRIVACY_LINK_DEST/bundle" "$PRIVACY_LINK_DEST/output"
+privacy_link_dest_rc=$?
+check_eq "privacy publication atomically replaces a stale review symlink without following it" "1" \
+  "$([[ $privacy_link_dest_rc -eq 0 && "$(cat "$PRIVACY_LINK_DEST/victim")" == 'do not overwrite symlink victim' && -f "$PRIVACY_LINK_DEST/bundle/privacy-review.txt" && ! -L "$PRIVACY_LINK_DEST/bundle/privacy-review.txt" && ! -e "$PRIVACY_LINK_DEST/bundle/manifest.txt" ]] && grep -Fxq $'status\tno-known-sentinels' "$PRIVACY_LINK_DEST/bundle/privacy-review.txt" && ! compgen -G "$PRIVACY_LINK_DEST/bundle.privacy-*" > /dev/null && echo 1 || echo 0)"
+
+for unsafe_review_kind in directory fifo; do
+  PRIVACY_UNSAFE_DEST="$TMP/privacy-unsafe-review-$unsafe_review_kind"
+  mkdir -p "$PRIVACY_UNSAFE_DEST/bundle/raw"
+  printf 'clean payload\n' > "$PRIVACY_UNSAFE_DEST/bundle/raw/data.txt"
+  printf 'stale manifest\n' > "$PRIVACY_UNSAFE_DEST/bundle/manifest.txt"
+  if [[ "$unsafe_review_kind" == directory ]]; then
+    mkdir "$PRIVACY_UNSAFE_DEST/bundle/privacy-review.txt"
+  else
+    mkfifo "$PRIVACY_UNSAFE_DEST/bundle/privacy-review.txt"
+  fi
+  timeout --signal=TERM --kill-after=1 5 bash -c '
+    DIAG_SOURCE_ONLY=1
+    source "$1/diagnose.sh"
+    OUT_DIR="$2"
+    SCRIPT_DIR="$1"
+    write_privacy_review
+  ' _ "$REPO_ROOT" "$PRIVACY_UNSAFE_DEST/bundle" \
+    > "$PRIVACY_UNSAFE_DEST/output" 2>&1
+  privacy_unsafe_dest_rc=$?
+  check_eq "privacy publication rejects a $unsafe_review_kind review destination without blocking" "1" \
+    "$([[ $privacy_unsafe_dest_rc -eq 1 && ! -e "$PRIVACY_UNSAFE_DEST/bundle/manifest.txt" ]] && [[ $unsafe_review_kind == directory && -d "$PRIVACY_UNSAFE_DEST/bundle/privacy-review.txt" || $unsafe_review_kind == fifo && -p "$PRIVACY_UNSAFE_DEST/bundle/privacy-review.txt" ]] && ! compgen -G "$PRIVACY_UNSAFE_DEST/bundle.privacy-*" > /dev/null && echo 1 || echo 0)"
+done
+
+PRIVACY_UNSAFE_LINK="$TMP/privacy-unsafe-link"
+mkdir -p "$PRIVACY_UNSAFE_LINK/bundle/raw"
+printf 'old review\n' > "$PRIVACY_UNSAFE_LINK/bundle/privacy-review.txt"
+printf 'stale manifest\n' > "$PRIVACY_UNSAFE_LINK/bundle/manifest.txt"
+printf 'external payload\n' > "$PRIVACY_UNSAFE_LINK/victim"
+ln -s "$PRIVACY_UNSAFE_LINK/victim" "$PRIVACY_UNSAFE_LINK/bundle/raw/link"
+privacy_write_fixture "$PRIVACY_UNSAFE_LINK/bundle" "$PRIVACY_UNSAFE_LINK/output"
+privacy_unsafe_link_rc=$?
+check_eq "privacy inventory rejects non-control symlinks without touching their targets" "1" \
+  "$([[ $privacy_unsafe_link_rc -ne 0 && "$(cat "$PRIVACY_UNSAFE_LINK/victim")" == 'external payload' && "$(cat "$PRIVACY_UNSAFE_LINK/bundle/privacy-review.txt")" == 'old review' && ! -e "$PRIVACY_UNSAFE_LINK/bundle/manifest.txt" ]] && ! compgen -G "$PRIVACY_UNSAFE_LINK/bundle.privacy-*" > /dev/null && echo 1 || echo 0)"
+
+PRIVACY_SPECIAL="$TMP/privacy-special-entry"
+mkdir -p "$PRIVACY_SPECIAL/bundle/raw"
+printf 'old review\n' > "$PRIVACY_SPECIAL/bundle/privacy-review.txt"
+printf 'stale manifest\n' > "$PRIVACY_SPECIAL/bundle/manifest.txt"
+mkfifo "$PRIVACY_SPECIAL/bundle/raw/fifo"
+timeout --signal=TERM --kill-after=1 5 bash -c '
+  DIAG_SOURCE_ONLY=1
+  source "$1/diagnose.sh"
+  OUT_DIR="$2"
+  SCRIPT_DIR="$1"
+  write_privacy_review
+' _ "$REPO_ROOT" "$PRIVACY_SPECIAL/bundle" > "$PRIVACY_SPECIAL/output" 2>&1
+privacy_special_rc=$?
+check_eq "privacy inventory rejects special files without blocking" "1" \
+  "$([[ $privacy_special_rc -eq 1 && "$(cat "$PRIVACY_SPECIAL/bundle/privacy-review.txt")" == 'old review' && ! -e "$PRIVACY_SPECIAL/bundle/manifest.txt" ]] && ! compgen -G "$PRIVACY_SPECIAL/bundle.privacy-*" > /dev/null && echo 1 || echo 0)"
+
+PRIVACY_CONTROL_NAME="$TMP/privacy-control-name"
+mkdir -p "$PRIVACY_CONTROL_NAME/bundle/raw"
+printf 'unsafe pathname\n' > "$PRIVACY_CONTROL_NAME/bundle/raw/"$'tab\tname'
+printf 'old review\n' > "$PRIVACY_CONTROL_NAME/bundle/privacy-review.txt"
+printf 'stale manifest\n' > "$PRIVACY_CONTROL_NAME/bundle/manifest.txt"
+privacy_write_fixture "$PRIVACY_CONTROL_NAME/bundle" "$PRIVACY_CONTROL_NAME/output"
+privacy_control_name_rc=$?
+check_eq "privacy inventory rejects control characters in relative names" "1" \
+  "$([[ $privacy_control_name_rc -ne 0 && "$(cat "$PRIVACY_CONTROL_NAME/bundle/privacy-review.txt")" == 'old review' && ! -e "$PRIVACY_CONTROL_NAME/bundle/manifest.txt" ]] && ! compgen -G "$PRIVACY_CONTROL_NAME/bundle.privacy-*" > /dev/null && echo 1 || echo 0)"
+
+if ((EUID != 0)); then
+  PRIVACY_UNREADABLE="$TMP/privacy-unreadable"
+  mkdir -p "$PRIVACY_UNREADABLE/bundle/raw"
+  printf 'unreadable payload\n' > "$PRIVACY_UNREADABLE/bundle/raw/data.txt"
+  chmod 000 "$PRIVACY_UNREADABLE/bundle/raw/data.txt"
+  printf 'old review\n' > "$PRIVACY_UNREADABLE/bundle/privacy-review.txt"
+  printf 'stale manifest\n' > "$PRIVACY_UNREADABLE/bundle/manifest.txt"
+  privacy_write_fixture "$PRIVACY_UNREADABLE/bundle" "$PRIVACY_UNREADABLE/output"
+  privacy_unreadable_rc=$?
+  chmod 0600 "$PRIVACY_UNREADABLE/bundle/raw/data.txt"
+  check_eq "privacy inventory rejects unreadable regular files" "1" \
+    "$([[ $privacy_unreadable_rc -ne 0 && "$(cat "$PRIVACY_UNREADABLE/bundle/privacy-review.txt")" == 'old review' && ! -e "$PRIVACY_UNREADABLE/bundle/manifest.txt" ]] && ! compgen -G "$PRIVACY_UNREADABLE/bundle.privacy-*" > /dev/null && echo 1 || echo 0)"
+
+  PRIVACY_UNREADABLE_DIR="$TMP/privacy-unreadable-directory"
+  mkdir -p "$PRIVACY_UNREADABLE_DIR/bundle/raw/locked"
+  printf 'hidden payload\n' > "$PRIVACY_UNREADABLE_DIR/bundle/raw/locked/data.txt"
+  chmod 000 "$PRIVACY_UNREADABLE_DIR/bundle/raw/locked"
+  printf 'old review\n' > "$PRIVACY_UNREADABLE_DIR/bundle/privacy-review.txt"
+  printf 'stale manifest\n' > "$PRIVACY_UNREADABLE_DIR/bundle/manifest.txt"
+  privacy_write_fixture "$PRIVACY_UNREADABLE_DIR/bundle" "$PRIVACY_UNREADABLE_DIR/output"
+  privacy_unreadable_dir_rc=$?
+  chmod 0700 "$PRIVACY_UNREADABLE_DIR/bundle/raw/locked"
+  check_eq "privacy inventory rejects unreadable directories" "1" \
+    "$([[ $privacy_unreadable_dir_rc -ne 0 && "$(cat "$PRIVACY_UNREADABLE_DIR/bundle/privacy-review.txt")" == 'old review' && ! -e "$PRIVACY_UNREADABLE_DIR/bundle/manifest.txt" ]] && ! compgen -G "$PRIVACY_UNREADABLE_DIR/bundle.privacy-*" > /dev/null && echo 1 || echo 0)"
+else
+  ok "privacy inventory rejects unreadable regular files [skipped while tests run as root]"
+  ok "privacy inventory rejects unreadable directories [skipped while tests run as root]"
+fi
+
+PRIVACY_COMMAND_FAIL="$TMP/privacy-command-failures"
+mkdir -p "$PRIVACY_COMMAND_FAIL/bin" "$PRIVACY_COMMAND_FAIL/find-bundle/raw" \
+  "$PRIVACY_COMMAND_FAIL/sort-bundle/raw" "$PRIVACY_COMMAND_FAIL/grep-bundle/raw" \
+  "$PRIVACY_COMMAND_FAIL/node-bundle/raw"
+PRIVACY_REAL_FIND="$(command -v find)"
+PRIVACY_REAL_GREP="$(command -v grep)"
+cat > "$PRIVACY_COMMAND_FAIL/bin/find" << 'EOF'
+#!/usr/bin/env bash
+"$DIAG_TEST_REAL_FIND" "$@"
+exit 7
+EOF
+cat > "$PRIVACY_COMMAND_FAIL/bin/grep" << 'EOF'
+#!/usr/bin/env bash
+exit 2
+EOF
+cat > "$PRIVACY_COMMAND_FAIL/bin/sort" << 'EOF'
+#!/usr/bin/env bash
+exit 7
+EOF
+cat > "$PRIVACY_COMMAND_FAIL/bin/node" << 'EOF'
+#!/usr/bin/env bash
+exit 7
+EOF
+chmod +x "$PRIVACY_COMMAND_FAIL/bin/find" "$PRIVACY_COMMAND_FAIL/bin/sort" \
+  "$PRIVACY_COMMAND_FAIL/bin/grep" "$PRIVACY_COMMAND_FAIL/bin/node"
+for command_case in find sort grep node; do
+  command_bundle="$PRIVACY_COMMAND_FAIL/${command_case}-bundle"
+  printf 'private-secret-550e8400-e29b-41d4-a716-446655440000\n' \
+    > "$command_bundle/raw/data.txt"
+  printf 'old review\n' > "$command_bundle/privacy-review.txt"
+  printf 'stale manifest\n' > "$command_bundle/manifest.txt"
+  command_bin="$PRIVACY_COMMAND_FAIL/${command_case}-bin"
+  mkdir -p "$command_bin"
+  ln -s "$PRIVACY_COMMAND_FAIL/bin/$command_case" "$command_bin/$command_case"
+  PATH="$command_bin:$PATH" \
+    DIAG_TEST_REAL_FIND="$PRIVACY_REAL_FIND" \
+    timeout --signal=TERM --kill-after=1 5 bash -c '
+      DIAG_SOURCE_ONLY=1
+      source "$1/diagnose.sh"
+      OUT_DIR="$2"
+      SCRIPT_DIR="$1"
+      write_privacy_review
+    ' _ "$REPO_ROOT" "$command_bundle" > "$PRIVACY_COMMAND_FAIL/$command_case.output" 2>&1
+  command_fail_rc=$?
+  check_eq "privacy scan fails closed without secret leakage when $command_case fails" "1" \
+    "$([[ $command_fail_rc -eq 1 && "$(cat "$command_bundle/privacy-review.txt")" == 'old review' && ! -e "$command_bundle/manifest.txt" ]] && ! grep -q 'private-secret\|550e8400' "$PRIVACY_COMMAND_FAIL/$command_case.output" && ! compgen -G "$command_bundle.privacy-*" > /dev/null && echo 1 || echo 0)"
+done
+
+PRIVACY_DEVICE_MISMATCH="$TMP/privacy-device-mismatch"
+mkdir -p "$PRIVACY_DEVICE_MISMATCH/bin" "$PRIVACY_DEVICE_MISMATCH/bundle/raw"
+printf 'private-secret-550e8400-e29b-41d4-a716-446655440000\n' \
+  > "$PRIVACY_DEVICE_MISMATCH/bundle/raw/data.txt"
+printf 'old review\n' > "$PRIVACY_DEVICE_MISMATCH/bundle/privacy-review.txt"
+printf 'stale manifest\n' > "$PRIVACY_DEVICE_MISMATCH/bundle/manifest.txt"
+PRIVACY_REAL_STAT="$(command -v stat)"
+cat > "$PRIVACY_DEVICE_MISMATCH/bin/stat" << 'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == -c && "$2" == '%d' && "${@: -1}" == *.privacy-review.* ]]; then
+  printf '999999999\n'
+  exit 0
+fi
+exec "$DIAG_TEST_REAL_STAT" "$@"
+EOF
+chmod +x "$PRIVACY_DEVICE_MISMATCH/bin/stat"
+PATH="$PRIVACY_DEVICE_MISMATCH/bin:$PATH" \
+  DIAG_TEST_REAL_STAT="$PRIVACY_REAL_STAT" \
+  timeout --signal=TERM --kill-after=1 5 bash -c '
+    DIAG_SOURCE_ONLY=1
+    source "$1/diagnose.sh"
+    OUT_DIR="$2"
+    SCRIPT_DIR="$1"
+    write_privacy_review
+  ' _ "$REPO_ROOT" "$PRIVACY_DEVICE_MISMATCH/bundle" \
+  > "$PRIVACY_DEVICE_MISMATCH/output" 2>&1
+privacy_device_mismatch_rc=$?
+check_eq "privacy publication rejects cross-device sibling candidates before scanning" "1" \
+  "$([[ $privacy_device_mismatch_rc -eq 1 && "$(cat "$PRIVACY_DEVICE_MISMATCH/bundle/privacy-review.txt")" == 'old review' && ! -e "$PRIVACY_DEVICE_MISMATCH/bundle/manifest.txt" ]] && grep -Fxq 'error: privacy publication candidates are not on the bundle filesystem' "$PRIVACY_DEVICE_MISMATCH/output" && ! grep -q 'private-secret\|550e8400' "$PRIVACY_DEVICE_MISMATCH/output" && ! compgen -G "$PRIVACY_DEVICE_MISMATCH/bundle.privacy-*" > /dev/null && echo 1 || echo 0)"
+
+PRIVACY_RACE="$TMP/privacy-inventory-race"
+mkdir -p "$PRIVACY_RACE/bin" "$PRIVACY_RACE/bundle/raw"
+printf 'stable payload\n' > "$PRIVACY_RACE/bundle/raw/data.txt"
+printf 'old review\n' > "$PRIVACY_RACE/bundle/privacy-review.txt"
+printf 'stale manifest\n' > "$PRIVACY_RACE/bundle/manifest.txt"
+cat > "$PRIVACY_RACE/bin/grep" << 'EOF'
+#!/usr/bin/env bash
+if (set -o noclobber; : > "$DIAG_TEST_RACE_MARKER") 2> /dev/null; then
+  printf 'late inventory entry\n' > "$DIAG_TEST_RACE_FILE"
+fi
+exec "$DIAG_TEST_REAL_GREP" "$@"
+EOF
+chmod +x "$PRIVACY_RACE/bin/grep"
+PATH="$PRIVACY_RACE/bin:$PATH" \
+  DIAG_TEST_REAL_GREP="$PRIVACY_REAL_GREP" \
+  DIAG_TEST_RACE_MARKER="$PRIVACY_RACE/triggered" \
+  DIAG_TEST_RACE_FILE="$PRIVACY_RACE/bundle/raw/late.txt" \
+  timeout --signal=TERM --kill-after=1 5 bash -c '
+    DIAG_SOURCE_ONLY=1
+    source "$1/diagnose.sh"
+    OUT_DIR="$2"
+    SCRIPT_DIR="$1"
+    write_privacy_review
+  ' _ "$REPO_ROOT" "$PRIVACY_RACE/bundle" > "$PRIVACY_RACE/output" 2>&1
+privacy_race_rc=$?
+check_eq "privacy scan rejects inventory growth during sentinel probes" "1" \
+  "$([[ $privacy_race_rc -eq 1 && -f "$PRIVACY_RACE/bundle/raw/late.txt" && "$(cat "$PRIVACY_RACE/bundle/privacy-review.txt")" == 'old review' && ! -e "$PRIVACY_RACE/bundle/manifest.txt" ]] && ! compgen -G "$PRIVACY_RACE/bundle.privacy-*" > /dev/null && echo 1 || echo 0)"
+
+PRIVACY_FD_FAIL="$TMP/privacy-fd-cleanup"
+mkdir -p "$PRIVACY_FD_FAIL/bin" "$PRIVACY_FD_FAIL/bundle/raw"
+printf 'payload\n' > "$PRIVACY_FD_FAIL/bundle/raw/data.txt"
+ln -s "$PRIVACY_COMMAND_FAIL/bin/grep" "$PRIVACY_FD_FAIL/bin/grep"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$PRIVACY_FD_FAIL/bundle"
+  SCRIPT_DIR="$REPO_ROOT"
+  PATH="$PRIVACY_FD_FAIL/bin:$PATH"
+  before_fds="$(find /proc/self/fd -mindepth 1 -maxdepth 1 -printf x | wc -c)"
+  for _ in 1 2 3; do
+    write_privacy_review > /dev/null 2>&1 && exit 1
+  done
+  after_fds="$(find /proc/self/fd -mindepth 1 -maxdepth 1 -printf x | wc -c)"
+  [[ "$after_fds" == "$before_fds" && -z "$PRIVACY_REVIEW_FD" ]]
+) > /dev/null 2>&1
+check_eq "repeated privacy scan failures close their candidate descriptor" "0" "$?"
+
+PRIVACY_FINALIZE_FAIL="$TMP/privacy-finalization-failure"
+mkdir -p "$PRIVACY_FINALIZE_FAIL/bundle"/{raw,results,state}
+printf 'payload\n' > "$PRIVACY_FINALIZE_FAIL/bundle/raw/data.txt"
+printf 'MODE=quick\n' > "$PRIVACY_FINALIZE_FAIL/bundle/results/meta.env"
+printf 'stale manifest\n' > "$PRIVACY_FINALIZE_FAIL/bundle/manifest.txt"
+timeout --signal=TERM --kill-after=1 5 bash -c '
+  DIAG_SOURCE_ONLY=1
+  source "$1/diagnose.sh"
+  OUT_DIR="$2"
+  META_FILE="$2/results/meta.env"
+  STATE_DIR="$2/state"
+  SCRIPT_DIR="$1"
+  DIAG_LOG_FILE=""
+  PATH="$3:$PATH"
+  manifest_called="$4"
+  persist_session_end() { :; }
+  sync_meta_completed() { :; }
+  node() { :; }
+  write_manifest() { : > "$manifest_called"; }
+  complete_diagnostic
+' _ "$REPO_ROOT" "$PRIVACY_FINALIZE_FAIL/bundle" "$PRIVACY_FD_FAIL/bin" \
+  "$PRIVACY_FINALIZE_FAIL/manifest-called" > "$PRIVACY_FINALIZE_FAIL/output" 2>&1
+privacy_finalize_fail_rc=$?
+check_eq "privacy failure suppresses manifest generation and final success" "1" \
+  "$([[ $privacy_finalize_fail_rc -eq 1 && ! -e "$PRIVACY_FINALIZE_FAIL/manifest-called" && ! -e "$PRIVACY_FINALIZE_FAIL/bundle/manifest.txt" ]] && ! grep -q 'done\. Bundle' "$PRIVACY_FINALIZE_FAIL/output" && echo 1 || echo 0)"
 
 echo "== manifest covers the final bundled log lines =="
 MB="$TMP/manifest-bundle"

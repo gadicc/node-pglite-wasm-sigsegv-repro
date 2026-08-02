@@ -68,6 +68,10 @@ GROUP_PLAN_TEMP=""
 GROUP_META_TEMP=""
 PREFLIGHT_MANIFEST_TEMP=""
 PREFLIGHT_META_TEMP=""
+PRIVACY_REVIEW_TEMP=""
+PRIVACY_INVENTORY_BEFORE=""
+PRIVACY_INVENTORY_AFTER=""
+PRIVACY_REVIEW_FD=""
 GROUP_PLAN_DIGEST=""
 CPU_TARGET="auto"
 WORST_CPU_OVERRIDE=""
@@ -83,8 +87,8 @@ CPU_EXPLICIT=0
 CPU_FLAG_SEEN=0
 PENDING_CPU_TARGET_UNAVAILABLE=0
 REQUIRED_COMMANDS=(
-  awk basename bash cat cut date dirname find flock grep head mkdir mktemp mv node
-  nproc paste readlink rm sed setsid sha256sum sleep sort sync tail taskset tee timeout
+  awk basename bash cat chmod cmp cut date dirname find flock grep head mkdir mktemp mv node
+  nproc paste readlink rm sed setsid sha256sum sleep sort stat sync tail taskset tee timeout
   touch tr uniq wc xargs
 )
 PREFLIGHT_ARTIFACTS=(
@@ -1292,6 +1296,7 @@ redo_marker_temp_cleanup() {
     case "$PREFLIGHT_META_TEMP" in "${OUT_DIR:-}/results"/.preflight.meta.*) rm -f -- "$PREFLIGHT_META_TEMP" ;; esac
     PREFLIGHT_META_TEMP=""
   fi
+  privacy_review_temp_cleanup || true
 }
 
 # ---------------------------------------------------------------------------
@@ -2468,45 +2473,391 @@ phase_gdb_dispatch() {
 }
 
 # ------------------------------------------------------------------
+privacy_review_temp_cleanup() {
+  local cleanup_rc=0
+  if [[ -n "$PRIVACY_REVIEW_FD" ]]; then
+    if exec {PRIVACY_REVIEW_FD}>&- 2> /dev/null; then
+      PRIVACY_REVIEW_FD=""
+    else
+      cleanup_rc=1
+    fi
+  fi
+  if [[ -n "$PRIVACY_REVIEW_TEMP" ]]; then
+    case "$PRIVACY_REVIEW_TEMP" in
+      "${OUT_DIR:-}".privacy-review.*)
+        if rm -f -- "$PRIVACY_REVIEW_TEMP" 2> /dev/null; then
+          PRIVACY_REVIEW_TEMP=""
+        else
+          cleanup_rc=1
+        fi
+        ;;
+    esac
+  fi
+  if [[ -n "$PRIVACY_INVENTORY_BEFORE" ]]; then
+    case "$PRIVACY_INVENTORY_BEFORE" in
+      "${OUT_DIR:-}".privacy-inventory-before.*)
+        if rm -f -- "$PRIVACY_INVENTORY_BEFORE" 2> /dev/null; then
+          PRIVACY_INVENTORY_BEFORE=""
+        else
+          cleanup_rc=1
+        fi
+        ;;
+    esac
+  fi
+  if [[ -n "$PRIVACY_INVENTORY_AFTER" ]]; then
+    case "$PRIVACY_INVENTORY_AFTER" in
+      "${OUT_DIR:-}".privacy-inventory-after.*)
+        if rm -f -- "$PRIVACY_INVENTORY_AFTER" 2> /dev/null; then
+          PRIVACY_INVENTORY_AFTER=""
+        else
+          cleanup_rc=1
+        fi
+        ;;
+    esac
+  fi
+  return "$cleanup_rc"
+}
+
+privacy_manifest_invalidate() {
+  local manifest="$OUT_DIR/manifest.txt"
+  if [[ -e "$manifest" || -L "$manifest" ]]; then
+    [[ -f "$manifest" || -L "$manifest" ]] || {
+      echo "error: unsafe stale manifest destination" >&2
+      return 1
+    }
+    rm -f -- "$manifest" || {
+      echo "error: could not invalidate stale manifest before privacy scan" >&2
+      return 1
+    }
+    [[ ! -e "$manifest" && ! -L "$manifest" ]] || {
+      echo "error: stale manifest remains after privacy invalidation" >&2
+      return 1
+    }
+  fi
+  # Always synchronize, including an abort retry after an earlier directory
+  # sync error, so a failed scan cannot leave stale authority durable on disk.
+  sync -f "$OUT_DIR" > /dev/null 2>&1 || {
+    echo "error: could not synchronize stale manifest invalidation" >&2
+    return 1
+  }
+}
+
+privacy_inventory_build() {
+  local destination="$1"
+  if ! LC_ALL=C find "$OUT_DIR" -mindepth 1 -print0 2> /dev/null |
+    LC_ALL=C sort -z > "$destination" 2> /dev/null; then
+    echo "error: could not enumerate the complete privacy inventory" >&2
+    return 1
+  fi
+}
+
+privacy_sibling_temps_share_device() {
+  local bundle_device temp_device tmp
+  bundle_device="$(stat -c '%d' -- "$OUT_DIR" 2> /dev/null)" || {
+    echo "error: could not validate privacy publication filesystem" >&2
+    return 1
+  }
+  [[ "$bundle_device" =~ ^[0-9]+$ ]] || {
+    echo "error: could not validate privacy publication filesystem" >&2
+    return 1
+  }
+  for tmp in "$PRIVACY_REVIEW_TEMP" "$PRIVACY_INVENTORY_BEFORE" \
+    "$PRIVACY_INVENTORY_AFTER"; do
+    [[ -n "$tmp" && -f "$tmp" && ! -L "$tmp" ]] || {
+      echo "error: unsafe privacy publication candidate" >&2
+      return 1
+    }
+    temp_device="$(stat -c '%d' -- "$tmp" 2> /dev/null)" || {
+      echo "error: could not validate privacy publication filesystem" >&2
+      return 1
+    }
+    [[ "$temp_device" =~ ^[0-9]+$ && "$temp_device" == "$bundle_device" ]] || {
+      echo "error: privacy publication candidates are not on the bundle filesystem" >&2
+      return 1
+    }
+  done
+}
+
+privacy_entry_fingerprint() {
+  stat -c '%d:%i:%f:%h:%s:%y:%z' -- "$1" 2> /dev/null
+}
+
+privacy_inventory_validate() {
+  local inventory="$1" stats_name="$2" file rel fingerprint
+  local -n stats_ref="$stats_name"
+  stats_ref=()
+  while IFS= read -r -d '' file; do
+    [[ "$file" == "$OUT_DIR/"* ]] || {
+      echo "error: privacy inventory escaped the diagnostics bundle" >&2
+      return 1
+    }
+    rel="${file#"$OUT_DIR"/}"
+    [[ -n "$rel" && ! "$rel" =~ [[:cntrl:]] ]] || {
+      echo "error: privacy inventory contains an unsafe control pathname" >&2
+      return 1
+    }
+    # These are finalizer-controlled outputs, not scan inputs. Only their
+    # exact top-level spellings are excluded; nested names remain ordinary.
+    case "$rel" in
+      privacy-review.txt | manifest.txt) continue ;;
+    esac
+    [[ ! -L "$file" ]] || {
+      echo "error: privacy inventory contains a symbolic link" >&2
+      return 1
+    }
+    if [[ -d "$file" ]]; then
+      [[ -r "$file" && -x "$file" ]] || {
+        echo "error: privacy inventory contains an unreadable directory" >&2
+        return 1
+      }
+    elif [[ -f "$file" ]]; then
+      [[ -r "$file" ]] || {
+        echo "error: privacy inventory contains an unreadable file" >&2
+        return 1
+      }
+    else
+      echo "error: privacy inventory contains a special file" >&2
+      return 1
+    fi
+    fingerprint="$(privacy_entry_fingerprint "$file")" || {
+      echo "error: could not stat a privacy inventory entry" >&2
+      return 1
+    }
+    [[ -n "$fingerprint" ]] || return 1
+    stats_ref["$rel"]="$fingerprint"
+  done < "$inventory"
+}
+
+privacy_grep_probe() {
+  local category="$1" rel="$2" file="$3" output_fd="$4" grep_rc=0
+  shift 4
+  LC_ALL=C grep "$@" -- "$file" > /dev/null 2>&1 || grep_rc=$?
+  case "$grep_rc" in
+    0)
+      printf '%s\t%s\n' "$category" "$rel" >&"$output_fd" || return 3
+      return 0
+      ;;
+    1) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+privacy_review_abort() {
+  privacy_review_temp_cleanup || true
+  privacy_manifest_invalidate > /dev/null 2>&1 || true
+  echo "error: privacy sentinel scan failed closed" >&2
+  return 1
+}
+
 write_privacy_review() {
-  local review="$OUT_DIR/privacy-review.txt" file rel found=0
-  {
-    printf '# Automated privacy sentinel scan\n'
-    printf '# Matches list only category and relative file; inspect raw files before sharing.\n'
-  } > "$review"
+  local review="$OUT_DIR/privacy-review.txt" review_state="absent"
+  local file rel fingerprint probe_rc found=0 scan_failed=0 review_fd=""
+  local -A stats_before=() stats_after=()
+
+  [[ -d "$OUT_DIR" && ! -L "$OUT_DIR" && -r "$OUT_DIR" &&
+    -w "$OUT_DIR" && -x "$OUT_DIR" ]] || {
+    echo "error: diagnostics bundle is unsafe for privacy publication" >&2
+    return 1
+  }
+
+  # Revoke the previous derived generation before any privacy failure can be
+  # mistaken for a complete finalization. The wider results/report transaction
+  # remains deliberately outside this scoped change.
+  privacy_manifest_invalidate || return 1
+
+  if [[ -e "$review" || -L "$review" ]]; then
+    [[ -f "$review" || -L "$review" ]] || {
+      privacy_review_abort
+      return 1
+    }
+    review_state="$(stat -c '%d:%i:%f:%h:%s:%y:%z' -- "$review" 2> /dev/null)" || {
+      privacy_review_abort
+      return 1
+    }
+  fi
+
+  PRIVACY_INVENTORY_BEFORE="$(mktemp "${OUT_DIR}.privacy-inventory-before.XXXXXX")" || {
+    privacy_review_abort
+    return 1
+  }
+  PRIVACY_INVENTORY_AFTER="$(mktemp "${OUT_DIR}.privacy-inventory-after.XXXXXX")" || {
+    privacy_review_abort
+    return 1
+  }
+  PRIVACY_REVIEW_TEMP="$(mktemp "${OUT_DIR}.privacy-review.XXXXXX")" || {
+    privacy_review_abort
+    return 1
+  }
+  chmod 0600 "$PRIVACY_INVENTORY_BEFORE" "$PRIVACY_INVENTORY_AFTER" \
+    "$PRIVACY_REVIEW_TEMP" || {
+    privacy_review_abort
+    return 1
+  }
+  privacy_sibling_temps_share_device || {
+    privacy_review_abort
+    return 1
+  }
+
+  privacy_inventory_build "$PRIVACY_INVENTORY_BEFORE" || {
+    privacy_review_abort
+    return 1
+  }
+  privacy_inventory_validate "$PRIVACY_INVENTORY_BEFORE" stats_before || {
+    privacy_review_abort
+    return 1
+  }
+
+  if ! exec {review_fd}>> "$PRIVACY_REVIEW_TEMP"; then
+    privacy_review_abort
+    return 1
+  fi
+  PRIVACY_REVIEW_FD="$review_fd"
+  if ! printf '# Automated privacy sentinel scan\n' >&"$review_fd" ||
+    ! printf '# Matches list only category and relative file; inspect raw files before sharing.\n' >&"$review_fd"; then
+    privacy_review_abort
+    return 1
+  fi
 
   while IFS= read -r -d '' file; do
     rel="${file#"$OUT_DIR"/}"
     case "$rel" in
       privacy-review.txt | manifest.txt) continue ;;
     esac
-    if [[ -n "${HOME:-}" && "$HOME" != "/" ]] && grep -aFq -- "$HOME" "$file" 2> /dev/null; then
-      printf 'known-home-path\t%s\n' "$rel" >> "$review"
-      found=1
-    fi
-    if grep -aFq -- "$OUT_DIR" "$file" 2> /dev/null; then
-      printf 'known-bundle-path\t%s\n' "$rel" >> "$review"
-      found=1
-    fi
-    if grep -aFq -- "$SCRIPT_DIR" "$file" 2> /dev/null; then
-      printf 'known-repository-path\t%s\n' "$rel" >> "$review"
-      found=1
-    fi
-    if grep -aEq '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}' "$file" 2> /dev/null; then
-      printf 'uuid-shape\t%s\n' "$rel" >> "$review"
-      found=1
-    fi
-    if grep -aEiq '(^|[^0-9a-f])([0-9a-f]{2}[:-]){5}[0-9a-f]{2}([^0-9a-f]|$)' "$file" 2> /dev/null; then
-      printf 'mac-shape\t%s\n' "$rel" >> "$review"
-      found=1
-    fi
-  done < <(find "$OUT_DIR" -type f -print0 | sort -z)
+    [[ -f "$file" && ! -L "$file" ]] || continue
+    fingerprint="$(privacy_entry_fingerprint "$file")" || {
+      scan_failed=1
+      break
+    }
+    [[ "$fingerprint" == "${stats_before[$rel]:-}" ]] || {
+      scan_failed=1
+      break
+    }
 
+    if [[ -n "${HOME:-}" && "$HOME" != "/" ]]; then
+      probe_rc=0
+      privacy_grep_probe known-home-path "$rel" "$file" "$review_fd" \
+        -aFq -e "$HOME" || probe_rc=$?
+      case "$probe_rc" in 0) found=1 ;; 1) : ;; *) scan_failed=1; break ;; esac
+    fi
+    probe_rc=0
+    privacy_grep_probe known-bundle-path "$rel" "$file" "$review_fd" \
+      -aFq -e "$OUT_DIR" || probe_rc=$?
+    case "$probe_rc" in 0) found=1 ;; 1) : ;; *) scan_failed=1; break ;; esac
+    probe_rc=0
+    privacy_grep_probe known-repository-path "$rel" "$file" "$review_fd" \
+      -aFq -e "$SCRIPT_DIR" || probe_rc=$?
+    case "$probe_rc" in 0) found=1 ;; 1) : ;; *) scan_failed=1; break ;; esac
+    probe_rc=0
+    privacy_grep_probe uuid-shape "$rel" "$file" "$review_fd" \
+      -aEq -e '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}' || probe_rc=$?
+    case "$probe_rc" in 0) found=1 ;; 1) : ;; *) scan_failed=1; break ;; esac
+    probe_rc=0
+    privacy_grep_probe mac-shape "$rel" "$file" "$review_fd" \
+      -aEiq -e '(^|[^0-9a-f])([0-9a-f]{2}[:-]){5}[0-9a-f]{2}([^0-9a-f]|$)' || probe_rc=$?
+    case "$probe_rc" in 0) found=1 ;; 1) : ;; *) scan_failed=1; break ;; esac
+
+    fingerprint="$(privacy_entry_fingerprint "$file")" || {
+      scan_failed=1
+      break
+    }
+    [[ "$fingerprint" == "${stats_before[$rel]:-}" ]] || {
+      scan_failed=1
+      break
+    }
+  done < "$PRIVACY_INVENTORY_BEFORE"
+
+  ((scan_failed == 0)) || {
+    privacy_review_abort
+    return 1
+  }
   if ((found == 0)); then
-    printf 'status\tno-known-sentinels\n' >> "$review"
+    printf 'status\tno-known-sentinels\n' >&"$review_fd" || {
+      privacy_review_abort
+      return 1
+    }
   else
-    printf 'status\treview-required\n' >> "$review"
+    printf 'status\treview-required\n' >&"$review_fd" || {
+      privacy_review_abort
+      return 1
+    }
   fi
+  if ! exec {review_fd}>&-; then
+    privacy_review_abort
+    return 1
+  fi
+  review_fd=""
+  PRIVACY_REVIEW_FD=""
+
+  privacy_inventory_build "$PRIVACY_INVENTORY_AFTER" || {
+    privacy_review_abort
+    return 1
+  }
+  cmp -s -- "$PRIVACY_INVENTORY_BEFORE" "$PRIVACY_INVENTORY_AFTER" || {
+    privacy_review_abort
+    return 1
+  }
+  privacy_inventory_validate "$PRIVACY_INVENTORY_AFTER" stats_after || {
+    privacy_review_abort
+    return 1
+  }
+  ((${#stats_before[@]} == ${#stats_after[@]})) || {
+    privacy_review_abort
+    return 1
+  }
+  for rel in "${!stats_before[@]}"; do
+    [[ "${stats_after[$rel]:-}" == "${stats_before[$rel]}" ]] || {
+      privacy_review_abort
+      return 1
+    }
+  done
+
+  [[ ! -e "$OUT_DIR/manifest.txt" && ! -L "$OUT_DIR/manifest.txt" ]] || {
+    privacy_review_abort
+    return 1
+  }
+  if [[ "$review_state" == absent ]]; then
+    [[ ! -e "$review" && ! -L "$review" ]] || {
+      privacy_review_abort
+      return 1
+    }
+  else
+    [[ "$(stat -c '%d:%i:%f:%h:%s:%y:%z' -- "$review" 2> /dev/null)" == "$review_state" ]] || {
+      privacy_review_abort
+      return 1
+    }
+  fi
+
+  chmod 0644 "$PRIVACY_REVIEW_TEMP" || {
+    privacy_review_abort
+    return 1
+  }
+  sync -f "$PRIVACY_REVIEW_TEMP" > /dev/null 2>&1 || {
+    privacy_review_abort
+    return 1
+  }
+  privacy_sibling_temps_share_device || {
+    privacy_review_abort
+    return 1
+  }
+  # Direct rename never degrades into a cross-filesystem copy-and-unlink if a
+  # mount changes after the device recheck. Suppress runtime path disclosure.
+  node -e '
+    const fs = require("fs");
+    if (process.argv.length !== 3) process.exit(2);
+    fs.renameSync(process.argv[1], process.argv[2]);
+  ' -- "$PRIVACY_REVIEW_TEMP" "$review" > /dev/null 2>&1 || {
+    privacy_review_abort
+    return 1
+  }
+  PRIVACY_REVIEW_TEMP=""
+  sync -f "$OUT_DIR" > /dev/null 2>&1 || {
+    privacy_review_abort
+    return 1
+  }
+  privacy_review_temp_cleanup || {
+    privacy_review_abort
+    return 1
+  }
 }
 
 write_manifest() {
