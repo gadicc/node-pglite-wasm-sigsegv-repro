@@ -835,7 +835,7 @@ const check = (label, cond) => {
   else { console.log(`FAIL ${label}`); failures += 1; }
 };
 check("truncated baseline marked partial", r.baseline.partial === true);
-check("truncated baseline recovered waves", r.baseline.completedWaves === 1 && r.baseline.failedWaves === 1);
+check("truncated baseline recovered waves", r.baseline.processedWaves === 2 && r.baseline.completedWaves === 2 && r.baseline.failedWaves === 1);
 check("truncated baseline invocations nonzero", r.baseline.totalChildInvocations === 4);
 process.exit(failures === 0 ? 0 : 1);
 EOF

@@ -16,7 +16,9 @@ test("parseReproLog: epoch-prefixed log with failures", () => {
   assert.equal(r.v8, "14.1.146.11-node.14");
   assert.equal(r.children, 4);
   assert.equal(r.requestedWaves, 5);
+  assert.equal(r.processedWaves, 5);
   assert.equal(r.completedWaves, 5);
+  assert.equal(r.fullyPassedWaves, 3);
   assert.equal(r.failedWaves, 2);
   assert.equal(r.totalChildInvocations, 20);
   assert.equal(r.sigsegvCount, 2);
@@ -48,13 +50,16 @@ test("parseReproLog: truncated log recovers wave counts from wave rows", () => {
   assert.equal(r.finalLine, null);
   assert.equal(r.children, 2);
   assert.equal(r.requestedWaves, 5);
-  assert.equal(r.completedWaves, 1);
+  assert.equal(r.processedWaves, 2);
+  assert.equal(r.completedWaves, 2);
+  assert.equal(r.fullyPassedWaves, 1);
   assert.equal(r.failedWaves, 1);
   // Both printed waves forked all of their children, failed ones included,
   // so the SIGSEGV can never be reported over zero invocations.
   assert.equal(r.totalChildInvocations, 4);
   assert.equal(r.sigsegvCount, 1);
   assert.equal(r.otherFailureCount, 0);
+  assert.equal(r.unclassifiedFailureCount, 0);
   assert.equal(r.firstFailureAfterSec, 12);
   assert.equal(r.durationSec, 12);
 });
@@ -72,10 +77,26 @@ test("parseReproLog: duplicate wave rows are not double-counted", () => {
     "wave=2 passed=1/2",
   ].join("\n"));
   assert.equal(r.partial, true);
-  assert.equal(r.completedWaves, 1);
+  assert.equal(r.completedWaves, 2);
   assert.equal(r.failedWaves, 1);
   assert.equal(r.totalChildInvocations, 4);
   assert.ok(r.notes.some((n) => n.includes("duplicate wave=1")));
+});
+
+test("parseReproLog: truncated failed wave accounts for missing child details", () => {
+  const r = parseReproLog([
+    "1753950000\tnode=v25.2.1 v8=14.1.146.11-node.14 platform=linux arch=x64 children=4 waves=5",
+    "1753950012\twave=1 passed=0/4",
+  ].join("\n"));
+  assert.equal(r.partial, true);
+  assert.equal(r.processedWaves, 1);
+  assert.equal(r.failedWaves, 1);
+  assert.equal(r.totalChildInvocations, 4);
+  assert.equal(r.sigsegvCount, 0);
+  assert.equal(r.otherFailureCount, 0);
+  assert.equal(r.unclassifiedFailureCount, 4);
+  assert.equal(r.firstFailureAfterSec, 12);
+  assert.ok(r.notes.some((note) => note.includes("only 0 child detail")));
 });
 
 test("parseReproLog: wave rows disagreeing with the header are not counted", () => {
@@ -108,7 +129,8 @@ test("renderReport: partial baseline and group data are marked as truncated", ()
   const baseline = {
     children: 2,
     requestedWaves: 5,
-    completedWaves: 1,
+    processedWaves: 2,
+    completedWaves: 2,
     failedWaves: 1,
     totalChildInvocations: 4,
     sigsegvCount: 1,
@@ -123,7 +145,8 @@ test("renderReport: partial baseline and group data are marked as truncated", ()
     cpus: "0-7",
     children: 2,
     wavesRequested: 5,
-    completedWaves: 1,
+    processedWaves: 2,
+    completedWaves: 2,
     failedWaves: 1,
     totalChildInvocations: 4,
     sigsegvCount: 1,
@@ -138,8 +161,8 @@ test("renderReport: partial baseline and group data are marked as truncated", ()
     groups: [group],
   };
   const md = renderReport(results);
-  assert.ok(md.includes("| Waves | 1/5 completed, 1 failed (log truncated; partial data) |"));
-  assert.ok(md.includes("| pcores | 0-7 | 2 | 1/5 (1 failed) (log truncated; partial data) |"));
+  assert.ok(md.includes("| Waves | 2/5 processed, 1 failed (log truncated; partial data) |"));
+  assert.ok(md.includes("| pcores | 0-7 | 2 | 2/5 processed (1 failed) (log truncated; partial data) |"));
 
   // The same counts from a completed run carry no truncation marker.
   const complete = renderReport({
@@ -148,6 +171,30 @@ test("renderReport: partial baseline and group data are marked as truncated", ()
     groups: [{ ...group, partial: false }],
   });
   assert.ok(!complete.includes("log truncated"));
+});
+
+test("renderReport: unclassified truncated failures are never called clean", () => {
+  const md = renderReport({
+    collectedAt: "2026-08-02T00:00:00.000Z",
+    config: {},
+    environment: {},
+    baseline: {
+      children: 4,
+      requestedWaves: 5,
+      processedWaves: 1,
+      completedWaves: 1,
+      failedWaves: 1,
+      totalChildInvocations: 4,
+      sigsegvCount: 0,
+      otherFailureCount: 0,
+      unclassifiedFailureCount: 4,
+      partial: true,
+      log: "logs/baseline/run1.log",
+    },
+  });
+  assert.match(md, /Unclassified failures \(summary only\) \| 4/);
+  assert.match(md, /Workload failures occurred/);
+  assert.doesNotMatch(md, /No failure reproduced/);
 });
 
 test("renderReport: incomplete frequency artifacts are excluded from conclusions", () => {

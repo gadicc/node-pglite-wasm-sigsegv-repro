@@ -152,11 +152,12 @@ export function renderReport(results) {
     }
     L.push("| Metric | Value |");
     L.push("| --- | --- |");
-    L.push(`| Waves | ${b.completedWaves}/${b.requestedWaves} completed, ${b.failedWaves} failed${b.partial ? " (log truncated; partial data)" : ""} |`);
+    L.push(`| Waves | ${b.processedWaves ?? b.completedWaves}/${b.requestedWaves} processed, ${b.failedWaves} failed${b.partial ? " (log truncated; partial data)" : ""} |`);
     L.push(`| Child invocations | ${b.totalChildInvocations} |`);
     L.push(`| SIGSEGV | ${b.sigsegvCount} |`);
     L.push(`| Other failures | ${b.otherFailureCount} |`);
-    L.push(`| Child failure rate | ${statsCell(b.sigsegvCount + b.otherFailureCount, b.totalChildInvocations)} |`);
+    if ((b.unclassifiedFailureCount ?? 0) > 0) L.push(`| Unclassified failures (summary only) | ${b.unclassifiedFailureCount} |`);
+    L.push(`| Child failure rate | ${statsCell(b.sigsegvCount + b.otherFailureCount + (b.unclassifiedFailureCount ?? 0), b.totalChildInvocations)} |`);
     L.push(`| Time to first failure | ${fmtSec(b.firstFailureAfterSec)} |`);
     L.push(`| Duration | ${fmtSec(b.durationSec)} |`);
     L.push(`| Frequency (${b.frequency?.method ?? "n/a"}) | avg ${fmtMHz(b.frequency?.avgMHz)}, max ${fmtMHz(b.frequency?.maxMHz)} |`);
@@ -177,10 +178,10 @@ export function renderReport(results) {
     L.push("| Group | CPUs | Children | Waves | Child failures | Rate / 95% CI | Eff. freq (avg/max) |");
     L.push("| --- | --- | --- | --- | --- | --- | --- |");
     for (const g of r.groups) {
-      const f = g.sigsegvCount + (g.otherFailureCount ?? 0);
+      const f = g.sigsegvCount + (g.otherFailureCount ?? 0) + (g.unclassifiedFailureCount ?? 0);
       const n = g.totalChildInvocations ?? 0;
       L.push(
-        `| ${g.name} | ${g.cpus} | ${g.children} | ${g.completedWaves ?? "?"}/${g.wavesRequested} (${g.failedWaves ?? "?"} failed)${g.partial ? " (log truncated; partial data)" : ""} | ${f}/${n} | ${n ? `${pct(f / n)} ${ci(f, n)}` : "—"} | ${fmtMHz(g.frequency?.avgMHz)} / ${fmtMHz(g.frequency?.maxMHz)} |`,
+        `| ${g.name} | ${g.cpus} | ${g.children} | ${g.processedWaves ?? g.completedWaves ?? "?"}/${g.wavesRequested} processed (${g.failedWaves ?? "?"} failed)${g.partial ? " (log truncated; partial data)" : ""} | ${f}/${n}${(g.unclassifiedFailureCount ?? 0) > 0 ? ` (${g.unclassifiedFailureCount} unclassified)` : ""} | ${n ? `${pct(f / n)} ${ci(f, n)}` : "—"} | ${fmtMHz(g.frequency?.avgMHz)} / ${fmtMHz(g.frequency?.maxMHz)} |`,
       );
     }
     L.push("");
@@ -350,13 +351,19 @@ function renderConclusions(r) {
 
   // 1. Did it reproduce at all?
   let totalSig = 0;
+  let totalOther = 0;
+  let totalUnclassified = 0;
   let totalRuns = 0;
   if (r.baseline) {
     totalSig += r.baseline.sigsegvCount;
+    totalOther += r.baseline.otherFailureCount ?? 0;
+    totalUnclassified += r.baseline.unclassifiedFailureCount ?? 0;
     totalRuns += r.baseline.totalChildInvocations;
   }
   for (const g of r.groups ?? []) {
     totalSig += g.sigsegvCount ?? 0;
+    totalOther += g.otherFailureCount ?? 0;
+    totalUnclassified += g.unclassifiedFailureCount ?? 0;
     totalRuns += g.totalChildInvocations ?? 0;
   }
   for (const c of r.individual ?? []) {
@@ -364,7 +371,10 @@ function renderConclusions(r) {
     totalRuns += c.runs;
   }
   if (totalSig > 0) {
-    C.push(`- **The problem reproduced**: ${totalSig} SIGSEGV(s) across ${totalRuns} child-process runs in this diagnostic session.`);
+    const unresolved = totalUnclassified > 0 ? ` Another ${totalUnclassified} failure(s) were visible only in wave summaries and could not be classified.` : "";
+    C.push(`- **The problem reproduced**: ${totalSig} SIGSEGV(s) across ${totalRuns} child-process runs in this diagnostic session.${unresolved}`);
+  } else if (totalOther > 0 || totalUnclassified > 0) {
+    C.push(`- Workload failures occurred across ${totalRuns} child-process runs, but none were confirmed as SIGSEGV (${totalOther} classified other failure(s), ${totalUnclassified} unclassified summary-only failure(s)).`);
   } else if (totalRuns > 0) {
     C.push(`- **No failure reproduced** in ${totalRuns} child-process runs (95% upper bound on the pooled per-run rate: ${pct(zeroFailureUpperBound(totalRuns))}). This does not rule out the defect; see Limitations.`);
   } else {
@@ -397,9 +407,18 @@ function renderConclusions(r) {
     C.push("- CPU localization: no failures observed on any tested CPU; the cross-CPU concentration test is not applicable (zero total failures).");
   }
   const failingGroups = (r.groups ?? []).filter((g) => (g.sigsegvCount ?? 0) > 0);
-  const cleanGroups = (r.groups ?? []).filter((g) => (g.sigsegvCount ?? 0) === 0 && (g.totalChildInvocations ?? 0) > 0);
+  const cleanGroups = (r.groups ?? []).filter(
+    (g) =>
+      (g.sigsegvCount ?? 0) === 0 &&
+      (g.otherFailureCount ?? 0) === 0 &&
+      (g.unclassifiedFailureCount ?? 0) === 0 &&
+      (g.totalChildInvocations ?? 0) > 0,
+  );
+  const unresolvedGroups = (r.groups ?? []).filter(
+    (g) => (g.sigsegvCount ?? 0) === 0 && ((g.otherFailureCount ?? 0) > 0 || (g.unclassifiedFailureCount ?? 0) > 0),
+  );
   if (failingGroups.length > 0) {
-    C.push(`- **Group isolation**: failures in group(s) ${failingGroups.map((g) => `${g.name} (${g.cpus})`).join(", ")}; clean group(s): ${cleanGroups.length > 0 ? cleanGroups.map((g) => `${g.name} (${g.cpus})`).join(", ") : "none"}.`);
+    C.push(`- **Group isolation**: SIGSEGV in group(s) ${failingGroups.map((g) => `${g.name} (${g.cpus})`).join(", ")}; clean group(s): ${cleanGroups.length > 0 ? cleanGroups.map((g) => `${g.name} (${g.cpus})`).join(", ") : "none"}${unresolvedGroups.length > 0 ? `; unresolved non-SIGSEGV/unclassified failures in: ${unresolvedGroups.map((g) => `${g.name} (${g.cpus})`).join(", ")}` : ""}.`);
   }
 
   // 3. Frequency effect: the prespecified two-group contrast (turbo-on vs

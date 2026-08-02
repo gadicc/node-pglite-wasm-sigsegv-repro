@@ -395,11 +395,14 @@ export function collect(outDir) {
       if (existsSync(logPath)) {
         const parsed = parseReproLog(readFileSync(logPath, "utf8"));
         Object.assign(entry, {
+          processedWaves: parsed.processedWaves,
           completedWaves: parsed.completedWaves,
+          fullyPassedWaves: parsed.fullyPassedWaves,
           failedWaves: parsed.failedWaves,
           totalChildInvocations: parsed.totalChildInvocations,
           sigsegvCount: parsed.sigsegvCount,
           otherFailureCount: parsed.otherFailureCount,
+          unclassifiedFailureCount: parsed.unclassifiedFailureCount,
           firstFailureAfterSec: parsed.firstFailureAfterSec,
           durationSec: parsed.durationSec,
           failures: parsed.failures,
