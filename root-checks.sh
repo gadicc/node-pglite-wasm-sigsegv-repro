@@ -27,54 +27,13 @@
 #     (--SvcTag, --Uuid, --SysId, --Asset, --PropOwnTag, ... are NOT queried)
 #   - no full cctk export
 set -Eeuo pipefail
+umask 077
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
   echo "usage: sudo $0 <diagnostics-bundle-dir>" >&2
   exit 2
-}
-
-root_checks_prepare_out_dir() {
-  local bundle="$1" env_dir="$1/env" out_dir="$1/env/root"
-  [[ -d "$bundle" && ! -L "$bundle" ]] || {
-    echo "error: bundle must be a real directory, not a symlink: $bundle" >&2
-    return 1
-  }
-  if [[ -e "$env_dir" || -L "$env_dir" ]]; then
-    [[ -d "$env_dir" && ! -L "$env_dir" ]] || {
-      echo "error: refusing unsafe env path: $env_dir" >&2
-      return 1
-    }
-  else
-    mkdir -- "$env_dir" || return 1
-  fi
-  if [[ -e "$out_dir" || -L "$out_dir" ]]; then
-    [[ -d "$out_dir" && ! -L "$out_dir" ]] || {
-      echo "error: refusing unsafe privileged output path: $out_dir" >&2
-      return 1
-    }
-  else
-    mkdir -- "$out_dir" || return 1
-  fi
-}
-
-root_checks_validate_files() {
-  local out_dir="$1" name target
-  shift
-  [[ -d "$out_dir" ]] || return 1
-  for name in "$@"; do
-    target="$out_dir/$name"
-    [[ ! -L "$target" ]] || return 1
-    [[ ! -e "$target" || -f "$target" ]] || return 1
-  done
-}
-
-root_checks_validate_destinations() {
-  local out_dir="$1"
-  shift
-  [[ -d "$out_dir" && ! -L "$out_dir" ]] || return 1
-  root_checks_validate_files "$out_dir" "$@"
 }
 
 root_checks_main() {
@@ -88,26 +47,53 @@ root_checks_main() {
     exit 4
   fi
 
-  bundle="$(cd -- "$bundle" && pwd -P)"
-  root_checks_prepare_out_dir "$bundle" || exit 1
-  local out_dir="$bundle/env/root"
-  local out_fd anchored_out
-  exec {out_fd}< "$out_dir" || exit 1
-  anchored_out="/proc/self/fd/$out_fd"
-  local -a output_names=(
-    kernel-warnings.txt intel-undervolt.txt cctk.txt turbostat.txt root-checks.meta
-  )
-  root_checks_validate_destinations "$out_dir" "${output_names[@]}" || {
-    echo "error: refusing symlink or non-file privileged output destination under $out_dir" >&2
+  command -v runuser > /dev/null 2>&1 || {
+    echo "error: missing required command: runuser" >&2
+    exit 4
+  }
+  [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]] || {
+    echo "error: run through sudo from a non-root account so evidence can be published without root privileges" >&2
+    exit 1
+  }
+  [[ "${SUDO_UID:-}" =~ ^[0-9]+$ && "$SUDO_UID" != "0" ]] || {
+    echo "error: SUDO_UID must identify a non-root invoking user" >&2
+    exit 1
+  }
+  local invoking_uid invoking_gid
+  invoking_uid="$(id -u "$SUDO_USER" 2> /dev/null)" || {
+    echo "error: cannot resolve invoking user '$SUDO_USER'" >&2
+    exit 1
+  }
+  invoking_gid="$(id -g "$SUDO_USER" 2> /dev/null)" || {
+    echo "error: cannot resolve invoking group for '$SUDO_USER'" >&2
+    exit 1
+  }
+  [[ "$invoking_uid" == "$SUDO_UID" ]] || {
+    echo "error: SUDO_USER and SUDO_UID identify different invoking users" >&2
     exit 1
   }
 
-  # Collect outside the user-owned bundle. Only completed regular files are
-  # moved into destinations that are revalidated immediately before use.
+  bundle="$(cd -- "$bundle" && pwd -P)"
+  runuser -u "$SUDO_USER" -- test -d "$bundle" &&
+    runuser -u "$SUDO_USER" -- test -w "$bundle" || {
+      echo "error: invoking user cannot write the diagnostics bundle" >&2
+      exit 1
+    }
+  local -a output_names=(
+    kernel-warnings.txt intel-undervolt.txt cctk.txt turbostat.txt root-checks.meta
+  )
+
+  # Collect outside the user-owned bundle. Root never opens or renames a
+  # destination beneath the bundle; final placement is delegated below.
   local stage_dir
   stage_dir="$(mktemp -d /tmp/root-checks.XXXXXX)" || exit 1
+  [[ "$(stat -Lc '%u:%g:%a' -- "$stage_dir" 2> /dev/null)" == "0:0:700" ]] || {
+    echo "error: root-checks staging directory is not root-owned and mode 0700" >&2
+    exit 1
+  }
   cleanup_stage() {
     local name
+    [[ -n "$stage_dir" ]] || return 0
     for name in "${output_names[@]}"; do rm -f -- "$stage_dir/$name"; done
     rmdir -- "$stage_dir" 2> /dev/null || true
   }
@@ -128,7 +114,7 @@ local -a CCTK_ALLOWLIST=(
   "SpeedShift"       # Intel SpeedShift (HWP)
 )
 
-echo "[root-checks] staging privileged reads for $out_dir"
+echo "[root-checks] staging privileged reads for $bundle/env/root"
 
 # 1. kernel warnings -------------------------------------------------------
 {
@@ -181,33 +167,44 @@ echo "[root-checks] staging privileged reads for $out_dir"
   echo "host_bundle=."
 } > "$stage_dir/root-checks.meta"
 
-[[ -d "$out_dir" && ! -L "$out_dir" && "$out_dir" -ef "$anchored_out" ]] || {
-  echo "error: privileged output directory changed during collection; refusing placement" >&2
-  exit 1
-}
-root_checks_validate_files "$anchored_out" "${output_names[@]}" || {
-  echo "error: privileged output destinations changed during collection; refusing placement" >&2
-  exit 1
-}
-local name target
+local name
 for name in "${output_names[@]}"; do
-  chmod 0644 "$stage_dir/$name"
-  if [[ -n "${SUDO_USER:-}" ]]; then
-    chown "$SUDO_USER":"$(id -gn "$SUDO_USER")" "$stage_dir/$name" 2> /dev/null || true
-  fi
-done
-for name in "${output_names[@]}"; do
-  target="$anchored_out/$name"
-  root_checks_validate_files "$anchored_out" "$name" || {
-    echo "error: unsafe destination appeared before placing $name" >&2
+  [[ -f "$stage_dir/$name" && ! -L "$stage_dir/$name" ]] || {
+    echo "error: unsafe staged root-checks artifact: $name" >&2
     exit 1
   }
-  mv -fT -- "$stage_dir/$name" "$target"
+  [[ "$(stat -Lc '%u:%g:%a:%h' -- "$stage_dir/$name" 2> /dev/null)" == "0:0:600:1" ]] || {
+    echo "error: staged root-checks artifact has unsafe ownership, mode, or links: $name" >&2
+    exit 1
+  }
+done
+for name in "${output_names[@]}"; do
+  chown "$invoking_uid:$invoking_gid" "$stage_dir/$name" || {
+    echo "error: could not hand staged artifact to the invoking user: $name" >&2
+    exit 1
+  }
 done
 
-exec {out_fd}<&-
+# The parent directory remains root-only until every exact artifact has been
+# handed off. Disable privileged cleanup before granting the user access: from
+# this point onward, root performs no filesystem operation on staging/bundle.
 trap - EXIT INT TERM
-cleanup_stage
+trap '' INT TERM
+if ! chown "$invoking_uid:$invoking_gid" "$stage_dir"; then
+  trap - INT TERM
+  cleanup_stage
+  echo "error: could not hand staging directory to the invoking user" >&2
+  exit 1
+fi
+trap 'exit 130' INT
+trap 'exit 143' TERM
+if ! runuser -u "$SUDO_USER" -- /bin/bash \
+  "$SCRIPT_DIR/diagnose-lib/publish-root-checks-output.sh" "$stage_dir" "$bundle"; then
+  echo "error: could not publish root-checks evidence; invoking user owns staging directory $stage_dir" >&2
+  exit 1
+fi
+stage_dir=""
+trap - INT TERM
 echo "[root-checks] done. Regenerate the report with:"
 echo "  ./diagnose.sh --resume \"$bundle\" --yes"
 }

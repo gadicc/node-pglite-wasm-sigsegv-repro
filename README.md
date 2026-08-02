@@ -101,6 +101,9 @@ sudo ./frequency-ab.sh 19 20 diagnostics/<bundle> # the A/B/A experiment
   `--IntelSagv`, `--Speedstep`, `--CStatesCtrl`, `--AdaptiveCStates`,
   `--ThermalManagement`, `--SpeedShift`). It never writes BIOS settings,
   never takes a password, and never produces a full `cctk` export.
+  Run it through `sudo` from a non-root account. Privileged reads are collected
+  in a private staging directory, then an unprivileged helper publishes the
+  five allowlisted evidence files into the user-owned bundle.
 - `frequency-ab.sh` is the only script that changes anything; see below.
 
 ### Frequency A/B/A (`frequency-ab.sh`)

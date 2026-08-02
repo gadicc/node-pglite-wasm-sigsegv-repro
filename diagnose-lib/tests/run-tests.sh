@@ -438,27 +438,48 @@ else
   ok "unprivileged frequency publisher rejects a command-log symlink [skipped while tests run as root]"
 fi
 
-ROOT_GUARD="$TMP/root-checks-guard"
-mkdir -p "$ROOT_GUARD/bundle/env" "$ROOT_GUARD/redirect"
-ln -s "$ROOT_GUARD/redirect" "$ROOT_GUARD/bundle/env/root"
-(
-  ROOT_CHECKS_SOURCE_ONLY=1
-  source "$REPO_ROOT/root-checks.sh"
-  root_checks_prepare_out_dir "$ROOT_GUARD/bundle"
-) > /dev/null 2>&1
-check_eq "root-checks rejects symlinked output directory" "1" "$([[ $? -ne 0 ]] && echo 1 || echo 0)"
-rm "$ROOT_GUARD/bundle/env/root"
-mkdir "$ROOT_GUARD/bundle/env/root"
-printf 'safe\n' > "$ROOT_GUARD/victim"
-ln -s "$ROOT_GUARD/victim" "$ROOT_GUARD/bundle/env/root/cctk.txt"
-(
-  ROOT_CHECKS_SOURCE_ONLY=1
-  source "$REPO_ROOT/root-checks.sh"
-  root_checks_validate_destinations "$ROOT_GUARD/bundle/env/root" cctk.txt
-) > /dev/null 2>&1
-root_file_guard_rc=$?
-check_eq "root-checks rejects symlinked output file" "1" \
-  "$([[ $root_file_guard_rc -ne 0 && "$(cat "$ROOT_GUARD/victim")" == safe ]] && echo 1 || echo 0)"
+if ((EUID != 0)); then
+  root_publish_stage_prepare() {
+    local stage="$1" name
+    mkdir -p "$stage"
+    chmod 0700 "$stage"
+    for name in kernel-warnings.txt intel-undervolt.txt cctk.txt turbostat.txt root-checks.meta; do
+      printf 'staged %s\n' "$name" > "$stage/$name"
+      chmod 0600 "$stage/$name"
+    done
+  }
+
+  ROOT_PUBLISH="$TMP/root-checks-publish"
+  root_publish_stage_prepare "$ROOT_PUBLISH/stage"
+  mkdir -p "$ROOT_PUBLISH/bundle/env/root"
+  printf 'safe root-checks victim\n' > "$ROOT_PUBLISH/victim"
+  ln -s "$ROOT_PUBLISH/victim" "$ROOT_PUBLISH/bundle/env/root/cctk.txt"
+  bash "$LIB/publish-root-checks-output.sh" "$ROOT_PUBLISH/stage" "$ROOT_PUBLISH/bundle" \
+    > /dev/null 2>&1
+  root_publish_rc=$?
+  root_publish_safe=0
+  [[ $root_publish_rc -eq 0 ]] &&
+    [[ "$(cat "$ROOT_PUBLISH/victim")" == "safe root-checks victim" ]] &&
+    [[ -f "$ROOT_PUBLISH/bundle/env/root/cctk.txt" && ! -L "$ROOT_PUBLISH/bundle/env/root/cctk.txt" ]] &&
+    [[ "$(cat "$ROOT_PUBLISH/bundle/env/root/cctk.txt")" == "staged cctk.txt" ]] &&
+    [[ "$(stat -Lc '%a' "$ROOT_PUBLISH/bundle/env/root/cctk.txt")" == "644" ]] &&
+    [[ ! -e "$ROOT_PUBLISH/stage" ]] && root_publish_safe=1
+  check_eq "unprivileged root-checks publisher safely replaces an output symlink" "1" "$root_publish_safe"
+
+  ROOT_SUBSTITUTE="$TMP/root-checks-substitute"
+  root_publish_stage_prepare "$ROOT_SUBSTITUTE/stage"
+  mkdir -p "$ROOT_SUBSTITUTE/bundle/env" "$ROOT_SUBSTITUTE/substitute"
+  printf 'safe directory victim\n' > "$ROOT_SUBSTITUTE/substitute/sentinel"
+  ln -s "$ROOT_SUBSTITUTE/substitute" "$ROOT_SUBSTITUTE/bundle/env/root"
+  bash "$LIB/publish-root-checks-output.sh" "$ROOT_SUBSTITUTE/stage" "$ROOT_SUBSTITUTE/bundle" \
+    > /dev/null 2>&1
+  root_substitute_rc=$?
+  check_eq "unprivileged root-checks publisher rejects output-directory substitution" "1" \
+    "$([[ $root_substitute_rc -ne 0 && "$(cat "$ROOT_SUBSTITUTE/substitute/sentinel")" == "safe directory victim" && ! -e "$ROOT_SUBSTITUTE/substitute/cctk.txt" && -f "$ROOT_SUBSTITUTE/stage/cctk.txt" ]] && echo 1 || echo 0)"
+else
+  ok "unprivileged root-checks publisher safely replaces an output symlink [skipped while tests run as root]"
+  ok "unprivileged root-checks publisher rejects output-directory substitution [skipped while tests run as root]"
+fi
 
 echo "== --redo phase handling =="
 RB="$TMP/redo-bundle"
