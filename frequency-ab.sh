@@ -251,6 +251,41 @@ frequency_validate_initial_no_turbo() {
   [[ "$output_ref" == 0 ]] || return 13
 }
 
+frequency_validate_cap_target() {
+  local cap_khz="$1" policy="$2" path_output_name="$3" value_output_name="$4"
+  local -n path_output_ref="$path_output_name"
+  local -n value_output_ref="$value_output_name"
+  local canonical_policy="" cap_target_path="" canonical_target=""
+  local -a values=()
+  local i allowlisted=0
+
+  path_output_ref=""
+  value_output_ref=""
+  [[ -n "$cap_khz" ]] || return 0
+
+  [[ -n "$policy" && "$policy" == /* ]] || return 20
+  canonical_policy="$(readlink -f -- "$policy" 2> /dev/null)" || return 20
+  [[ "$canonical_policy" == "$policy" && -d "$canonical_policy" ]] || return 20
+
+  cap_target_path="$canonical_policy/scaling_max_freq"
+  canonical_target="$(readlink -f -- "$cap_target_path" 2> /dev/null)" || return 21
+  [[ -f "$canonical_target" && ! -L "$canonical_target" &&
+    -r "$canonical_target" && -w "$canonical_target" ]] || return 21
+  mapfile -t values < "$canonical_target" || return 21
+  ((${#values[@]} == 1)) && [[ "${values[0]}" =~ ^[1-9][0-9]*$ ]] || return 21
+
+  for ((i = 0; i < ${#DIAG_RESTORE_RULES[@]}; i += 2)); do
+    if [[ "${DIAG_RESTORE_RULES[$i]}" == "$canonical_target" ]]; then
+      allowlisted=1
+      break
+    fi
+  done
+  ((allowlisted == 1)) || return 22
+
+  path_output_ref="$canonical_target"
+  value_output_ref="${values[0]}"
+}
+
 frequency_not_applicable() {
   local message="$1"
   # No stage exists at this decision point. Clear its deterministic future
@@ -336,6 +371,8 @@ fi
 
 POLICY="$(readlink -f "/sys/devices/system/cpu/cpu${CPU}/cpufreq" 2> /dev/null || echo "")"
 [[ -n "$POLICY" ]] || diag_warn "no cpufreq policy found for cpu $CPU"
+CAP_SCALING_MAX_PATH=""
+CAP_PREFLIGHT_SCALING_MAX=""
 
 DIAG_BUNDLE_ROOT="$BUNDLE"
 DIAG_REPO_ROOT="$SCRIPT_DIR"
@@ -416,6 +453,26 @@ case "$initial_state_rc" in
   *) diag_die "could not validate the initial intel_pstate/no_turbo state" ;;
 esac
 
+cap_target_rc=0
+frequency_validate_cap_target \
+  "$CAP_KHZ" "$POLICY" CAP_SCALING_MAX_PATH CAP_PREFLIGHT_SCALING_MAX || cap_target_rc=$?
+case "$cap_target_rc" in
+  0) ;;
+  20)
+    frequency_not_applicable \
+      "--cap needs a resolvable canonical cpufreq policy for cpu $CPU." || exit $?
+    ;;
+  21)
+    frequency_not_applicable \
+      "--cap needs a safe, readable, writable scaling_max_freq file with one canonical positive value." || exit $?
+    ;;
+  22)
+    frequency_not_applicable \
+      "--cap scaling_max_freq target is outside the trusted restore allowlist." || exit $?
+    ;;
+  *) diag_die "could not validate the frequency-cap target" ;;
+esac
+
 # Older versions placed restore authority in the bundle. It is intentionally
 # never trusted or migrated by this privileged script.
 LEGACY_RESTORE_FILE="$BUNDLE/state/restore-frequency-ab.tsv"
@@ -494,9 +551,15 @@ printf 'RESTORED=%s\n' "$([[ "$now" == "$SAVED_NO_TURBO" ]] && echo 1 || echo 0)
 [[ "$now" == "$SAVED_NO_TURBO" ]] || diag_warn "no_turbo restore verification FAILED (now $now)"
 
 # Optional, clearly labelled per-CPU frequency-cap experiment.
-if [[ -n "$CAP_KHZ" && -n "$POLICY" ]]; then
-  smax_path="$POLICY/scaling_max_freq"
-  saved_smax="$(cat "$smax_path")"
+if [[ -n "$CAP_KHZ" ]]; then
+  cap_phase_path=""
+  saved_smax=""
+  frequency_validate_cap_target \
+    "$CAP_KHZ" "$POLICY" cap_phase_path saved_smax ||
+    diag_die "frequency-cap target became unsafe or unusable before the cap leg"
+  [[ "$cap_phase_path" == "$CAP_SCALING_MAX_PATH" ]] ||
+    diag_die "frequency-cap target changed after preflight"
+  smax_path="$cap_phase_path"
   diag_warn "per-CPU frequency-cap experiment: intel_pstate/HWP may not"
   diag_warn "strictly clamp scaling_max_freq; measured samples decide."
   diag_restore_save "$smax_path"

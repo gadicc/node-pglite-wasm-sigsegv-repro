@@ -666,6 +666,82 @@ printf '1\n' > "$FREQUENCY_INITIAL/no-turbo"
 ) > /dev/null 2>&1
 check_eq "frequency A/B/A refuses an already disabled-turbo initial state" "13" "$?"
 
+FREQUENCY_CAP_POLICY="$FREQUENCY_INITIAL/policy0"
+mkdir -p "$FREQUENCY_CAP_POLICY"
+printf '5500000\n' > "$FREQUENCY_CAP_POLICY/scaling_max_freq"
+(
+  FREQUENCY_AB_SOURCE_ONLY=1
+  source "$REPO_ROOT/frequency-ab.sh"
+  target="unexpected"
+  saved="unexpected"
+  frequency_validate_cap_target "" "$FREQUENCY_INITIAL/missing-policy" target saved
+  [[ -z "$target" && -z "$saved" ]]
+) > /dev/null 2>&1
+check_eq "frequency A/B/A does not require a cpufreq policy without --cap" "0" "$?"
+
+(
+  FREQUENCY_AB_SOURCE_ONLY=1
+  source "$REPO_ROOT/frequency-ab.sh"
+  target=""
+  saved=""
+  frequency_validate_cap_target 4200000 "" target saved
+) > /dev/null 2>&1
+check_eq "frequency --cap refuses a missing cpufreq policy" "20" "$?"
+
+(
+  FREQUENCY_AB_SOURCE_ONLY=1
+  source "$REPO_ROOT/frequency-ab.sh"
+  target=""
+  saved=""
+  DIAG_RESTORE_RULES=(
+    "$FREQUENCY_CAP_POLICY/scaling_max_freq" '^[0-9]+$'
+  )
+  frequency_validate_cap_target 4200000 "$FREQUENCY_CAP_POLICY" target saved
+  [[ "$target" == "$FREQUENCY_CAP_POLICY/scaling_max_freq" && "$saved" == 5500000 ]]
+) > /dev/null 2>&1
+check_eq "frequency --cap accepts a safe allowlisted scaling_max_freq target" "0" "$?"
+
+FREQUENCY_CAP_ALIAS_POLICY="$FREQUENCY_INITIAL/policy-alias"
+mkdir -p "$FREQUENCY_CAP_ALIAS_POLICY"
+ln -s "$FREQUENCY_CAP_POLICY/scaling_max_freq" "$FREQUENCY_CAP_ALIAS_POLICY/scaling_max_freq"
+(
+  FREQUENCY_AB_SOURCE_ONLY=1
+  source "$REPO_ROOT/frequency-ab.sh"
+  target=""
+  saved=""
+  DIAG_RESTORE_RULES=(
+    "$FREQUENCY_CAP_POLICY/scaling_max_freq" '^[0-9]+$'
+  )
+  frequency_validate_cap_target 4200000 "$FREQUENCY_CAP_ALIAS_POLICY" target saved
+  [[ "$target" == "$FREQUENCY_CAP_POLICY/scaling_max_freq" && "$saved" == 5500000 ]]
+) > /dev/null 2>&1
+check_eq "frequency --cap safely canonicalizes a scaling_max_freq symlink" "0" "$?"
+
+FREQUENCY_CAP_MALFORMED_POLICY="$FREQUENCY_INITIAL/policy-malformed"
+mkdir -p "$FREQUENCY_CAP_MALFORMED_POLICY"
+printf '05500000\n' > "$FREQUENCY_CAP_MALFORMED_POLICY/scaling_max_freq"
+(
+  FREQUENCY_AB_SOURCE_ONLY=1
+  source "$REPO_ROOT/frequency-ab.sh"
+  target=""
+  saved=""
+  DIAG_RESTORE_RULES=(
+    "$FREQUENCY_CAP_MALFORMED_POLICY/scaling_max_freq" '^[0-9]+$'
+  )
+  frequency_validate_cap_target 4200000 "$FREQUENCY_CAP_MALFORMED_POLICY" target saved
+) > /dev/null 2>&1
+check_eq "frequency --cap rejects a noncanonical saved scaling_max_freq value" "21" "$?"
+
+(
+  FREQUENCY_AB_SOURCE_ONLY=1
+  source "$REPO_ROOT/frequency-ab.sh"
+  target=""
+  saved=""
+  DIAG_RESTORE_RULES=("$FREQUENCY_INITIAL/other-target" '^[0-9]+$')
+  frequency_validate_cap_target 4200000 "$FREQUENCY_CAP_POLICY" target saved
+) > /dev/null 2>&1
+check_eq "frequency --cap rejects a scaling_max_freq target outside restore authority" "22" "$?"
+
 (
   FREQUENCY_AB_SOURCE_ONLY=1
   source "$REPO_ROOT/frequency-ab.sh"
@@ -681,6 +757,25 @@ check_eq "frequency A/B/A refuses an already disabled-turbo initial state" "13" 
     "$publisher_called" == 0 && ! -e "$FREQUENCY_INITIAL/absent-new-stage" ]]
 ) > /dev/null 2>&1
 check_eq "frequency applicability refusal creates and publishes no new stage" "0" "$?"
+(
+  FREQUENCY_AB_SOURCE_ONLY=1
+  source "$REPO_ROOT/frequency-ab.sh"
+  FREQUENCY_STAGE_DIR="$FREQUENCY_INITIAL/absent-cap-stage"
+  FREQUENCY_OUTPUT_CLEANUP_ARMED=0
+  cap_rc=0
+  target=""
+  saved=""
+  frequency_validate_cap_target 4200000 "" target saved || cap_rc=$?
+  [[ "$cap_rc" == 20 ]] || exit 1
+  refusal_rc=0
+  frequency_not_applicable "cap target missing" > /dev/null 2>&1 || refusal_rc=$?
+  publisher_called=0
+  frequency_publish_outputs() { publisher_called=1; }
+  diag_cleanup_artifacts > /dev/null 2>&1
+  [[ "$refusal_rc" == 4 && -z "$FREQUENCY_STAGE_DIR" && "$publisher_called" == 0 &&
+    ! -e "$FREQUENCY_INITIAL/absent-cap-stage" ]]
+) > /dev/null 2>&1
+check_eq "frequency --cap target refusal creates and publishes no new stage" "0" "$?"
 if ((EUID != 0)); then
   (cd "$REPO_ROOT" && bash ./frequency-ab.sh 19 1 "$TMP") > /dev/null 2>&1
   check_eq "frequency-ab.sh refuses non-root (rc=4)" "4" "$?"
