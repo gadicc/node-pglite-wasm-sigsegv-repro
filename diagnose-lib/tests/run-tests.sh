@@ -805,7 +805,16 @@ mkdir -p "$RB"/{results,state,logs/individual}
 printf '19\t1\t139\t2\n19\t2\t0\t2\n' > "$RB/results/individual.tsv"
 printf 'VERSION=1\nTARGET_CPUS=19\nRUNS_PER_CPU=2\nSKIPPED=0\nCOMPLETED=1\n' > "$RB/results/individual.meta"
 touch "$RB/state/phase-individual.done" "$RB/state/phase-baseline.done"
-printf 'MODE=quick\nINDIVIDUAL_RUNS=20\nCOMPLETED_PHASES=baseline,individual\n' > "$RB/results/meta.env"
+cat > "$RB/results/meta.env" << EOF
+MODE=quick
+BASELINE_CHILDREN=8
+BASELINE_WAVES=10
+GROUP_WAVES=10
+INDIVIDUAL_RUNS=20
+GDB_MAX_RUNS=6
+SKIP_GDB=0
+COMPLETED_PHASES=baseline,individual
+EOF
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
@@ -813,6 +822,7 @@ printf 'MODE=quick\nINDIVIDUAL_RUNS=20\nCOMPLETED_PHASES=baseline,individual\n' 
   OUT_DIR="$RB"
   STATE_DIR="$RB/state"
   META_FILE="$RB/results/meta.env"
+  load_stored_config "$RB"
   REDO_PLAN=(individual frequency gdb)
   apply_redo_plan
 ) > /dev/null 2>&1
@@ -1093,7 +1103,16 @@ printf '{}\n' > "$DEPENDENT_RB/results.json"
 printf 'old report\n' > "$DEPENDENT_RB/report.md"
 printf 'old manifest\n' > "$DEPENDENT_RB/manifest.txt"
 touch "$DEPENDENT_RB/state/phase-"{baseline,groups,individual,frequency,gdb}.done
-printf 'COMPLETED_PHASES=baseline,groups,individual,frequency,gdb\n' > "$DEPENDENT_RB/results/meta.env"
+cat > "$DEPENDENT_RB/results/meta.env" << EOF
+MODE=default
+BASELINE_CHILDREN=16
+BASELINE_WAVES=50
+GROUP_WAVES=50
+INDIVIDUAL_RUNS=50
+GDB_MAX_RUNS=12
+SKIP_GDB=0
+COMPLETED_PHASES=baseline,groups,individual,frequency,gdb
+EOF
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
@@ -1127,7 +1146,16 @@ mkdir -p "$REDO_FAIL_RB"/{results,state,logs/individual}
 printf '19\t1\t139\t2\n' > "$REDO_FAIL_RB/results/individual.tsv"
 printf 'individual log\n' > "$REDO_FAIL_RB/logs/individual/cpu-19.log"
 touch "$REDO_FAIL_RB/state/phase-"{baseline,individual,frequency,gdb}.done
-printf 'COMPLETED_PHASES=baseline,individual,frequency,gdb\n' > "$REDO_FAIL_RB/results/meta.env"
+cat > "$REDO_FAIL_RB/results/meta.env" << EOF
+MODE=default
+BASELINE_CHILDREN=16
+BASELINE_WAVES=50
+GROUP_WAVES=50
+INDIVIDUAL_RUNS=50
+GDB_MAX_RUNS=12
+SKIP_GDB=0
+COMPLETED_PHASES=baseline,individual,frequency,gdb
+EOF
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
@@ -1154,7 +1182,7 @@ redo_failure_ok=0
   [[ ! -e "$REDO_FAIL_RB/state/phase-individual.done" ]] &&
   [[ ! -e "$REDO_FAIL_RB/state/phase-frequency.done" ]] &&
   [[ ! -e "$REDO_FAIL_RB/state/phase-gdb.done" ]] &&
-  grep -q '^COMPLETED_PHASES=baseline$' "$REDO_FAIL_RB/results/meta.env" && redo_failure_ok=1
+  grep -q '^COMPLETED_PHASES=baseline,individual,frequency,gdb$' "$REDO_FAIL_RB/results/meta.env" && redo_failure_ok=1
 check_eq "redo move failure leaves a private recoverable transaction" "1" "$redo_failure_ok"
 (
   DIAG_SOURCE_ONLY=1
@@ -1221,6 +1249,333 @@ redo_signal_recovery_rc=$?
 check_eq "redo resumes after a handled signal" "1" \
   "$([[ $redo_signal_recovery_rc -eq 0 && ! -e "$REDO_SIGNAL_RB/state/redo.pending" && ! -e "$REDO_SIGNAL_RB/results/individual.tsv" ]] && echo 1 || echo 0)"
 
+redo_atomic_bundle_setup() {
+  local bundle="$1"
+  mkdir -p "$bundle"/{results,state,logs/individual}
+  printf '19\t1\t139\t2\n' > "$bundle/results/individual.tsv"
+  printf 'old individual log\n' > "$bundle/logs/individual/cpu-19.log"
+  touch "$bundle/state/phase-"{baseline,individual,frequency,gdb}.done
+  cat > "$bundle/results/meta.env" << EOF
+MODE=quick
+BASELINE_CHILDREN=8
+BASELINE_WAVES=10
+GROUP_WAVES=10
+INDIVIDUAL_RUNS=5
+GDB_MAX_RUNS=6
+SKIP_GDB=0
+UNRELATED_NOTE=preserve-this-row
+COMPLETED_PHASES=baseline,individual,frequency,gdb
+EOF
+}
+
+REDO_MARKER_FAIL="$TMP/redo-marker-publish-failure"
+redo_atomic_bundle_setup "$REDO_MARKER_FAIL"
+cp "$REDO_MARKER_FAIL/results/meta.env" "$REDO_MARKER_FAIL/meta.before"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$REDO_MARKER_FAIL"
+  STATE_DIR="$REDO_MARKER_FAIL/state"
+  META_FILE="$REDO_MARKER_FAIL/results/meta.env"
+  MODE=quick BASELINE_CHILDREN=8 BASELINE_WAVES=10 GROUP_WAVES=10
+  INDIVIDUAL_RUNS=9 GDB_MAX_RUNS=6 SKIP_GDB=1
+  REDO_PLAN=(individual frequency gdb)
+  redo_marker_rename() { return 97; }
+  apply_redo_plan
+) > /dev/null 2>&1
+redo_marker_fail_rc=$?
+redo_marker_fail_ok=0
+[[ $redo_marker_fail_rc -ne 0 ]] &&
+  [[ ! -e "$REDO_MARKER_FAIL/state/redo.pending" ]] &&
+  [[ -f "$REDO_MARKER_FAIL/results/individual.tsv" ]] &&
+  [[ -f "$REDO_MARKER_FAIL/state/phase-individual.done" ]] &&
+  cmp -s "$REDO_MARKER_FAIL/meta.before" "$REDO_MARKER_FAIL/results/meta.env" && redo_marker_fail_ok=1
+check_eq "redo marker publication failure precedes config and evidence mutation" "1" "$redo_marker_fail_ok"
+find "$REDO_MARKER_FAIL/state" -maxdepth 1 -type f -name '.redo.pending.*' -delete
+
+REDO_EXACT_RETRY="$TMP/redo-exact-pending-retry"
+redo_atomic_bundle_setup "$REDO_EXACT_RETRY"
+printf 'original pending command log\n' > "$REDO_EXACT_RETRY/commands.log"
+printf 'original pending run log\n' > "$REDO_EXACT_RETRY/run.log"
+cp "$REDO_EXACT_RETRY/results/meta.env" "$REDO_EXACT_RETRY/meta.before"
+cp "$REDO_EXACT_RETRY/commands.log" "$REDO_EXACT_RETRY/commands.before"
+cp "$REDO_EXACT_RETRY/run.log" "$REDO_EXACT_RETRY/run.before"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$REDO_EXACT_RETRY"
+  STATE_DIR="$REDO_EXACT_RETRY/state"
+  META_FILE="$REDO_EXACT_RETRY/results/meta.env"
+  MODE=quick BASELINE_CHILDREN=8 BASELINE_WAVES=10 GROUP_WAVES=10
+  INDIVIDUAL_RUNS=9 GDB_MAX_RUNS=6 SKIP_GDB=1
+  REDO_PLAN=(individual frequency gdb)
+  redo_after_marker_publish() { return 98; }
+  apply_redo_plan
+) > /dev/null 2>&1
+redo_post_publish_rc=$?
+redo_post_publish_ok=0
+[[ $redo_post_publish_rc -ne 0 ]] &&
+  grep -q $'^VERSION\t2$' "$REDO_EXACT_RETRY/state/redo.pending" &&
+  grep -q $'^CONFIG\tINDIVIDUAL_RUNS\t9$' "$REDO_EXACT_RETRY/state/redo.pending" &&
+  [[ -f "$REDO_EXACT_RETRY/results/individual.tsv" ]] &&
+  [[ -f "$REDO_EXACT_RETRY/state/phase-individual.done" ]] &&
+  cmp -s "$REDO_EXACT_RETRY/meta.before" "$REDO_EXACT_RETRY/results/meta.env" && redo_post_publish_ok=1
+check_eq "post-publication interruption leaves old config and evidence behind a V2 marker" "1" "$redo_post_publish_ok"
+
+"$REPO_ROOT/diagnose.sh" --resume "$REDO_EXACT_RETRY" --redo gdb --yes > /dev/null 2>&1
+redo_phase_conflict_rc=$?
+redo_phase_conflict_ok=0
+[[ $redo_phase_conflict_rc -ne 0 ]] &&
+  [[ -f "$REDO_EXACT_RETRY/state/redo.pending" ]] &&
+  [[ -f "$REDO_EXACT_RETRY/results/individual.tsv" ]] &&
+  [[ ! -e "$REDO_EXACT_RETRY/state/superseded" ]] &&
+  cmp -s "$REDO_EXACT_RETRY/meta.before" "$REDO_EXACT_RETRY/results/meta.env" &&
+  cmp -s "$REDO_EXACT_RETRY/commands.before" "$REDO_EXACT_RETRY/commands.log" &&
+  cmp -s "$REDO_EXACT_RETRY/run.before" "$REDO_EXACT_RETRY/run.log" && redo_phase_conflict_ok=1
+check_eq "mismatched repeated redo closure fails before logs, config, evidence, or archive mutate" "1" "$redo_phase_conflict_ok"
+
+cp "$REDO_EXACT_RETRY/results/meta.env" "$REDO_EXACT_RETRY/conflict.before"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$REDO_EXACT_RETRY"
+  STATE_DIR="$REDO_EXACT_RETRY/state"
+  META_FILE="$REDO_EXACT_RETRY/results/meta.env"
+  REDO_PLAN=(individual frequency gdb)
+  INDIVIDUAL_RUNS=10
+  INDIVIDUAL_RUNS_EXPLICIT=1
+  reconcile_pending_redo_request
+) > /dev/null 2>&1
+redo_conflicting_retry_rc=$?
+redo_conflicting_retry_ok=0
+[[ $redo_conflicting_retry_rc -ne 0 ]] &&
+  [[ -f "$REDO_EXACT_RETRY/state/redo.pending" ]] &&
+  [[ -f "$REDO_EXACT_RETRY/results/individual.tsv" ]] &&
+  [[ ! -e "$REDO_EXACT_RETRY/state/superseded" ]] &&
+  cmp -s "$REDO_EXACT_RETRY/conflict.before" "$REDO_EXACT_RETRY/results/meta.env" && redo_conflicting_retry_ok=1
+check_eq "conflicting pending retry fails before bundle mutation" "1" "$redo_conflicting_retry_ok"
+
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$REDO_EXACT_RETRY"
+  STATE_DIR="$REDO_EXACT_RETRY/state"
+  META_FILE="$REDO_EXACT_RETRY/results/meta.env"
+  REDO_PLAN=(individual frequency gdb)
+  INDIVIDUAL_RUNS=9
+  INDIVIDUAL_RUNS_EXPLICIT=1
+  reconcile_pending_redo_request
+  printf '%s|%s|%s\n' "$MODE" "$SKIP_GDB" "$REDO_REQUEST_SATISFIED_BY_PENDING" > "$TMP/redo-exact-adopted"
+  recover_pending_redo
+  apply_redo_plan
+) > /dev/null 2>&1
+redo_exact_retry_rc=$?
+redo_exact_stash="$(find "$REDO_EXACT_RETRY/state/superseded" -mindepth 1 -maxdepth 1 -type d -name 'redo-*' -print -quit)"
+redo_exact_retry_ok=0
+[[ $redo_exact_retry_rc -eq 0 ]] &&
+  [[ "$(cat "$TMP/redo-exact-adopted")" == 'quick|1|1' ]] &&
+  [[ ! -e "$REDO_EXACT_RETRY/state/redo.pending" ]] &&
+  [[ "$(find "$REDO_EXACT_RETRY/state/superseded" -mindepth 1 -maxdepth 1 -type d -name 'redo-*' | wc -l)" -eq 1 ]] &&
+  [[ -f "$redo_exact_stash/individual/results/individual.tsv" ]] &&
+  [[ "$(sed -n 's/^INDIVIDUAL_RUNS=//p' "$REDO_EXACT_RETRY/results/meta.env")" == 9 ]] &&
+  [[ "$(sed -n 's/^SKIP_GDB=//p' "$REDO_EXACT_RETRY/results/meta.env")" == 1 ]] &&
+  grep -q '^UNRELATED_NOTE=preserve-this-row$' "$REDO_EXACT_RETRY/results/meta.env" &&
+  grep -q '^COMPLETED_PHASES=baseline$' "$REDO_EXACT_RETRY/results/meta.env" && redo_exact_retry_ok=1
+check_eq "exact pending retry adopts target and finishes one archive" "1" "$redo_exact_retry_ok"
+
+REDO_CONFIG_RENAME="$TMP/redo-config-rename-failure"
+redo_atomic_bundle_setup "$REDO_CONFIG_RENAME"
+cp "$REDO_CONFIG_RENAME/results/meta.env" "$REDO_CONFIG_RENAME/meta.before"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$REDO_CONFIG_RENAME"
+  STATE_DIR="$REDO_CONFIG_RENAME/state"
+  META_FILE="$REDO_CONFIG_RENAME/results/meta.env"
+  MODE=quick BASELINE_CHILDREN=8 BASELINE_WAVES=10 GROUP_WAVES=10
+  INDIVIDUAL_RUNS=9 GDB_MAX_RUNS=6 SKIP_GDB=1
+  REDO_PLAN=(individual frequency gdb)
+  meta_config_rename() { return 97; }
+  apply_redo_plan
+) > /dev/null 2>&1
+redo_config_rename_rc=$?
+redo_config_rename_ok=0
+[[ $redo_config_rename_rc -ne 0 ]] &&
+  [[ -f "$REDO_CONFIG_RENAME/state/redo.pending" ]] &&
+  [[ ! -e "$REDO_CONFIG_RENAME/results/individual.tsv" ]] &&
+  [[ ! -e "$REDO_CONFIG_RENAME/state/phase-individual.done" ]] &&
+  cmp -s "$REDO_CONFIG_RENAME/meta.before" "$REDO_CONFIG_RENAME/results/meta.env" &&
+  ! find "$REDO_CONFIG_RENAME/results" -maxdepth 1 -name '.meta.env.*' -print -quit | grep -q . && redo_config_rename_ok=1
+check_eq "config rename failure leaves recoverable archive with old metadata" "1" "$redo_config_rename_ok"
+
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$REDO_CONFIG_RENAME"
+  STATE_DIR="$REDO_CONFIG_RENAME/state"
+  META_FILE="$REDO_CONFIG_RENAME/results/meta.env"
+  REDO_PLAN=()
+  reconcile_pending_redo_request
+  printf '%s|%s|%s\n' "$MODE" "$INDIVIDUAL_RUNS" "$SKIP_GDB" > "$TMP/redo-plain-adopted"
+  recover_pending_redo
+) > /dev/null 2>&1
+redo_plain_recovery_rc=$?
+redo_plain_recovery_ok=0
+[[ $redo_plain_recovery_rc -eq 0 ]] &&
+  [[ "$(cat "$TMP/redo-plain-adopted")" == 'quick|9|1' ]] &&
+  [[ ! -e "$REDO_CONFIG_RENAME/state/redo.pending" ]] &&
+  [[ "$(sed -n 's/^INDIVIDUAL_RUNS=//p' "$REDO_CONFIG_RENAME/results/meta.env")" == 9 ]] &&
+  grep -q '^UNRELATED_NOTE=preserve-this-row$' "$REDO_CONFIG_RENAME/results/meta.env" && redo_plain_recovery_ok=1
+check_eq "plain recovery adopts the embedded target before phase execution" "1" "$redo_plain_recovery_ok"
+
+REDO_POST_META="$TMP/redo-post-meta-interruption"
+redo_atomic_bundle_setup "$REDO_POST_META"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$REDO_POST_META"
+  STATE_DIR="$REDO_POST_META/state"
+  META_FILE="$REDO_POST_META/results/meta.env"
+  MODE=quick BASELINE_CHILDREN=8 BASELINE_WAVES=10 GROUP_WAVES=10
+  INDIVIDUAL_RUNS=9 GDB_MAX_RUNS=6 SKIP_GDB=1
+  REDO_PLAN=(individual frequency gdb)
+  redo_after_meta_publish() { return 99; }
+  apply_redo_plan
+) > /dev/null 2>&1
+redo_post_meta_rc=$?
+redo_post_meta_ok=0
+[[ $redo_post_meta_rc -ne 0 ]] &&
+  [[ -f "$REDO_POST_META/state/redo.pending" ]] &&
+  [[ ! -e "$REDO_POST_META/results/individual.tsv" ]] &&
+  [[ "$(sed -n 's/^INDIVIDUAL_RUNS=//p' "$REDO_POST_META/results/meta.env")" == 9 ]] &&
+  grep -q '^COMPLETED_PHASES=baseline$' "$REDO_POST_META/results/meta.env" && redo_post_meta_ok=1
+check_eq "post-config pre-unlink interruption retains the committed target and marker" "1" "$redo_post_meta_ok"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$REDO_POST_META"
+  STATE_DIR="$REDO_POST_META/state"
+  META_FILE="$REDO_POST_META/results/meta.env"
+  recover_pending_redo
+) > /dev/null 2>&1
+redo_post_meta_recovery_rc=$?
+check_eq "post-config recovery removes marker without a second archive" "1" \
+  "$([[ $redo_post_meta_recovery_rc -eq 0 && ! -e "$REDO_POST_META/state/redo.pending" && "$(find "$REDO_POST_META/state/superseded" -mindepth 1 -maxdepth 1 -type d -name 'redo-*' | wc -l)" -eq 1 ]] && echo 1 || echo 0)"
+
+write_test_v2_marker() {
+  local marker="$1" mode="$2" baseline_children="$3" baseline_waves="$4"
+  cat > "$marker" << EOF
+VERSION	2
+TXN	redo-20260802T000000-v2test
+CONFIG	MODE	$mode
+CONFIG	BASELINE_CHILDREN	$baseline_children
+CONFIG	BASELINE_WAVES	$baseline_waves
+CONFIG	GROUP_WAVES	10
+CONFIG	INDIVIDUAL_RUNS	5
+CONFIG	GDB_MAX_RUNS	6
+CONFIG	SKIP_GDB	0
+PHASE	gdb
+EOF
+}
+
+FORGED_CONFIG_RB="$TMP/redo-forged-config-closure"
+mkdir -p "$FORGED_CONFIG_RB"/{results,state}
+cat > "$FORGED_CONFIG_RB/results/meta.env" << EOF
+MODE=quick
+BASELINE_CHILDREN=8
+BASELINE_WAVES=10
+GROUP_WAVES=10
+INDIVIDUAL_RUNS=5
+GDB_MAX_RUNS=6
+SKIP_GDB=0
+COMPLETED_PHASES=baseline,gdb
+EOF
+touch "$FORGED_CONFIG_RB/state/phase-baseline.done" "$FORGED_CONFIG_RB/state/phase-gdb.done"
+write_test_v2_marker "$FORGED_CONFIG_RB/state/redo.pending" default 16 50
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$FORGED_CONFIG_RB"
+  STATE_DIR="$FORGED_CONFIG_RB/state"
+  META_FILE="$FORGED_CONFIG_RB/results/meta.env"
+  reconcile_pending_redo_request
+) > /dev/null 2>&1
+forged_config_rc=$?
+forged_config_ok=0
+[[ $forged_config_rc -ne 0 ]] &&
+  [[ -f "$FORGED_CONFIG_RB/state/phase-baseline.done" ]] &&
+  [[ -f "$FORGED_CONFIG_RB/state/phase-gdb.done" ]] &&
+  [[ "$(sed -n 's/^MODE=//p' "$FORGED_CONFIG_RB/results/meta.env")" == quick ]] &&
+  [[ ! -e "$FORGED_CONFIG_RB/state/superseded" ]] && forged_config_ok=1
+check_eq "V2 target cannot relabel completed evidence outside its phase closure" "1" "$forged_config_ok"
+
+MISSING_STORED_CONFIG_RB="$TMP/redo-missing-stored-config"
+mkdir -p "$MISSING_STORED_CONFIG_RB"/{results,state}
+cat > "$MISSING_STORED_CONFIG_RB/results/meta.env" << EOF
+MODE=quick
+BASELINE_CHILDREN=8
+GROUP_WAVES=10
+INDIVIDUAL_RUNS=5
+GDB_MAX_RUNS=6
+SKIP_GDB=0
+COMPLETED_PHASES=baseline,gdb
+EOF
+touch "$MISSING_STORED_CONFIG_RB/state/phase-baseline.done" "$MISSING_STORED_CONFIG_RB/state/phase-gdb.done"
+write_test_v2_marker "$MISSING_STORED_CONFIG_RB/state/redo.pending" quick 8 10
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$MISSING_STORED_CONFIG_RB"
+  STATE_DIR="$MISSING_STORED_CONFIG_RB/state"
+  META_FILE="$MISSING_STORED_CONFIG_RB/results/meta.env"
+  reconcile_pending_redo_request
+) > /dev/null 2>&1
+missing_stored_config_rc=$?
+check_eq "missing stored config cannot authorize relabeling completed evidence" "1" \
+  "$([[ $missing_stored_config_rc -ne 0 && -f "$MISSING_STORED_CONFIG_RB/state/phase-baseline.done" && ! -e "$MISSING_STORED_CONFIG_RB/state/superseded" ]] && echo 1 || echo 0)"
+
+INVALID_V2_DIR="$TMP/redo-invalid-v2"
+mkdir -p "$INVALID_V2_DIR"
+write_test_v2_marker "$INVALID_V2_DIR/valid" quick 8 10
+sed '/^CONFIG	SKIP_GDB	/d' "$INVALID_V2_DIR/valid" > "$INVALID_V2_DIR/missing"
+awk '{ print; if ($0 == "CONFIG\tMODE\tquick") print }' "$INVALID_V2_DIR/valid" > "$INVALID_V2_DIR/duplicate"
+awk '
+  /^CONFIG\tBASELINE_CHILDREN\t/ { child=$0; next }
+  /^CONFIG\tBASELINE_WAVES\t/ { print; print child; next }
+  { print }
+' "$INVALID_V2_DIR/valid" > "$INVALID_V2_DIR/out-of-order"
+sed 's/^CONFIG	INDIVIDUAL_RUNS	5$/CONFIG	INDIVIDUAL_RUNS	05/' \
+  "$INVALID_V2_DIR/valid" > "$INVALID_V2_DIR/noncanonical"
+write_test_v2_marker "$INVALID_V2_DIR/unreachable-mode" quick 16 50
+sed 's/^VERSION	2$/VERSION	1/' "$INVALID_V2_DIR/valid" > "$INVALID_V2_DIR/v1-with-config"
+invalid_v2_result="$(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  valid=0 rejected=0
+  redo_transaction_validate "$INVALID_V2_DIR/valid" && valid=1
+  for marker in missing duplicate out-of-order noncanonical unreachable-mode v1-with-config; do
+    redo_transaction_validate "$INVALID_V2_DIR/$marker" || rejected=$((rejected + 1))
+  done
+  printf '%s|%s\n' "$valid" "$rejected"
+)"
+check_eq "V2 grammar rejects missing, duplicate, out-of-order, noncanonical, unreachable, and V1 CONFIG rows" \
+  "1|6" "$invalid_v2_result"
+
+META_TEMP_CLEANUP="$TMP/meta-temp-cleanup"
+mkdir -p "$META_TEMP_CLEANUP"/{results,state}
+printf 'MODE=quick\n' > "$META_TEMP_CLEANUP/results/meta.env"
+touch "$META_TEMP_CLEANUP/results/.meta.env.interrupted"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  STATE_DIR="$META_TEMP_CLEANUP/state"
+  META_FILE="$META_TEMP_CLEANUP/results/meta.env"
+  META_UPDATE_TEMP="$META_TEMP_CLEANUP/results/.meta.env.interrupted"
+  redo_marker_temp_cleanup
+)
+check_eq "interruption cleanup removes a tracked atomic metadata temp" "1" \
+  "$([[ ! -e "$META_TEMP_CLEANUP/results/.meta.env.interrupted" ]] && echo 1 || echo 0)"
+
 CRAFTED_REDO_RB="$TMP/redo-crafted-marker-bundle"
 mkdir -p "$CRAFTED_REDO_RB"/{results,state}
 printf 'gdb evidence\n' > "$CRAFTED_REDO_RB/results/gdb.meta"
@@ -1258,25 +1613,29 @@ printf 'source evidence\n' > "$CONFLICT_REDO_RB/results/gdb.meta"
 printf 'archive evidence\n' > "$CONFLICT_REDO_RB/state/superseded/$conflict_txn/gdb/results/gdb.meta"
 touch "$CONFLICT_REDO_RB/state/phase-gdb.done"
 printf 'COMPLETED_PHASES=gdb\n' > "$CONFLICT_REDO_RB/results/meta.env"
+printf 'original command log\n' > "$CONFLICT_REDO_RB/commands.log"
+printf 'original run log\n' > "$CONFLICT_REDO_RB/run.log"
 printf 'VERSION\t1\nTXN\t%s\nPHASE\tgdb\nARTIFACT\tgdb\tresults/gdb.meta\n' "$conflict_txn" \
   > "$CONFLICT_REDO_RB/state/redo.pending"
-(
-  DIAG_SOURCE_ONLY=1
-  source "$REPO_ROOT/diagnose.sh"
-  OUT_DIR="$CONFLICT_REDO_RB"
-  STATE_DIR="$CONFLICT_REDO_RB/state"
-  META_FILE="$CONFLICT_REDO_RB/results/meta.env"
-  recover_pending_redo
-) > /dev/null 2>&1
+cp "$CONFLICT_REDO_RB/results/meta.env" "$CONFLICT_REDO_RB/meta.before"
+cp "$CONFLICT_REDO_RB/results/gdb.meta" "$CONFLICT_REDO_RB/source.before"
+cp "$CONFLICT_REDO_RB/state/superseded/$conflict_txn/gdb/results/gdb.meta" "$CONFLICT_REDO_RB/archive.before"
+cp "$CONFLICT_REDO_RB/commands.log" "$CONFLICT_REDO_RB/commands.before"
+cp "$CONFLICT_REDO_RB/run.log" "$CONFLICT_REDO_RB/run.before"
+find "$CONFLICT_REDO_RB" -type d -printf '%P\n' | sort > "$CONFLICT_REDO_RB/dirs.before"
+"$REPO_ROOT/diagnose.sh" --resume "$CONFLICT_REDO_RB" --yes > /dev/null 2>&1
 conflict_redo_rc=$?
 conflict_redo_ok=0
 [[ $conflict_redo_rc -ne 0 ]] &&
-  [[ "$(cat "$CONFLICT_REDO_RB/results/gdb.meta")" == "source evidence" ]] &&
-  [[ "$(cat "$CONFLICT_REDO_RB/state/superseded/$conflict_txn/gdb/results/gdb.meta")" == "archive evidence" ]] &&
+  cmp -s "$CONFLICT_REDO_RB/source.before" "$CONFLICT_REDO_RB/results/gdb.meta" &&
+  cmp -s "$CONFLICT_REDO_RB/archive.before" "$CONFLICT_REDO_RB/state/superseded/$conflict_txn/gdb/results/gdb.meta" &&
+  cmp -s "$CONFLICT_REDO_RB/meta.before" "$CONFLICT_REDO_RB/results/meta.env" &&
+  cmp -s "$CONFLICT_REDO_RB/commands.before" "$CONFLICT_REDO_RB/commands.log" &&
+  cmp -s "$CONFLICT_REDO_RB/run.before" "$CONFLICT_REDO_RB/run.log" &&
   [[ -f "$CONFLICT_REDO_RB/state/phase-gdb.done" ]] &&
-  grep -q '^COMPLETED_PHASES=gdb$' "$CONFLICT_REDO_RB/results/meta.env" &&
-  [[ -f "$CONFLICT_REDO_RB/state/redo.pending" ]] && conflict_redo_ok=1
-check_eq "conflicting redo source and archive fail before metadata mutation" "1" "$conflict_redo_ok"
+  [[ -f "$CONFLICT_REDO_RB/state/redo.pending" ]] &&
+  find "$CONFLICT_REDO_RB" -type d -printf '%P\n' | sort | cmp -s "$CONFLICT_REDO_RB/dirs.before" - && conflict_redo_ok=1
+check_eq "conflicting redo pair fails before logs, directories, config, or evidence mutate" "1" "$conflict_redo_ok"
 
 CONSENT_RB="$TMP/redo-consent-bundle"
 mkdir -p "$CONSENT_RB"/{results,state,logs/individual}
@@ -1729,6 +2088,54 @@ printf 'MODE=quick\nINDIVIDUAL_RUNS=20\nCOMPLETED_PHASES=baseline\n' > "$RB/resu
 )
 check_eq "incomplete phase accepts overridden individual run count" "50" "$(sed -n 's/^INDIVIDUAL_RUNS=//p' "$RB/results/meta.env")"
 check_eq "persisting incomplete-phase override retains other completion metadata" "baseline" "$(sed -n 's/^COMPLETED_PHASES=//p' "$RB/results/meta.env")"
+
+ATOMIC_OVERRIDE_RB="$TMP/atomic-ordinary-override"
+mkdir -p "$ATOMIC_OVERRIDE_RB"/{results,state}
+cat > "$ATOMIC_OVERRIDE_RB/results/meta.env" << EOF
+MODE=quick
+BASELINE_CHILDREN=8
+BASELINE_WAVES=10
+GROUP_WAVES=10
+INDIVIDUAL_RUNS=5
+GDB_MAX_RUNS=6
+SKIP_GDB=0
+UNRELATED_NOTE=keep=verbatim
+COMPLETED_PHASES=baseline
+EOF
+cp "$ATOMIC_OVERRIDE_RB/results/meta.env" "$ATOMIC_OVERRIDE_RB/meta.before"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$ATOMIC_OVERRIDE_RB"
+  STATE_DIR="$ATOMIC_OVERRIDE_RB/state"
+  META_FILE="$ATOMIC_OVERRIDE_RB/results/meta.env"
+  MODE=quick BASELINE_CHILDREN=8 BASELINE_WAVES=10 GROUP_WAVES=10
+  INDIVIDUAL_RUNS=9 GDB_MAX_RUNS=6 SKIP_GDB=0
+  meta_config_rename() { return 97; }
+  persist_effective_config
+) > /dev/null 2>&1
+atomic_override_fail_rc=$?
+atomic_override_fail_ok=0
+[[ $atomic_override_fail_rc -ne 0 ]] &&
+  cmp -s "$ATOMIC_OVERRIDE_RB/meta.before" "$ATOMIC_OVERRIDE_RB/results/meta.env" &&
+  ! find "$ATOMIC_OVERRIDE_RB/results" -maxdepth 1 -name '.meta.env.*' -print -quit | grep -q . && atomic_override_fail_ok=1
+check_eq "ordinary override rename failure preserves the previous metadata generation" "1" "$atomic_override_fail_ok"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$ATOMIC_OVERRIDE_RB"
+  STATE_DIR="$ATOMIC_OVERRIDE_RB/state"
+  META_FILE="$ATOMIC_OVERRIDE_RB/results/meta.env"
+  MODE=quick BASELINE_CHILDREN=8 BASELINE_WAVES=10 GROUP_WAVES=10
+  INDIVIDUAL_RUNS=9 GDB_MAX_RUNS=6 SKIP_GDB=0
+  persist_effective_config
+)
+atomic_override_ok=0
+[[ "$(sed -n 's/^INDIVIDUAL_RUNS=//p' "$ATOMIC_OVERRIDE_RB/results/meta.env")" == 9 ]] &&
+  [[ "$(grep -c '^INDIVIDUAL_RUNS=' "$ATOMIC_OVERRIDE_RB/results/meta.env")" -eq 1 ]] &&
+  grep -q '^UNRELATED_NOTE=keep=verbatim$' "$ATOMIC_OVERRIDE_RB/results/meta.env" &&
+  grep -q '^COMPLETED_PHASES=baseline$' "$ATOMIC_OVERRIDE_RB/results/meta.env" && atomic_override_ok=1
+check_eq "ordinary override publishes one atomic config while preserving unrelated metadata" "1" "$atomic_override_ok"
 
 OVERRIDE_RB="$TMP/completed-override-bundle"
 mkdir -p "$OVERRIDE_RB"/{results,state}

@@ -53,9 +53,14 @@ declare -a REDO_PLAN=()
 REDO_MARKER_TEMP=""
 REDO_NEW_TXN_ID=""
 REDO_TXN_ID=""
+REDO_TXN_VERSION=""
 declare -a REDO_TXN_PHASES=()
 declare -a REDO_TXN_OWNERS=()
 declare -a REDO_TXN_PATHS=()
+declare -A REDO_TXN_CONFIG=()
+REDO_REQUEST_SATISFIED_BY_PENDING=0
+REDO_RECOVERED_PENDING=0
+META_UPDATE_TEMP=""
 WORST_CPU_OVERRIDE=""
 SESSION_DID_WORK=0
 MODE_EXPLICIT=0
@@ -318,13 +323,85 @@ sync_meta_completed() {
 }
 
 persist_effective_config() {
-  meta_set MODE "$MODE"
-  meta_set BASELINE_CHILDREN "$BASELINE_CHILDREN"
-  meta_set BASELINE_WAVES "$BASELINE_WAVES"
-  meta_set GROUP_WAVES "$GROUP_WAVES"
-  meta_set INDIVIDUAL_RUNS "$INDIVIDUAL_RUNS"
-  meta_set GDB_MAX_RUNS "$GDB_MAX_RUNS"
-  meta_set SKIP_GDB "$SKIP_GDB"
+  rewrite_meta_atomic 1 0
+}
+
+completed_phases_value() {
+  local list="" f
+  for f in "$STATE_DIR"/phase-*.done; do
+    [[ -e "$f" ]] || continue
+    f="${f##*/phase-}"
+    f="${f%.done}"
+    list="${list:+$list,}$f"
+  done
+  printf '%s\n' "$list"
+}
+
+meta_config_rename() {
+  mv -T -- "$1" "$2"
+}
+
+# Replace the persisted execution configuration as one rename while retaining
+# every unrelated metadata row verbatim. Redo completion state joins that same
+# atomic rewrite only after all evidence moves have completed.
+rewrite_meta_atomic() {
+  local include_config="$1" include_completed="$2" tmp line key completed="" meta_dir
+  meta_dir="${META_FILE%/*}"
+  tmp="$(mktemp "$meta_dir/.meta.env.XXXXXX")" ||
+    diag_die "cannot prepare atomic metadata update"
+  META_UPDATE_TEMP="$tmp"
+  if ((include_completed == 1)); then
+    completed="$(completed_phases_value)"
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    key="${line%%=*}"
+    case "$key" in
+      MODE | BASELINE_CHILDREN | BASELINE_WAVES | GROUP_WAVES | INDIVIDUAL_RUNS | GDB_MAX_RUNS | SKIP_GDB)
+        if ((include_config == 1)); then continue; fi
+        ;;
+      COMPLETED_PHASES)
+        if ((include_completed == 1)); then continue; fi
+        ;;
+    esac
+    printf '%s\n' "$line" >> "$tmp" || {
+      rm -f -- "$tmp"
+      META_UPDATE_TEMP=""
+      diag_die "cannot write atomic metadata update"
+    }
+  done < "$META_FILE"
+  {
+    if ((include_config == 1)); then
+      printf 'MODE=%s\n' "$MODE"
+      printf 'BASELINE_CHILDREN=%s\n' "$BASELINE_CHILDREN"
+      printf 'BASELINE_WAVES=%s\n' "$BASELINE_WAVES"
+      printf 'GROUP_WAVES=%s\n' "$GROUP_WAVES"
+      printf 'INDIVIDUAL_RUNS=%s\n' "$INDIVIDUAL_RUNS"
+      printf 'GDB_MAX_RUNS=%s\n' "$GDB_MAX_RUNS"
+      printf 'SKIP_GDB=%s\n' "$SKIP_GDB"
+    fi
+    ((include_completed == 0)) || printf 'COMPLETED_PHASES=%s\n' "$completed"
+  } >> "$tmp" || {
+    rm -f -- "$tmp"
+    META_UPDATE_TEMP=""
+    diag_die "cannot write atomic metadata update"
+  }
+  chmod --reference="$META_FILE" "$tmp" || {
+    rm -f -- "$tmp"
+    META_UPDATE_TEMP=""
+    diag_die "cannot protect atomic metadata update"
+  }
+  sync -f "$tmp" || {
+    rm -f -- "$tmp"
+    META_UPDATE_TEMP=""
+    diag_die "cannot synchronize atomic metadata update"
+  }
+  meta_config_rename "$tmp" "$META_FILE" || {
+    rm -f -- "$tmp"
+    META_UPDATE_TEMP=""
+    diag_die "cannot publish atomic metadata update"
+  }
+  META_UPDATE_TEMP=""
+  sync -f "$meta_dir" || diag_die "cannot synchronize metadata directory"
 }
 
 redo_plan_contains() {
@@ -475,36 +552,78 @@ redo_derived_path_is_allowed() {
 }
 
 # Parse pending redo state strictly as data. Never source this user-owned file.
+redo_config_value_is_valid() {
+  local key="$1" value="$2"
+  case "$key" in
+    MODE) [[ "$value" == default || "$value" == quick || "$value" == full ]] ;;
+    BASELINE_CHILDREN | BASELINE_WAVES | GROUP_WAVES | INDIVIDUAL_RUNS | GDB_MAX_RUNS)
+      [[ "$value" =~ ^[1-9][0-9]*$ ]]
+      ;;
+    SKIP_GDB) [[ "$value" == 0 || "$value" == 1 ]] ;;
+    *) return 1 ;;
+  esac
+}
+
+redo_write_config_records() {
+  printf 'CONFIG\tMODE\t%s\n' "$MODE"
+  printf 'CONFIG\tBASELINE_CHILDREN\t%s\n' "$BASELINE_CHILDREN"
+  printf 'CONFIG\tBASELINE_WAVES\t%s\n' "$BASELINE_WAVES"
+  printf 'CONFIG\tGROUP_WAVES\t%s\n' "$GROUP_WAVES"
+  printf 'CONFIG\tINDIVIDUAL_RUNS\t%s\n' "$INDIVIDUAL_RUNS"
+  printf 'CONFIG\tGDB_MAX_RUNS\t%s\n' "$GDB_MAX_RUNS"
+  printf 'CONFIG\tSKIP_GDB\t%s\n' "$SKIP_GDB"
+}
+
 redo_transaction_validate() {
   local marker="$1" line kind owner path version="" txn="" last_rank=0 rank section=version
+  local config_index=0 expected_key
+  local -a config_keys=(MODE BASELINE_CHILDREN BASELINE_WAVES GROUP_WAVES INDIVIDUAL_RUNS GDB_MAX_RUNS SKIP_GDB)
   local -A phases=() records=()
   REDO_TXN_ID=""
+  REDO_TXN_VERSION=""
   REDO_TXN_PHASES=()
   REDO_TXN_OWNERS=()
   REDO_TXN_PATHS=()
+  REDO_TXN_CONFIG=()
   [[ -f "$marker" && ! -L "$marker" ]] || return 1
   while IFS= read -r line || [[ -n "$line" ]]; do
     IFS=$'\t' read -r kind owner path <<< "$line"
     case "$kind" in
       VERSION)
-        [[ "$section" == version && "$line" == "VERSION"$'\t'"$owner" && "$owner" == 1 ]] || return 1
-        version=1
+        [[ "$section" == version && "$line" == "VERSION"$'\t'"$owner" &&
+          ("$owner" == 1 || "$owner" == 2) ]] || return 1
+        version="$owner"
         section=txn
         ;;
       TXN)
         [[ "$section" == txn && "$line" == "TXN"$'\t'"$owner" &&
           "$owner" =~ ^redo-[0-9]{8}T[0-9]{6}-[A-Za-z0-9]+$ ]] || return 1
         txn="$owner"
-        section=phases
+        if [[ "$version" == 2 ]]; then section=config; else section=phases; fi
+        ;;
+      CONFIG)
+        [[ "$version" == 2 && "$section" == config && $config_index -lt ${#config_keys[@]} ]] || return 1
+        expected_key="${config_keys[$config_index]}"
+        [[ "$owner" == "$expected_key" && "$line" == "CONFIG"$'\t'"$owner"$'\t'"$path" ]] || return 1
+        redo_config_value_is_valid "$owner" "$path" || return 1
+        [[ -z "${REDO_TXN_CONFIG[$owner]:-}" ]] || return 1
+        REDO_TXN_CONFIG[$owner]="$path"
+        config_index=$((config_index + 1))
         ;;
       PHASE)
-        [[ "$section" == phases && "$line" == "PHASE"$'\t'"$owner" ]] || return 1
+        if [[ "$version" == 2 ]]; then
+          [[ ("$section" == config || "$section" == phases) && $config_index -eq ${#config_keys[@]} ]] || return 1
+        else
+          [[ "$section" == phases ]] || return 1
+        fi
+        [[ "$line" == "PHASE"$'\t'"$owner" ]] || return 1
         redo_phase_supported "$owner" && [[ -z "${phases[$owner]:-}" ]] || return 1
         case "$owner" in baseline) rank=1 ;; groups) rank=2 ;; individual) rank=3 ;; frequency) rank=4 ;; gdb) rank=5 ;; esac
         ((rank > last_rank)) || return 1
         last_rank=$rank
         phases[$owner]=1
         REDO_TXN_PHASES+=("$owner")
+        section=phases
         ;;
       DERIVED)
         [[ "$section" == phases || "$section" == derived ]] || return 1
@@ -526,7 +645,21 @@ redo_transaction_validate() {
       *) return 1 ;;
     esac
   done < "$marker"
-  [[ "$version" == 1 && -n "$txn" && ${#REDO_TXN_PHASES[@]} -gt 0 ]] || return 1
+  [[ ("$version" == 1 || "$version" == 2) && -n "$txn" && ${#REDO_TXN_PHASES[@]} -gt 0 ]] || return 1
+  [[ "$version" == 1 || $config_index -eq ${#config_keys[@]} ]] || return 1
+  if [[ "$version" == 2 ]]; then
+    case "${REDO_TXN_CONFIG[MODE]}" in
+      quick)
+        [[ "${REDO_TXN_CONFIG[BASELINE_CHILDREN]}" == 8 && "${REDO_TXN_CONFIG[BASELINE_WAVES]}" == 10 ]] || return 1
+        ;;
+      default)
+        [[ "${REDO_TXN_CONFIG[BASELINE_CHILDREN]}" == 16 && "${REDO_TXN_CONFIG[BASELINE_WAVES]}" == 50 ]] || return 1
+        ;;
+      full)
+        [[ "${REDO_TXN_CONFIG[BASELINE_CHILDREN]}" == 16 && "${REDO_TXN_CONFIG[BASELINE_WAVES]}" == 100 ]] || return 1
+        ;;
+    esac
+  fi
   local phase
   for phase in "${REDO_TXN_OWNERS[@]}"; do
     [[ "$phase" == derived || -n "${phases[$phase]:-}" ]] || return 1
@@ -537,7 +670,128 @@ redo_transaction_validate() {
   if [[ -n "${phases[individual]:-}" ]]; then
     [[ -n "${phases[frequency]:-}" && -n "${phases[gdb]:-}" ]] || return 1
   fi
+  REDO_TXN_VERSION="$version"
   REDO_TXN_ID="$txn"
+}
+
+redo_adopt_pending_config() {
+  [[ "$REDO_TXN_VERSION" == 2 ]] || return 0
+  MODE="${REDO_TXN_CONFIG[MODE]}"
+  BASELINE_CHILDREN="${REDO_TXN_CONFIG[BASELINE_CHILDREN]}"
+  BASELINE_WAVES="${REDO_TXN_CONFIG[BASELINE_WAVES]}"
+  GROUP_WAVES="${REDO_TXN_CONFIG[GROUP_WAVES]}"
+  INDIVIDUAL_RUNS="${REDO_TXN_CONFIG[INDIVIDUAL_RUNS]}"
+  GDB_MAX_RUNS="${REDO_TXN_CONFIG[GDB_MAX_RUNS]}"
+  SKIP_GDB="${REDO_TXN_CONFIG[SKIP_GDB]}"
+}
+
+redo_transaction_has_phase() {
+  local wanted="$1" phase
+  for phase in "${REDO_TXN_PHASES[@]}"; do
+    [[ "$phase" == "$wanted" ]] && return 0
+  done
+  return 1
+}
+
+redo_changed_config_authorized_for_phase() {
+  local phase="$1"
+  [[ ! -f "$STATE_DIR/phase-$phase.done" ]] || redo_transaction_has_phase "$phase"
+}
+
+# A syntactically valid marker must not relabel completed evidence that it
+# leaves in place. Only a transaction containing the affected phase may alter
+# the config key that describes that phase's evidence.
+redo_transaction_target_is_authorized() {
+  [[ "$REDO_TXN_VERSION" == 2 ]] || return 0
+  local key stored target phase
+  for key in MODE BASELINE_CHILDREN BASELINE_WAVES GROUP_WAVES INDIVIDUAL_RUNS GDB_MAX_RUNS SKIP_GDB; do
+    stored="$(metadata_value "$META_FILE" "$key")"
+    target="${REDO_TXN_CONFIG[$key]}"
+    [[ "$stored" == "$target" ]] && continue
+    case "$key" in
+      MODE)
+        for phase in baseline groups individual gdb; do
+          redo_changed_config_authorized_for_phase "$phase" || return 1
+        done
+        ;;
+      BASELINE_CHILDREN | BASELINE_WAVES)
+        redo_changed_config_authorized_for_phase baseline || return 1
+        ;;
+      GROUP_WAVES)
+        redo_changed_config_authorized_for_phase groups || return 1
+        ;;
+      INDIVIDUAL_RUNS)
+        redo_changed_config_authorized_for_phase individual || return 1
+        ;;
+      GDB_MAX_RUNS | SKIP_GDB)
+        redo_changed_config_authorized_for_phase gdb || return 1
+        ;;
+    esac
+  done
+}
+
+redo_pending_phase_request_matches() {
+  ((${#REDO_PLAN[@]} == 0)) && return 0
+  ((${#REDO_PLAN[@]} == ${#REDO_TXN_PHASES[@]})) || return 1
+  local i
+  for ((i = 0; i < ${#REDO_PLAN[@]}; i++)); do
+    [[ "${REDO_PLAN[$i]}" == "${REDO_TXN_PHASES[$i]}" ]] || return 1
+  done
+}
+
+redo_pending_explicit_config_matches_v2() {
+  if ((MODE_EXPLICIT == 1)); then
+    [[ "$MODE" == "${REDO_TXN_CONFIG[MODE]}" &&
+      "$BASELINE_CHILDREN" == "${REDO_TXN_CONFIG[BASELINE_CHILDREN]}" &&
+      "$BASELINE_WAVES" == "${REDO_TXN_CONFIG[BASELINE_WAVES]}" &&
+      "$GROUP_WAVES" == "${REDO_TXN_CONFIG[GROUP_WAVES]}" &&
+      "$INDIVIDUAL_RUNS" == "${REDO_TXN_CONFIG[INDIVIDUAL_RUNS]}" &&
+      "$GDB_MAX_RUNS" == "${REDO_TXN_CONFIG[GDB_MAX_RUNS]}" ]] || return 1
+  else
+    ((GROUP_WAVES_EXPLICIT == 0)) || [[ "$GROUP_WAVES" == "${REDO_TXN_CONFIG[GROUP_WAVES]}" ]] || return 1
+    ((INDIVIDUAL_RUNS_EXPLICIT == 0)) || [[ "$INDIVIDUAL_RUNS" == "${REDO_TXN_CONFIG[INDIVIDUAL_RUNS]}" ]] || return 1
+    ((GDB_MAX_RUNS_EXPLICIT == 0)) || [[ "$GDB_MAX_RUNS" == "${REDO_TXN_CONFIG[GDB_MAX_RUNS]}" ]] || return 1
+  fi
+  ((SKIP_GDB_EXPLICIT == 0)) || [[ "$SKIP_GDB" == "${REDO_TXN_CONFIG[SKIP_GDB]}" ]]
+}
+
+redo_pending_explicit_config_matches_v1() {
+  local key
+  if ((MODE_EXPLICIT == 1)); then
+    for key in MODE BASELINE_CHILDREN BASELINE_WAVES GROUP_WAVES INDIVIDUAL_RUNS GDB_MAX_RUNS; do
+      [[ "${!key}" == "$(metadata_value "$META_FILE" "$key")" ]] || return 1
+    done
+  else
+    ((GROUP_WAVES_EXPLICIT == 0)) || [[ "$GROUP_WAVES" == "$(metadata_value "$META_FILE" GROUP_WAVES)" ]] || return 1
+    ((INDIVIDUAL_RUNS_EXPLICIT == 0)) || [[ "$INDIVIDUAL_RUNS" == "$(metadata_value "$META_FILE" INDIVIDUAL_RUNS)" ]] || return 1
+    ((GDB_MAX_RUNS_EXPLICIT == 0)) || [[ "$GDB_MAX_RUNS" == "$(metadata_value "$META_FILE" GDB_MAX_RUNS)" ]] || return 1
+  fi
+  ((SKIP_GDB_EXPLICIT == 0)) || [[ "$SKIP_GDB" == "$(metadata_value "$META_FILE" SKIP_GDB)" ]]
+}
+
+# Reconcile an interrupted transaction before consent or any resumed-bundle
+# mutation. A plain resume adopts V2's target. Repeating --redo must name the
+# exact pending closure, and any explicitly repeated config must agree.
+reconcile_pending_redo_request() {
+  local marker="$STATE_DIR/redo.pending"
+  [[ -e "$marker" || -L "$marker" ]] || return 0
+  redo_transaction_validate "$marker" ||
+    diag_die "pending redo transaction is malformed; refusing bundle mutation"
+  redo_transaction_target_is_authorized ||
+    diag_die "pending redo target would relabel completed evidence outside its phase closure"
+  redo_transaction_pairs_are_recoverable ||
+    diag_die "pending redo has an unsafe or conflicting source/archive state"
+  redo_pending_phase_request_matches ||
+    diag_die "requested --redo phases conflict with the pending redo transaction"
+  if [[ "$REDO_TXN_VERSION" == 2 ]]; then
+    redo_pending_explicit_config_matches_v2 ||
+      diag_die "explicit configuration conflicts with the pending redo target"
+    redo_adopt_pending_config
+  else
+    redo_pending_explicit_config_matches_v1 ||
+      diag_die "explicit configuration conflicts with the V1 pending redo metadata"
+  fi
+  ((${#REDO_PLAN[@]} == 0)) || REDO_REQUEST_SATISFIED_BY_PENDING=1
 }
 
 redo_ensure_destination_parent() {
@@ -566,9 +820,60 @@ redo_source_parent_is_safe() {
   done
 }
 
+redo_destination_parent_is_safe_readonly() {
+  local stash="$1" relative="$2" current="$stash" part
+  local parent="${relative%/*}"
+  [[ "$parent" != "$relative" ]] || return 0
+  if [[ -e "$current" || -L "$current" ]]; then
+    [[ -d "$current" && ! -L "$current" ]] || return 1
+  else
+    return 0
+  fi
+  IFS='/' read -ra parts <<< "$parent"
+  for part in "${parts[@]}"; do
+    current="$current/$part"
+    if [[ -e "$current" || -L "$current" ]]; then
+      [[ -d "$current" && ! -L "$current" ]] || return 1
+    else
+      return 0
+    fi
+  done
+}
+
+# Validate the complete pending move set without creating archive directories.
+# main calls this before consent-adjacent logging or mkdir can mutate a resumed
+# bundle; execution repeats it to close the gap between reconciliation and use.
+redo_transaction_pairs_are_recoverable() {
+  local superseded="$STATE_DIR/superseded" stash="$STATE_DIR/superseded/$REDO_TXN_ID"
+  local i source dest bucket source_exists dest_exists
+  if [[ -e "$superseded" || -L "$superseded" ]]; then
+    [[ -d "$superseded" && ! -L "$superseded" ]] || return 1
+  fi
+  if [[ -e "$stash" || -L "$stash" ]]; then
+    [[ -d "$stash" && ! -L "$stash" ]] || return 1
+  fi
+  for ((i = 0; i < ${#REDO_TXN_PATHS[@]}; i++)); do
+    source="$OUT_DIR/${REDO_TXN_PATHS[$i]}"
+    bucket="${REDO_TXN_OWNERS[$i]}"
+    dest="$stash/$bucket/${REDO_TXN_PATHS[$i]}"
+    redo_source_parent_is_safe "${REDO_TXN_PATHS[$i]}" || return 1
+    redo_destination_parent_is_safe_readonly "$stash" "$bucket/${REDO_TXN_PATHS[$i]}" || return 1
+    source_exists=0
+    dest_exists=0
+    [[ -e "$source" || -L "$source" ]] && source_exists=1
+    [[ -e "$dest" || -L "$dest" ]] && dest_exists=1
+    ((source_exists + dest_exists == 1)) || return 1
+  done
+}
+
 redo_transaction_execute() {
   local marker="$STATE_DIR/redo.pending"
   redo_transaction_validate "$marker" || diag_die "pending redo transaction is malformed; refusing bundle mutation"
+  redo_transaction_target_is_authorized ||
+    diag_die "pending redo target would relabel completed evidence outside its phase closure"
+  redo_transaction_pairs_are_recoverable ||
+    diag_die "pending redo has an unsafe or conflicting source/archive state"
+  redo_adopt_pending_config
   local superseded="$STATE_DIR/superseded"
   if [[ -e "$superseded" || -L "$superseded" ]]; then
     [[ -d "$superseded" && ! -L "$superseded" ]] ||
@@ -601,13 +906,14 @@ redo_transaction_execute() {
   done
 
   # Invalidate the complete dependency closure before the first evidence move.
+  # meta.env remains on its previous, internally consistent generation until
+  # every archive move is complete.
   for phase in "${REDO_TXN_PHASES[@]}"; do
     rm -f -- "$STATE_DIR/phase-$phase.done" ||
       diag_die "pending redo could not invalidate phase $phase"
     [[ ! -e "$STATE_DIR/phase-$phase.done" && ! -L "$STATE_DIR/phase-$phase.done" ]] ||
       diag_die "pending redo could not invalidate phase $phase"
   done
-  sync_meta_completed || diag_die "pending redo could not synchronize completed phases"
   SESSION_DID_WORK=1
 
   for ((i = 0; i < ${#REDO_TXN_PATHS[@]}; i++)); do
@@ -627,8 +933,23 @@ redo_transaction_execute() {
       diag_die "pending redo has conflicting or missing source/archive state for ${REDO_TXN_PATHS[$i]}"
     fi
   done
+
+  if [[ "$REDO_TXN_VERSION" == 2 ]]; then
+    rewrite_meta_atomic 1 1
+  else
+    # V1 markers predate embedded config and were only published after their
+    # target config had already reached meta.env.
+    rewrite_meta_atomic 0 1
+  fi
+  redo_after_meta_publish ||
+    diag_die "pending redo interrupted after metadata publication"
   rm -f -- "$marker" || diag_die "pending redo completed but its transaction marker could not be removed"
+  sync -f "$STATE_DIR" || diag_die "pending redo could not synchronize transaction completion"
   diag_log "archive: previous evidence preserved under ${stash#"$OUT_DIR"/}; phases ${REDO_TXN_PHASES[*]} will run fresh"
+}
+
+redo_after_meta_publish() {
+  :
 }
 
 redo_record_if_present() {
@@ -652,19 +973,32 @@ redo_transaction_publish() {
   chmod 0600 "$REDO_MARKER_TEMP" || diag_die "cannot protect redo transaction"
   redo_transaction_validate "$REDO_MARKER_TEMP" ||
     diag_die "generated redo transaction failed validation"
-  mv -nT -- "$REDO_MARKER_TEMP" "$pending" || diag_die "cannot publish redo transaction"
+  redo_marker_rename "$REDO_MARKER_TEMP" "$pending" || diag_die "cannot publish redo transaction"
   [[ ! -e "$REDO_MARKER_TEMP" ]] || diag_die "another redo transaction appeared concurrently"
+  sync -f "$pending" || diag_die "cannot synchronize redo transaction"
+  sync -f "$STATE_DIR" || diag_die "cannot synchronize redo transaction directory"
   REDO_MARKER_TEMP=""
   REDO_NEW_TXN_ID=""
+  redo_after_marker_publish || diag_die "redo interrupted after transaction publication"
   redo_transaction_execute
+}
+
+redo_marker_rename() {
+  mv -nT -- "$1" "$2"
+}
+
+redo_after_marker_publish() {
+  :
 }
 
 apply_redo_plan() {
   ((${#REDO_PLAN[@]} > 0)) || return 0
+  ((REDO_REQUEST_SATISFIED_BY_PENDING == 0)) || return 0
   redo_transaction_prepare
   local phase path artifact
   {
-    printf 'VERSION\t1\nTXN\t%s\n' "$REDO_NEW_TXN_ID"
+    printf 'VERSION\t2\nTXN\t%s\n' "$REDO_NEW_TXN_ID"
+    redo_write_config_records
     for phase in "${REDO_PLAN[@]}"; do printf 'PHASE\t%s\n' "$phase"; done
     for path in results.json report.md privacy-review.txt manifest.txt; do
       redo_record_if_present DERIVED - "$path"
@@ -699,13 +1033,19 @@ recover_pending_redo() {
   [[ -e "$pending" || -L "$pending" ]] || return 0
   diag_log "recovering interrupted redo transaction before phase execution"
   redo_transaction_execute
+  REDO_RECOVERED_PENDING=1
 }
 
 redo_marker_temp_cleanup() {
-  [[ -n "$REDO_MARKER_TEMP" ]] || return 0
-  case "$REDO_MARKER_TEMP" in "$STATE_DIR"/.redo.pending.*) rm -f -- "$REDO_MARKER_TEMP" ;; esac
-  REDO_MARKER_TEMP=""
-  REDO_NEW_TXN_ID=""
+  if [[ -n "$REDO_MARKER_TEMP" ]]; then
+    case "$REDO_MARKER_TEMP" in "$STATE_DIR"/.redo.pending.*) rm -f -- "$REDO_MARKER_TEMP" ;; esac
+    REDO_MARKER_TEMP=""
+    REDO_NEW_TXN_ID=""
+  fi
+  if [[ -n "$META_UPDATE_TEMP" ]]; then
+    case "$META_UPDATE_TEMP" in "${META_FILE%/*}"/.meta.env.*) rm -f -- "$META_UPDATE_TEMP" ;; esac
+    META_UPDATE_TEMP=""
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -1597,7 +1937,9 @@ archive_incomplete_gdb_attempt() {
   redo_transaction_prepare
   local path
   {
-    printf 'VERSION\t1\nTXN\t%s\nPHASE\tgdb\n' "$REDO_NEW_TXN_ID"
+    printf 'VERSION\t2\nTXN\t%s\n' "$REDO_NEW_TXN_ID"
+    redo_write_config_records
+    printf 'PHASE\tgdb\n'
     for path in results.json report.md privacy-review.txt manifest.txt; do
       redo_record_if_present DERIVED - "$path"
     done
@@ -1843,6 +2185,15 @@ main() {
   fi
   validate_config
 
+  # A pending redo is authoritative for its seven persisted config keys. Read
+  # and reconcile it before dependency checks, topology discovery, consent, or
+  # any mutation of the resumed bundle.
+  if [[ -n "$RESUME_DIR" ]]; then
+    META_FILE="$OUT_DIR/results/meta.env"
+    STATE_DIR="$OUT_DIR/state"
+    reconcile_pending_redo_request
+  fi
+
   # Work from the repository root regardless of the caller's CWD.
   cd "$SCRIPT_DIR"
   [[ -f repro.mjs && -f child.mjs ]] ||
@@ -1914,10 +2265,17 @@ main() {
   fi
   # Stored configuration seeds resume defaults, but explicit CLI overrides
   # describe the run that is about to execute and must be reflected in JSON.
+  # A redo publishes its V2 target before changing config or evidence, then
+  # commits config with completion metadata after all archive moves. Ordinary
+  # resume overrides use the same atomic metadata rewrite without a marker.
   recover_pending_redo
-  persist_effective_config
-
-  apply_redo_plan
+  if ((REDO_RECOVERED_PENDING == 0)); then
+    if ((${#REDO_PLAN[@]} > 0)); then
+      apply_redo_plan
+    else
+      persist_effective_config
+    fi
+  fi
 
   # ---- phase 1 ----
   if phase_is_done preflight; then
