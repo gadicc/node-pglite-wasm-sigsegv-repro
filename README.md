@@ -215,10 +215,13 @@ interrupted archive is recovered before phase execution on the next resume.
 
 Per-CPU rates and baseline/group **wave** rates are reported with Wilson 95%
 confidence intervals. CPU localization is descriptive because its sequential
-batches are not exchangeable; the frequency legs get an exact comparison on
-SIGSEGV counts over valid runs plus, separately labelled, the
-binomial probability of the
-clean leg *under an assumed fixed baseline rate*. Concurrent children in a
+batches are not exchangeable. For the prespecified frequency A/B/A reversal,
+each turbo-on leg is compared separately with the turbo-off leg using a
+one-sided Fisher exact test on confirmed SIGSEGV counts over valid runs. A
+replicated reduction is claimed only when both comparisons are in the
+prespecified direction and both have p < 0.05 (reported conservatively as the
+larger p-value); the legs are not pooled, and an invalid run disables that
+inference. Concurrent children in a
 wave share timing, load, and machine state, so they are correlated rather than
 independent trials: child failure totals are descriptive, while a wave is
 positive if it contains at least one confirmed SIGSEGV, negative only when all
@@ -504,7 +507,7 @@ Consequences:
   A/B tests and, if it comes to it, an Intel erratum report.
 
 A frequency A/B/A test on core 19 (single-child runs, back-to-back in one
-session) shows the defect tracks the clock:
+session) showed an association with the tested clock conditions:
 
 | Condition | scaling_max_freq | Effective clock under load | Result |
 | --- | --- | --- | --- |
@@ -513,20 +516,24 @@ session) shows the defect tracks the clock:
 | Restored | 4.7 GHz | ~4.7 GHz boost | 9/20 runs SIGSEGV |
 | Turbo disabled (`intel_pstate/no_turbo=1`) | 2.1 GHz | non-turbo | 0/20 runs SIGSEGV |
 
-Against the combined stock rate of 15/40, the binomial probability of the
-capped 0/20 is ~8e-5. The independent no-turbo control also passed 20/20;
-with turbo disabled, sysfs reported a 2.1 GHz ceiling for CPU 19. Two
-caveats: the 800 MHz policy cap did not fully clamp (`scaling_cur_freq`
-still sampled 1.3-2.8 GHz under load, an intel_pstate/HWP behavior that
-prevents assigning an exact threshold from that test), and the stock
-per-run rate itself drifts between batches (30% then 45%). The two clean
-lower-frequency controls are nonetheless decisive: this is a
-frequency/voltage margin, not hard logic. The defective cores fail at high
-boost and pass when downclocked, consistent with marginal voltage at boost
-- firmware/BIOS voltage configuration, platform power delivery, or
-out-of-spec silicon. Disabling SaGV did not change the result (9/20), so
-system-agent voltage/frequency scaling is not required. The highest-value
-remaining control is a full stock-BIOS retest, ahead of any erratum report.
+For the prespecified A/cap/A reversal, the one-sided Fisher exact contrasts
+are 6/20 vs 0/20 (p = 0.0101) and 9/20 vs 0/20 (p = 0.000614), so the
+replicated gate reports the larger p-value, 0.0101. The independent no-turbo
+control also passed 20/20; with turbo disabled, sysfs reported a 2.1 GHz
+ceiling for CPU 19. Two caveats: the 800 MHz policy cap did not fully clamp
+(`scaling_cur_freq` still sampled 1.3-2.8 GHz under load, an intel_pstate/HWP
+behavior that prevents assigning an exact threshold from that test), and the
+stock per-run rate itself drifts between batches (30% then 45%). The repeated
+zero observed lower-frequency legs are associated with fewer failures in this
+session, but the sequential, non-randomized design does not establish a
+frequency or voltage-margin mechanism as causal and cannot exclude time/order
+effects. The pattern is consistent with marginal voltage at boost—whether
+from firmware/BIOS voltage configuration, platform power delivery, or
+out-of-spec silicon—but does not distinguish among those explanations.
+Disabling SaGV did not change the result (9/20), so system-agent
+voltage/frequency scaling is not required for the observed failure. The
+highest-value remaining control is a full stock-BIOS retest, ahead of any
+erratum report.
 
 Power-source controls on core 19, all with turbo enabled, reproduced the
 fault through either USB-C port and with the machine running on battery:

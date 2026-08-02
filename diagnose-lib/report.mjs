@@ -12,8 +12,7 @@ import path from "node:path";
 import {
   wilson,
   zeroFailureUpperBound,
-  fisherExact2x2,
-  binomZeroProbability,
+  fisherExactGreater,
 } from "./stats.mjs";
 
 function pct(x, digits = 1) {
@@ -168,30 +167,64 @@ function reproWaveStatsCell(result) {
 }
 
 function analyzeFrequencyAb(fa) {
-  const a1 = fa.legs.find((leg) => leg.leg === "A1");
-  const b = fa.legs.find((leg) => leg.leg === "B");
-  const a2 = fa.legs.find((leg) => leg.leg === "A2");
-  if (!a1 || !b || !a2) return null;
+  if (!Array.isArray(fa?.legs) || fa.legs.length !== 3) {
+    return { valid: false, issues: ["expected exactly one A1, B, and A2 leg"] };
+  }
+  const byName = new Map();
+  for (const leg of fa.legs) {
+    if (!["A1", "B", "A2"].includes(leg?.leg) || byName.has(leg.leg)) {
+      return { valid: false, issues: ["expected exactly one A1, B, and A2 leg"] };
+    }
+    byName.set(leg.leg, leg);
+  }
+  const a1 = byName.get("A1");
+  const b = byName.get("B");
+  const a2 = byName.get("A2");
+  if (!a1 || !b || !a2) {
+    return { valid: false, issues: ["expected exactly one A1, B, and A2 leg"] };
+  }
+  const issues = [];
+  for (const leg of [a1, b, a2]) {
+    if (!Number.isSafeInteger(leg.runs) || leg.runs <= 0 ||
+        !Number.isSafeInteger(leg.failures) || !Number.isSafeInteger(leg.sigsegv) ||
+        leg.failures < 0 || leg.failures > leg.runs || leg.sigsegv !== leg.failures) {
+      issues.push(`${leg.leg} has invalid or inconsistent run/SIGSEGV counts`);
+    }
+    if (!Array.isArray(leg.invalidRuns) || leg.invalidRuns.length > 0) {
+      issues.push(`${leg.leg} contains invalid or unverified runs`);
+    }
+  }
+  if (issues.length > 0) return { valid: false, issues };
+  if (!Number.isSafeInteger(a1.runs + b.runs) || !Number.isSafeInteger(a2.runs + b.runs)) {
+    return { valid: false, issues: ["frequency comparison totals exceed the safe integer range"] };
+  }
   const a1F = a1.sigsegv;
   const a2F = a2.sigsegv;
   const bF = b.sigsegv;
-  const aF = a1F + a2F;
-  const aN = a1.runs + a2.runs;
   const bN = b.runs;
-  const invalid = fa.legs.reduce((sum, leg) => sum + (leg.invalidRuns?.length ?? 0), 0);
+  const pA1GreaterB = fisherExactGreater(a1F, a1.runs - a1F, bF, bN - bF);
+  const pA2GreaterB = fisherExactGreater(a2F, a2.runs - a2F, bF, bN - bF);
+  const a1Directional = a1F / a1.runs > bF / bN;
+  const a2Directional = a2F / a2.runs > bF / bN;
+  const replicatedP = Math.max(pA1GreaterB, pA2GreaterB);
+  const replicatedReduction = a1Directional && a2Directional &&
+    pA1GreaterB < 0.05 && pA2GreaterB < 0.05;
   return {
+    valid: true,
+    issues: [],
     a1,
     b,
     a2,
     a1F,
     a2F,
     bF,
-    aF,
-    aN,
     bN,
-    invalid,
-    bothAReproduced: a1F > 0 && a2F > 0,
-    aLegsDiscordant: (a1F > 0) !== (a2F > 0),
+    pA1GreaterB,
+    pA2GreaterB,
+    replicatedP,
+    a1Directional,
+    a2Directional,
+    replicatedReduction,
   };
 }
 
@@ -453,22 +486,23 @@ export function renderReport(results) {
     }
     L.push("");
     const fx = analyzeFrequencyAb(fa);
-    if (fx?.aLegsDiscordant) {
-      L.push(`The turbo-on legs disagree (A1 ${fx.a1F}/${fx.a1.runs}, A2 ${fx.a2F}/${fx.a2.runs}). This is compatible with temporal drift or an order effect, so the pooled turbo-on contrast is omitted and no suppression claim is made.`);
-      L.push("");
-    } else if (fx?.bothAReproduced && fx.aN > 0 && fx.bN > 0) {
-      const p = fisherExact2x2(fx.aF, fx.aN - fx.aF, fx.bF, fx.bN - fx.bF);
-      L.push(`Both turbo-on legs reproduced (A1 ${fx.a1F}/${fx.a1.runs}, A2 ${fx.a2F}/${fx.a2.runs}). Fisher exact test on their pooled SIGSEGV counts (${fx.aF}/${fx.aN}) vs turbo-off (${fx.bF}/${fx.bN}): two-sided p = ${p.toExponential(2)}.${fx.invalid > 0 ? ` ${fx.invalid} invalid run(s) excluded (non-SIGSEGV exits).` : ""}`);
-      if (fx.bF === 0) {
-        const assumed = fx.aF / fx.aN;
-        L.push(``);
-        L.push(`Separately, *assuming a fixed per-run baseline rate equal to the pooled turbo-on rate* (${pct(assumed)}), the probability of observing 0/${fx.bN} under turbo-off is ${binomZeroProbability(fx.bN, assumed).toExponential(2)} (binomial, assumption stated, not a confidence statement).`);
+    if (!fx.valid) {
+      L.push(`Frequency inference is unavailable: ${fx.issues.join("; ")}. The leg rows remain descriptive, but no reduction or suppression claim is made.`);
+    } else {
+      L.push(`Prespecified directional Fisher exact tests (turbo-on failure rate > turbo-off): A1 vs B p = ${fx.pA1GreaterB.toExponential(2)}; A2 vs B p = ${fx.pA2GreaterB.toExponential(2)}. Replicated gate p = max(p1, p2) = ${fx.replicatedP.toExponential(2)} (both comparisons must be directional and strictly p < 0.05).`);
+      if (fx.replicatedReduction && fx.bF === 0) {
+        L.push(`Both directional comparisons pass and the sampled turbo-off leg had zero observed failures (0/${fx.bN}). This does not prove a zero failure rate.`);
+        L.push("The sequential, non-randomized A/B/A result supports an association under this session's conditions; it does not by itself establish frequency as the cause or exclude time/order confounding.");
+      } else if (fx.replicatedReduction) {
+        L.push(`Both directional comparisons pass, supporting a replicated observed reduction in the turbo-off leg (${fx.bF}/${fx.bN}); failures were not completely suppressed.`);
+        L.push("The sequential, non-randomized A/B/A result supports an association under this session's conditions; it does not by itself establish frequency as the cause or exclude time/order confounding.");
+      } else if (!fx.a1Directional || !fx.a2Directional) {
+        L.push("The prespecified direction was not observed in both comparisons, so the reversal gate failed and no reduction or suppression claim is made.");
+      } else {
+        L.push("Both point estimates were in the prespecified direction, but at least one exact comparison did not pass p < 0.05; the replicated gate failed and no reduction or suppression claim is made.");
       }
-      L.push("");
-    } else if (fx && fx.a1F === 0 && fx.a2F === 0) {
-      L.push(`Neither turbo-on leg reproduced (A1 0/${fx.a1.runs}, A2 0/${fx.a2.runs}); the A/B/A experiment cannot establish suppression.${fx.bF > 0 ? ` The turbo-off leg itself had ${fx.bF}/${fx.bN} SIGSEGV.` : ""}`);
-      L.push("");
     }
+    L.push("");
   } else if (r.frequencyAbStatus?.status === "incomplete") {
     L.push("Incomplete manual A/B/A artifacts were preserved but excluded from");
     L.push("all statistics and conclusions:");
@@ -732,30 +766,22 @@ function renderConclusions(r) {
     C.push(`- **Group isolation**: SIGSEGV in group(s) ${failingGroups.map((g) => `${g.name} (${g.cpus})`).join(", ")}; clean group(s): ${cleanGroups.length > 0 ? cleanGroups.map((g) => `${g.name} (${g.cpus})`).join(", ") : "none"}${unresolvedGroups.length > 0 ? `; no clean group conclusion for: ${unresolvedGroups.map((g) => `${g.name} (${g.cpus})`).join(", ")}` : ""}.`);
   }
 
-  // 3. Frequency effect: the prespecified two-group contrast (turbo-on vs
-  // turbo-off) uses SIGSEGV counts over valid runs only; non-SIGSEGV exits
-  // are invalid runs and never enter the test.
+  // 3. Frequency effect: each turbo-on leg must independently pass the
+  // prespecified directional comparison against turbo-off. Pooling cannot
+  // rescue a failed reversal, and any invalid run disables inference.
   if (r.frequencyAb) {
     const fa = r.frequencyAb;
     const fx = analyzeFrequencyAb(fa);
-    if (fx) {
-      const invalidNote = fx.invalid > 0 ? ` ${fx.invalid} invalid run(s) excluded (non-SIGSEGV exits).` : "";
-      if (fx.aLegsDiscordant) {
-        C.push(`- Frequency A/B/A is **inconclusive because the reversal failed**: A1 produced ${fx.a1F}/${fx.a1.runs} SIGSEGV while A2 produced ${fx.a2F}/${fx.a2.runs}. Temporal drift or order confounding cannot be separated from a frequency effect, so no pooled suppression inference is reported.${invalidNote}`);
-      } else if (fx.bothAReproduced && fx.aN > 0 && fx.bN > 0) {
-        const p = fisherExact2x2(fx.aF, fx.aN - fx.aF, fx.bF, fx.bN - fx.bF);
-        if (fx.bF === 0 && p < 0.05) {
-          C.push(`- **Frequency dependence**: both turbo-on legs reproduced (A1 ${fx.a1F}/${fx.a1.runs}, A2 ${fx.a2F}/${fx.a2.runs}) while turbo-off was clean (0/${fx.bN}); pooled Fisher exact p = ${p.toExponential(2)}. The reversible pattern supports suppression at lower frequency in this session, consistent with a frequency/voltage margin rather than hard logic.${invalidNote}`);
-        } else if (fx.bF > 0) {
-          C.push(`- Frequency A/B/A: both turbo-on legs reproduced, but SIGSEGV also occurred with turbo disabled (${fx.bF}/${fx.bN} vs ${fx.aF}/${fx.aN} pooled turbo-on; Fisher exact p = ${p.toExponential(2)}). Downclocking did not fully suppress the failure in this session.${invalidNote}`);
-        } else {
-          C.push(`- Frequency A/B/A showed a reversible pattern (A1 ${fx.a1F}/${fx.a1.runs}, turbo-off 0/${fx.bN}, A2 ${fx.a2F}/${fx.a2.runs}), but the pooled Fisher exact p = ${p.toExponential(2)} is inconclusive at this sample size.${invalidNote}`);
-        }
-      } else if (fx.a1F === 0 && fx.a2F === 0 && fx.bF === 0) {
-        C.push(`- Frequency A/B/A: no failures in any leg; the test is uninformative for frequency dependence (the defect did not reproduce in either turbo-on leg).${invalidNote}`);
-      } else {
-        C.push(`- Frequency A/B/A: neither turbo-on leg reproduced, while turbo-off produced ${fx.bF}/${fx.bN} SIGSEGV; this does not support suppression at lower frequency.${invalidNote}`);
-      }
+    if (!fx.valid) {
+      C.push(`- Frequency A/B/A inference is unavailable because ${fx.issues.join("; ")}; leg counts are descriptive only and support no reduction or suppression claim.`);
+    } else if (fx.replicatedReduction && fx.bF === 0) {
+      C.push(`- **Frequency-associated zero observed failures during turbo-off**: A1 ${fx.a1F}/${fx.a1.runs}, B 0/${fx.bN}, A2 ${fx.a2F}/${fx.a2.runs}; replicated directional Fisher gate p = ${fx.replicatedP.toExponential(2)}. This means no failures were observed in the sampled B leg, not that its true rate is zero. The sequential, non-randomized design supports an association in this session but does not by itself establish frequency as causal or exclude time/order confounding.`);
+    } else if (fx.replicatedReduction) {
+      C.push(`- **Frequency-associated replicated reduction**: A1 ${fx.a1F}/${fx.a1.runs}, B ${fx.bF}/${fx.bN}, A2 ${fx.a2F}/${fx.a2.runs}; replicated directional Fisher gate p = ${fx.replicatedP.toExponential(2)}. Failures persisted in B, so this is not complete suppression. The sequential, non-randomized design supports an association in this session but does not by itself establish frequency as causal or exclude time/order confounding.`);
+    } else if (!fx.a1Directional || !fx.a2Directional) {
+      C.push(`- Frequency A/B/A: the prespecified reduction direction was not observed in both A-vs-B comparisons (one-sided p1=${fx.pA1GreaterB.toExponential(2)}, p2=${fx.pA2GreaterB.toExponential(2)}); the reversal gate failed and no reduction or suppression claim is made.`);
+    } else {
+      C.push(`- Frequency A/B/A: both point estimates favored fewer failures in B, but the replicated directional Fisher gate did not pass (p1=${fx.pA1GreaterB.toExponential(2)}, p2=${fx.pA2GreaterB.toExponential(2)}, max=${fx.replicatedP.toExponential(2)}; each must be <0.05). No reduction or suppression claim is made.`);
     }
   } else if (r.frequencyAbStatus?.status === "incomplete") {
     C.push("- Frequency dependence was not analyzed because the manual A/B/A artifacts are incomplete or restoration was not verified.");

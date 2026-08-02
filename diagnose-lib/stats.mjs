@@ -4,6 +4,7 @@
 //   node stats.mjs wilson <failures> <n>
 //   node stats.mjs zero-upper <n> [confidence]
 //   node stats.mjs fisher <a> <b> <c> <d>
+//   node stats.mjs fisher-greater <a> <b> <c> <d>
 //   node stats.mjs binom-zero <n> <rate>
 //
 // All probability computations use log-space arithmetic so they stay
@@ -105,6 +106,32 @@ export function fisherExact2x2(a, b, c, d) {
   return Math.min(1, p);
 }
 
+// Fisher's exact one-sided upper-tail test for a greater failure rate in
+// group 1 than group 2. With fixed margins, sum every supported table whose
+// group-1 failure count is at least the observed count.
+export function fisherExactGreater(a, b, c, d) {
+  for (const v of [a, b, c, d]) {
+    if (!Number.isSafeInteger(v) || v < 0) {
+      throw new Error(`fisherExactGreater: invalid cell value ${v}`);
+    }
+  }
+  const r1 = a + b;
+  const r2 = c + d;
+  const col1 = a + c;
+  const n = r1 + r2;
+  if (!Number.isSafeInteger(r1) || !Number.isSafeInteger(r2) ||
+      !Number.isSafeInteger(col1) || !Number.isSafeInteger(n)) {
+    throw new Error("fisherExactGreater: table totals exceed the safe integer range");
+  }
+  if (n === 0) return 1;
+  const hi = Math.min(r1, col1);
+  let p = 0;
+  for (let x = a; x <= hi; x += 1) {
+    p += hypergeomProb(x, r1, r2, col1, n);
+  }
+  return Math.min(1, p);
+}
+
 // Probability of observing zero failures in n independent trials if the
 // true per-trial failure rate were `rate`. This is NOT a confidence
 // statement; callers must label the assumed baseline rate explicitly.
@@ -145,6 +172,9 @@ function cli(argv) {
     case "fisher":
       out = { pTwoSided: fisherExact2x2(nums[0], nums[1], nums[2], nums[3]) };
       break;
+    case "fisher-greater":
+      out = { pGreater: fisherExactGreater(nums[0], nums[1], nums[2], nums[3]) };
+      break;
     case "binom-zero":
       out = { probability: binomZeroProbability(nums[0], nums[1]) };
       break;
@@ -153,7 +183,7 @@ function cli(argv) {
       break;
     default:
       console.error(
-        "usage: node stats.mjs <wilson|zero-upper|fisher|binom-zero|summarize> ...",
+        "usage: node stats.mjs <wilson|zero-upper|fisher|fisher-greater|binom-zero|summarize> ...",
       );
       process.exitCode = 2;
       return;

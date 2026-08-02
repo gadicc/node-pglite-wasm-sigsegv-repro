@@ -958,7 +958,7 @@ test("renderReport: stale cap artifacts are explicitly excluded", () => {
   assert.doesNotMatch(md, /requested cap .* MHz/);
 });
 
-test("renderReport: discordant A legs cannot support a pooled suppression claim", () => {
+function renderFrequencyCase(a1Failures, bFailures, a2Failures, overrides = {}) {
   const leg = (name, failures, noTurbo) => ({
     leg: name,
     runs: 20,
@@ -967,21 +967,89 @@ test("renderReport: discordant A legs cannot support a pooled suppression claim"
     invalidRuns: [],
     noTurbo,
   });
-  const md = renderReport({
+  const legs = [leg("A1", a1Failures, 0), leg("B", bFailures, 1), leg("A2", a2Failures, 0)];
+  for (const [index, patch] of Object.entries(overrides)) Object.assign(legs[Number(index)], patch);
+  return renderReport({
     collectedAt: "2026-08-02T00:00:00.000Z",
     config: {},
     environment: {},
     frequencyAb: {
       cpu: 19,
       restored: true,
-      legs: [leg("A1", 20, 0), leg("B", 0, 1), leg("A2", 0, 0)],
+      legs,
     },
   });
-  assert.match(md, /turbo-on legs disagree/);
-  assert.match(md, /reversal failed/);
-  assert.match(md, /no pooled suppression inference/);
-  assert.doesNotMatch(md, /Lower frequency suppressed/);
-  assert.doesNotMatch(md, /Fisher exact test on their pooled/);
+}
+
+test("renderReport: a strong pooled contrast cannot rescue a failed A2 replication", () => {
+  const md = renderFrequencyCase(20, 0, 1);
+  assert.match(md, /A1 vs B p = 7\.25e-12; A2 vs B p = 5\.00e-1/);
+  assert.match(md, /Replicated gate p = max\(p1, p2\) = 5\.00e-1/);
+  assert.match(md, /replicated gate failed/);
+  assert.doesNotMatch(md, /\*\*Frequency-associated/);
+  assert.doesNotMatch(md, /pooled Fisher|fixed per-run baseline rate/);
+});
+
+test("renderReport: replicated directional gate supports zero observed turbo-off failures", () => {
+  const md = renderFrequencyCase(5, 0, 5);
+  assert.match(md, /Replicated gate p = max\(p1, p2\) = 2\.36e-2/);
+  assert.match(md, /Frequency-associated zero observed failures during turbo-off/);
+  assert.match(md, /not that its true rate is zero/);
+  assert.match(md, /does not by itself establish frequency as causal/);
+  assert.doesNotMatch(md, /binomial|pooled/);
+});
+
+test("renderReport: B failures distinguish replicated reduction from complete suppression", () => {
+  const md = renderFrequencyCase(10, 1, 10);
+  assert.match(md, /Frequency-associated replicated reduction/);
+  assert.match(md, /Failures persisted in B|Failures were not completely suppressed/);
+  assert.doesNotMatch(md, /Frequency-associated complete observed suppression/);
+});
+
+test("renderReport: low counts, strict boundary, and wrong direction fail closed", () => {
+  const low = renderFrequencyCase(1, 0, 1, {
+    0: { runs: 1 }, 1: { runs: 1 }, 2: { runs: 1 },
+  });
+  assert.match(low, /max\(p1, p2\) = 5\.00e-1/);
+  assert.match(low, /replicated gate failed/);
+  assert.doesNotMatch(low, /\*\*Frequency-associated/);
+
+  const boundary = renderFrequencyCase(4, 0, 4);
+  assert.match(boundary, /max\(p1, p2\) = 5\.30e-2/);
+  assert.match(boundary, /each must be <0\.05/);
+  assert.doesNotMatch(boundary, /\*\*Frequency-associated/);
+
+  const wrongDirection = renderFrequencyCase(0, 1, 5);
+  assert.match(wrongDirection, /prespecified direction was not observed/);
+  assert.match(wrongDirection, /reversal gate failed/);
+  assert.doesNotMatch(wrongDirection, /\*\*Frequency-associated/);
+});
+
+test("renderReport: invalid counts, invalid runs, and duplicate legs disable inference", () => {
+  const inconsistent = renderFrequencyCase(5, 0, 5, { 0: { sigsegv: 4 } });
+  assert.match(inconsistent, /inference is unavailable.*invalid or inconsistent/);
+  assert.match(inconsistent, /descriptive only/);
+  assert.doesNotMatch(inconsistent, /\*\*Frequency-associated/);
+
+  const zeroRuns = renderFrequencyCase(5, 0, 5, { 0: { runs: 0 } });
+  assert.match(zeroRuns, /inference is unavailable.*invalid or inconsistent/);
+  assert.match(zeroRuns, /descriptive only/);
+  assert.doesNotMatch(zeroRuns, /\*\*Frequency-associated/);
+
+  const invalidRun = renderFrequencyCase(5, 0, 5, { 2: { invalidRuns: [{ run: 1, rc: 126 }] } });
+  assert.match(invalidRun, /inference is unavailable.*contains invalid/);
+  assert.doesNotMatch(invalidRun, /\*\*Frequency-associated/);
+
+  const duplicate = renderFrequencyCase(5, 0, 5, { 2: { leg: "A1" } });
+  assert.match(duplicate, /inference is unavailable.*exactly one A1, B, and A2/);
+  assert.doesNotMatch(duplicate, /\*\*Frequency-associated/);
+});
+
+test("renderReport: discordant A legs cannot support a suppression claim", () => {
+  const md = renderFrequencyCase(20, 0, 0);
+  assert.match(md, /prespecified direction was not observed/);
+  assert.match(md, /reversal gate failed/);
+  assert.doesNotMatch(md, /\*\*Frequency-associated/);
 });
 
 test("renderReport: GDB failure is not described as a clean bounded run", () => {

@@ -4,6 +4,7 @@ import {
   wilson,
   zeroFailureUpperBound,
   fisherExact2x2,
+  fisherExactGreater,
   binomZeroProbability,
   summarize,
 } from "../stats.mjs";
@@ -63,6 +64,25 @@ test("fisherExact2x2: identical rates give p = 1", () => {
 
 test("fisherExact2x2: symmetric in group order", () => {
   closeTo(fisherExact2x2(1, 9, 5, 5), fisherExact2x2(5, 5, 1, 9), 1e-12);
+});
+
+test("fisherExactGreater: validated one-sided upper-tail reference values", () => {
+  closeTo(fisherExactGreater(5, 15, 0, 20), 34 / 1443, 1e-12);
+  closeTo(fisherExactGreater(1, 19, 0, 20), 0.5, 1e-12);
+  closeTo(fisherExactGreater(4, 16, 0, 20), 51 / 962, 1e-12);
+  closeTo(fisherExactGreater(20, 0, 0, 20), 7.254444551924844e-12, 1e-20);
+  closeTo(fisherExactGreater(0, 20, 5, 15), 1, 1e-12);
+  closeTo(fisherExactGreater(5, 15, 5, 15), 0.6417867224318657, 1e-12);
+});
+
+test("fisherExactGreater: rejects invalid cells and unsafe margins", () => {
+  for (const cells of [
+    [-1, 1, 1, 1], [0.5, 1, 1, 1], [Number.NaN, 1, 1, 1],
+    [Number.MAX_SAFE_INTEGER, 1, 0, 0],
+  ]) {
+    assert.throws(() => fisherExactGreater(...cells));
+  }
+  assert.equal(fisherExactGreater(0, 0, 0, 0), 1);
 });
 
 test("binomZeroProbability: README's ~8e-5 example", () => {
