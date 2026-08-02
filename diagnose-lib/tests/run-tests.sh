@@ -151,6 +151,27 @@ prepare_frequency_publish_stage() {
     "$stage/publish-control.meta"
 }
 
+write_derived_output_fixture() {
+  local bundle="$1" name
+  for name in manifest.txt privacy-review.txt results.json report.md; do
+    printf 'stale %s\n' "$name" > "$bundle/$name"
+  done
+}
+
+derived_outputs_absent() {
+  local bundle="$1" name
+  for name in manifest.txt privacy-review.txt results.json report.md; do
+    [[ ! -e "$bundle/$name" && ! -L "$bundle/$name" ]] || return 1
+  done
+}
+
+derived_outputs_present() {
+  local bundle="$1" name
+  for name in manifest.txt privacy-review.txt results.json report.md; do
+    [[ -e "$bundle/$name" || -L "$bundle/$name" ]] || return 1
+  done
+}
+
 # Shared real/alternate CPU fixtures for persisted selection-policy tests.
 TEST_ONLINE_CPUS="$(sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' /proc/self/status)"
 TEST_ONLINE_CPU="$(diag_cpulist_expand "$TEST_ONLINE_CPUS" | head -1)"
@@ -913,6 +934,10 @@ if ((EUID != 0)); then
   chmod 0700 "$PUBLISH_STAGE" "$PUBLISH_STAGE/results" "$PUBLISH_STAGE/freq"
   printf 'old command\n' > "$PUBLISH_BUNDLE/commands.log"
   touch "$PUBLISH_BUNDLE/state/phase-frequency.done"
+  write_derived_output_fixture "$PUBLISH_BUNDLE"
+  printf 'safe derived victim\n' > "$TMP/frequency-derived-victim"
+  rm -f "$PUBLISH_BUNDLE/privacy-review.txt"
+  ln -s "$TMP/frequency-derived-victim" "$PUBLISH_BUNDLE/privacy-review.txt"
   printf 'safe victim\n' > "$TMP/frequency-publish-victim"
   ln -s "$TMP/frequency-publish-victim" "$PUBLISH_BUNDLE/results/frequency-ab.tsv"
   printf 'new evidence\n' > "$PUBLISH_STAGE/results/frequency-ab.tsv"
@@ -938,8 +963,25 @@ if ((EUID != 0)); then
     grep -q '^old command$' "$PUBLISH_BUNDLE/commands.log" &&
     grep -q '^new command$' "$PUBLISH_BUNDLE/commands.log" &&
     [[ ! -e "$PUBLISH_BUNDLE/state/phase-frequency.done" ]] &&
+    derived_outputs_absent "$PUBLISH_BUNDLE" &&
+    [[ "$(cat "$TMP/frequency-derived-victim")" == "safe derived victim" ]] &&
     [[ ! -e "$PUBLISH_STAGE" ]] && publish_safe=1
-  check_eq "frequency publisher replaces a raced symlink and invalidates the old marker" "1" "$publish_safe"
+  check_eq "frequency publisher invalidates derived outputs before replacing evidence" "1" "$publish_safe"
+
+  DERIVED_CRASH_BUNDLE="$TMP/frequency-derived-crash-bundle"
+  DERIVED_CRASH_STAGE="$TMP/frequency-derived-crash-stage"
+  mkdir -p "$DERIVED_CRASH_BUNDLE"/{results,freq,state}
+  prepare_frequency_publish_stage "$DERIVED_CRASH_STAGE" 0
+  printf 'old evidence\n' > "$DERIVED_CRASH_BUNDLE/results/frequency-ab.tsv"
+  printf 'old command\n' > "$DERIVED_CRASH_BUNDLE/commands.log"
+  touch "$DERIVED_CRASH_BUNDLE/state/phase-frequency.done"
+  write_derived_output_fixture "$DERIVED_CRASH_BUNDLE"
+  DIAG_TEST_PUBLISH_KILL_AFTER_MANIFEST_INVALIDATION=1 \
+    bash "$LIB/publish-frequency-output.sh" "$DERIVED_CRASH_STAGE" "$DERIVED_CRASH_BUNDLE" \
+    > /dev/null 2>&1
+  derived_crash_rc=$?
+  check_eq "post-manifest crash leaves evidence untouched behind an absent manifest" "1" \
+    "$([[ $derived_crash_rc -ne 0 && ! -e "$DERIVED_CRASH_BUNDLE/manifest.txt" && -f "$DERIVED_CRASH_BUNDLE/privacy-review.txt" && -f "$DERIVED_CRASH_BUNDLE/results.json" && -f "$DERIVED_CRASH_BUNDLE/report.md" && "$(cat "$DERIVED_CRASH_BUNDLE/results/frequency-ab.tsv")" == "old evidence" && "$(cat "$DERIVED_CRASH_BUNDLE/commands.log")" == "old command" && -f "$DERIVED_CRASH_BUNDLE/state/phase-frequency.done" && -f "$DERIVED_CRASH_STAGE/results/frequency-ab.tsv" ]] && echo 1 || echo 0)"
 
   NO_CAP_BUNDLE="$TMP/frequency-no-cap-bundle"
   NO_CAP_STAGE="$TMP/frequency-no-cap-stage"
@@ -991,10 +1033,26 @@ if ((EUID != 0)); then
   prepare_frequency_publish_stage "$MALFORMED_CONTROL_STAGE" 0
   printf 'CAP_REQUESTED=0\n' >> "$MALFORMED_CONTROL_STAGE/publish-control.meta"
   touch "$MALFORMED_CONTROL_BUNDLE/state/phase-frequency.done"
+  write_derived_output_fixture "$MALFORMED_CONTROL_BUNDLE"
   bash "$LIB/publish-frequency-output.sh" "$MALFORMED_CONTROL_STAGE" "$MALFORMED_CONTROL_BUNDLE" > /dev/null 2>&1
   malformed_control_rc=$?
-  check_eq "malformed publication control fails before marker invalidation" "1" \
-    "$([[ $malformed_control_rc -ne 0 && -f "$MALFORMED_CONTROL_BUNDLE/state/phase-frequency.done" && -f "$MALFORMED_CONTROL_STAGE/results/frequency-ab.tsv" ]] && echo 1 || echo 0)"
+  check_eq "malformed staging preserves derived outputs, marker, and evidence" "1" \
+    "$([[ $malformed_control_rc -ne 0 && -f "$MALFORMED_CONTROL_BUNDLE/state/phase-frequency.done" && -f "$MALFORMED_CONTROL_STAGE/results/frequency-ab.tsv" ]] && derived_outputs_present "$MALFORMED_CONTROL_BUNDLE" && [[ "$(cat "$MALFORMED_CONTROL_BUNDLE/manifest.txt")" == "stale manifest.txt" ]] && echo 1 || echo 0)"
+
+  NONREPLACEABLE_DERIVED_BUNDLE="$TMP/frequency-nonreplaceable-derived-bundle"
+  NONREPLACEABLE_DERIVED_STAGE="$TMP/frequency-nonreplaceable-derived-stage"
+  mkdir -p "$NONREPLACEABLE_DERIVED_BUNDLE"/{results,freq,state}
+  prepare_frequency_publish_stage "$NONREPLACEABLE_DERIVED_STAGE" 0
+  printf 'old evidence\n' > "$NONREPLACEABLE_DERIVED_BUNDLE/results/frequency-ab.tsv"
+  touch "$NONREPLACEABLE_DERIVED_BUNDLE/state/phase-frequency.done"
+  write_derived_output_fixture "$NONREPLACEABLE_DERIVED_BUNDLE"
+  rm -f "$NONREPLACEABLE_DERIVED_BUNDLE/report.md"
+  mkdir "$NONREPLACEABLE_DERIVED_BUNDLE/report.md"
+  bash "$LIB/publish-frequency-output.sh" \
+    "$NONREPLACEABLE_DERIVED_STAGE" "$NONREPLACEABLE_DERIVED_BUNDLE" > /dev/null 2>&1
+  nonreplaceable_derived_rc=$?
+  check_eq "nonreplaceable derived output is rejected before manifest or evidence mutation" "1" \
+    "$([[ $nonreplaceable_derived_rc -ne 0 && -f "$NONREPLACEABLE_DERIVED_BUNDLE/manifest.txt" && -d "$NONREPLACEABLE_DERIVED_BUNDLE/report.md" && "$(cat "$NONREPLACEABLE_DERIVED_BUNDLE/results/frequency-ab.tsv")" == "old evidence" && -f "$NONREPLACEABLE_DERIVED_BUNDLE/state/phase-frequency.done" && -f "$NONREPLACEABLE_DERIVED_STAGE/results/frequency-ab.tsv" ]] && echo 1 || echo 0)"
 
   UNTERMINATED_CONTROL_BUNDLE="$TMP/frequency-unterminated-control-bundle"
   UNTERMINATED_CONTROL_STAGE="$TMP/frequency-unterminated-control-stage"
@@ -1186,7 +1244,10 @@ if ((EUID != 0)); then
 else
   ok "frequency-ab.sh non-root guard [skipped while tests run as root]"
   ok "root-checks.sh non-root guard [skipped while tests run as root]"
-  ok "frequency publisher replaces a raced symlink and invalidates the old marker [skipped while tests run as root]"
+  ok "frequency publisher invalidates derived outputs before replacing evidence [skipped while tests run as root]"
+  ok "post-manifest crash leaves evidence untouched behind an absent manifest [skipped while tests run as root]"
+  ok "malformed staging preserves derived outputs, marker, and evidence [skipped while tests run as root]"
+  ok "nonreplaceable derived output is rejected before manifest or evidence mutation [skipped while tests run as root]"
   ok "unprivileged frequency publisher rejects a command-log symlink [skipped while tests run as root]"
   ok "frequency publisher aborts before artifact moves when marker invalidation fails [skipped while tests run as root]"
   ok "killed mixed-generation publish cannot satisfy assessFrequencyAb [skipped while tests run as root]"
@@ -1209,6 +1270,7 @@ if ((EUID != 0)); then
   ROOT_PUBLISH="$TMP/root-checks-publish"
   root_publish_stage_prepare "$ROOT_PUBLISH/stage"
   mkdir -p "$ROOT_PUBLISH/bundle/env/root"
+  write_derived_output_fixture "$ROOT_PUBLISH/bundle"
   printf 'safe root-checks victim\n' > "$ROOT_PUBLISH/victim"
   ln -s "$ROOT_PUBLISH/victim" "$ROOT_PUBLISH/bundle/env/root/cctk.txt"
   bash "$LIB/publish-root-checks-output.sh" "$ROOT_PUBLISH/stage" "$ROOT_PUBLISH/bundle" \
@@ -1220,8 +1282,22 @@ if ((EUID != 0)); then
     [[ -f "$ROOT_PUBLISH/bundle/env/root/cctk.txt" && ! -L "$ROOT_PUBLISH/bundle/env/root/cctk.txt" ]] &&
     [[ "$(cat "$ROOT_PUBLISH/bundle/env/root/cctk.txt")" == "staged cctk.txt" ]] &&
     [[ "$(stat -Lc '%a' "$ROOT_PUBLISH/bundle/env/root/cctk.txt")" == "644" ]] &&
+    derived_outputs_absent "$ROOT_PUBLISH/bundle" &&
     [[ ! -e "$ROOT_PUBLISH/stage" ]] && root_publish_safe=1
-  check_eq "unprivileged root-checks publisher safely replaces an output symlink" "1" "$root_publish_safe"
+  check_eq "root-checks publisher invalidates derived outputs before replacing evidence" "1" "$root_publish_safe"
+
+  ROOT_INVALID_STAGE="$TMP/root-checks-invalid-stage"
+  root_publish_stage_prepare "$ROOT_INVALID_STAGE/stage"
+  mkdir -p "$ROOT_INVALID_STAGE/bundle/env/root"
+  printf 'old root evidence\n' > "$ROOT_INVALID_STAGE/bundle/env/root/cctk.txt"
+  write_derived_output_fixture "$ROOT_INVALID_STAGE/bundle"
+  rm -f "$ROOT_INVALID_STAGE/stage/cctk.txt"
+  mkdir "$ROOT_INVALID_STAGE/stage/cctk.txt"
+  bash "$LIB/publish-root-checks-output.sh" \
+    "$ROOT_INVALID_STAGE/stage" "$ROOT_INVALID_STAGE/bundle" > /dev/null 2>&1
+  root_invalid_stage_rc=$?
+  check_eq "invalid root-checks staging preserves every derived output and evidence" "1" \
+    "$([[ $root_invalid_stage_rc -ne 0 && "$(cat "$ROOT_INVALID_STAGE/bundle/env/root/cctk.txt")" == "old root evidence" && -d "$ROOT_INVALID_STAGE/stage/cctk.txt" ]] && derived_outputs_present "$ROOT_INVALID_STAGE/bundle" && [[ "$(cat "$ROOT_INVALID_STAGE/bundle/manifest.txt")" == "stale manifest.txt" ]] && echo 1 || echo 0)"
 
   ROOT_SUBSTITUTE="$TMP/root-checks-substitute"
   root_publish_stage_prepare "$ROOT_SUBSTITUTE/stage"
@@ -1234,7 +1310,8 @@ if ((EUID != 0)); then
   check_eq "unprivileged root-checks publisher rejects output-directory substitution" "1" \
     "$([[ $root_substitute_rc -ne 0 && "$(cat "$ROOT_SUBSTITUTE/substitute/sentinel")" == "safe directory victim" && ! -e "$ROOT_SUBSTITUTE/substitute/cctk.txt" && -f "$ROOT_SUBSTITUTE/stage/cctk.txt" ]] && echo 1 || echo 0)"
 else
-  ok "unprivileged root-checks publisher safely replaces an output symlink [skipped while tests run as root]"
+  ok "root-checks publisher invalidates derived outputs before replacing evidence [skipped while tests run as root]"
+  ok "invalid root-checks staging preserves every derived output and evidence [skipped while tests run as root]"
   ok "unprivileged root-checks publisher rejects output-directory substitution [skipped while tests run as root]"
 fi
 

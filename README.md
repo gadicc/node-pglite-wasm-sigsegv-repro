@@ -106,6 +106,12 @@ sudo ./frequency-ab.sh 19 20 diagnostics/<bundle> # the A/B/A experiment
   five allowlisted evidence files into the user-owned bundle.
 - `frequency-ab.sh` is the only script that changes anything; see below.
 
+Both companion publishers validate their complete staging and destination
+sets before changing the bundle. A successful publication invalidates
+`manifest.txt` first, then removes the stale privacy review, results JSON, and
+report before replacing evidence. Run `diagnose.sh --resume` afterward to
+regenerate those derived outputs for the new evidence generation.
+
 ### Frequency A/B/A (`frequency-ab.sh`)
 
 The turbo A/B/A experiment temporarily changes a runtime setting, so it is

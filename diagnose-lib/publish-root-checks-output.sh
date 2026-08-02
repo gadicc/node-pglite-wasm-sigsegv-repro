@@ -3,6 +3,10 @@
 # Destination paths are user-mutable, so this helper must never run as root.
 set -Eeuo pipefail
 
+publisher_lib_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=publish-common.sh
+source "$publisher_lib_dir/publish-common.sh"
+
 if [[ $# -ne 2 ]]; then
   echo "usage: publish-root-checks-output.sh <staging-dir> <bundle-dir>" >&2
   exit 2
@@ -31,18 +35,12 @@ parent="$bundle/env"
 destination_dir="$parent/root"
 for dir in "$parent" "$destination_dir"; do
   if [[ -e "$dir" || -L "$dir" ]]; then
-    [[ -d "$dir" && ! -L "$dir" ]] || {
+    [[ -d "$dir" && ! -L "$dir" && -w "$dir" ]] || {
       echo "error: refusing unsafe bundle output directory: $dir" >&2
       exit 1
     }
-  else
-    mkdir -- "$dir"
   fi
 done
-[[ -w "$destination_dir" ]] || {
-  echo "error: root-checks output directory is not writable by the invoking user" >&2
-  exit 1
-}
 
 declare -a output_names=(
   kernel-warnings.txt intel-undervolt.txt cctk.txt turbostat.txt root-checks.meta
@@ -60,6 +58,21 @@ for name in "${output_names[@]}"; do
   destination="$destination_dir/$name"
   [[ ! -e "$destination" || -f "$destination" || -L "$destination" ]] || {
     echo "error: root-checks destination is not replaceable: $name" >&2
+    exit 1
+  }
+done
+
+# Invalidate stale derived reports only after the complete staging and
+# destination set is known safe, and before any evidence directory or file is
+# created or replaced.
+publish_invalidate_derived_outputs "$bundle" || exit 1
+
+for dir in "$parent" "$destination_dir"; do
+  if [[ ! -e "$dir" && ! -L "$dir" ]]; then
+    mkdir -- "$dir"
+  fi
+  [[ -d "$dir" && ! -L "$dir" && -w "$dir" ]] || {
+    echo "error: refusing unsafe bundle output directory after invalidation: $dir" >&2
     exit 1
   }
 done

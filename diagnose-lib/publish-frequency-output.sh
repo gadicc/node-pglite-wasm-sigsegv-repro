@@ -4,6 +4,10 @@
 # may change at any time, so all final opens and renames use only user authority.
 set -Eeuo pipefail
 
+publisher_lib_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=publish-common.sh
+source "$publisher_lib_dir/publish-common.sh"
+
 if [[ $# -ne 2 ]]; then
   echo "usage: publish-frequency-output.sh <staging-dir> <bundle-dir>" >&2
   exit 2
@@ -31,12 +35,10 @@ bundle="$2"
 for dir in results freq; do
   target_dir="$bundle/$dir"
   if [[ -e "$target_dir" || -L "$target_dir" ]]; then
-    [[ -d "$target_dir" && ! -L "$target_dir" ]] || {
+    [[ -d "$target_dir" && ! -L "$target_dir" && -w "$target_dir" ]] || {
       echo "error: unsafe bundle output directory: $dir" >&2
       exit 1
     }
-  else
-    mkdir -- "$target_dir"
   fi
 done
 
@@ -157,23 +159,38 @@ commands_destination="$bundle/commands.log"
   exit 1
 }
 
-# An existing marker belongs to the previous artifact generation. Invalidate
-# it before changing any evidence so interruption can only leave a generation
-# that diagnose --resume must revalidate. The publisher never recreates it.
 state_dir="$bundle/state"
 if [[ -e "$state_dir" || -L "$state_dir" ]]; then
-  [[ -d "$state_dir" && ! -L "$state_dir" ]] || {
+  [[ -d "$state_dir" && ! -L "$state_dir" && -w "$state_dir" ]] || {
     echo "error: refusing unsafe bundle state directory" >&2
     exit 1
   }
-else
-  mkdir -- "$state_dir"
 fi
-[[ -w "$state_dir" ]] || {
-  echo "error: bundle state directory is not writable by the invoking user" >&2
+completion_marker="$state_dir/phase-frequency.done"
+[[ (! -e "$completion_marker" && ! -L "$completion_marker") ||
+  -f "$completion_marker" || -L "$completion_marker" ]] || {
+  echo "error: previous frequency completion marker is not safely removable" >&2
   exit 1
 }
-completion_marker="$state_dir/phase-frequency.done"
+
+# Stale reports and their checksum manifest must never describe a newly
+# published evidence generation. This is the first bundle mutation.
+publish_invalidate_derived_outputs "$bundle" || exit 1
+
+for dir in results freq state; do
+  target_dir="$bundle/$dir"
+  if [[ ! -e "$target_dir" && ! -L "$target_dir" ]]; then
+    mkdir -- "$target_dir"
+  fi
+  [[ -d "$target_dir" && ! -L "$target_dir" && -w "$target_dir" ]] || {
+    echo "error: unsafe bundle output directory after invalidation: $dir" >&2
+    exit 1
+  }
+done
+
+# An existing marker belongs to the previous artifact generation. Invalidate
+# it before changing any evidence so interruption can only leave a generation
+# that diagnose --resume must revalidate. The publisher never recreates it.
 if ! rm -f -- "$completion_marker"; then
   echo "error: could not invalidate the previous frequency completion marker" >&2
   exit 1
