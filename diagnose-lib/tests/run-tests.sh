@@ -198,6 +198,29 @@ else
   malformed_ledger_rc=$?
 fi
 check_eq "restore ledger rejects malformed rows" "1" "$([[ $malformed_ledger_rc -ne 0 ]] && echo 1 || echo 0)"
+printf '/sys/allowed\t1' > "$LEDGER_GUARD_DIR/restore.tsv"
+if diag_restore_ledger_is_valid "$LEDGER_GUARD_DIR/restore.tsv" /sys/allowed '^[01]$'; then
+  unterminated_valid_rc=0
+else
+  unterminated_valid_rc=$?
+fi
+check_eq "restore ledger processes an allowlisted row without final newline" "0" "$unterminated_valid_rc"
+printf '%s\tpwned' "$LEDGER_GUARD_DIR/victim" > "$LEDGER_GUARD_DIR/restore.tsv"
+if diag_restore_ledger_is_valid "$LEDGER_GUARD_DIR/restore.tsv" /sys/allowed '^[01]$'; then
+  unterminated_forbidden_rc=0
+else
+  unterminated_forbidden_rc=$?
+fi
+check_eq "restore ledger rejects a forbidden row without final newline" "1" \
+  "$([[ $unterminated_forbidden_rc -ne 0 ]] && echo 1 || echo 0)"
+printf '\0' > "$LEDGER_GUARD_DIR/restore.tsv"
+if diag_restore_ledger_is_valid "$LEDGER_GUARD_DIR/restore.tsv" /sys/allowed '^[01]$'; then
+  zero_row_ledger_rc=0
+else
+  zero_row_ledger_rc=$?
+fi
+check_eq "nonempty restore ledger cannot validate zero rows" "1" \
+  "$([[ $zero_row_ledger_rc -ne 0 ]] && echo 1 || echo 0)"
 printf '/sys/allowed\t1\n' > "$LEDGER_GUARD_DIR/real-ledger"
 ln -s "$LEDGER_GUARD_DIR/real-ledger" "$LEDGER_GUARD_DIR/restore.tsv.symlink"
 if diag_restore_ledger_is_valid "$LEDGER_GUARD_DIR/restore.tsv.symlink" /sys/allowed '^[01]$'; then

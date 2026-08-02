@@ -292,11 +292,13 @@ diag_restore_ledger_is_valid() {
   (($# > 0 && $# % 2 == 0)) || return 1
   [[ -f "$ledger" && ! -L "$ledger" ]] || return 1
 
-  local path value extra allowed pattern matched
+  local path value extra allowed pattern matched validated_rows=0
   declare -A seen=()
-  while IFS=$'\t' read -r path value extra; do
+  while IFS=$'\t' read -r path value extra ||
+    [[ -n "${path:-}${value:-}${extra:-}" ]]; do
     [[ -n "$path" && -n "$value" && -z "$extra" && -z "${seen[$path]:-}" ]] || return 1
     seen[$path]=1
+    validated_rows=$((validated_rows + 1))
     matched=0
     local -a rules=("$@")
     local i
@@ -310,6 +312,7 @@ diag_restore_ledger_is_valid() {
     done
     ((matched == 1)) || return 1
   done < "$ledger"
+  [[ ! -s "$ledger" || $validated_rows -gt 0 ]]
 }
 
 diag_require_not_symlink() {
