@@ -251,6 +251,8 @@ validate_config() {
   diag_require_uint "--individual-runs" "$INDIVIDUAL_RUNS"
   diag_require_uint "--group-waves" "$GROUP_WAVES"
   diag_require_uint "--gdb-max-runs" "$GDB_MAX_RUNS"
+  [[ "$GDB_MAX_RUNS" =~ ^(0|[1-9][0-9]*)$ ]] ||
+    diag_die "--gdb-max-runs must be a canonical non-negative integer, got '$GDB_MAX_RUNS'"
   diag_require_uint "baseline children" "$BASELINE_CHILDREN"
   diag_require_uint "baseline waves" "$BASELINE_WAVES"
   [[ "$SKIP_GDB" == "0" || "$SKIP_GDB" == "1" ]] ||
@@ -259,6 +261,8 @@ validate_config() {
     diag_die "runs, waves, children, and gdb attempts must all be >= 1"
   if [[ -n "$WORST_CPU_OVERRIDE" ]]; then
     diag_require_uint "--cpu" "$WORST_CPU_OVERRIDE"
+    [[ "$WORST_CPU_OVERRIDE" =~ ^(0|[1-9][0-9]*)$ ]] ||
+      diag_die "--cpu must be a canonical non-negative integer, got '$WORST_CPU_OVERRIDE'"
   fi
   if [[ -n "$REDO_PHASES" && -z "$RESUME_DIR" ]]; then
     diag_die "--redo requires --resume DIR (it re-runs phases of an existing bundle)"
@@ -1491,6 +1495,37 @@ frequency_result_is_complete() {
 }
 
 # ------------------------------------------------------------------
+GDB_ATTEMPTED_RUNS=""
+GDB_CLEAN_RUNS=""
+GDB_CAPTURED_RUNS=""
+GDB_ERROR_RUNS=""
+
+# Read the single terminal accounting record produced by capture-fault.sh.
+# The runner log is not evidence unless the record is exact, unique, last,
+# and internally reconciles with the configured attempt ceiling.
+gdb_run_counts_read() {
+  local logf="$1" max_runs="$2" line="" last_nonempty="" prefix_count=0
+  GDB_ATTEMPTED_RUNS=""
+  GDB_CLEAN_RUNS=""
+  GDB_CAPTURED_RUNS=""
+  GDB_ERROR_RUNS=""
+  [[ -f "$logf" && ! -L "$logf" && "$max_runs" =~ ^[1-9][0-9]*$ ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" ]] && last_nonempty="$line"
+    if [[ "$line" == GDB_RUN_COUNTS* ]]; then
+      prefix_count=$((prefix_count + 1))
+    fi
+  done < "$logf"
+  ((prefix_count == 1)) || return 1
+  [[ "$last_nonempty" =~ ^GDB_RUN_COUNTS\ attempted=(0|[1-9][0-9]*)\ clean=(0|[1-9][0-9]*)\ captured=(0|[1-9][0-9]*)\ errors=(0|[1-9][0-9]*)$ ]] || return 1
+  GDB_ATTEMPTED_RUNS="${BASH_REMATCH[1]}"
+  GDB_CLEAN_RUNS="${BASH_REMATCH[2]}"
+  GDB_CAPTURED_RUNS="${BASH_REMATCH[3]}"
+  GDB_ERROR_RUNS="${BASH_REMATCH[4]}"
+  ((GDB_ATTEMPTED_RUNS <= max_runs)) || return 1
+  ((GDB_ATTEMPTED_RUNS == GDB_CLEAN_RUNS + GDB_CAPTURED_RUNS + GDB_ERROR_RUNS)) || return 1
+}
+
 phase_gdb() {
   local cpu="$1"
   local meta="$OUT_DIR/results/gdb.meta"
@@ -1504,7 +1539,16 @@ phase_gdb() {
   run_gdb_logged "$cpu" "$GDB_MAX_RUNS" "$GDB_MAX_CAPTURES" "$OUT_DIR/gdb" \
     "$OUT_DIR/logs/gdb/runner.log" || rc=$?
   printf 'EXIT_CODE=%s\n' "$rc" >> "$meta"
-  if ! gdb_result_is_complete "$rc"; then
+  gdb_run_counts_read "$OUT_DIR/logs/gdb/runner.log" "$GDB_MAX_RUNS" ||
+    diag_die "gdb runner did not produce one valid terminal run-count record; phase remains resumable"
+  {
+    printf 'ATTEMPTED_RUNS=%s\n' "$GDB_ATTEMPTED_RUNS"
+    printf 'CLEAN_RUNS=%s\n' "$GDB_CLEAN_RUNS"
+    printf 'CAPTURED_RUNS=%s\n' "$GDB_CAPTURED_RUNS"
+    printf 'ERROR_RUNS=%s\n' "$GDB_ERROR_RUNS"
+  } >> "$meta"
+  if ! gdb_result_is_complete "$rc" "$GDB_MAX_RUNS" "$GDB_ATTEMPTED_RUNS" \
+    "$GDB_CLEAN_RUNS" "$GDB_CAPTURED_RUNS" "$GDB_ERROR_RUNS"; then
     case "$rc" in
       4) diag_die "gdb capture lost a required dependency; phase remains resumable" ;;
       5) diag_die "gdb runner failed (see logs/gdb/runner.log); phase remains resumable" ;;
@@ -1519,7 +1563,16 @@ phase_gdb() {
 }
 
 gdb_result_is_complete() {
-  [[ "$1" == "0" || "$1" == "3" ]]
+  local rc="$1" max_runs="$2" attempted="$3" clean="$4" captured="$5" errors="$6"
+  [[ "$max_runs" =~ ^[1-9][0-9]*$ && "$attempted" =~ ^(0|[1-9][0-9]*)$ &&
+    "$clean" =~ ^(0|[1-9][0-9]*)$ && "$captured" =~ ^(0|[1-9][0-9]*)$ &&
+    "$errors" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  ((attempted <= max_runs && attempted == clean + captured + errors)) || return 1
+  case "$rc" in
+    0) ((captured >= 1)) ;;
+    3) ((attempted == max_runs && captured == 0 && clean >= 1)) ;;
+    *) return 1 ;;
+  esac
 }
 
 gdb_attempt_path_is_meaningful() {

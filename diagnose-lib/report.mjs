@@ -334,6 +334,9 @@ export function renderReport(results) {
   if (r.gdb?.status === "captured") {
     const g = r.gdb;
     L.push(`Fault captured on CPU ${g.cpu} (pinned by taskset, so the faulting CPU is known by construction).`);
+    if (g.countsAvailable) {
+      L.push(`Attempt accounting: ${g.attemptedRuns} attempted, ${g.cleanRuns} clean, ${g.capturedRuns} captured, and ${g.errorRuns} runner error(s).`);
+    }
     L.push("");
     L.push("| Capture | Instruction | Intended addr | si_addr (source) | Diff | Differing bits | Intended mapped/writable | si_addr mapped | Classification |");
     L.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
@@ -348,8 +351,13 @@ export function renderReport(results) {
       L.push("");
     }
   } else if (r.gdb?.status === "no-fault") {
-    L.push(`Ran ${r.gdb.maxRuns ?? "the configured number of"} pinned attempt(s) on CPU ${r.gdb.cpu ?? "—"} without capturing a fault.`);
-    if (r.gdb.maxRuns > 0) L.push(`The zero-failure 95% upper bound per attempt is ${pct(zeroFailureUpperBound(r.gdb.maxRuns))}; this does not disprove the defect.`);
+    if (r.gdb.countsAvailable) {
+      L.push(`Ran ${r.gdb.attemptedRuns} pinned attempt(s) on CPU ${r.gdb.cpu ?? "—"}: ${r.gdb.cleanRuns} clean and ${r.gdb.errorRuns} runner error(s), with no captured fault.`);
+      L.push(`Using only the ${r.gdb.cleanRuns} clean attempt(s), the zero-failure 95% upper bound per attempt is ${pct(zeroFailureUpperBound(r.gdb.cleanRuns))}; this does not disprove the defect.`);
+    } else {
+      L.push(`The legacy GDB result reports no captured fault on CPU ${r.gdb.cpu ?? "—"}, but per-attempt clean/error accounting is unavailable.`);
+      L.push("No zero-failure bound is calculated because the number of successfully executed clean attempts is unknown.");
+    }
     L.push("");
   } else if (r.gdb?.status === "failed") {
     L.push(`The capture runner failed before producing valid completed evidence${r.gdb.reason ? `: ${r.gdb.reason}` : "."}`);
@@ -530,7 +538,9 @@ function renderConclusions(r) {
       }
     }
   } else if (r.gdb?.status === "no-fault") {
-    const bound = r.gdb.maxRuns > 0 ? ` (95% upper bound ${pct(zeroFailureUpperBound(r.gdb.maxRuns))} per attempt)` : "";
+    const bound = r.gdb.countsAvailable
+      ? ` (95% upper bound ${pct(zeroFailureUpperBound(r.gdb.cleanRuns))} per clean attempt; n=${r.gdb.cleanRuns})`
+      : " (legacy result: clean-attempt denominator unavailable, so no bound)";
     C.push(`- GDB capture ran to its limit without observing a fault${bound}; no fresh signature was obtained.`);
   } else if (r.gdb?.status === "failed") {
     C.push("- GDB capture failed operationally; it provides neither a no-fault bound nor a signature conclusion.");

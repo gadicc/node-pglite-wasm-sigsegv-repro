@@ -219,7 +219,10 @@ prove a zero rate; the report shows the exact 95% upper bound
 `1 - 0.05^(1/n)` (approximately `3/n`). A CPU with 50 clean runs is only
 cleared of per-run rates above ~5.8%, and observed rates can drift between
 batches, so treat "clean" verdicts as exclusions of high rates, not proof
-of correct hardware.
+of correct hardware. For GDB capture, `n` includes only attempts that actually
+ran the workload cleanly: debugger/runner errors are reported separately and
+never inflate the no-fault denominator. Legacy bundles without exact attempt
+accounting retain their no-fault observation but receive no numerical bound.
 
 ### Testing the tooling
 

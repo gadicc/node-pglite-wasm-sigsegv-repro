@@ -212,7 +212,19 @@ esac
 EOF
 cat > "$PIPELINE_DIR/bin/gdb" << 'EOF'
 #!/usr/bin/env bash
-printf 'Inferior 1 exited normally\n'
+case "${FAKE_GDB_MODE:-clean}" in
+  clean) printf 'Inferior 1 exited normally\n' ;;
+  error) printf 'synthetic debugger error\n' ;;
+  capture) printf 'Program received signal SIGSEGV, Segmentation fault.\n' ;;
+  one-clean-rest-error)
+    count=0
+    [[ -f "$FAKE_GDB_COUNTER" ]] && count="$(cat "$FAKE_GDB_COUNTER")"
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$FAKE_GDB_COUNTER"
+    if ((count == 1)); then printf 'Inferior 1 exited normally\n'; else printf 'synthetic debugger error\n'; fi
+    ;;
+  *) exit 92 ;;
+esac
 EOF
 cat > "$PIPELINE_DIR/bin/timeout" << 'EOF'
 #!/usr/bin/env bash
@@ -275,6 +287,36 @@ check_eq "individual pipeline preserves SIGSEGV batch semantics" "1|1" \
   printf '%s\n' "$gdb_rc" > "$PIPELINE_DIR/gdb.rc"
 )
 check_eq "GDB logging pipeline preserves the no-fault status" "3" "$(cat "$PIPELINE_DIR/gdb.rc")"
+check_eq "GDB logging pipeline preserves terminal all-clean accounting" \
+  "GDB_RUN_COUNTS attempted=1 clean=1 captured=0 errors=0" \
+  "$(tail -1 "$PIPELINE_DIR/out/gdb-runner.log")"
+
+gdb_capture_case() {
+  local label="$1" mode="$2" runs="$3" captures="$4" expected_rc="$5" expected_counts="$6"
+  local case_dir="$PIPELINE_DIR/$label" output="$PIPELINE_DIR/$label.log" rc=0
+  mkdir -p "$case_dir"
+  rm -f "$PIPELINE_DIR/$label.counter"
+  (
+    cd "$REPO_ROOT" || exit 99
+    PATH="$PIPELINE_DIR/bin:$PATH" FAKE_GDB_MODE="$mode" \
+      FAKE_GDB_COUNTER="$PIPELINE_DIR/$label.counter" \
+      bash ./capture-fault.sh 0 "$runs" "$captures" "$case_dir"
+  ) > "$output" 2>&1 || rc=$?
+  local record_count
+  record_count="$(grep -c '^GDB_RUN_COUNTS ' "$output" || true)"
+  check_eq "$label status and unique terminal accounting" \
+    "$expected_rc|1|$expected_counts" "$rc|$record_count|$(tail -1 "$output")"
+}
+gdb_capture_case "gdb-all-clean" clean 3 1 3 \
+  "GDB_RUN_COUNTS attempted=3 clean=3 captured=0 errors=0"
+gdb_capture_case "gdb-clean-plus-errors" one-clean-rest-error 6 1 3 \
+  "GDB_RUN_COUNTS attempted=6 clean=1 captured=0 errors=5"
+gdb_capture_case "gdb-all-errors" error 3 1 5 \
+  "GDB_RUN_COUNTS attempted=3 clean=0 captured=0 errors=3"
+gdb_capture_case "gdb-early-capture" capture 6 1 0 \
+  "GDB_RUN_COUNTS attempted=1 clean=0 captured=1 errors=0"
+gdb_capture_case "gdb-exhausted-with-captures" capture 2 3 0 \
+  "GDB_RUN_COUNTS attempted=2 clean=0 captured=2 errors=0"
 grep -q 'timeout --foreground --signal=KILL' "$REPO_ROOT/capture-fault.sh"
 check_eq "GDB timeout remains inside the tracked foreground group" "0" "$?"
 
@@ -507,6 +549,8 @@ bash "$REPO_ROOT/capture-fault.sh" > /dev/null 2>&1
 check_eq "capture-fault.sh usage error (rc=2)" "2" "$?"
 bash "$REPO_ROOT/capture-fault.sh" 0 x 1 "$TMP/out" > /dev/null 2>&1
 check_eq "capture-fault.sh rejects non-numeric runs (rc=2)" "2" "$?"
+bash "$REPO_ROOT/capture-fault.sh" 0 06 1 "$TMP/out" > /dev/null 2>&1
+check_eq "capture-fault.sh rejects non-canonical run counts (rc=2)" "2" "$?"
 # Missing dependency: a PATH containing everything except gdb.
 mkdir -p "$TMP/bin"
 for c in bash grep rm mkdir cat date head tail sort find xargs timeout taskset node tee awk sed chmod tac printf; do
@@ -1490,9 +1534,52 @@ check_eq "worst_cpu ranks only a fully validated individual phase" "4" "$worst_c
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
-  gdb_result_is_complete 0 && gdb_result_is_complete 3 && ! gdb_result_is_complete 5
+  gdb_result_is_complete 0 6 2 1 1 0 &&
+    gdb_result_is_complete 3 6 6 1 0 5 &&
+    ! gdb_result_is_complete 3 6 6 0 0 6 &&
+    ! gdb_result_is_complete 3 6 5 5 0 0 &&
+    ! gdb_result_is_complete 0 6 6 6 0 0 &&
+    ! gdb_result_is_complete 5 6 6 0 0 6
 )
-check_eq "only captured/no-fault gdb outcomes are phase-complete" "0" "$?"
+check_eq "only reconciled captured/no-fault GDB outcomes are phase-complete" "0" "$?"
+
+GDB_COUNTS_LOG="$TMP/gdb-counts.log"
+printf 'run=1 clean\nGDB_RUN_COUNTS attempted=6 clean=1 captured=0 errors=5\n' > "$GDB_COUNTS_LOG"
+gdb_counts_status="$(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  if gdb_run_counts_read "$GDB_COUNTS_LOG" 6; then
+    printf '%s|%s|%s|%s\n' "$GDB_ATTEMPTED_RUNS" "$GDB_CLEAN_RUNS" \
+      "$GDB_CAPTURED_RUNS" "$GDB_ERROR_RUNS"
+  fi
+)"
+check_eq "terminal GDB accounting parser retains clean/error split" "6|1|0|5" "$gdb_counts_status"
+printf 'GDB_RUN_COUNTS attempted=6 clean=1 captured=0 errors=5\nGDB_RUN_COUNTS attempted=6 clean=1 captured=0 errors=5\n' > "$GDB_COUNTS_LOG"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  ! gdb_run_counts_read "$GDB_COUNTS_LOG" 6
+)
+check_eq "duplicate GDB accounting records are rejected" "0" "$?"
+
+GDB_MALFORMED_PHASE="$TMP/gdb-malformed-phase"
+mkdir -p "$GDB_MALFORMED_PHASE"/{results,state,logs/gdb,gdb}
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$GDB_MALFORMED_PHASE"
+  STATE_DIR="$GDB_MALFORMED_PHASE/state"
+  GDB_MAX_RUNS=6
+  GDB_MAX_CAPTURES=1
+  run_gdb_logged() {
+    printf 'GDB_RUN_COUNTS attempted=6 clean=1 captured=0 errors=4\n' > "$5"
+    return 3
+  }
+  phase_gdb 19
+) > /dev/null 2>&1
+malformed_phase_rc=$?
+check_eq "malformed GDB accounting cannot close the phase" "1" \
+  "$([[ $malformed_phase_rc -ne 0 && ! -e "$GDB_MALFORMED_PHASE/state/phase-gdb.done" ]] && echo 1 || echo 0)"
 
 FREQUENCY_COMPLETE="$TMP/frequency-complete"
 mkdir -p "$FREQUENCY_COMPLETE/results"
@@ -1542,6 +1629,14 @@ check_eq "conflicting mode flags are rejected" "1" "$([[ $mode_conflict_rc -ne 0
 "$REPO_ROOT/diagnose.sh" --gdb-max-runs 0 --dry-run --yes > /dev/null 2>&1
 zero_gdb_rc=$?
 check_eq "zero gdb attempts are rejected" "1" "$([[ $zero_gdb_rc -ne 0 ]] && echo 1 || echo 0)"
+"$REPO_ROOT/diagnose.sh" --gdb-max-runs 06 --dry-run --yes > /dev/null 2>&1
+noncanonical_gdb_rc=$?
+check_eq "non-canonical gdb attempts are rejected before execution" "1" \
+  "$([[ $noncanonical_gdb_rc -ne 0 ]] && echo 1 || echo 0)"
+"$REPO_ROOT/diagnose.sh" --cpu 01 --dry-run --yes > /dev/null 2>&1
+noncanonical_cpu_rc=$?
+check_eq "non-canonical CPU overrides are rejected before execution" "1" \
+  "$([[ $noncanonical_cpu_rc -ne 0 ]] && echo 1 || echo 0)"
 "$REPO_ROOT/diagnose.sh" --cpu 999999 --dry-run --yes > /dev/null 2>&1
 unusable_cpu_rc=$?
 check_eq "unusable CPU override is rejected" "1" "$([[ $unusable_cpu_rc -ne 0 ]] && echo 1 || echo 0)"
@@ -1859,6 +1954,10 @@ cat > "$B/results/gdb.meta" << EOF
 CPU=19
 MAX_RUNS=6
 EXIT_CODE=0
+ATTEMPTED_RUNS=1
+CLEAN_RUNS=0
+CAPTURED_RUNS=1
+ERROR_RUNS=0
 EOF
 
 # Simulated manual root-checks.sh output.
@@ -1886,6 +1985,7 @@ check("worst cpu is 19", r.worstCpu === 19);
 check("individual tally", r.individual.length === 2 && r.individual[1].sigsegv === 6 && r.individual[0].failures === 0);
 check("individual phase completion status", r.individualStatus.status === "complete" && r.individual[1].runs === 20);
 check("gdb signature match", r.gdb.status === "captured" && r.gdb.captures.length === 1 && r.gdb.captures[0].matchesKnownSignature === true);
+check("gdb attempt accounting", r.gdb.attemptedRuns === 1 && r.gdb.cleanRuns === 0 && r.gdb.capturedRuns === 1 && r.gdb.errorRuns === 0);
 check("gdb capture file trimmed", r.gdb.captures[0].mappings === undefined);
 check("freq ab restored + legs", r.frequencyAb.restored === true && r.frequencyAb.legs.length === 3);
 check("freq leg B measured clock", r.frequencyAb.legs[1].frequency.avgMHz === 2100);
@@ -1894,7 +1994,7 @@ check("root checks merged", Boolean(r.rootChecks) && r.rootChecks["cctk.txt"].in
 process.exit(failures === 0 ? 0 : 1);
 EOF
 if node "$TMP/check-results.mjs" "$B/results.json"; then
-  pass=$((pass + 13))
+  pass=$((pass + 14))
 else
   fail=$((fail + 1))
 fi

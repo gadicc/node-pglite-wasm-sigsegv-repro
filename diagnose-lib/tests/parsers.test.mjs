@@ -311,15 +311,36 @@ test("renderReport: GDB failure is not described as a clean bounded run", () => 
   assert.doesNotMatch(md, /captured no fault within the run limit/);
 });
 
-test("renderReport: GDB exit 3 has an explicit no-fault bound", () => {
+test("renderReport: GDB no-fault bound uses only clean attempts", () => {
   const md = renderReport({
     collectedAt: "2026-08-02T00:00:00.000Z",
     config: {},
     environment: {},
-    gdb: { status: "no-fault", cpu: 19, maxRuns: 6, exitCode: 3, captures: [] },
+    gdb: {
+      status: "no-fault", cpu: 19, maxRuns: 6, exitCode: 3, captures: [],
+      countsAvailable: true, attemptedRuns: 6, cleanRuns: 1, capturedRuns: 0, errorRuns: 5,
+    },
   });
-  assert.match(md, /Ran 6 pinned attempt/);
-  assert.match(md, /95% upper bound/);
+  assert.match(md, /6 pinned attempt/);
+  assert.match(md, /1 clean and 5 runner error/);
+  assert.match(md, /95% upper bound per attempt is 95\.0%/);
+  assert.match(md, /n=1/);
+  assert.doesNotMatch(md, /39\.3%/);
+});
+
+test("renderReport: legacy GDB no-fault result has no numerical bound", () => {
+  const md = renderReport({
+    collectedAt: "2026-08-02T00:00:00.000Z",
+    config: {},
+    environment: {},
+    gdb: {
+      status: "no-fault", cpu: 19, maxRuns: 6, exitCode: 3, captures: [],
+      countsAvailable: false, attemptedRuns: null, cleanRuns: null, capturedRuns: null, errorRuns: null,
+    },
+  });
+  assert.match(md, /legacy GDB result/);
+  assert.match(md, /denominator unavailable, so no bound/);
+  assert.doesNotMatch(md, /95% upper bound \d/);
 });
 
 test("parseGdbCapture: known +2^42 signature (real transcript)", () => {

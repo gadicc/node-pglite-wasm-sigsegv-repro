@@ -214,6 +214,8 @@ test("collect: terminal GDB metadata distinguishes no-fault from failure", () =>
   writeFileSync(path.join(noFaultDir, "state", "phase-gdb.done"), "");
   const noFault = collect(noFaultDir);
   assert.equal(noFault.gdb.status, "no-fault");
+  assert.equal(noFault.gdb.countsAvailable, false);
+  assert.equal(noFault.gdb.cleanRuns, null);
 
   const failedDir = mkdtempSync(path.join(tmpdir(), "collect-test-"));
   tmpDirs.push(failedDir);
@@ -221,6 +223,48 @@ test("collect: terminal GDB metadata distinguishes no-fault from failure", () =>
   writeFileSync(path.join(failedDir, "results", "gdb.meta"), "CPU=19\nMAX_RUNS=6\nEXIT_CODE=5\n");
   const failed = collect(failedDir);
   assert.equal(failed.gdb.status, "failed");
+});
+
+test("collect: GDB no-fault accounting excludes runner errors from the denominator", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "collect-test-"));
+  tmpDirs.push(dir);
+  mkdirSync(path.join(dir, "results"));
+  mkdirSync(path.join(dir, "state"));
+  mkdirSync(path.join(dir, "gdb"));
+  writeFileSync(
+    path.join(dir, "results", "gdb.meta"),
+    "CPU=19\nMAX_RUNS=6\nEXIT_CODE=3\nATTEMPTED_RUNS=6\nCLEAN_RUNS=1\nCAPTURED_RUNS=0\nERROR_RUNS=5\n",
+  );
+  for (let run = 2; run <= 6; run += 1) {
+    writeFileSync(path.join(dir, "gdb", `cpu19-run${run}.txt`), "synthetic runner error\n");
+  }
+  writeFileSync(path.join(dir, "state", "phase-gdb.done"), "");
+  const result = collect(dir);
+  assert.equal(result.gdb.status, "no-fault");
+  assert.equal(result.gdb.attemptedRuns, 6);
+  assert.equal(result.gdb.cleanRuns, 1);
+  assert.equal(result.gdb.capturedRuns, 0);
+  assert.equal(result.gdb.errorRuns, 5);
+  assert.equal(result.gdb.countsAvailable, true);
+});
+
+test("collect: malformed or contradictory GDB run counts are incomplete", () => {
+  for (const [exitCode, counts, reason] of [
+    ["3", "ATTEMPTED_RUNS=6\nCLEAN_RUNS=1\nCAPTURED_RUNS=0\nERROR_RUNS=4\n", /run counts/],
+    ["3", "ATTEMPTED_RUNS=06\nCLEAN_RUNS=6\nCAPTURED_RUNS=0\nERROR_RUNS=0\n", /run counts/],
+    ["3", "ATTEMPTED_RUNS=6\nCLEAN_RUNS=6\nCAPTURED_RUNS=0\n", /run counts/],
+    ["3e0", "ATTEMPTED_RUNS=6\nCLEAN_RUNS=6\nCAPTURED_RUNS=0\nERROR_RUNS=0\n", /exit code/],
+  ]) {
+    const dir = mkdtempSync(path.join(tmpdir(), "collect-test-"));
+    tmpDirs.push(dir);
+    mkdirSync(path.join(dir, "results"));
+    mkdirSync(path.join(dir, "state"));
+    writeFileSync(path.join(dir, "results", "gdb.meta"), `CPU=19\nMAX_RUNS=6\nEXIT_CODE=${exitCode}\n${counts}`);
+    writeFileSync(path.join(dir, "state", "phase-gdb.done"), "");
+    const result = collect(dir);
+    assert.equal(result.gdb.status, "incomplete");
+    assert.match(result.gdb.reason, reason);
+  }
 });
 
 test("assessIndividual: exact completion and partial prefixes have explicit status", () => {

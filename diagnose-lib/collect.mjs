@@ -68,6 +68,27 @@ function readIndividualMeta(file) {
   return { present: true, values, errors };
 }
 
+function readGdbMeta(file) {
+  if (!existsSync(file)) return { present: false, values: {}, errors: [] };
+  const values = {};
+  const errors = [];
+  const allowed = new Set([
+    "CPU", "MAX_RUNS", "EXIT_CODE", "ATTEMPTED_RUNS", "CLEAN_RUNS",
+    "CAPTURED_RUNS", "ERROR_RUNS", "SKIPPED", "SKIP_REASON",
+  ]);
+  const lines = readFileSync(file, "utf8").split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  for (const line of lines) {
+    const match = line.match(/^([A-Z_]+)=(.*)$/);
+    if (!match || !allowed.has(match[1]) || Object.hasOwn(values, match[1])) {
+      errors.push("GDB metadata contains a malformed, duplicate, or unknown field");
+      continue;
+    }
+    values[match[1]] = match[2];
+  }
+  return { present: true, values, errors };
+}
+
 function num(v) {
   if (v === undefined || v === null || v === "") return null;
   const n = Number(v);
@@ -467,10 +488,13 @@ export function assessFrequencyAb(rows, meta, phaseDone) {
   return reasons.length > 0 ? { status: "incomplete", reasons } : { status: "complete", reasons: [] };
 }
 
-export function assessGdb(meta, phaseDone, captures, transcriptCount) {
+export function assessGdb(meta, phaseDone, captures, transcriptCount, metaState = { errors: [] }) {
   const hasMeta = Object.keys(meta).length > 0;
-  if (!hasMeta && !phaseDone && transcriptCount === 0) {
+  if (!hasMeta && !metaState.present && !phaseDone && transcriptCount === 0) {
     return { status: "not-run", reason: null };
+  }
+  if (metaState.errors?.length > 0) {
+    return { status: "incomplete", reason: metaState.errors.join("; ") };
   }
   if (meta.SKIPPED === "1") {
     if (!phaseDone) return { status: "incomplete", reason: "skip metadata has no phase completion marker" };
@@ -478,18 +502,74 @@ export function assessGdb(meta, phaseDone, captures, transcriptCount) {
     return { status: "skipped", reason: meta.SKIP_REASON ?? null };
   }
 
-  const exitCode = num(meta.EXIT_CODE);
+  const countKeys = ["ATTEMPTED_RUNS", "CLEAN_RUNS", "CAPTURED_RUNS", "ERROR_RUNS"];
+  const countFieldsPresent = countKeys.filter((key) => meta[key] !== undefined).length;
+  let counts = {
+    attemptedRuns: null,
+    cleanRuns: null,
+    capturedRuns: null,
+    errorRuns: null,
+    countsAvailable: false,
+  };
+  if (countFieldsPresent > 0) {
+    const canonicalUint = (value) => {
+      if (!/^(0|[1-9][0-9]*)$/.test(value ?? "")) return null;
+      const parsed = Number(value);
+      return Number.isSafeInteger(parsed) ? parsed : null;
+    };
+    const maxRuns = canonicalUint(meta.MAX_RUNS);
+    const attemptedRuns = canonicalUint(meta.ATTEMPTED_RUNS);
+    const cleanRuns = canonicalUint(meta.CLEAN_RUNS);
+    const capturedRuns = canonicalUint(meta.CAPTURED_RUNS);
+    const errorRuns = canonicalUint(meta.ERROR_RUNS);
+    if (
+      countFieldsPresent !== countKeys.length ||
+      maxRuns === null || maxRuns < 1 ||
+      attemptedRuns === null || cleanRuns === null || capturedRuns === null || errorRuns === null ||
+      attemptedRuns !== cleanRuns + capturedRuns + errorRuns ||
+      attemptedRuns > maxRuns
+    ) {
+      return { status: "incomplete", reason: "GDB run counts are missing, malformed, or inconsistent" };
+    }
+    counts = { attemptedRuns, cleanRuns, capturedRuns, errorRuns, countsAvailable: true };
+  }
+
+  let exitCode = null;
+  if (meta.EXIT_CODE !== undefined) {
+    if (!/^(0|[1-9][0-9]*)$/.test(meta.EXIT_CODE)) {
+      return { status: "incomplete", reason: "GDB exit code is malformed" };
+    }
+    exitCode = Number(meta.EXIT_CODE);
+    if (!Number.isSafeInteger(exitCode)) {
+      return { status: "incomplete", reason: "GDB exit code is malformed" };
+    }
+  }
   if (exitCode !== null && exitCode !== 0 && exitCode !== 3) {
-    return { status: "failed", reason: `capture runner exited with code ${exitCode}` };
+    return { status: "failed", reason: `capture runner exited with code ${exitCode}`, ...counts };
   }
   if (!phaseDone) {
     return { status: "incomplete", reason: "phase completion marker is missing" };
   }
-  if (exitCode === 0 && captures.length > 0) return { status: "captured", reason: null };
+  if (counts.countsAvailable && transcriptCount !== counts.capturedRuns + counts.errorRuns) {
+    return { status: "incomplete", reason: "GDB run counts conflict with retained transcripts" };
+  }
+  if (
+    exitCode === 0 && counts.countsAvailable &&
+    (counts.capturedRuns < 1 || counts.capturedRuns !== captures.length)
+  ) {
+    return { status: "incomplete", reason: "captured exit code conflicts with GDB run counts" };
+  }
+  if (
+    exitCode === 3 && counts.countsAvailable &&
+    (counts.attemptedRuns !== Number(meta.MAX_RUNS) || counts.capturedRuns !== 0 || counts.cleanRuns < 1)
+  ) {
+    return { status: "incomplete", reason: "no-fault exit code conflicts with GDB run counts" };
+  }
+  if (exitCode === 0 && captures.length > 0) return { status: "captured", reason: null, ...counts };
   if (exitCode === 0) {
     return { status: "incomplete", reason: "runner reported a capture but no fault transcript was parsed" };
   }
-  if (exitCode === 3 && captures.length === 0) return { status: "no-fault", reason: null };
+  if (exitCode === 3 && captures.length === 0) return { status: "no-fault", reason: null, ...counts };
   if (exitCode === 3) {
     return { status: "incomplete", reason: "no-fault exit code conflicts with captured faults" };
   }
@@ -636,7 +716,8 @@ export function collect(outDir) {
   }
 
   // --- gdb ---
-  const gdbMeta = readKeyValues(path.join(resultsDir, "gdb.meta"));
+  const gdbMetaState = readGdbMeta(path.join(resultsDir, "gdb.meta"));
+  const gdbMeta = gdbMetaState.values;
   const gdbDir = path.join(outDir, "gdb");
   const captures = [];
   let transcriptCount = 0;
@@ -658,6 +739,7 @@ export function collect(outDir) {
     existsSync(path.join(outDir, "state", "phase-gdb.done")),
     captures,
     transcriptCount,
+    gdbMetaState,
   );
   if (gdbStatus.status !== "not-run") {
     const identical =

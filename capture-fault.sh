@@ -26,8 +26,8 @@ max_captures="$3"
 out_dir="$4"
 
 for v in cpu max_runs max_captures; do
-  if [[ ! "${!v}" =~ ^[0-9]+$ ]]; then
-    echo "error: $v must be a non-negative integer, got '${!v}'" >&2
+  if [[ ! "${!v}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    echo "error: $v must be a canonical non-negative integer, got '${!v}'" >&2
     exit 2
   fi
 done
@@ -55,6 +55,12 @@ mkdir -p "$out_dir" || {
 captures=0
 clean_runs=0
 error_runs=0
+
+emit_run_counts() {
+  local attempted="$1"
+  printf 'GDB_RUN_COUNTS attempted=%s clean=%s captured=%s errors=%s\n' \
+    "$attempted" "$clean_runs" "$captures" "$error_runs"
+}
 
 for ((run = 1; run <= max_runs; run++)); do
   out="$out_dir/cpu${cpu}-run${run}.txt"
@@ -84,6 +90,7 @@ for ((run = 1; run <= max_runs; run++)); do
     echo "run=${run} cpu=${cpu} CAPTURED (${out##*/})"
     if [ "$captures" -ge "$max_captures" ]; then
       echo "done: ${captures} capture(s) after ${run} run(s)"
+      emit_run_counts "$run"
       exit 0
     fi
   elif grep -q "exited normally" "$out"; then
@@ -98,11 +105,14 @@ done
 
 if [ "$captures" -gt 0 ]; then
   echo "done: ${captures} capture(s) after ${max_runs} run(s)"
+  emit_run_counts "$max_runs"
   exit 0
 fi
 if [ "$clean_runs" -eq 0 ]; then
   echo "error: no run executed the workload successfully (${error_runs} error run(s))" >&2
+  emit_run_counts "$max_runs"
   exit 5
 fi
 echo "done: 0 captures after ${max_runs} run(s) (${clean_runs} clean, ${error_runs} errors)"
+emit_run_counts "$max_runs"
 exit 3
