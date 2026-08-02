@@ -75,14 +75,26 @@ test("summarizeFreqSamples: turbostat per-CPU aggregates all CPUs without a filt
   assert.equal(all.maxMHz, 3000);
 });
 
-test("summarizeFreqSamples: legacy turbostat --Summary capture falls back with whole-system note", () => {
+test("summarizeFreqSamples: legacy summary is unavailable for a pinned CPU", () => {
   const dir = writeCapture(LEGACY_SUMMARY_SAMPLES);
   const legacy = summarizeFreqSamples(dir, "exp", new Set([2]));
+  assert.equal(legacy.available, false);
+  assert.equal(legacy.samples, 0);
+  assert.equal(legacy.avgMHz, undefined);
+  assert.equal(legacy.maxMHz, undefined);
+  assert.match(legacy.note, /cannot represent the requested CPU selection/);
+  assert.match(legacy.note, /omitted/);
+});
+
+test("summarizeFreqSamples: legacy summary remains available without a CPU filter", () => {
+  const dir = writeCapture(LEGACY_SUMMARY_SAMPLES);
+  const legacy = summarizeFreqSamples(dir, "exp");
+  assert.equal(legacy.available, true);
   assert.equal(legacy.samples, 2);
   assert.equal(legacy.avgMHz, 1166.5);
   assert.equal(legacy.maxMHz, 1200);
   assert.match(legacy.note, /whole-system summary/);
-  assert.match(legacy.note, /not the pinned CPU/);
+  assert.match(legacy.note, /including idle time/);
 });
 
 test("summarizeFreqSamples: missing samples file is reported unavailable", () => {

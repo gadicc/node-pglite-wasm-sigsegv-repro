@@ -133,13 +133,20 @@ export function summarizeFreqSamples(outDir, tag, cpuFilter = null) {
       // Legacy capture from `turbostat --Summary`: no per-CPU header, so all
       // that is available is the first-column whole-system Avg_MHz, which
       // averages every CPU over the interval including idle time.
+      if (cpuFilter) {
+        summary.available = false;
+        summary.samples = 0;
+        summary.note =
+          "legacy turbostat --Summary capture cannot represent the requested CPU selection; frequency values omitted";
+        return summary;
+      }
       const mhz = [];
       for (const line of text.split("\n")) {
         const m = line.match(/^\s*(\d+(?:\.\d+)?)\s/);
         if (m) mhz.push(Number(m[1]));
       }
       summary.note =
-        "turbostat --Summary capture; Avg_MHz is a whole-system summary average (includes idle time), not the pinned CPU";
+        "legacy turbostat --Summary capture; Avg_MHz is a whole-system summary average including idle time";
       if (mhz.length > 0) {
         summary.avgMHz = Math.round((mhz.reduce((a, b) => a + b, 0) / mhz.length) * 100) / 100;
         summary.maxMHz = Math.max(...mhz);
