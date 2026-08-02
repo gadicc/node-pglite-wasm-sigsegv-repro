@@ -23,12 +23,24 @@ bundle="$2"
   echo "error: unsafe frequency staging directory" >&2
   exit 1
 }
+[[ -d "$bundle" && ! -L "$bundle" && -w "$bundle" ]] || {
+  echo "error: diagnostics bundle is not a writable real directory" >&2
+  exit 1
+}
+
+lock_rc=0
+diag_bundle_lock_acquire "$bundle" || lock_rc=$?
+((lock_rc == 0)) || exit "$lock_rc"
+
+# Everything below validates or mutates the shared destination and therefore
+# runs under the bundle's directory lock. Private staging remains untouched on
+# lock contention and can be retried by the invoking user.
 [[ "$(stat -Lc '%u:%a' -- "$stage" 2> /dev/null)" == "$EUID:700" ]] || {
   echo "error: frequency staging directory has unsafe ownership or mode" >&2
   exit 1
 }
 [[ -d "$bundle" && ! -L "$bundle" && -w "$bundle" ]] || {
-  echo "error: diagnostics bundle is not a writable real directory" >&2
+  echo "error: diagnostics bundle changed after its writer lock was acquired" >&2
   exit 1
 }
 

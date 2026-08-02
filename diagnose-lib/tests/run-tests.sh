@@ -293,6 +293,16 @@ cleanup_artifact_rc=$?
 check_eq "handled interruption runs artifact cleanup hook" "1" \
   "$([[ $cleanup_artifact_rc -eq 143 && "$(cat "$CLEANUP_ARTIFACT_MARKER" 2> /dev/null)" == "partial evidence" ]] && echo 1 || echo 0)"
 
+(
+  diag_cleanup_now() { :; }
+  diag_cleanup_artifacts() { return 75; }
+  diag_restore_lock_release() { :; }
+  diag_cleanup_exit 0
+) > /dev/null 2>&1
+cleanup_busy_rc=$?
+check_eq "normal cleanup preserves retryable publisher contention status" "75" \
+  "$cleanup_busy_rc"
+
 WORKLOAD_SIGNAL_DIR="$TMP/workload-signal"
 mkdir -p "$WORKLOAD_SIGNAL_DIR/bin"
 printf '0\n' > "$WORKLOAD_SIGNAL_DIR/no_turbo"
@@ -717,6 +727,281 @@ check_eq "dead experiment lock is reclaimed for SIGKILL recovery" "1" \
   "$([[ $stale_ready_seen -eq 1 && $stale_recovery_rc -eq 0 ]] && echo 1 || echo 0)"
 rm -f "$stale_fifo"
 
+echo "== diagnostics bundle writer lock =="
+BUNDLE_LOCK_ROOT="$TMP/bundle-writer-lock"
+mkdir -p "$BUNDLE_LOCK_ROOT/real/bundle"
+ln -s "$BUNDLE_LOCK_ROOT/real" "$BUNDLE_LOCK_ROOT/alias"
+exec {bundle_lock_holder}< "$BUNDLE_LOCK_ROOT/real/bundle"
+flock -x "$bundle_lock_holder"
+bash -c '
+  source "$1"
+  diag_bundle_lock_acquire "$2"
+' _ "$LIB/bundle-lock.sh" "$BUNDLE_LOCK_ROOT/alias/bundle" > /dev/null 2>&1
+bundle_lock_busy_rc=$?
+check_eq "directory lock serializes same-inode bundle aliases with busy rc 75" "75" \
+  "$bundle_lock_busy_rc"
+LOCK_ERROR_BIN="$TMP/bundle-lock-error-bin"
+mkdir -p "$LOCK_ERROR_BIN"
+printf '#!/usr/bin/env bash\nexit 7\n' > "$LOCK_ERROR_BIN/flock"
+chmod +x "$LOCK_ERROR_BIN/flock"
+PATH="$LOCK_ERROR_BIN:$PATH" bash -c '
+  source "$1"
+  diag_bundle_lock_acquire "$2"
+' _ "$LIB/bundle-lock.sh" "$BUNDLE_LOCK_ROOT/real/bundle" > /dev/null 2>&1
+bundle_lock_error_rc=$?
+check_eq "operational flock failures remain distinct from retryable contention" "1" \
+  "$bundle_lock_error_rc"
+
+LOCK_SWAP_ROOT="$TMP/bundle-lock-path-swap"
+LOCK_SWAP_BIN="$LOCK_SWAP_ROOT/bin"
+LOCK_SWAP_BUNDLE="$LOCK_SWAP_ROOT/bundle"
+LOCK_SWAP_MOVED="$LOCK_SWAP_ROOT/original-inode"
+LOCK_SWAP_MARKER="$LOCK_SWAP_ROOT/swapped"
+mkdir -p "$LOCK_SWAP_BIN" "$LOCK_SWAP_BUNDLE"
+cat > "$LOCK_SWAP_BIN/stat" << 'EOF'
+#!/usr/bin/env bash
+last_arg="${!#}"
+if [[ "$last_arg" == /proc/self/fd/* && ! -e "$DIAG_TEST_STAT_SWAP_MARKER" ]]; then
+  stat_output="$("$DIAG_TEST_REAL_STAT" "$@")" || exit $?
+  mv -T -- "$DIAG_TEST_STAT_SWAP_BUNDLE" "$DIAG_TEST_STAT_SWAP_MOVED" || exit 1
+  mkdir -- "$DIAG_TEST_STAT_SWAP_BUNDLE" || exit 1
+  : > "$DIAG_TEST_STAT_SWAP_MARKER"
+  printf '%s\n' "$stat_output"
+  exit 0
+fi
+exec "$DIAG_TEST_REAL_STAT" "$@"
+EOF
+chmod +x "$LOCK_SWAP_BIN/stat"
+LOCK_SWAP_REAL_STAT="$(command -v stat)"
+PATH="$LOCK_SWAP_BIN:$PATH" \
+  DIAG_TEST_REAL_STAT="$LOCK_SWAP_REAL_STAT" \
+  DIAG_TEST_STAT_SWAP_MARKER="$LOCK_SWAP_MARKER" \
+  DIAG_TEST_STAT_SWAP_BUNDLE="$LOCK_SWAP_BUNDLE" \
+  DIAG_TEST_STAT_SWAP_MOVED="$LOCK_SWAP_MOVED" \
+  timeout --signal=TERM --kill-after=1 5 bash -c '
+    source "$1"
+    diag_bundle_lock_acquire "$2"
+  ' _ "$LIB/bundle-lock.sh" "$LOCK_SWAP_BUNDLE" > /dev/null 2>&1
+bundle_lock_swap_rc=$?
+bundle_lock_swap_retry_rc=1
+if [[ $bundle_lock_swap_rc -ne 0 && -d "$LOCK_SWAP_BUNDLE" &&
+  -d "$LOCK_SWAP_MOVED" && -f "$LOCK_SWAP_MARKER" ]]; then
+  bash -c '
+    source "$1"
+    diag_bundle_lock_acquire "$2"
+    diag_bundle_lock_release
+  ' _ "$LIB/bundle-lock.sh" "$LOCK_SWAP_BUNDLE" > /dev/null 2>&1
+  bundle_lock_swap_retry_rc=$?
+fi
+check_eq "bundle replacement during lock acquisition fails closed" "1" \
+  "$([[ $bundle_lock_swap_rc -eq 1 && $bundle_lock_swap_retry_rc -eq 0 ]] && echo 1 || echo 0)"
+flock -u "$bundle_lock_holder"
+exec {bundle_lock_holder}<&-
+(
+  source "$LIB/bundle-lock.sh"
+  diag_bundle_lock_acquire "$BUNDLE_LOCK_ROOT/alias/bundle"
+  diag_bundle_lock_release
+)
+bundle_lock_retry_rc=$?
+check_eq "directory lock can be acquired immediately after the writer exits" "0" \
+  "$bundle_lock_retry_rc"
+check_eq "directory lock creates no persistent bundle artifact" "0" \
+  "$(find "$BUNDLE_LOCK_ROOT/real/bundle" -mindepth 1 -print -quit | wc -l)"
+
+# The dynamic lock FD is deliberately inherited. If a writer is killed while
+# its child can still write, contenders remain excluded until that child exits.
+INHERITED_LOCK_BUNDLE="$TMP/inherited-bundle-writer-lock"
+INHERITED_LOCK_READY="$TMP/inherited-bundle-writer.ready"
+INHERITED_LOCK_FIFO="$TMP/inherited-bundle-writer.fifo"
+mkdir -p "$INHERITED_LOCK_BUNDLE"
+mkfifo "$INHERITED_LOCK_FIFO"
+exec {inherited_lock_control_fd}<> "$INHERITED_LOCK_FIFO"
+setsid bash -c '
+  source "$1"
+  diag_bundle_lock_acquire "$2"
+  bash -c '\''printf "%s\n" "$BASHPID" > "$1"; read -r -u "$2" _'\'' _ "$3" "$4" &
+  wait
+' _ "$LIB/bundle-lock.sh" "$INHERITED_LOCK_BUNDLE" "$INHERITED_LOCK_READY" \
+  "$inherited_lock_control_fd" > /dev/null 2>&1 &
+inherited_lock_parent=$!
+inherited_lock_ready=0
+for _ in {1..100}; do
+  if [[ -s "$INHERITED_LOCK_READY" ]]; then
+    inherited_lock_ready=1
+    break
+  fi
+  sleep 0.01
+done
+kill -KILL "$inherited_lock_parent" 2> /dev/null || true
+inherited_parent_stopped=0
+for _ in {1..100}; do
+  inherited_parent_state=""
+  if [[ -r "/proc/$inherited_lock_parent/stat" ]]; then
+    read -r _ _ inherited_parent_state _ < "/proc/$inherited_lock_parent/stat" || true
+  fi
+  if [[ -z "$inherited_parent_state" || "$inherited_parent_state" == Z ||
+    "$inherited_parent_state" == X ]]; then
+    inherited_parent_stopped=1
+    break
+  fi
+  sleep 0.01
+done
+if ((inherited_parent_stopped == 1)); then
+  wait "$inherited_lock_parent" 2> /dev/null || true
+fi
+bash -c '
+  source "$1"
+  diag_bundle_lock_acquire "$2"
+' _ "$LIB/bundle-lock.sh" "$INHERITED_LOCK_BUNDLE" > /dev/null 2>&1
+inherited_lock_busy_rc=$?
+printf 'release\n' >&"$inherited_lock_control_fd"
+inherited_lock_released=0
+for _ in {1..100}; do
+  if bash -c '
+    source "$1"
+    diag_bundle_lock_acquire "$2"
+    diag_bundle_lock_release
+  ' _ "$LIB/bundle-lock.sh" "$INHERITED_LOCK_BUNDLE" > /dev/null 2>&1; then
+    inherited_lock_released=1
+    break
+  fi
+  sleep 0.01
+done
+if ((inherited_lock_released == 0)); then
+  # The parent was a dedicated session leader, so this cleans up any orphaned
+  # lock-holding child without relying on a potentially blocking wait.
+  kill -KILL -- "-$inherited_lock_parent" 2> /dev/null || true
+  inherited_lock_child="$(cat "$INHERITED_LOCK_READY" 2> /dev/null || true)"
+  [[ "$inherited_lock_child" =~ ^[0-9]+$ ]] &&
+    kill -KILL "$inherited_lock_child" 2> /dev/null || true
+fi
+check_eq "SIGKILL retains the lock while an inherited writer child lives" "1" \
+  "$([[ $inherited_lock_ready -eq 1 && $inherited_parent_stopped -eq 1 && $inherited_lock_busy_rc -eq 75 && $inherited_lock_released -eq 1 ]] && echo 1 || echo 0)"
+exec {inherited_lock_control_fd}<&-
+rm -f "$INHERITED_LOCK_FIFO"
+
+exec {source_only_lock}< "$BUNDLE_LOCK_ROOT/real/bundle"
+flock -x "$source_only_lock"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+)
+source_only_lock_rc=$?
+flock -u "$source_only_lock"
+exec {source_only_lock}<&-
+check_eq "source-only diagnose acquires no bundle lock" "0" "$source_only_lock_rc"
+
+# Main must lock a resumed bundle before even a dry-run trusts its metadata.
+# Contention is a retryable status and cannot append logs, rewrite metadata,
+# or otherwise change the bundle snapshot.
+resume_busy_tree_before="$(find "$CPU_POLICY_RB" -printf '%P\t%y\t%s\n' | sort)"
+resume_busy_meta_before="$(sha256sum "$CPU_POLICY_RB/results/meta.env")"
+exec {resume_busy_fd}< "$CPU_POLICY_RB"
+flock -x "$resume_busy_fd"
+"$REPO_ROOT/diagnose.sh" --resume "$CPU_POLICY_RB" --dry-run --yes > /dev/null 2>&1
+resume_busy_rc=$?
+resume_busy_tree_after="$(find "$CPU_POLICY_RB" -printf '%P\t%y\t%s\n' | sort)"
+resume_busy_meta_after="$(sha256sum "$CPU_POLICY_RB/results/meta.env")"
+check_eq "resume dry-run returns busy rc 75 without mutating its bundle" "1" \
+  "$([[ $resume_busy_rc -eq 75 && "$resume_busy_tree_after" == "$resume_busy_tree_before" && "$resume_busy_meta_after" == "$resume_busy_meta_before" && ! -e "$CPU_POLICY_RB/commands.log" ]] && echo 1 || echo 0)"
+
+# Locks are per directory inode rather than process-global: another complete
+# bundle remains readable while the first one is busy.
+DISTINCT_LOCK_BUNDLE="$TMP/distinct-writer-lock-bundle"
+cp -a "$CPU_POLICY_RB" "$DISTINCT_LOCK_BUNDLE"
+"$REPO_ROOT/diagnose.sh" --resume "$DISTINCT_LOCK_BUNDLE" --dry-run --yes \
+  > /dev/null 2>&1
+distinct_lock_rc=$?
+check_eq "distinct diagnostics bundles do not contend" "0" "$distinct_lock_rc"
+flock -u "$resume_busy_fd"
+exec {resume_busy_fd}<&-
+"$REPO_ROOT/diagnose.sh" --resume "$CPU_POLICY_RB" --dry-run --yes > /dev/null 2>&1
+check_eq "resume dry-run retries after the active writer exits" "0" "$?"
+
+FRESH_DRY_RUN_OUT="$TMP/fresh-dry-run-no-create"
+"$REPO_ROOT/diagnose.sh" --out-dir "$FRESH_DRY_RUN_OUT" --dry-run --yes \
+  > /dev/null 2>&1
+fresh_dry_run_rc=$?
+check_eq "fresh dry-run neither creates nor locks its output directory" "1" \
+  "$([[ $fresh_dry_run_rc -eq 0 && ! -e "$FRESH_DRY_RUN_OUT" ]] && echo 1 || echo 0)"
+
+# Help must stay side-effect free even if a busy resume path is also supplied.
+exec {help_busy_fd}< "$CPU_POLICY_RB"
+flock -x "$help_busy_fd"
+"$REPO_ROOT/diagnose.sh" --resume "$CPU_POLICY_RB" --help > /dev/null 2>&1
+help_busy_rc=$?
+flock -u "$help_busy_fd"
+exec {help_busy_fd}<&-
+check_eq "help does not acquire a diagnostics bundle lock" "0" "$help_busy_rc"
+
+# Pause the first real fresh diagnose invocation inside its successful flock
+# call. A second invocation must see rc 75. Before releasing the first, add a
+# competing entry so its under-lock emptiness check proves that initialization
+# cannot proceed from a stale pre-lock observation.
+FRESH_RACE_ROOT="$TMP/fresh-writer-race"
+FRESH_RACE_BUNDLE="$FRESH_RACE_ROOT/bundle"
+FRESH_RACE_SHIM="$FRESH_RACE_ROOT/bin"
+FRESH_RACE_READY="$FRESH_RACE_ROOT/ready"
+FRESH_RACE_FIFO="$FRESH_RACE_ROOT/release.fifo"
+mkdir -p "$FRESH_RACE_SHIM"
+mkfifo "$FRESH_RACE_FIFO"
+exec {fresh_race_control_fd}<> "$FRESH_RACE_FIFO"
+cat > "$FRESH_RACE_SHIM/flock" << 'EOF'
+#!/usr/bin/env bash
+"$DIAG_TEST_REAL_FLOCK" "$@"
+lock_rc=$?
+if ((lock_rc == 0)) && [[ "$DIAG_TEST_FLOCK_MODE" == pause ]]; then
+  : > "$DIAG_TEST_FLOCK_READY"
+  read -r -u "$DIAG_TEST_FLOCK_FD" _
+elif ((lock_rc == 0)) && [[ "$DIAG_TEST_FLOCK_MODE" == reject ]]; then
+  exit 97
+fi
+exit "$lock_rc"
+EOF
+chmod +x "$FRESH_RACE_SHIM/flock"
+FRESH_RACE_REAL_FLOCK="$(command -v flock)"
+PATH="$FRESH_RACE_SHIM:$PATH" \
+  DIAG_TEST_REAL_FLOCK="$FRESH_RACE_REAL_FLOCK" \
+  DIAG_TEST_FLOCK_MODE=pause \
+  DIAG_TEST_FLOCK_READY="$FRESH_RACE_READY" \
+  DIAG_TEST_FLOCK_FD="$fresh_race_control_fd" \
+  timeout --signal=TERM --kill-after=1 15 \
+  "$REPO_ROOT/diagnose.sh" --out-dir "$FRESH_RACE_BUNDLE" --yes \
+  > "$FRESH_RACE_ROOT/first.output" 2>&1 &
+fresh_race_first_pid=$!
+fresh_race_ready=0
+for _ in {1..300}; do
+  if [[ -e "$FRESH_RACE_READY" ]]; then
+    fresh_race_ready=1
+    break
+  fi
+  kill -0 "$fresh_race_first_pid" 2> /dev/null || break
+  sleep 0.01
+done
+fresh_race_second_rc=1
+if ((fresh_race_ready == 1)); then
+  PATH="$FRESH_RACE_SHIM:$PATH" \
+    DIAG_TEST_REAL_FLOCK="$FRESH_RACE_REAL_FLOCK" \
+    DIAG_TEST_FLOCK_MODE=reject \
+    timeout --signal=TERM --kill-after=1 5 \
+    "$REPO_ROOT/diagnose.sh" --out-dir "$FRESH_RACE_BUNDLE" --yes \
+    > "$FRESH_RACE_ROOT/second.output" 2>&1
+  fresh_race_second_rc=$?
+  printf 'concurrent creator\n' > "$FRESH_RACE_BUNDLE/late-entry"
+fi
+# This cannot block: the harness holds both ends of the control FIFO. If the
+# fixture died, the byte remains buffered and timeout still bounds the wait.
+printf 'release\n' >&"$fresh_race_control_fd"
+wait "$fresh_race_first_pid"
+fresh_race_first_rc=$?
+exec {fresh_race_control_fd}<&-
+fresh_race_entries=""
+if [[ -d "$FRESH_RACE_BUNDLE" ]]; then
+  fresh_race_entries="$(find "$FRESH_RACE_BUNDLE" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)"
+fi
+check_eq "concurrent fresh writers serialize and recheck emptiness under lock" "1" \
+  "$([[ $fresh_race_ready -eq 1 && $fresh_race_second_rc -eq 75 && $fresh_race_first_rc -ne 0 && "$fresh_race_entries" == late-entry ]] && echo 1 || echo 0)"
+
 (
   diag_require_not_symlink "$LEDGER_GUARD_DIR/restore.tsv.symlink"
 ) > /dev/null 2>&1
@@ -956,6 +1241,36 @@ if ((EUID != 0)); then
   check_eq "frequency-ab.sh refuses non-root (rc=4)" "4" "$?"
   bash "$REPO_ROOT/root-checks.sh" "$TMP" > /dev/null 2>&1
   check_eq "root-checks.sh refuses non-root (rc=4)" "4" "$?"
+
+  FREQUENCY_BUSY="$TMP/frequency-publisher-busy"
+  mkdir -p "$FREQUENCY_BUSY/real/bundle"/{results,freq,state}
+  ln -s "$FREQUENCY_BUSY/real" "$FREQUENCY_BUSY/alias"
+  prepare_frequency_publish_stage "$FREQUENCY_BUSY/stage" 0
+  printf 'old evidence\n' > "$FREQUENCY_BUSY/real/bundle/results/frequency-ab.tsv"
+  printf 'old command\n' > "$FREQUENCY_BUSY/real/bundle/commands.log"
+  touch "$FREQUENCY_BUSY/real/bundle/state/phase-frequency.done"
+  write_derived_output_fixture "$FREQUENCY_BUSY/real/bundle"
+  exec {frequency_busy_fd}< "$FREQUENCY_BUSY/real/bundle"
+  flock -x "$frequency_busy_fd"
+  bash "$LIB/publish-frequency-output.sh" \
+    "$FREQUENCY_BUSY/stage" "$FREQUENCY_BUSY/alias/bundle" > /dev/null 2>&1
+  frequency_busy_rc=$?
+  frequency_busy_unchanged=0
+  [[ $frequency_busy_rc -eq 75 ]] &&
+    [[ "$(cat "$FREQUENCY_BUSY/real/bundle/results/frequency-ab.tsv")" == "old evidence" ]] &&
+    [[ "$(cat "$FREQUENCY_BUSY/real/bundle/commands.log")" == "old command" ]] &&
+    [[ -f "$FREQUENCY_BUSY/real/bundle/state/phase-frequency.done" ]] &&
+    derived_outputs_present "$FREQUENCY_BUSY/real/bundle" &&
+    [[ -f "$FREQUENCY_BUSY/stage/results/frequency-ab.tsv" ]] && frequency_busy_unchanged=1
+  check_eq "busy frequency publisher returns 75 without mutating stage or bundle" "1" \
+    "$frequency_busy_unchanged"
+  flock -u "$frequency_busy_fd"
+  exec {frequency_busy_fd}<&-
+  bash "$LIB/publish-frequency-output.sh" \
+    "$FREQUENCY_BUSY/stage" "$FREQUENCY_BUSY/alias/bundle" > /dev/null 2>&1
+  frequency_busy_retry_rc=$?
+  check_eq "frequency publication retries after the bundle lock is released" "1" \
+    "$([[ $frequency_busy_retry_rc -eq 0 && ! -e "$FREQUENCY_BUSY/stage" && ! -e "$FREQUENCY_BUSY/real/bundle/state/phase-frequency.done" ]] && derived_outputs_absent "$FREQUENCY_BUSY/real/bundle" && echo 1 || echo 0)"
 
   PUBLISH_BUNDLE="$TMP/frequency-publish-bundle"
   PUBLISH_STAGE="$TMP/frequency-publish-stage"
@@ -1231,6 +1546,40 @@ if ((EUID != 0)); then
   check_eq "next invocation publishes SIGKILL-stranded frequency staging" "1" \
     "$([[ $stage_recovery_rc -eq 0 && ! -e "$STAGE_RECOVERY/stage" && ! -e "$STAGE_RECOVERY/state/output-stage.pending" && ! -e "$STAGE_RECOVERY/old-bundle/state/phase-frequency.done" && "$(cat "$STAGE_RECOVERY/old-bundle/results/frequency-ab.tsv")" == $'A1\t1\t0\t1' ]] && echo 1 || echo 0)"
 
+  BUSY_RECOVERY="$TMP/frequency-busy-stage-recovery"
+  mkdir -p "$BUSY_RECOVERY/state" "$BUSY_RECOVERY/old-bundle" \
+    "$BUSY_RECOVERY/current-bundle"
+  prepare_frequency_publish_stage "$BUSY_RECOVERY/stage" 0
+  write_derived_output_fixture "$BUSY_RECOVERY/old-bundle"
+  exec {busy_recovery_fd}< "$BUSY_RECOVERY/old-bundle"
+  flock -x "$busy_recovery_fd"
+  (
+    FREQUENCY_AB_SOURCE_ONLY=1
+    source "$REPO_ROOT/frequency-ab.sh"
+    unset FREQUENCY_AB_SOURCE_ONLY
+    INVOKING_UID="$(id -u)"
+    INVOKING_GID="$(id -g)"
+    FREQUENCY_STATE_UID="$INVOKING_UID"
+    FREQUENCY_STATE_GID="$INVOKING_GID"
+    SUDO_USER="$(id -un)"
+    FREQUENCY_STAGE_DIR="$BUSY_RECOVERY/stage"
+    FREQUENCY_STAGE_RECORD="$BUSY_RECOVERY/state/output-stage.pending"
+    BUNDLE="$BUSY_RECOVERY/current-bundle"
+    runuser() {
+      [[ "$1" == -u && "$3" == -- ]] || return 1
+      shift 3
+      "$@"
+    }
+    diag_recover_pending_restore() { :; }
+    frequency_stage_record_write "$BUSY_RECOVERY/old-bundle"
+    frequency_recover_prior_state
+  ) > /dev/null 2>&1
+  busy_recovery_rc=$?
+  flock -u "$busy_recovery_fd"
+  exec {busy_recovery_fd}<&-
+  check_eq "busy frequency recovery retains its exact stage and record for retry" "1" \
+    "$([[ $busy_recovery_rc -eq 75 && -f "$BUSY_RECOVERY/stage/results/frequency-ab.tsv" && -f "$BUSY_RECOVERY/state/output-stage.pending" ]] && derived_outputs_present "$BUSY_RECOVERY/old-bundle" && ! compgen -G "$BUSY_RECOVERY/stage.unpublished.*" > /dev/null && echo 1 || echo 0)"
+
   FORGED_RECOVERY="$TMP/frequency-forged-stage-record"
   mkdir -p "$FORGED_RECOVERY/state"
   printf '/tmp/allowed\t/forged\n' > "$FORGED_RECOVERY/state/output-stage.pending"
@@ -1274,6 +1623,8 @@ if ((EUID != 0)); then
 else
   ok "frequency-ab.sh non-root guard [skipped while tests run as root]"
   ok "root-checks.sh non-root guard [skipped while tests run as root]"
+  ok "busy frequency publisher returns 75 without mutating stage or bundle [skipped while tests run as root]"
+  ok "frequency publication retries after the bundle lock is released [skipped while tests run as root]"
   ok "frequency publisher invalidates derived outputs before replacing evidence [skipped while tests run as root]"
   ok "post-manifest crash leaves evidence untouched behind an absent manifest [skipped while tests run as root]"
   ok "malformed staging preserves derived outputs, marker, and evidence [skipped while tests run as root]"
@@ -1282,6 +1633,7 @@ else
   ok "frequency publisher aborts before artifact moves when marker invalidation fails [skipped while tests run as root]"
   ok "killed mixed-generation publish cannot satisfy assessFrequencyAb [skipped while tests run as root]"
   ok "next invocation publishes SIGKILL-stranded frequency staging [skipped while tests run as root]"
+  ok "busy frequency recovery retains its exact stage and record for retry [skipped while tests run as root]"
   ok "frequency staging record rejects control-character ambiguity [skipped while tests run as root]"
   ok "unrecorded deterministic stage is explicitly handed off [skipped while tests run as root]"
 fi
@@ -1297,6 +1649,33 @@ if ((EUID != 0)); then
     seal_root_checks_fixture "$stage" "$generation"
     chmod 0600 "$stage"/*
   }
+
+  ROOT_BUSY="$TMP/root-checks-publisher-busy"
+  root_publish_stage_prepare "$ROOT_BUSY/stage"
+  mkdir -p "$ROOT_BUSY/real/bundle/env/root"
+  ln -s "$ROOT_BUSY/real" "$ROOT_BUSY/alias"
+  printf 'old root evidence\n' > "$ROOT_BUSY/real/bundle/env/root/cctk.txt"
+  write_derived_output_fixture "$ROOT_BUSY/real/bundle"
+  exec {root_busy_fd}< "$ROOT_BUSY/real/bundle"
+  flock -x "$root_busy_fd"
+  bash "$LIB/publish-root-checks-output.sh" \
+    "$ROOT_BUSY/stage" "$ROOT_BUSY/alias/bundle" > /dev/null 2>&1
+  root_busy_rc=$?
+  root_busy_unchanged=0
+  [[ $root_busy_rc -eq 75 ]] &&
+    [[ "$(cat "$ROOT_BUSY/real/bundle/env/root/cctk.txt")" == "old root evidence" ]] &&
+    derived_outputs_present "$ROOT_BUSY/real/bundle" &&
+    [[ -f "$ROOT_BUSY/stage/cctk.txt" && -f "$ROOT_BUSY/stage/root-checks.meta" ]] &&
+    root_busy_unchanged=1
+  check_eq "busy root-checks publisher returns 75 without mutating stage or bundle" "1" \
+    "$root_busy_unchanged"
+  flock -u "$root_busy_fd"
+  exec {root_busy_fd}<&-
+  bash "$LIB/publish-root-checks-output.sh" \
+    "$ROOT_BUSY/stage" "$ROOT_BUSY/alias/bundle" > /dev/null 2>&1
+  root_busy_retry_rc=$?
+  check_eq "root-check publication retries after the bundle lock is released" "1" \
+    "$([[ $root_busy_retry_rc -eq 0 && ! -e "$ROOT_BUSY/stage" ]] && derived_outputs_absent "$ROOT_BUSY/real/bundle" && node "$LIB/root-checks-evidence.mjs" --validate-complete "$ROOT_BUSY/real/bundle" > /dev/null 2>&1 && echo 1 || echo 0)"
 
   ROOT_PUBLISH="$TMP/root-checks-publish"
   root_publish_stage_prepare "$ROOT_PUBLISH/stage"
@@ -1414,6 +1793,8 @@ if ((EUID != 0)); then
   check_eq "unprivileged root-checks publisher rejects output-directory substitution" "1" \
     "$([[ $root_substitute_rc -ne 0 && "$(cat "$ROOT_SUBSTITUTE/substitute/sentinel")" == "safe directory victim" && ! -e "$ROOT_SUBSTITUTE/substitute/cctk.txt" && -f "$ROOT_SUBSTITUTE/stage/cctk.txt" ]] && echo 1 || echo 0)"
 else
+  ok "busy root-checks publisher returns 75 without mutating stage or bundle [skipped while tests run as root]"
+  ok "root-check publication retries after the bundle lock is released [skipped while tests run as root]"
   ok "root-checks publisher invalidates derived outputs before replacing evidence [skipped while tests run as root]"
   ok "killed root-check publication exposes no mixed or hash-mismatched snapshot [skipped while tests run as root]"
   ok "root-check publication retry completes one validated generation [skipped while tests run as root]"
@@ -4014,6 +4395,68 @@ grep -q $'^status\t' "$B/privacy-review.txt"
 check_eq "finalization writes privacy review" "0" "$?"
 (cd "$B" && sha256sum -c manifest.txt) > /dev/null 2>&1
 check_eq "end-to-end bundle manifest verifies" "0" "$?"
+
+if ((EUID != 0)); then
+  FINALIZER_LOCK_ROOT="$TMP/finalizer-writer-lock"
+  FINALIZER_LOCK_READY="$FINALIZER_LOCK_ROOT/ready"
+  FINALIZER_LOCK_FIFO="$FINALIZER_LOCK_ROOT/release.fifo"
+  FINALIZER_FREQUENCY_STAGE="$FINALIZER_LOCK_ROOT/frequency-stage"
+  FINALIZER_ROOT_STAGE="$FINALIZER_LOCK_ROOT/root-stage"
+  mkdir -p "$FINALIZER_LOCK_ROOT"
+  mkfifo "$FINALIZER_LOCK_FIFO"
+  exec {finalizer_lock_control_fd}<> "$FINALIZER_LOCK_FIFO"
+  prepare_frequency_publish_stage "$FINALIZER_FREQUENCY_STAGE" 0
+  root_publish_stage_prepare "$FINALIZER_ROOT_STAGE"
+  timeout --signal=TERM --kill-after=1 15 bash -c '
+    DIAG_SOURCE_ONLY=1
+    source "$1/diagnose.sh"
+    OUT_DIR="$2"
+    DIAG_BUNDLE_ROOT="$2"
+    DIAG_REPO_ROOT="$1"
+    META_FILE="$2/results/meta.env"
+    STATE_DIR="$2/state"
+    DIAG_LOG_FILE=""
+    diag_bundle_lock_acquire "$2"
+    finalize_report
+    : > "$3"
+    read -r -u "$4" _
+    diag_bundle_lock_release
+  ' _ "$REPO_ROOT" "$B" "$FINALIZER_LOCK_READY" "$finalizer_lock_control_fd" \
+    > "$FINALIZER_LOCK_ROOT/finalizer.output" 2>&1 &
+  finalizer_lock_pid=$!
+  finalizer_lock_ready=0
+  for _ in {1..300}; do
+    if [[ -e "$FINALIZER_LOCK_READY" ]]; then
+      finalizer_lock_ready=1
+      break
+    fi
+    kill -0 "$finalizer_lock_pid" 2> /dev/null || break
+    sleep 0.01
+  done
+  finalizer_outputs_before=""
+  finalizer_frequency_rc=1
+  finalizer_root_rc=1
+  if ((finalizer_lock_ready == 1)); then
+    finalizer_outputs_before="$(sha256sum "$B/manifest.txt" "$B/privacy-review.txt" "$B/results.json" "$B/report.md")"
+    timeout --signal=TERM --kill-after=1 5 \
+      bash "$LIB/publish-frequency-output.sh" "$FINALIZER_FREQUENCY_STAGE" "$B" \
+      > /dev/null 2>&1
+    finalizer_frequency_rc=$?
+    timeout --signal=TERM --kill-after=1 5 \
+      bash "$LIB/publish-root-checks-output.sh" "$FINALIZER_ROOT_STAGE" "$B" \
+      > /dev/null 2>&1
+    finalizer_root_rc=$?
+  fi
+  printf 'release\n' >&"$finalizer_lock_control_fd"
+  wait "$finalizer_lock_pid"
+  finalizer_lock_rc=$?
+  exec {finalizer_lock_control_fd}<&-
+  finalizer_outputs_after="$(sha256sum "$B/manifest.txt" "$B/privacy-review.txt" "$B/results.json" "$B/report.md" 2> /dev/null)"
+  check_eq "diagnose finalization excludes both unprivileged publishers" "1" \
+    "$([[ $finalizer_lock_ready -eq 1 && $finalizer_lock_rc -eq 0 && $finalizer_frequency_rc -eq 75 && $finalizer_root_rc -eq 75 && "$finalizer_outputs_after" == "$finalizer_outputs_before" && -f "$FINALIZER_FREQUENCY_STAGE/results/frequency-ab.tsv" && -f "$FINALIZER_ROOT_STAGE/root-checks.meta" ]] && echo 1 || echo 0)"
+else
+  ok "diagnose finalization excludes both unprivileged publishers [skipped while tests run as root]"
+fi
 
 echo
 printf 'passed=%d failed=%d\n' "$pass" "$fail"

@@ -178,10 +178,12 @@ frequency_publish_outputs() {
   for dir in "$FREQUENCY_STAGE_DIR/results" "$FREQUENCY_STAGE_DIR/freq" "$FREQUENCY_STAGE_DIR"; do
     chown "$INVOKING_UID:$INVOKING_GID" "$dir" || return 1
   done
-  if ! runuser -u "$SUDO_USER" -- /bin/bash \
-    "$SCRIPT_DIR/diagnose-lib/publish-frequency-output.sh" "$FREQUENCY_STAGE_DIR" "$BUNDLE"; then
+  local publish_rc=0
+  runuser -u "$SUDO_USER" -- /bin/bash \
+    "$SCRIPT_DIR/diagnose-lib/publish-frequency-output.sh" "$FREQUENCY_STAGE_DIR" "$BUNDLE" || publish_rc=$?
+  if ((publish_rc != 0)); then
     diag_warn "could not publish partial frequency evidence; invoking user owns staging directory $FREQUENCY_STAGE_DIR"
-    return 1
+    return "$publish_rc"
   fi
   FREQUENCY_OUTPUTS_PUBLISHED=1
   if ! frequency_stage_record_clear; then
@@ -191,7 +193,7 @@ frequency_publish_outputs() {
 }
 
 frequency_recover_pending_outputs() {
-  local requested_bundle="$BUNDLE" pending_bundle="" stage_owner=""
+  local requested_bundle="$BUNDLE" pending_bundle="" stage_owner="" publish_rc=0
   local has_record=0
   [[ -e "$FREQUENCY_STAGE_RECORD" || -L "$FREQUENCY_STAGE_RECORD" ]] && has_record=1
 
@@ -229,7 +231,8 @@ frequency_recover_pending_outputs() {
   BUNDLE="$pending_bundle"
   FREQUENCY_OUTPUTS_PUBLISHED=0
   if [[ "$stage_owner" == "0:700" ]]; then
-    if frequency_publish_outputs; then
+    frequency_publish_outputs || publish_rc=$?
+    if ((publish_rc == 0)); then
       diag_log "recovered and published frequency evidence left by a killed invocation"
       BUNDLE="$requested_bundle"
       FREQUENCY_STAGE_DIR="/tmp/node-pglite-frequency-uid-$INVOKING_UID"
@@ -237,8 +240,9 @@ frequency_recover_pending_outputs() {
       return 0
     fi
   else
-    if runuser -u "$SUDO_USER" -- /bin/bash \
-      "$SCRIPT_DIR/diagnose-lib/publish-frequency-output.sh" "$FREQUENCY_STAGE_DIR" "$BUNDLE"; then
+    runuser -u "$SUDO_USER" -- /bin/bash \
+      "$SCRIPT_DIR/diagnose-lib/publish-frequency-output.sh" "$FREQUENCY_STAGE_DIR" "$BUNDLE" || publish_rc=$?
+    if ((publish_rc == 0)); then
       frequency_stage_record_clear || return 1
       diag_log "recovered and published user-owned frequency staging evidence"
       BUNDLE="$requested_bundle"
@@ -246,6 +250,14 @@ frequency_recover_pending_outputs() {
       FREQUENCY_OUTPUTS_PUBLISHED=0
       return 0
     fi
+  fi
+
+  if ((publish_rc == 75)); then
+    BUNDLE="$requested_bundle"
+    FREQUENCY_STAGE_DIR="/tmp/node-pglite-frequency-uid-$INVOKING_UID"
+    FREQUENCY_OUTPUTS_PUBLISHED=0
+    diag_warn "diagnostics bundle is busy; retained frequency staging for a later retry"
+    return 75
   fi
 
   BUNDLE="$requested_bundle"
@@ -270,7 +282,11 @@ frequency_initial_no_turbo_read() {
 # restore/output state. Main calls this before any new applicability decision.
 frequency_recover_prior_state() {
   diag_recover_pending_restore || return 10
-  frequency_recover_pending_outputs || return 11
+  local publish_rc=0
+  frequency_recover_pending_outputs || publish_rc=$?
+  ((publish_rc == 0)) && return 0
+  ((publish_rc == 75)) && return 75
+  return 11
 }
 
 frequency_validate_initial_no_turbo() {
@@ -478,6 +494,10 @@ recovery_rc=0
 frequency_recover_prior_state || recovery_rc=$?
 case "$recovery_rc" in
   0) ;;
+  75)
+    diag_warn "another diagnostics bundle writer is active; retained pending frequency evidence for retry"
+    exit 75
+    ;;
   10) diag_die "refusing to start while a previous settings restore is pending" ;;
   11) diag_die "refusing to start while prior frequency staging cannot be safely recovered" ;;
   *) diag_die "could not recover prior frequency experiment state" ;;
@@ -535,13 +555,12 @@ FREQUENCY_GENERATION="${FREQUENCY_GENERATION//-/}"
 frequency_generation_is_valid "$FREQUENCY_GENERATION" ||
   diag_die "could not create a canonical frequency evidence generation token"
 
-# Prepare the destination directories as the invoking user. Root never opens
-# or creates an output inside the user-mutable bundle.
+# Confirm the destination is usable as the invoking user. Directory creation
+# is deferred to the locked unprivileged publisher; root never opens or creates
+# an output inside the user-mutable bundle.
 runuser -u "$SUDO_USER" -- test -d "$BUNDLE" &&
   runuser -u "$SUDO_USER" -- test -w "$BUNDLE" ||
   diag_die "invoking user cannot write the diagnostics bundle"
-runuser -u "$SUDO_USER" -- mkdir -p -- "$BUNDLE/results" "$BUNDLE/freq" ||
-  diag_die "invoking user could not prepare bundle output directories"
 declare -a AS_USER=(runuser -u "$SUDO_USER" --)
 diag_log "workload legs and bundle placement run as user $SUDO_USER (via runuser)"
 

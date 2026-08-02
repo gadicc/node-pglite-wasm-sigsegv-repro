@@ -230,10 +230,12 @@ if ! chown "$invoking_uid:$invoking_gid" "$stage_dir"; then
 fi
 trap 'exit 130' INT
 trap 'exit 143' TERM
-if ! runuser -u "$SUDO_USER" -- /bin/bash \
-  "$SCRIPT_DIR/diagnose-lib/publish-root-checks-output.sh" "$stage_dir" "$bundle"; then
+local publish_rc=0
+runuser -u "$SUDO_USER" -- /bin/bash \
+  "$SCRIPT_DIR/diagnose-lib/publish-root-checks-output.sh" "$stage_dir" "$bundle" || publish_rc=$?
+if ((publish_rc != 0)); then
   echo "error: could not publish root-checks evidence; invoking user owns staging directory $stage_dir" >&2
-  exit 1
+  return "$publish_rc"
 fi
 stage_dir=""
 trap - INT TERM

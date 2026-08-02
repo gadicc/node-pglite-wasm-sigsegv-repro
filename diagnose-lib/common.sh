@@ -529,20 +529,25 @@ diag_cleanup_artifacts() {
 }
 
 diag_cleanup_exit() {
-  local rc="$1" cleanup_rc=0
+  local rc="$1" cleanup_rc=0 artifact_rc=0
   trap - EXIT INT TERM
   if diag_cleanup_now; then
     :
   else
     cleanup_rc=$?
   fi
-  if ! diag_cleanup_artifacts; then
-    cleanup_rc=1
+  diag_cleanup_artifacts || artifact_rc=$?
+  if ((artifact_rc != 0)); then
+    if ((cleanup_rc == 0 && artifact_rc == 75)); then
+      cleanup_rc=75
+    else
+      cleanup_rc=1
+    fi
   fi
   if ! diag_restore_lock_release; then
     cleanup_rc=1
   fi
-  ((rc == 0 && cleanup_rc != 0)) && rc=1
+  ((rc == 0 && cleanup_rc != 0)) && rc=$cleanup_rc
   exit "$rc"
 }
 

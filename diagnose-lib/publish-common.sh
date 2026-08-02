@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Shared fail-closed helpers for unprivileged companion-output publishers.
 
+publish_common_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bundle-lock.sh
+source "$publish_common_dir/bundle-lock.sh"
+unset publish_common_dir
+
 publish_invalidate_derived_outputs() {
   local bundle="$1" path
   local -a derived=(manifest.txt privacy-review.txt results.json report.md)

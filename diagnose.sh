@@ -27,6 +27,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 LIB="$SCRIPT_DIR/diagnose-lib"
 # shellcheck source=diagnose-lib/common.sh
 source "$LIB/common.sh"
+# shellcheck source=diagnose-lib/bundle-lock.sh
+source "$LIB/bundle-lock.sh"
 
 # This unprivileged entrypoint never changes settings and must never inherit
 # restore authority from its environment or from a resumed bundle.
@@ -81,7 +83,7 @@ CPU_EXPLICIT=0
 CPU_FLAG_SEEN=0
 PENDING_CPU_TARGET_UNAVAILABLE=0
 REQUIRED_COMMANDS=(
-  awk basename bash cat cut date dirname find grep head mkdir mktemp mv node
+  awk basename bash cat cut date dirname find flock grep head mkdir mktemp mv node
   nproc paste readlink rm sed setsid sha256sum sleep sort sync tail taskset tee timeout
   touch tr uniq wc xargs
 )
@@ -149,6 +151,12 @@ EOF
 pre_pass() {
   while (($#)); do
     case "$1" in
+      -h | --help)
+        # Help is side-effect free even when combined with --resume. Handle it
+        # before resolving or locking any caller-supplied bundle path.
+        usage
+        exit 0
+        ;;
       --resume)
         RESUME_DIR="${2:?--resume needs a directory}"
         shift 2
@@ -2563,6 +2571,9 @@ diagnose_cleanup_exit() {
   redo_marker_temp_cleanup
   diag_process_group_stop
   diag_freq_sampler_stop
+  # Children inherit the lock descriptor intentionally. Reap all writers
+  # before closing our final descriptor so SIGKILL cannot expose live writes.
+  diag_bundle_lock_release || rc=1
   exit "$rc"
 }
 
@@ -2581,6 +2592,7 @@ on_interrupt() {
   # Best effort: a failed partial report must not mask the interrupt, so
   # the subshell contains diag_die's exit and the failure is swallowed.
   ( finalize_report ) 2> /dev/null || true
+  diag_bundle_lock_release 2> /dev/null || true
   if [[ "$sig" == "SIGINT" ]]; then exit 130; else exit 143; fi
 }
 
@@ -2658,6 +2670,11 @@ main() {
     fi
     RESUME_DIR="$resume_abs"
     OUT_DIR="$resume_abs"
+    # Lock before treating stored metadata, redo state, markers, or evidence
+    # as authoritative. A resume dry-run also needs one coherent snapshot.
+    local resume_lock_rc=0
+    diag_bundle_lock_acquire "$OUT_DIR" || resume_lock_rc=$?
+    ((resume_lock_rc == 0)) || return "$resume_lock_rc"
     [[ -d "$OUT_DIR/results" && ! -L "$OUT_DIR/results" &&
       -f "$OUT_DIR/results/meta.env" && ! -L "$OUT_DIR/results/meta.env" ]] ||
       diag_die "resume directory '$OUT_DIR' is not a diagnostic bundle (missing results/meta.env)"
@@ -2730,8 +2747,19 @@ main() {
   safety_gate
   print_plan
 
+  if [[ -z "$RESUME_DIR" ]]; then
+    # Only create the bundle root before locking. Recheck emptiness under the
+    # lock so concurrent fresh writers cannot both initialize one directory.
+    mkdir -p "$OUT_DIR"
+    OUT_DIR="$(cd "$OUT_DIR" && pwd -P)"
+    local fresh_lock_rc=0
+    diag_bundle_lock_acquire "$OUT_DIR" || fresh_lock_rc=$?
+    ((fresh_lock_rc == 0)) || return "$fresh_lock_rc"
+    if find "$OUT_DIR" -mindepth 1 -print -quit | grep -q .; then
+      diag_die "output directory '$OUT_DIR' became non-empty before initialization; use --resume to continue that bundle"
+    fi
+  fi
   mkdir -p "$OUT_DIR"/{results,logs/individual,state,env,freq,gdb}
-  OUT_DIR="$(cd "$OUT_DIR" && pwd)"
   DIAG_BUNDLE_ROOT="$OUT_DIR"
   DIAG_REPO_ROOT="$SCRIPT_DIR"
   META_FILE="$OUT_DIR/results/meta.env"
