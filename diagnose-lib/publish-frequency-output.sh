@@ -85,6 +85,33 @@ commands_destination="$bundle/commands.log"
   echo "error: refusing unsafe bundle command-log destination" >&2
   exit 1
 }
+
+# An existing marker belongs to the previous artifact generation. Invalidate
+# it before changing any evidence so interruption can only leave a generation
+# that diagnose --resume must revalidate. The publisher never recreates it.
+state_dir="$bundle/state"
+if [[ -e "$state_dir" || -L "$state_dir" ]]; then
+  [[ -d "$state_dir" && ! -L "$state_dir" ]] || {
+    echo "error: refusing unsafe bundle state directory" >&2
+    exit 1
+  }
+else
+  mkdir -- "$state_dir"
+fi
+[[ -w "$state_dir" ]] || {
+  echo "error: bundle state directory is not writable by the invoking user" >&2
+  exit 1
+}
+completion_marker="$state_dir/phase-frequency.done"
+if ! rm -f -- "$completion_marker"; then
+  echo "error: could not invalidate the previous frequency completion marker" >&2
+  exit 1
+fi
+[[ ! -e "$completion_marker" && ! -L "$completion_marker" ]] || {
+  echo "error: previous frequency completion marker is still present" >&2
+  exit 1
+}
+
 commands_tmp="$(mktemp "$bundle/.frequency-commands.XXXXXX")"
 cleanup_tmp() {
   [[ -z "${commands_tmp:-}" ]] || rm -f -- "$commands_tmp"
@@ -98,8 +125,15 @@ if [[ -f "$commands_destination" ]]; then
 fi
 cat -- "$staged_commands" >> "$commands_tmp"
 
+moves_completed=0
 for rel in "${present_files[@]}"; do
   mv -fT -- "$stage/$rel" "$bundle/$rel"
+  ((moves_completed += 1))
+  # Test-only crash injection proves the absent marker protects a bundle left
+  # between per-file moves; a real SIGKILL has the same publication state.
+  if [[ "${DIAG_TEST_FREQUENCY_PUBLISH_KILL_AFTER_FIRST_MOVE:-0}" == "1" && $moves_completed -eq 1 ]]; then
+    kill -KILL "$BASHPID"
+  fi
 done
 mv -fT -- "$commands_tmp" "$commands_destination"
 commands_tmp=""

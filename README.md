@@ -119,6 +119,9 @@ script through `sudo` from a non-root account: workload legs run as that user,
 while root writes evidence only to a private staging directory. After settings
 are restored, a helper running as the invoking user publishes complete or
 partial evidence into the bundle, including after a handled interruption.
+Before replacing any frequency evidence, publication removes the previous
+frequency completion marker; `diagnose.sh --resume` revalidates the new files
+before recreating it.
 Requested *and* measured frequencies (turbostat preferred,
 `scaling_cur_freq` fallback) are reported per leg; never trust
 `scaling_max_freq` alone on intel_pstate/HWP. A separate, clearly labelled

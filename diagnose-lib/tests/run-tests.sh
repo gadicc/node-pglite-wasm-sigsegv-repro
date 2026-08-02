@@ -386,10 +386,11 @@ if ((EUID != 0)); then
 
   PUBLISH_BUNDLE="$TMP/frequency-publish-bundle"
   PUBLISH_STAGE="$TMP/frequency-publish-stage"
-  mkdir -p "$PUBLISH_BUNDLE/results" "$PUBLISH_BUNDLE/freq" \
+  mkdir -p "$PUBLISH_BUNDLE/results" "$PUBLISH_BUNDLE/freq" "$PUBLISH_BUNDLE/state" \
     "$PUBLISH_STAGE/results" "$PUBLISH_STAGE/freq"
   chmod 0700 "$PUBLISH_STAGE" "$PUBLISH_STAGE/results" "$PUBLISH_STAGE/freq"
   printf 'old command\n' > "$PUBLISH_BUNDLE/commands.log"
+  touch "$PUBLISH_BUNDLE/state/phase-frequency.done"
   printf 'safe victim\n' > "$TMP/frequency-publish-victim"
   ln -s "$TMP/frequency-publish-victim" "$PUBLISH_BUNDLE/results/frequency-ab.tsv"
   printf 'new evidence\n' > "$PUBLISH_STAGE/results/frequency-ab.tsv"
@@ -414,8 +415,9 @@ if ((EUID != 0)); then
     [[ "$(cat "$PUBLISH_BUNDLE/freq/freq-ab-A1.method")" == "scaling_cur_freq" ]] &&
     grep -q '^old command$' "$PUBLISH_BUNDLE/commands.log" &&
     grep -q '^new command$' "$PUBLISH_BUNDLE/commands.log" &&
+    [[ ! -e "$PUBLISH_BUNDLE/state/phase-frequency.done" ]] &&
     [[ ! -e "$PUBLISH_STAGE" ]] && publish_safe=1
-  check_eq "unprivileged frequency publisher safely replaces a raced output symlink" "1" "$publish_safe"
+  check_eq "frequency publisher replaces a raced symlink and invalidates the old marker" "1" "$publish_safe"
 
   COMMAND_LINK_BUNDLE="$TMP/frequency-command-link-bundle"
   COMMAND_LINK_STAGE="$TMP/frequency-command-link-stage"
@@ -431,11 +433,55 @@ if ((EUID != 0)); then
   command_link_rc=$?
   check_eq "unprivileged frequency publisher rejects a command-log symlink" "1" \
     "$([[ $command_link_rc -ne 0 && "$(cat "$TMP/frequency-command-victim")" == "safe command victim" && -f "$COMMAND_LINK_STAGE/commands.log" ]] && echo 1 || echo 0)"
+
+  MARKER_FAIL_BUNDLE="$TMP/frequency-marker-fail-bundle"
+  MARKER_FAIL_STAGE="$TMP/frequency-marker-fail-stage"
+  mkdir -p "$MARKER_FAIL_BUNDLE/results" "$MARKER_FAIL_BUNDLE/freq" \
+    "$MARKER_FAIL_BUNDLE/state/phase-frequency.done" \
+    "$MARKER_FAIL_STAGE/results" "$MARKER_FAIL_STAGE/freq"
+  chmod 0700 "$MARKER_FAIL_STAGE" "$MARKER_FAIL_STAGE/results" "$MARKER_FAIL_STAGE/freq"
+  printf 'old evidence\n' > "$MARKER_FAIL_BUNDLE/results/frequency-ab.tsv"
+  printf 'new evidence\n' > "$MARKER_FAIL_STAGE/results/frequency-ab.tsv"
+  printf 'new command\n' > "$MARKER_FAIL_STAGE/commands.log"
+  chmod 0600 "$MARKER_FAIL_STAGE/results/frequency-ab.tsv" "$MARKER_FAIL_STAGE/commands.log"
+  bash "$LIB/publish-frequency-output.sh" "$MARKER_FAIL_STAGE" "$MARKER_FAIL_BUNDLE" \
+    > /dev/null 2>&1
+  marker_fail_rc=$?
+  check_eq "frequency publisher aborts before artifact moves when marker invalidation fails" "1" \
+    "$([[ $marker_fail_rc -ne 0 && "$(cat "$MARKER_FAIL_BUNDLE/results/frequency-ab.tsv")" == "old evidence" && "$(cat "$MARKER_FAIL_STAGE/results/frequency-ab.tsv")" == "new evidence" && -d "$MARKER_FAIL_BUNDLE/state/phase-frequency.done" ]] && echo 1 || echo 0)"
+
+  MIXED_BUNDLE="$TMP/frequency-mixed-bundle"
+  MIXED_STAGE="$TMP/frequency-mixed-stage"
+  mkdir -p "$MIXED_BUNDLE/results" "$MIXED_BUNDLE/freq" "$MIXED_BUNDLE/state" \
+    "$MIXED_STAGE/results" "$MIXED_STAGE/freq"
+  chmod 0700 "$MIXED_STAGE" "$MIXED_STAGE/results" "$MIXED_STAGE/freq"
+  printf 'A1\t1\t0\t1\nB\t1\t0\t1\nA2\t1\t0\t1\n' > "$MIXED_BUNDLE/results/frequency-ab.tsv"
+  printf 'CPU=19\nRUNS_PER_LEG=1\nRESTORED=1\nCOMPLETED=1\nLEG_A1_NO_TURBO=0\nLEG_B_NO_TURBO=1\nLEG_A2_NO_TURBO=0\n' \
+    > "$MIXED_BUNDLE/results/frequency-ab.meta"
+  touch "$MIXED_BUNDLE/state/phase-frequency.done"
+  printf 'A1\t1\t139\t2\nB\t1\t0\t2\nA2\t1\t139\t2\n' > "$MIXED_STAGE/results/frequency-ab.tsv"
+  printf 'CPU=20\nRUNS_PER_LEG=1\nRESTORED=1\nCOMPLETED=1\nLEG_A1_NO_TURBO=0\nLEG_B_NO_TURBO=1\nLEG_A2_NO_TURBO=0\n' \
+    > "$MIXED_STAGE/results/frequency-ab.meta"
+  printf 'new command\n' > "$MIXED_STAGE/commands.log"
+  chmod 0600 "$MIXED_STAGE/results/frequency-ab.tsv" \
+    "$MIXED_STAGE/results/frequency-ab.meta" "$MIXED_STAGE/commands.log"
+  bash -c 'DIAG_TEST_FREQUENCY_PUBLISH_KILL_AFTER_FIRST_MOVE=1 bash "$1" "$2" "$3"; rc=$?; exit "$rc"' \
+    _ "$LIB/publish-frequency-output.sh" "$MIXED_STAGE" "$MIXED_BUNDLE" \
+    > /dev/null 2>&1
+  mixed_publish_rc=$?
+  node "$LIB/collect.mjs" "$MIXED_BUNDLE" > /dev/null 2>&1
+  mixed_assessment="$(node -e \
+    'const fs=require("fs"); const r=JSON.parse(fs.readFileSync(process.argv[1], "utf8")); process.stdout.write(`${r.frequencyAbStatus.status}|${r.frequencyAb === undefined}`)' \
+    "$MIXED_BUNDLE/results.json")"
+  check_eq "killed mixed-generation publish cannot satisfy assessFrequencyAb" "1" \
+    "$([[ $mixed_publish_rc -ne 0 && ! -e "$MIXED_BUNDLE/state/phase-frequency.done" && "$(head -n 1 "$MIXED_BUNDLE/results/frequency-ab.tsv")" == $'A1\t1\t139\t2' && "$(head -n 1 "$MIXED_BUNDLE/results/frequency-ab.meta")" == 'CPU=19' && "$mixed_assessment" == 'incomplete|true' ]] && echo 1 || echo 0)"
 else
   ok "frequency-ab.sh non-root guard [skipped while tests run as root]"
   ok "root-checks.sh non-root guard [skipped while tests run as root]"
-  ok "unprivileged frequency publisher safely replaces a raced output symlink [skipped while tests run as root]"
+  ok "frequency publisher replaces a raced symlink and invalidates the old marker [skipped while tests run as root]"
   ok "unprivileged frequency publisher rejects a command-log symlink [skipped while tests run as root]"
+  ok "frequency publisher aborts before artifact moves when marker invalidation fails [skipped while tests run as root]"
+  ok "killed mixed-generation publish cannot satisfy assessFrequencyAb [skipped while tests run as root]"
 fi
 
 if ((EUID != 0)); then
