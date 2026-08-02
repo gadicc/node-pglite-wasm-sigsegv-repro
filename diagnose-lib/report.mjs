@@ -304,15 +304,21 @@ export function renderReport(results) {
   L.push("");
 
   // Optional privileged reads (manual root-checks.sh output).
-  if (r.rootChecks) {
-    L.push("### Privileged reads (manual `root-checks.sh`)");
+  const rootChecksStatus = r.rootChecksStatus?.status ?? "not-run";
+  if (rootChecksStatus === "complete" && r.rootChecks) {
+    L.push("### Privileged reads: out-of-band supplemental snapshot");
     L.push("");
-    L.push("Collected separately and read-only by a user-reviewed sudo run;");
-    L.push("diagnose.sh itself never elevates privileges.");
+    L.push("Collected separately and read-only by a user-reviewed `root-checks.sh`");
+    L.push("sudo run; `diagnose.sh` itself never elevates privileges. This is a");
+    L.push("supplemental point snapshot only and is never used for causal claims.");
+    if (r.rootChecksStatus?.collectedAt) {
+      L.push(`Snapshot collected: ${esc(r.rootChecksStatus.collectedAt)}.`);
+    }
     L.push("");
     const caps = { "kernel-warnings.txt": 40, "cctk.txt": 30, "intel-undervolt.txt": 30, "turbostat.txt": 20 };
-    for (const [file, text] of Object.entries(r.rootChecks)) {
-      if (file.endsWith(".meta")) continue;
+    for (const file of ["kernel-warnings.txt", "intel-undervolt.txt", "cctk.txt", "turbostat.txt"]) {
+      const text = r.rootChecks[file];
+      if (typeof text !== "string") continue;
       L.push(`\`env/root/${file}\`:`);
       L.push("");
       L.push("```");
@@ -323,6 +329,13 @@ export function renderReport(results) {
       L.push("```");
       L.push("");
     }
+  } else if (rootChecksStatus !== "not-run") {
+    L.push("### Privileged reads: out-of-band supplemental snapshot");
+    L.push("");
+    L.push(`**Root-checks evidence was excluded as ${rootChecksStatus}.**`);
+    for (const reason of r.rootChecksStatus?.reasons ?? []) L.push(`- ${esc(reason)}`);
+    L.push("No privileged-read payload is displayed or used for conclusions.");
+    L.push("");
   }
 
   // ------------------------------------------------------------------

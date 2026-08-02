@@ -769,6 +769,48 @@ test("renderReport: environment without an explicit complete preflight status is
   assert.doesNotMatch(md, /Power source at preflight \| battery/);
 });
 
+test("renderReport: complete root checks are a supplemental snapshot, never a causal claim", () => {
+  const md = renderReport({
+    collectedAt: "2026-08-02T00:00:00.000Z",
+    config: {},
+    rootChecksStatus: {
+      status: "complete",
+      reasons: [],
+      generation: "abcdef0123456789abcdef0123456789",
+      collectedAt: "2026-08-02T20:00:00+00:00",
+    },
+    rootChecks: {
+      "kernel-warnings.txt": "no warnings",
+      "intel-undervolt.txt": "offset 0 mV",
+      "cctk.txt": "IntelTME=Disabled",
+      "turbostat.txt": "Bzy_MHz 4200",
+    },
+  });
+  assert.match(md, /out-of-band supplemental snapshot/);
+  assert.match(md, /supplemental point snapshot only and is never used for causal claims/);
+  assert.match(md, /IntelTME=Disabled/);
+  const conclusions = md
+    .split("## Conclusions (derived from this run)\n")[1]
+    ?.split("\n## Limitations")[0];
+  assert.ok(conclusions);
+  assert.doesNotMatch(conclusions, /IntelTME|Disabled|offset 0 mV/);
+});
+
+test("renderReport: incomplete root checks are explained and crafted payloads are excluded", () => {
+  const md = renderReport({
+    collectedAt: "2026-08-02T00:00:00.000Z",
+    config: {},
+    rootChecksStatus: {
+      status: "invalid",
+      reasons: ["root-checks digest mismatch for cctk.txt"],
+    },
+    rootChecks: { "cctk.txt": "UNTRUSTED_ROOT_PAYLOAD" },
+  });
+  assert.match(md, /Root-checks evidence was excluded as invalid/);
+  assert.match(md, /root-checks digest mismatch for cctk\.txt/);
+  assert.doesNotMatch(md, /UNTRUSTED_ROOT_PAYLOAD/);
+});
+
 test("renderReport: clean heterogeneous phases do not get a pooled rate bound", () => {
   const md = renderReport({
     collectedAt: "2026-08-02T00:00:00.000Z",

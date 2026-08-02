@@ -103,7 +103,9 @@ sudo ./frequency-ab.sh 19 20 diagnostics/<bundle> # the A/B/A experiment
   never takes a password, and never produces a full `cctk` export.
   Run it through `sudo` from a non-root account. Privileged reads are collected
   in a private staging directory, then an unprivileged helper publishes the
-  five allowlisted evidence files into the user-owned bundle.
+  four allowlisted payloads plus strict digest metadata into the user-owned
+  bundle. A zero-byte completion marker is published last; incomplete, mixed,
+  oversized, or changed generations are excluded by the collector.
 - `frequency-ab.sh` is the only script that changes anything; see below.
 
 Both companion publishers validate their complete staging and destination
@@ -111,6 +113,8 @@ sets before changing the bundle. A successful publication invalidates
 `manifest.txt` first, then removes the stale privacy review, results JSON, and
 report before replacing evidence. Run `diagnose.sh --resume` afterward to
 regenerate those derived outputs for the new evidence generation.
+Validated privileged reads remain an out-of-band supplemental point snapshot;
+they are displayed for context but never used for causal conclusions.
 
 ### Frequency A/B/A (`frequency-ab.sh`)
 

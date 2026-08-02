@@ -51,6 +51,13 @@ root_checks_main() {
     echo "error: missing required command: runuser" >&2
     exit 4
   }
+  local dependency
+  for dependency in od sha256sum; do
+    command -v "$dependency" > /dev/null 2>&1 || {
+      echo "error: missing required command: $dependency" >&2
+      exit 4
+    }
+  done
   [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]] || {
     echo "error: run through sudo from a non-root account so evidence can be published without root privileges" >&2
     exit 1
@@ -79,9 +86,10 @@ root_checks_main() {
       echo "error: invoking user cannot write the diagnostics bundle" >&2
       exit 1
     }
-  local -a output_names=(
-    kernel-warnings.txt intel-undervolt.txt cctk.txt turbostat.txt root-checks.meta
+  local -a payload_names=(
+    kernel-warnings.txt intel-undervolt.txt cctk.txt turbostat.txt
   )
+  local -a output_names=("${payload_names[@]}" root-checks.meta)
 
   # Collect outside the user-owned bundle. Root never opens or renames a
   # destination beneath the bundle; final placement is delegated below.
@@ -162,9 +170,33 @@ echo "[root-checks] staging privileged reads for $bundle/env/root"
   fi
 } > "$stage_dir/turbostat.txt"
 
+local generation collected_at kernel_sha undervolt_sha cctk_sha turbostat_sha
+generation="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')" || {
+  echo "error: could not generate a root-checks evidence generation" >&2
+  exit 1
+}
+[[ "$generation" =~ ^[0-9a-f]{32}$ ]] || {
+  echo "error: generated root-checks evidence generation is malformed" >&2
+  exit 1
+}
+collected_at="$(date -Is)" || exit 1
+kernel_sha="$(sha256sum -- "$stage_dir/kernel-warnings.txt")" || exit 1
+undervolt_sha="$(sha256sum -- "$stage_dir/intel-undervolt.txt")" || exit 1
+cctk_sha="$(sha256sum -- "$stage_dir/cctk.txt")" || exit 1
+turbostat_sha="$(sha256sum -- "$stage_dir/turbostat.txt")" || exit 1
+kernel_sha="${kernel_sha%% *}"
+undervolt_sha="${undervolt_sha%% *}"
+cctk_sha="${cctk_sha%% *}"
+turbostat_sha="${turbostat_sha%% *}"
 {
-  echo "date=$(date -Is)"
-  echo "host_bundle=."
+  printf 'VERSION=1\n'
+  printf 'GENERATION=%s\n' "$generation"
+  printf 'COLLECTED_AT=%s\n' "$collected_at"
+  printf 'KERNEL_WARNINGS_SHA256=%s\n' "$kernel_sha"
+  printf 'INTEL_UNDERVOLT_SHA256=%s\n' "$undervolt_sha"
+  printf 'CCTK_SHA256=%s\n' "$cctk_sha"
+  printf 'TURBOSTAT_SHA256=%s\n' "$turbostat_sha"
+  printf 'COMPLETED=1\n'
 } > "$stage_dir/root-checks.meta"
 
 local name

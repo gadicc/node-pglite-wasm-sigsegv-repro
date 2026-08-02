@@ -25,6 +25,7 @@ import { assessBaselineEvidence } from "./baseline-evidence.mjs";
 import { assessGroupsEvidence, deriveIndividualTargetPolicy } from "./groups-evidence.mjs";
 import { inspectFrequencyEvidence, readBoundFrequencyArtifact } from "./frequency-evidence.mjs";
 import { assessPreflightEvidence } from "./preflight-evidence.mjs";
+import { assessRootChecksEvidence } from "./root-checks-evidence.mjs";
 
 const RUN_CONFIG_KEYS = new Set([
   "MODE", "BASELINE_CHILDREN", "BASELINE_WAVES", "GROUP_WAVES",
@@ -767,6 +768,9 @@ export function collect(outDir) {
   const preflightAssessment = runMetaState.bundleRootSafe
     ? assessPreflightEvidence(outDir)
     : { status: "invalid", reasons: ["bundle root cannot authorize preflight evidence"], generation: null };
+  const rootChecksAssessment = runMetaState.bundleRootSafe
+    ? assessRootChecksEvidence(outDir)
+    : { status: "invalid", reasons: ["bundle root cannot authorize root-checks evidence"], generation: null };
   const resultsDir = path.join(outDir, "results");
 
   const results = {
@@ -803,22 +807,21 @@ export function collect(outDir) {
       reasons: preflightAssessment.reasons,
       generation: preflightAssessment.generation,
     },
+    rootChecksStatus: {
+      status: rootChecksAssessment.status,
+      reasons: rootChecksAssessment.reasons,
+      generation: rootChecksAssessment.generation,
+      collectedAt: rootChecksAssessment.collectedAt ?? null,
+    },
   };
   if (preflightAssessment.status === "complete") {
     results.environment = preflightAssessment.environment;
   }
 
-  // Optional privileged reads produced by a manual `sudo ./root-checks.sh
-  // <bundle>` run (kept separate from diagnose.sh, which never elevates).
-  const rootDir = path.join(outDir, "env", "root");
-  if (runMetaState.bundleRootSafe && existsSync(rootDir)) {
-    const rootReads = {};
-    for (const f of readdirSync(rootDir).sort()) {
-      if (f.endsWith(".txt") || f.endsWith(".meta")) {
-        rootReads[f] = readFileSync(path.join(rootDir, f), "utf8").trim();
-      }
-    }
-    if (Object.keys(rootReads).length > 0) results.rootChecks = rootReads;
+  // Optional privileged reads remain out-of-band and are exposed only after
+  // their exact fixed envelope and completion marker validate.
+  if (rootChecksAssessment.status === "complete") {
+    results.rootChecks = rootChecksAssessment.rootChecks;
   }
 
   // --- baseline ---

@@ -172,6 +172,36 @@ derived_outputs_present() {
   done
 }
 
+seal_root_checks_fixture() {
+  local directory="$1" generation="${2:-abcdef0123456789abcdef0123456789}"
+  local kernel_sha undervolt_sha cctk_sha turbostat_sha
+  kernel_sha="$(sha256sum "$directory/kernel-warnings.txt" | awk '{print $1}')"
+  undervolt_sha="$(sha256sum "$directory/intel-undervolt.txt" | awk '{print $1}')"
+  cctk_sha="$(sha256sum "$directory/cctk.txt" | awk '{print $1}')"
+  turbostat_sha="$(sha256sum "$directory/turbostat.txt" | awk '{print $1}')"
+  cat > "$directory/root-checks.meta" << EOF
+VERSION=1
+GENERATION=$generation
+COLLECTED_AT=2026-08-02T20:00:00+00:00
+KERNEL_WARNINGS_SHA256=$kernel_sha
+INTEL_UNDERVOLT_SHA256=$undervolt_sha
+CCTK_SHA256=$cctk_sha
+TURBOSTAT_SHA256=$turbostat_sha
+COMPLETED=1
+EOF
+}
+
+write_root_checks_fixture() {
+  local bundle="$1" generation="${2:-abcdef0123456789abcdef0123456789}" name
+  local directory="$bundle/env/root"
+  mkdir -p "$directory"
+  for name in kernel-warnings.txt intel-undervolt.txt cctk.txt turbostat.txt; do
+    [[ -e "$directory/$name" ]] || printf 'root-check payload %s\n' "$name" > "$directory/$name"
+  done
+  seal_root_checks_fixture "$directory" "$generation"
+  : > "$directory/root-checks.done"
+}
+
 # Shared real/alternate CPU fixtures for persisted selection-policy tests.
 TEST_ONLINE_CPUS="$(sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' /proc/self/status)"
 TEST_ONLINE_CPU="$(diag_cpulist_expand "$TEST_ONLINE_CPUS" | head -1)"
@@ -1258,13 +1288,14 @@ fi
 
 if ((EUID != 0)); then
   root_publish_stage_prepare() {
-    local stage="$1" name
+    local stage="$1" generation="${2:-0123456789abcdef0123456789abcdef}" name
     mkdir -p "$stage"
     chmod 0700 "$stage"
-    for name in kernel-warnings.txt intel-undervolt.txt cctk.txt turbostat.txt root-checks.meta; do
+    for name in kernel-warnings.txt intel-undervolt.txt cctk.txt turbostat.txt; do
       printf 'staged %s\n' "$name" > "$stage/$name"
-      chmod 0600 "$stage/$name"
     done
+    seal_root_checks_fixture "$stage" "$generation"
+    chmod 0600 "$stage"/*
   }
 
   ROOT_PUBLISH="$TMP/root-checks-publish"
@@ -1282,9 +1313,44 @@ if ((EUID != 0)); then
     [[ -f "$ROOT_PUBLISH/bundle/env/root/cctk.txt" && ! -L "$ROOT_PUBLISH/bundle/env/root/cctk.txt" ]] &&
     [[ "$(cat "$ROOT_PUBLISH/bundle/env/root/cctk.txt")" == "staged cctk.txt" ]] &&
     [[ "$(stat -Lc '%a' "$ROOT_PUBLISH/bundle/env/root/cctk.txt")" == "644" ]] &&
+    [[ -f "$ROOT_PUBLISH/bundle/env/root/root-checks.done" && ! -s "$ROOT_PUBLISH/bundle/env/root/root-checks.done" ]] &&
+    node "$LIB/root-checks-evidence.mjs" --validate-complete "$ROOT_PUBLISH/bundle" > /dev/null 2>&1 &&
     derived_outputs_absent "$ROOT_PUBLISH/bundle" &&
     [[ ! -e "$ROOT_PUBLISH/stage" ]] && root_publish_safe=1
   check_eq "root-checks publisher invalidates derived outputs before replacing evidence" "1" "$root_publish_safe"
+
+  ROOT_RETRY="$TMP/root-checks-kill-retry"
+  root_publish_stage_prepare "$ROOT_RETRY/stage" 11111111111111111111111111111111
+  mkdir -p "$ROOT_RETRY/bundle"
+  write_root_checks_fixture "$ROOT_RETRY/bundle" 22222222222222222222222222222222
+  write_derived_output_fixture "$ROOT_RETRY/bundle"
+  DIAG_TEST_ROOT_PUBLISH_KILL_AFTER_FIRST_PAYLOAD=1 \
+    bash "$LIB/publish-root-checks-output.sh" "$ROOT_RETRY/stage" "$ROOT_RETRY/bundle" \
+    > /dev/null 2>&1
+  root_retry_kill_rc=$?
+  node "$LIB/collect.mjs" "$ROOT_RETRY/bundle" > /dev/null 2>&1
+  root_retry_mixed_status="$(node -e \
+    'const r=require(process.argv[1]); process.stdout.write(`${r.rootChecksStatus.status}|${r.rootChecks === undefined}`)' \
+    "$ROOT_RETRY/bundle/results.json")"
+  root_retry_kill_ok=0
+  [[ $root_retry_kill_rc -ne 0 ]] &&
+    [[ "$root_retry_mixed_status" == "invalid|true" ]] &&
+    [[ ! -e "$ROOT_RETRY/bundle/env/root/root-checks.done" ]] &&
+    [[ "$(cat "$ROOT_RETRY/bundle/env/root/kernel-warnings.txt")" == "staged kernel-warnings.txt" ]] &&
+    [[ "$(cat "$ROOT_RETRY/bundle/env/root/cctk.txt")" == "root-check payload cctk.txt" ]] &&
+    [[ -f "$ROOT_RETRY/stage/kernel-warnings.txt" && -f "$ROOT_RETRY/stage/root-checks.meta" ]] &&
+    root_retry_kill_ok=1
+  check_eq "killed root-check publication exposes no mixed or hash-mismatched snapshot" "1" "$root_retry_kill_ok"
+
+  bash "$LIB/publish-root-checks-output.sh" "$ROOT_RETRY/stage" "$ROOT_RETRY/bundle" \
+    > /dev/null 2>&1
+  root_retry_publish_rc=$?
+  node "$LIB/collect.mjs" "$ROOT_RETRY/bundle" > /dev/null 2>&1
+  root_retry_complete="$(node -e \
+    'const r=require(process.argv[1]); process.stdout.write(`${r.rootChecksStatus.status}|${r.rootChecksStatus.generation}|${r.rootChecks?.["cctk.txt"]}`)' \
+    "$ROOT_RETRY/bundle/results.json")"
+  check_eq "root-check publication retry completes one validated generation" "1" \
+    "$([[ $root_retry_publish_rc -eq 0 && "$root_retry_complete" == 'complete|11111111111111111111111111111111|staged cctk.txt' && ! -e "$ROOT_RETRY/stage" && ! -s "$ROOT_RETRY/bundle/env/root/root-checks.done" ]] && echo 1 || echo 0)"
 
   ROOT_INVALID_STAGE="$TMP/root-checks-invalid-stage"
   root_publish_stage_prepare "$ROOT_INVALID_STAGE/stage"
@@ -1299,6 +1365,44 @@ if ((EUID != 0)); then
   check_eq "invalid root-checks staging preserves every derived output and evidence" "1" \
     "$([[ $root_invalid_stage_rc -ne 0 && "$(cat "$ROOT_INVALID_STAGE/bundle/env/root/cctk.txt")" == "old root evidence" && -d "$ROOT_INVALID_STAGE/stage/cctk.txt" ]] && derived_outputs_present "$ROOT_INVALID_STAGE/bundle" && [[ "$(cat "$ROOT_INVALID_STAGE/bundle/manifest.txt")" == "stale manifest.txt" ]] && echo 1 || echo 0)"
 
+  ROOT_UNREADABLE="$TMP/root-checks-unreadable-destination"
+  root_publish_stage_prepare "$ROOT_UNREADABLE/stage"
+  mkdir -p "$ROOT_UNREADABLE/bundle"
+  write_root_checks_fixture "$ROOT_UNREADABLE/bundle"
+  write_derived_output_fixture "$ROOT_UNREADABLE/bundle"
+  chmod 0300 "$ROOT_UNREADABLE/bundle/env/root"
+  bash "$LIB/publish-root-checks-output.sh" \
+    "$ROOT_UNREADABLE/stage" "$ROOT_UNREADABLE/bundle" > /dev/null 2>&1
+  root_unreadable_rc=$?
+  chmod 0700 "$ROOT_UNREADABLE/bundle/env/root"
+  check_eq "unreadable root-check destination fails before derived invalidation" "1" \
+    "$([[ $root_unreadable_rc -ne 0 && -f "$ROOT_UNREADABLE/stage/cctk.txt" ]] && derived_outputs_present "$ROOT_UNREADABLE/bundle" && echo 1 || echo 0)"
+
+  ROOT_UNSEARCHABLE_PARENT="$TMP/root-checks-unsearchable-parent"
+  root_publish_stage_prepare "$ROOT_UNSEARCHABLE_PARENT/stage"
+  mkdir -p "$ROOT_UNSEARCHABLE_PARENT/bundle"
+  write_root_checks_fixture "$ROOT_UNSEARCHABLE_PARENT/bundle"
+  write_derived_output_fixture "$ROOT_UNSEARCHABLE_PARENT/bundle"
+  chmod 0200 "$ROOT_UNSEARCHABLE_PARENT/bundle/env"
+  bash "$LIB/publish-root-checks-output.sh" \
+    "$ROOT_UNSEARCHABLE_PARENT/stage" "$ROOT_UNSEARCHABLE_PARENT/bundle" > /dev/null 2>&1
+  root_unsearchable_parent_rc=$?
+  chmod 0700 "$ROOT_UNSEARCHABLE_PARENT/bundle/env"
+  check_eq "unsearchable env parent fails before derived or evidence mutation" "1" \
+    "$([[ $root_unsearchable_parent_rc -ne 0 && -f "$ROOT_UNSEARCHABLE_PARENT/stage/cctk.txt" && -f "$ROOT_UNSEARCHABLE_PARENT/bundle/env/root/root-checks.done" && "$(cat "$ROOT_UNSEARCHABLE_PARENT/bundle/env/root/cctk.txt")" == "root-check payload cctk.txt" ]] && derived_outputs_present "$ROOT_UNSEARCHABLE_PARENT/bundle" && echo 1 || echo 0)"
+
+  ROOT_EXTRA="$TMP/root-checks-extra-destination"
+  root_publish_stage_prepare "$ROOT_EXTRA/stage"
+  mkdir -p "$ROOT_EXTRA/bundle"
+  write_root_checks_fixture "$ROOT_EXTRA/bundle"
+  write_derived_output_fixture "$ROOT_EXTRA/bundle"
+  printf 'unknown\n' > "$ROOT_EXTRA/bundle/env/root/unknown.txt"
+  bash "$LIB/publish-root-checks-output.sh" "$ROOT_EXTRA/stage" "$ROOT_EXTRA/bundle" \
+    > /dev/null 2>&1
+  root_extra_rc=$?
+  check_eq "unknown root-check destination fails before derived invalidation" "1" \
+    "$([[ $root_extra_rc -ne 0 && -f "$ROOT_EXTRA/bundle/env/root/unknown.txt" && -f "$ROOT_EXTRA/stage/cctk.txt" ]] && derived_outputs_present "$ROOT_EXTRA/bundle" && echo 1 || echo 0)"
+
   ROOT_SUBSTITUTE="$TMP/root-checks-substitute"
   root_publish_stage_prepare "$ROOT_SUBSTITUTE/stage"
   mkdir -p "$ROOT_SUBSTITUTE/bundle/env" "$ROOT_SUBSTITUTE/substitute"
@@ -1311,7 +1415,12 @@ if ((EUID != 0)); then
     "$([[ $root_substitute_rc -ne 0 && "$(cat "$ROOT_SUBSTITUTE/substitute/sentinel")" == "safe directory victim" && ! -e "$ROOT_SUBSTITUTE/substitute/cctk.txt" && -f "$ROOT_SUBSTITUTE/stage/cctk.txt" ]] && echo 1 || echo 0)"
 else
   ok "root-checks publisher invalidates derived outputs before replacing evidence [skipped while tests run as root]"
+  ok "killed root-check publication exposes no mixed or hash-mismatched snapshot [skipped while tests run as root]"
+  ok "root-check publication retry completes one validated generation [skipped while tests run as root]"
   ok "invalid root-checks staging preserves every derived output and evidence [skipped while tests run as root]"
+  ok "unreadable root-check destination fails before derived invalidation [skipped while tests run as root]"
+  ok "unsearchable env parent fails before derived or evidence mutation [skipped while tests run as root]"
+  ok "unknown root-check destination fails before derived invalidation [skipped while tests run as root]"
   ok "unprivileged root-checks publisher rejects output-directory substitution [skipped while tests run as root]"
 fi
 
@@ -3730,6 +3839,7 @@ EOF
 mkdir -p "$B/env/root"
 printf '# cctk read-only allowlist probe\nTurboMode=Enabled\nIntelTME=Disabled\n' > "$B/env/root/cctk.txt"
 printf '# intel-undervolt read\ncore (0): voltage offset: 0 mV\n' > "$B/env/root/intel-undervolt.txt"
+write_root_checks_fixture "$B"
 
 node "$LIB/collect.mjs" "$B" > /dev/null
 node "$LIB/report.mjs" "$B" > /dev/null
@@ -3762,7 +3872,8 @@ check("freq ab restored + legs", r.frequencyAb.restored === true && r.frequencyA
 check("freq leg B measured clock", r.frequencyAb.legs[1].frequency.avgMHz === 2100);
 check("group failure tally", r.groups.length === 2 && r.groups[1].sigsegvCount === 2 && r.groups[0].sigsegvCount === 0);
 check("group completion structure", r.groups.every((group) => group.completionStatus === "complete"));
-check("root checks merged", Boolean(r.rootChecks) && r.rootChecks["cctk.txt"].includes("IntelTME=Disabled"));
+check("root checks merged", r.rootChecksStatus.status === "complete" &&
+  Boolean(r.rootChecks) && r.rootChecks["cctk.txt"].includes("IntelTME=Disabled"));
 process.exit(failures === 0 ? 0 : 1);
 EOF
 if node "$TMP/check-results.mjs" "$B/results.json"; then
