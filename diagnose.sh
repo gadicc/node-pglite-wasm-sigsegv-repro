@@ -1857,33 +1857,53 @@ phase_groups() {
 }
 
 # ------------------------------------------------------------------
-# CPUs of groups that observed failures (from group logs), or all online
-# CPUs when nothing failed (default/full) or nobody (quick, skip).
+# CPUs of groups that observed failures, or the validated stored group-plan
+# CPU union when nothing failed (default/full), or nobody (quick, skip).
 INDIVIDUAL_TARGET_CPUS=""
+INDIVIDUAL_TARGET_POLICY=""
+INDIVIDUAL_GROUP_PLAN_DIGEST=""
 compute_individual_targets() {
-  local failing=()
-  local row logf
-  while IFS=$'\t' read -r name kind cpus cluster children waves logf freq_tag rc; do
-    [[ -n "$name" ]] || continue
-    # repro.mjs only prints "child=" lines for failures.
-    if [[ -f "$OUT_DIR/$logf" ]] && grep -qE $'^[0-9]+\tchild=[0-9]+ code=' "$OUT_DIR/$logf"; then
-      failing+=("$cpus")
-    fi
-  done < "$OUT_DIR/results/groups.tsv"
-
-  if ((${#failing[@]} > 0)); then
-    INDIVIDUAL_TARGET_CPUS="$(
-      printf '%s\n' "${failing[@]}" | tr ',' '\n' |
-        while read -r part; do diag_cpulist_expand "$part"; done |
-        sort -n | uniq | diag_cpulist_compress
-    )"
-    return 0
-  fi
-  if [[ "$MODE" == "quick" ]]; then
-    INDIVIDUAL_TARGET_CPUS=""
+  local output line key value
+  local seen_policy=0 seen_targets=0 seen_digest=0
+  INDIVIDUAL_TARGET_CPUS=""
+  INDIVIDUAL_TARGET_POLICY=""
+  INDIVIDUAL_GROUP_PLAN_DIGEST=""
+  groups_plan_prepare
+  output="$(node "$LIB/groups-evidence.mjs" --individual-targets \
+    "$OUT_DIR" "$GROUP_PLAN_TEMP" "$GROUP_WAVES" "$MODE")" ||
+    diag_die "cannot derive individual CPU targets from the validated groups evidence; preserve it and resume with --redo groups"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^([A-Z_]+)=(.*)$ ]] ||
+      diag_die "groups target derivation produced malformed output"
+    key="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"
+    case "$key" in
+      TARGET_POLICY)
+        ((seen_policy == 0)) || diag_die "groups target derivation duplicated its policy"
+        [[ "$value" == failed-groups || "$value" == all-group-cpus || "$value" == quick-skip ]] ||
+          diag_die "groups target derivation produced an invalid policy"
+        INDIVIDUAL_TARGET_POLICY="$value"; seen_policy=1
+        ;;
+      TARGET_CPUS)
+        ((seen_targets == 0)) || diag_die "groups target derivation duplicated its CPU target"
+        INDIVIDUAL_TARGET_CPUS="$value"; seen_targets=1
+        ;;
+      GROUP_PLAN_DIGEST)
+        ((seen_digest == 0)) || diag_die "groups target derivation duplicated its plan digest"
+        [[ "$value" =~ ^[a-f0-9]{64}$ ]] || diag_die "groups target derivation produced an invalid plan digest"
+        INDIVIDUAL_GROUP_PLAN_DIGEST="$value"; seen_digest=1
+        ;;
+      *) diag_die "groups target derivation produced an unknown field" ;;
+    esac
+  done <<< "$output"
+  ((seen_policy == 1 && seen_targets == 1 && seen_digest == 1)) ||
+    diag_die "groups target derivation omitted required evidence"
+  if [[ "$INDIVIDUAL_TARGET_POLICY" == quick-skip ]]; then
+    [[ -z "$INDIVIDUAL_TARGET_CPUS" && "$MODE" == quick ]] ||
+      diag_die "groups target derivation produced an inconsistent skip policy"
     return 1
   fi
-  INDIVIDUAL_TARGET_CPUS="$ONLINE_CPUS"
+  individual_cpulist_is_canonical "$INDIVIDUAL_TARGET_CPUS" ||
+    diag_die "groups target derivation produced an invalid CPU list"
   return 0
 }
 
@@ -1898,11 +1918,14 @@ phase_individual() {
   fi
   if [[ -e "$meta" || -L "$meta" ]]; then
     individual_meta_read "$meta" &&
-      [[ "$INDIVIDUAL_META_SKIPPED" == 0 && "$INDIVIDUAL_META_TARGET_CPUS" == "$INDIVIDUAL_TARGET_CPUS" &&
-        "$INDIVIDUAL_META_RUNS" == "$INDIVIDUAL_RUNS" ]] ||
+      [[ "$INDIVIDUAL_META_VERSION" == 2 && "$INDIVIDUAL_META_SKIPPED" == 0 &&
+        "$INDIVIDUAL_META_TARGET_CPUS" == "$INDIVIDUAL_TARGET_CPUS" &&
+        "$INDIVIDUAL_META_RUNS" == "$INDIVIDUAL_RUNS" &&
+        "$INDIVIDUAL_META_TARGET_POLICY" == "$INDIVIDUAL_TARGET_POLICY" &&
+        "$INDIVIDUAL_META_GROUP_PLAN_DIGEST" == "$INDIVIDUAL_GROUP_PLAN_DIGEST" ]] ||
       diag_die "existing individual.meta does not match this resumable phase; preserve it and use --redo individual"
   fi
-  individual_meta_write "$INDIVIDUAL_TARGET_CPUS" "$INDIVIDUAL_RUNS" 0 0
+  individual_meta_write "$INDIVIDUAL_TARGET_CPUS" "$INDIVIDUAL_RUNS" 0 0 ""
   mkdir -p "$OUT_DIR/logs/individual"
   local -a cpus=()
   mapfile -t cpus < <(cpu_list_sorted "$INDIVIDUAL_TARGET_CPUS")
@@ -1932,7 +1955,7 @@ phase_individual() {
   done
   individual_rows_are_valid "$tsv" "$INDIVIDUAL_TARGET_CPUS" "$INDIVIDUAL_RUNS" 1 ||
     diag_die "individual results are incomplete or invalid; preserve them and use --redo individual if they cannot be resumed"
-  individual_meta_write "$INDIVIDUAL_TARGET_CPUS" "$INDIVIDUAL_RUNS" 0 1
+  individual_meta_write "$INDIVIDUAL_TARGET_CPUS" "$INDIVIDUAL_RUNS" 0 1 ""
   mark_done individual
 }
 
@@ -2004,20 +2027,26 @@ individual_cpu_batch_matches_wrapper() {
   ' "$tsv"
 }
 
+INDIVIDUAL_META_VERSION=""
 INDIVIDUAL_META_TARGET_CPUS=""
 INDIVIDUAL_META_RUNS=""
 INDIVIDUAL_META_SKIPPED=""
 INDIVIDUAL_META_COMPLETED=""
 INDIVIDUAL_META_SKIP_REASON=""
+INDIVIDUAL_META_TARGET_POLICY=""
+INDIVIDUAL_META_GROUP_PLAN_DIGEST=""
 
 individual_meta_read() {
   local file="$1" line key value
   local -A seen=()
+  INDIVIDUAL_META_VERSION=""
   INDIVIDUAL_META_TARGET_CPUS=""
   INDIVIDUAL_META_RUNS=""
   INDIVIDUAL_META_SKIPPED=""
   INDIVIDUAL_META_COMPLETED=""
   INDIVIDUAL_META_SKIP_REASON=""
+  INDIVIDUAL_META_TARGET_POLICY=""
+  INDIVIDUAL_META_GROUP_PLAN_DIGEST=""
   [[ -f "$file" && ! -L "$file" ]] || return 1
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ "$line" =~ ^([A-Z_]+)=(.*)$ ]] || return 1
@@ -2025,37 +2054,75 @@ individual_meta_read() {
     [[ -z "${seen[$key]:-}" ]] || return 1
     seen[$key]=1
     case "$key" in
-      VERSION) [[ "$value" == 1 ]] || return 1 ;;
+      VERSION) INDIVIDUAL_META_VERSION="$value" ;;
       TARGET_CPUS) INDIVIDUAL_META_TARGET_CPUS="$value" ;;
       RUNS_PER_CPU) INDIVIDUAL_META_RUNS="$value" ;;
       SKIPPED) INDIVIDUAL_META_SKIPPED="$value" ;;
       COMPLETED) INDIVIDUAL_META_COMPLETED="$value" ;;
       SKIP_REASON) INDIVIDUAL_META_SKIP_REASON="$value" ;;
+      TARGET_POLICY) INDIVIDUAL_META_TARGET_POLICY="$value" ;;
+      GROUP_PLAN_DIGEST) INDIVIDUAL_META_GROUP_PLAN_DIGEST="$value" ;;
       *) return 1 ;;
     esac
   done < "$file"
   [[ -n "${seen[VERSION]:-}" && -n "${seen[TARGET_CPUS]:-}" && -n "${seen[RUNS_PER_CPU]:-}" &&
     -n "${seen[SKIPPED]:-}" && -n "${seen[COMPLETED]:-}" ]] || return 1
+  [[ "$INDIVIDUAL_META_VERSION" == 1 || "$INDIVIDUAL_META_VERSION" == 2 ]] || return 1
   [[ "$INDIVIDUAL_META_RUNS" =~ ^[1-9][0-9]*$ && "$INDIVIDUAL_META_SKIPPED" =~ ^[01]$ &&
     "$INDIVIDUAL_META_COMPLETED" =~ ^[01]$ ]] || return 1
+  if [[ "$INDIVIDUAL_META_VERSION" == 1 ]]; then
+    [[ -z "${seen[TARGET_POLICY]:-}" && -z "${seen[GROUP_PLAN_DIGEST]:-}" ]] || return 1
+  else
+    [[ -n "${seen[TARGET_POLICY]:-}" && -n "${seen[GROUP_PLAN_DIGEST]:-}" &&
+      "$INDIVIDUAL_META_GROUP_PLAN_DIGEST" =~ ^[a-f0-9]{64}$ ]] || return 1
+    [[ "$INDIVIDUAL_META_TARGET_POLICY" == failed-groups ||
+      "$INDIVIDUAL_META_TARGET_POLICY" == all-group-cpus ||
+      "$INDIVIDUAL_META_TARGET_POLICY" == quick-skip ]] || return 1
+  fi
   if [[ "$INDIVIDUAL_META_SKIPPED" == 1 ]]; then
     [[ -z "$INDIVIDUAL_META_TARGET_CPUS" && "$INDIVIDUAL_META_COMPLETED" == 1 &&
       -n "$INDIVIDUAL_META_SKIP_REASON" ]] || return 1
+    [[ "$INDIVIDUAL_META_VERSION" == 1 || "$INDIVIDUAL_META_TARGET_POLICY" == quick-skip ]] || return 1
   else
     [[ -z "$INDIVIDUAL_META_SKIP_REASON" ]] || return 1
     individual_cpulist_is_canonical "$INDIVIDUAL_META_TARGET_CPUS" || return 1
+    [[ "$INDIVIDUAL_META_VERSION" == 1 || "$INDIVIDUAL_META_TARGET_POLICY" != quick-skip ]] || return 1
   fi
 }
 
 individual_meta_write() {
   local targets="$1" runs="$2" skipped="$3" completed="$4" reason="${5:-}" tmp
+  [[ "$INDIVIDUAL_TARGET_POLICY" == failed-groups ||
+    "$INDIVIDUAL_TARGET_POLICY" == all-group-cpus ||
+    "$INDIVIDUAL_TARGET_POLICY" == quick-skip ]] ||
+    diag_die "cannot publish individual metadata without a valid target policy"
+  [[ "$INDIVIDUAL_GROUP_PLAN_DIGEST" =~ ^[a-f0-9]{64}$ ]] ||
+    diag_die "cannot publish individual metadata without a valid group plan digest"
   tmp="$(mktemp "$OUT_DIR/results/.individual.meta.XXXXXX")" || diag_die "cannot create individual metadata"
   {
-    printf 'VERSION=1\nTARGET_CPUS=%s\nRUNS_PER_CPU=%s\n' "$targets" "$runs"
+    printf 'VERSION=2\nTARGET_CPUS=%s\nRUNS_PER_CPU=%s\n' "$targets" "$runs"
+    printf 'TARGET_POLICY=%s\nGROUP_PLAN_DIGEST=%s\n' \
+      "$INDIVIDUAL_TARGET_POLICY" "$INDIVIDUAL_GROUP_PLAN_DIGEST"
     printf 'SKIPPED=%s\nCOMPLETED=%s\n' "$skipped" "$completed"
     [[ -z "$reason" ]] || printf 'SKIP_REASON=%s\n' "$reason"
   } > "$tmp" || diag_die "cannot write individual metadata"
   mv -T -- "$tmp" "$OUT_DIR/results/individual.meta" || diag_die "cannot publish individual metadata"
+}
+
+individual_phase_matches_expected_targets() {
+  local should_run="$1" meta="$OUT_DIR/results/individual.meta"
+  [[ "$should_run" =~ ^[01]$ ]] || return 1
+  individual_meta_read "$meta" || return 1
+  [[ "$INDIVIDUAL_META_VERSION" == 2 &&
+    "$INDIVIDUAL_META_RUNS" == "$INDIVIDUAL_RUNS" &&
+    "$INDIVIDUAL_META_TARGET_POLICY" == "$INDIVIDUAL_TARGET_POLICY" &&
+    "$INDIVIDUAL_META_GROUP_PLAN_DIGEST" == "$INDIVIDUAL_GROUP_PLAN_DIGEST" ]] || return 1
+  if [[ "$should_run" == 1 ]]; then
+    [[ "$INDIVIDUAL_META_SKIPPED" == 0 &&
+      "$INDIVIDUAL_META_TARGET_CPUS" == "$INDIVIDUAL_TARGET_CPUS" ]]
+  else
+    [[ "$INDIVIDUAL_META_SKIPPED" == 1 && -z "$INDIVIDUAL_META_TARGET_CPUS" ]]
+  fi
 }
 
 individual_phase_result_is_complete() {
@@ -2626,12 +2693,20 @@ main() {
   fi
 
   # ---- phase 4 ----
+  # Resolve the expected policy even for a completed phase. This binds a
+  # resumed individual result to the validated group generation that selected
+  # its CPUs instead of accepting a self-consistent but unrelated result.
+  local individual_should_run=0
+  if compute_individual_targets; then
+    individual_should_run=1
+  fi
   if phase_is_done individual; then
-    individual_phase_result_is_complete ||
-      diag_die "completed individual phase has missing or invalid evidence; preserve it and resume with --redo individual"
+    individual_phase_result_is_complete &&
+      individual_phase_matches_expected_targets "$individual_should_run" ||
+      diag_die "completed individual phase does not match the validated group target policy; preserve it and resume with --redo individual"
     diag_log "phase 4/7 individual: already done, skipping (resume)"
   else
-    if compute_individual_targets; then
+    if ((individual_should_run == 1)); then
       diag_log "phase 4/7: individual CPU isolation (cpus $INDIVIDUAL_TARGET_CPUS, $INDIVIDUAL_RUNS runs each)"
       phase_individual
     else

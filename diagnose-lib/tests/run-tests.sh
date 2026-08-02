@@ -1881,8 +1881,8 @@ printf '%s\t1\t139\t1\n' "$TEST_OFFLINE_CANONICAL_CPU" > "$AUTO_OFFLINE_RB/resul
 touch "$AUTO_OFFLINE_RB/state"/phase-{preflight,baseline,groups,individual}.done
 auto_offline_output="$("$REPO_ROOT/diagnose.sh" --resume "$AUTO_OFFLINE_RB" --yes 2>&1)"
 auto_offline_rc=$?
-check_eq "resolved automatic worst CPU must still be online before targeted phases" "1" \
-  "$([[ $auto_offline_rc -ne 0 && "$auto_offline_output" == *"resolved automatic worst CPU $TEST_OFFLINE_CANONICAL_CPU"* && ! -e "$AUTO_OFFLINE_RB/state/phase-frequency.done" && ! -e "$AUTO_OFFLINE_RB/state/phase-gdb.done" ]] && echo 1 || echo 0)"
+check_eq "stale automatic worst-CPU evidence is rejected by group target provenance" "1" \
+  "$([[ $auto_offline_rc -ne 0 && "$auto_offline_output" == *"does not match the validated group target policy"* && ! -e "$AUTO_OFFLINE_RB/state/phase-frequency.done" && ! -e "$AUTO_OFFLINE_RB/state/phase-gdb.done" ]] && echo 1 || echo 0)"
 
 COLLECT_CPU_RB="$TMP/collect-cpu-policy"
 mkdir -p "$COLLECT_CPU_RB/results"
@@ -2198,6 +2198,8 @@ printf 'COMPLETED_PHASES=\n' > "$INDIVIDUAL_COMPLETE/results/meta.env"
   STATE_DIR="$INDIVIDUAL_COMPLETE/state"
   META_FILE="$INDIVIDUAL_COMPLETE/results/meta.env"
   INDIVIDUAL_TARGET_CPUS=19
+  INDIVIDUAL_TARGET_POLICY=failed-groups
+  INDIVIDUAL_GROUP_PLAN_DIGEST="$(printf '0%.0s' {1..64})"
   INDIVIDUAL_RUNS=2
   phase_individual
 ) > /dev/null 2>&1
@@ -2213,6 +2215,8 @@ printf 'COMPLETED_PHASES=\n' > "$INDIVIDUAL_SKIPPED/results/meta.env"
   OUT_DIR="$INDIVIDUAL_SKIPPED"
   STATE_DIR="$INDIVIDUAL_SKIPPED/state"
   META_FILE="$INDIVIDUAL_SKIPPED/results/meta.env"
+  INDIVIDUAL_TARGET_POLICY=quick-skip
+  INDIVIDUAL_GROUP_PLAN_DIGEST="$(printf '0%.0s' {1..64})"
   INDIVIDUAL_RUNS=5
   phase_individual_skipped
 ) > /dev/null 2>&1
@@ -2889,10 +2893,13 @@ PLAN_DIGEST=$groups_plan_digest
 COMPLETED=1
 EOF
 
-# CPU 8: 20 clean runs; CPU 19: 6 SIGSEGV in 20 runs.
+# CPUs 16-18: 20 clean runs each; CPU 19: 6 SIGSEGV in 20 runs. These
+# exactly match the validated failing-group target policy.
 : > "$B/results/individual.tsv"
-for i in $(seq 1 20); do
-  printf '8\t%s\t0\t2\n' "$i" >> "$B/results/individual.tsv"
+for cpu in 16 17 18; do
+  for i in $(seq 1 20); do
+    printf '%s\t%s\t0\t2\n' "$cpu" "$i" >> "$B/results/individual.tsv"
+  done
 done
 for i in $(seq 1 20); do
   if ((i <= 6)); then
@@ -2902,9 +2909,11 @@ for i in $(seq 1 20); do
   fi
 done
 cat > "$B/results/individual.meta" << EOF
-VERSION=1
-TARGET_CPUS=8,19
+VERSION=2
+TARGET_CPUS=16-19
 RUNS_PER_CPU=20
+TARGET_POLICY=failed-groups
+GROUP_PLAN_DIGEST=$groups_plan_digest
 SKIPPED=0
 COMPLETED=1
 EOF
@@ -2982,8 +2991,8 @@ check("wave-level clustered counts propagated", r.baseline.sigsegvWaveCount === 
 check("baseline completion structure", r.baseline.completionStatus === "complete" && r.baseline.issues.length === 0);
 check("baseline evidence envelope", r.baselineStatus.status === "complete" && r.baselineStatus.reasons.length === 0);
 check("worst cpu is 19", r.worstCpu === 19);
-check("individual tally", r.individual.length === 2 && r.individual[1].sigsegv === 6 && r.individual[0].failures === 0);
-check("individual phase completion status", r.individualStatus.status === "complete" && r.individual[1].runs === 20);
+check("individual tally", r.individual.length === 4 && r.individual[3].sigsegv === 6 && r.individual.slice(0, 3).every((cpu) => cpu.failures === 0));
+check("individual phase completion status", r.individualStatus.status === "complete" && r.individual[3].runs === 20);
 check("gdb signature match", r.gdb.status === "captured" && r.gdb.captures.length === 1 && r.gdb.captures[0].matchesKnownSignature === true);
 check("gdb attempt accounting", r.gdb.attemptedRuns === 1 && r.gdb.cleanRuns === 0 && r.gdb.capturedRuns === 1 && r.gdb.errorRuns === 0);
 check("gdb capture file trimmed", r.gdb.captures[0].mappings === undefined);

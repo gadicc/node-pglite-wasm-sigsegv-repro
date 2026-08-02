@@ -32,6 +32,7 @@ function parseCanonicalCpuList(value) {
   if (parts.length > 65536) return null;
   let previous = -2;
   let count = 0;
+  const ranges = [];
   for (const part of parts) {
     const match = part.match(/^(0|[1-9][0-9]*)(?:-(0|[1-9][0-9]*))?$/);
     if (!match) return null;
@@ -41,9 +42,24 @@ function parseCanonicalCpuList(value) {
         (match[2] !== undefined && first === last) || first <= previous + 1) return null;
     count += last - first + 1;
     if (!Number.isSafeInteger(count) || count > 65536) return null;
+    ranges.push([first, last]);
     previous = last;
   }
-  return { count };
+  return { count, ranges };
+}
+
+function compressCpuRanges(ranges) {
+  const sorted = ranges.toSorted((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const parts = [];
+  for (const [first, last] of sorted) {
+    const previous = parts.at(-1);
+    if (previous && first <= previous[1] + 1) {
+      previous[1] = Math.max(previous[1], last);
+    } else {
+      parts.push([first, last]);
+    }
+  }
+  return parts.map(([first, last]) => first === last ? `${first}` : `${first}-${last}`).join(",");
 }
 
 function validCluster(value) {
@@ -201,6 +217,32 @@ function validatePlanRows(rows, wavesExpected) {
 export function groupsPlanDigest(planRows) {
   const canonical = planRows.map((row) => row.join("\t")).join("\n") + (planRows.length > 0 ? "\n" : "");
   return createHash("sha256").update(canonical).digest("hex");
+}
+
+// Derive phase-4 selection exclusively from a completed, validated groups
+// envelope. In particular, parsed failed-wave counts include accepted failures
+// that have no child detail row, while the no-failure fallback retains the CPU
+// universe recorded by the group plan rather than consulting live topology.
+export function deriveIndividualTargetPolicy(groupsAssessment, mode) {
+  if (groupsAssessment?.status !== "complete" || !["quick", "default", "full"].includes(mode)) return null;
+  const failingEntries = groupsAssessment.entries.filter(({ parsed }) => parsed?.failedWaves > 0);
+  const targetEntries = failingEntries.length > 0
+    ? failingEntries
+    : mode === "quick" ? [] : groupsAssessment.entries;
+  const ranges = [];
+  for (const entry of targetEntries) {
+    const parsed = parseCanonicalCpuList(entry.cpus);
+    if (!parsed || ranges.length + parsed.ranges.length > 65536) return null;
+    ranges.push(...parsed.ranges);
+  }
+  const skipped = failingEntries.length === 0 && mode === "quick";
+  if (!skipped && ranges.length === 0) return null;
+  return {
+    targetPolicy: failingEntries.length > 0 ? "failed-groups" : skipped ? "quick-skip" : "all-group-cpus",
+    targetCpus: compressCpuRanges(ranges),
+    groupPlanDigest: groupsAssessment.meta.PLAN_DIGEST,
+    skipped,
+  };
 }
 
 export function readGroupsPlanFile(file) {
@@ -536,7 +578,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       process.exit(1);
     }
     console.log(groupsPlanDigest(plan.rows));
-  } else if (["--check-fresh", "--validate-complete", "--validate-before-mark"].includes(flag) &&
+  } else if (["--check-fresh", "--validate-complete", "--validate-before-mark", "--individual-targets"].includes(flag) &&
       outDirOrPlan && planFile && wavesS !== undefined) {
     const plan = readGroupsPlanFile(planFile);
     const waves = canonicalPositiveUint(wavesS);
@@ -556,15 +598,26 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       const result = assessGroupsEvidence(outDirOrPlan, {
         expectedGroupWaves: waves,
         expectedPlanRows: plan.rows,
-        requireMarker: flag === "--validate-complete",
+        requireMarker: flag !== "--validate-before-mark",
       });
       if (result.status !== "complete") {
         for (const reason of result.reasons) console.error(reason);
         process.exit(1);
       }
+      if (flag === "--individual-targets") {
+        const mode = process.argv[6];
+        const target = deriveIndividualTargetPolicy(result, mode);
+        if (!target) {
+          console.error("cannot derive individual targets from groups evidence and mode");
+          process.exit(1);
+        }
+        console.log(`TARGET_POLICY=${target.targetPolicy}`);
+        console.log(`TARGET_CPUS=${target.targetCpus}`);
+        console.log(`GROUP_PLAN_DIGEST=${target.groupPlanDigest}`);
+      }
     }
   } else {
-    console.error("usage: node groups-evidence.mjs --plan-digest <plan> | --{check-fresh,validate-complete,validate-before-mark} <bundle> <plan> <waves>");
+    console.error("usage: node groups-evidence.mjs --plan-digest <plan> | --{check-fresh,validate-complete,validate-before-mark} <bundle> <plan> <waves> | --individual-targets <bundle> <plan> <waves> <mode>");
     process.exit(2);
   }
 }

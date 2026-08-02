@@ -13,7 +13,12 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { collect } from "../collect.mjs";
-import { assessGroupsEvidence, checkFreshGroupsTargets, groupsPlanDigest } from "../groups-evidence.mjs";
+import {
+  assessGroupsEvidence,
+  checkFreshGroupsTargets,
+  deriveIndividualTargetPolicy,
+  groupsPlanDigest,
+} from "../groups-evidence.mjs";
 import { renderReport } from "../report.mjs";
 
 const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
@@ -78,6 +83,65 @@ test("groups envelope accepts one ordered plan generation and retains l2 cluster
   assert.equal(collected.groupsStatus.status, "complete");
   assert.equal(collected.groups[1].clusterId, l2Cluster);
   assert.equal(collected.groups[1].sigsegvCount, 2);
+});
+
+test("individual targets come from validated failed waves, including summary-only failures", () => {
+  const dir = bundle();
+  writeFileSync(path.join(dir, "logs", "groups", `${l2Name}.log`), [
+    "node=v25.2.1 v8=test platform=linux arch=x64 children=4 waves=5",
+    "wave=1 passed=3/4",
+    "wave=2 passed=4/4",
+    "wave=3 passed=4/4",
+    "wave=4 passed=4/4",
+    "wave=5 passed=4/4",
+    "failedWaves=1 completedWaves=5 requestedWaves=5",
+    "",
+  ].join("\n"));
+  const result = assessGroupsEvidence(dir, expectations);
+  assert.equal(result.status, "complete");
+  assert.equal(result.entries[1].parsed.failedWaves, 1);
+  assert.equal(result.entries[1].parsed.failures.length, 0);
+  assert.deepEqual(deriveIndividualTargetPolicy(result, "quick"), {
+    targetPolicy: "failed-groups",
+    targetCpus: "4-7",
+    groupPlanDigest: groupsPlanDigest(plan),
+    skipped: false,
+  });
+
+  copyFileSync(path.join(fixtures, "repro-clean-4x5.log"), path.join(dir, "logs", "groups", `${l2Name}.log`));
+  writeFileSync(path.join(dir, "results", "groups.tsv"), rowsText(plan.map((row) => [...row, "0"])));
+  const clean = assessGroupsEvidence(dir, expectations);
+  assert.equal(clean.status, "complete");
+  assert.deepEqual(deriveIndividualTargetPolicy(clean, "quick"), {
+    targetPolicy: "quick-skip",
+    targetCpus: "",
+    groupPlanDigest: groupsPlanDigest(plan),
+    skipped: true,
+  });
+  assert.equal(deriveIndividualTargetPolicy(clean, "default").targetCpus, "0-7");
+});
+
+test("collector rejects individual evidence from a different group target policy", () => {
+  const dir = bundle();
+  writeFileSync(path.join(dir, "state", "phase-individual.done"), "");
+  writeFileSync(path.join(dir, "results", "individual.tsv"),
+    "0\t1\t139\t1\n0\t2\t0\t1\n");
+  writeFileSync(path.join(dir, "results", "individual.meta"), [
+    "VERSION=2",
+    "TARGET_CPUS=0",
+    "RUNS_PER_CPU=2",
+    "TARGET_POLICY=failed-groups",
+    `GROUP_PLAN_DIGEST=${groupsPlanDigest(plan)}`,
+    "SKIPPED=0",
+    "COMPLETED=1",
+    "",
+  ].join("\n"));
+  const result = collect(dir);
+  assert.equal(result.groupsStatus.status, "complete");
+  assert.equal(result.individualStatus.status, "invalid");
+  assert.match(result.individualStatus.reasons.join("; "), /does not match/);
+  assert.equal(result.individual, undefined);
+  assert.equal(result.worstCpu, null);
 });
 
 test("groups envelope distinguishes absent, marker-only, missing, and exact interrupted prefixes", () => {

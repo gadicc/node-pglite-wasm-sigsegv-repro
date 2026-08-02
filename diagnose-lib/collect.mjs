@@ -22,7 +22,7 @@ import path from "node:path";
 import { parseReproLog } from "./parse-repro-log.mjs";
 import { parseGdbCapture } from "./parse-gdb.mjs";
 import { assessBaselineEvidence } from "./baseline-evidence.mjs";
-import { assessGroupsEvidence } from "./groups-evidence.mjs";
+import { assessGroupsEvidence, deriveIndividualTargetPolicy } from "./groups-evidence.mjs";
 
 function readKeyValues(file) {
   const out = {};
@@ -147,7 +147,10 @@ function readIndividualMeta(file) {
   if (!existsSync(file)) return { present: false, values: {}, errors: [] };
   const values = {};
   const errors = [];
-  const allowed = new Set(["VERSION", "TARGET_CPUS", "RUNS_PER_CPU", "SKIPPED", "COMPLETED", "SKIP_REASON"]);
+  const allowed = new Set([
+    "VERSION", "TARGET_CPUS", "RUNS_PER_CPU", "SKIPPED", "COMPLETED",
+    "SKIP_REASON", "TARGET_POLICY", "GROUP_PLAN_DIGEST",
+  ]);
   const text = readFileSync(file, "utf8");
   const lines = text.split("\n");
   if (lines.at(-1) === "") lines.pop();
@@ -405,8 +408,24 @@ export function assessIndividual(rows, meta, phaseDone, metaState = {}) {
     reasons.push("individual metadata is missing required fields");
     invalid = true;
   }
-  if (meta.VERSION !== "1") {
+  if (meta.VERSION !== "1" && meta.VERSION !== "2") {
     reasons.push("individual metadata version is missing or unsupported");
+    invalid = true;
+  }
+  const provenanceRequired = meta.VERSION === "2";
+  if (provenanceRequired) {
+    if (!Object.hasOwn(meta, "TARGET_POLICY") ||
+        !Object.hasOwn(meta, "GROUP_PLAN_DIGEST")) {
+      reasons.push("individual metadata is missing target provenance fields");
+      invalid = true;
+    }
+    if (!["failed-groups", "all-group-cpus", "quick-skip"].includes(meta.TARGET_POLICY) ||
+        !/^[a-f0-9]{64}$/.test(meta.GROUP_PLAN_DIGEST ?? "")) {
+      reasons.push("individual target provenance is malformed");
+      invalid = true;
+    }
+  } else if (Object.hasOwn(meta, "TARGET_POLICY") || Object.hasOwn(meta, "GROUP_PLAN_DIGEST")) {
+    reasons.push("legacy individual metadata contains unsupported provenance fields");
     invalid = true;
   }
   const runsPerCpu = canonicalUint(meta.RUNS_PER_CPU);
@@ -427,8 +446,15 @@ export function assessIndividual(rows, meta, phaseDone, metaState = {}) {
       reasons.push("skipped individual metadata is inconsistent");
       invalid = true;
     }
+    if (provenanceRequired && meta.TARGET_POLICY !== "quick-skip") {
+      reasons.push("skipped individual metadata has an inconsistent target policy");
+      invalid = true;
+    }
   } else if (!targetSet || targetSet.size === 0 || meta.SKIP_REASON !== undefined) {
     reasons.push("individual target CPU metadata is missing or invalid");
+    invalid = true;
+  } else if (provenanceRequired && meta.TARGET_POLICY === "quick-skip") {
+    reasons.push("non-skipped individual metadata has an inconsistent target policy");
     invalid = true;
   }
 
@@ -500,7 +526,36 @@ export function assessIndividual(rows, meta, phaseDone, metaState = {}) {
     runsPerCpu,
     acceptedRows: unambiguousRows,
     skipReason: meta.SKIP_REASON ?? null,
+    metadataVersion: meta.VERSION ?? null,
+    targetPolicy: meta.TARGET_POLICY ?? null,
+    groupPlanDigest: meta.GROUP_PLAN_DIGEST ?? null,
   };
+}
+
+export function reconcileIndividualWithGroups(assessment, meta, groupsAssessment, mode, configuredRuns) {
+  if (assessment.status === "not-run") return assessment;
+  const reasons = [...assessment.reasons];
+  let status = assessment.status;
+  let acceptedRows = assessment.acceptedRows;
+  if (groupsAssessment.status !== "complete") {
+    reasons.push("validated group evidence is unavailable for individual target provenance");
+    if (status !== "invalid") status = "incomplete";
+    acceptedRows = [];
+  } else {
+    const expected = deriveIndividualTargetPolicy(groupsAssessment, mode);
+    const mismatch = !expected || meta.VERSION !== "2" ||
+      meta.TARGET_POLICY !== expected.targetPolicy ||
+      meta.GROUP_PLAN_DIGEST !== expected.groupPlanDigest ||
+      meta.TARGET_CPUS !== expected.targetCpus ||
+      meta.SKIPPED !== (expected.skipped ? "1" : "0") ||
+      canonicalUint(configuredRuns) === null || meta.RUNS_PER_CPU !== configuredRuns;
+    if (mismatch) {
+      reasons.push("individual target policy does not match the validated group evidence generation");
+      status = "invalid";
+      acceptedRows = [];
+    }
+  }
+  return { ...assessment, status, reasons: [...new Set(reasons)], acceptedRows };
 }
 
 export function collectFreqAb(outDir, rows, meta) {
@@ -800,12 +855,12 @@ export function collect(outDir) {
   // --- individual ---
   const individualRows = readExactTsv(path.join(resultsDir, "individual.tsv"));
   const individualMetaState = readIndividualMeta(path.join(resultsDir, "individual.meta"));
-  const individualAssessment = assessIndividual(
+  const individualAssessment = reconcileIndividualWithGroups(assessIndividual(
     individualRows,
     individualMetaState.values,
     existsSync(path.join(outDir, "state", "phase-individual.done")),
     individualMetaState,
-  );
+  ), individualMetaState.values, groupsAssessment, meta.MODE, meta.INDIVIDUAL_RUNS);
   const { acceptedRows, ...individualStatus } = individualAssessment;
   results.individualStatus = individualStatus;
   if (acceptedRows.length > 0) results.individual = collectIndividual(acceptedRows);

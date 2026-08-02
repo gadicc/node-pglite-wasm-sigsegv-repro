@@ -325,13 +325,11 @@ test("collect: invalid individual evidence cannot select worstCpu", () => {
   const r = collect(dir);
   assert.equal(r.individualStatus.status, "invalid");
   assert.equal(r.worstCpu, null);
-  assert.equal(r.individual.find((c) => c.cpu === 3), undefined);
-  const cpu4 = r.individual.find((c) => c.cpu === 4);
-  assert.equal(cpu4.runs, 4);
-  assert.equal(cpu4.sigsegv, 1);
+  assert.equal(r.individual, undefined);
+  assert.match(r.individualStatus.reasons.join("; "), /group evidence is unavailable/);
 });
 
-test("collect: complete individual evidence selects worstCpu", () => {
+test("collect: self-consistent individual evidence is non-authoritative without groups", () => {
   const dir = mkdtempSync(path.join(tmpdir(), "collect-test-"));
   tmpDirs.push(dir);
   mkdirSync(path.join(dir, "results"));
@@ -342,6 +340,8 @@ test("collect: complete individual evidence selects worstCpu", () => {
     "VERSION=1\nTARGET_CPUS=3-4\nRUNS_PER_CPU=2\nSKIPPED=0\nCOMPLETED=1\n");
   writeFileSync(path.join(dir, "state", "phase-individual.done"), "");
   const r = collect(dir);
-  assert.equal(r.individualStatus.status, "complete");
-  assert.equal(r.worstCpu, 4);
+  assert.equal(r.individualStatus.status, "incomplete");
+  assert.equal(r.individual, undefined);
+  assert.equal(r.worstCpu, null);
+  assert.match(r.individualStatus.reasons.join("; "), /group evidence is unavailable/);
 });
