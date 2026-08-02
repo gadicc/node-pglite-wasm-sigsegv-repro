@@ -58,6 +58,55 @@ function reproFailureCount(result) {
     (result.unclassifiedFailureCount ?? 0);
 }
 
+function validReproWaveCounts(result) {
+  if (!validReproCounts(result)) return false;
+  const fields = [
+    result?.processedWaves,
+    result?.fullyPassedWaves,
+    result?.failedWaves,
+    result?.sigsegvWaveCount,
+    result?.sigsegvResolvedWaveCount,
+    result?.sigsegvUnresolvedWaveCount,
+    result?.otherFailureWaveCount,
+    result?.unclassifiedFailureWaveCount,
+  ];
+  if (!fields.every((value) => Number.isSafeInteger(value) && value >= 0)) return false;
+  const [processed, clean, failed, sigsegv, resolved, unresolved, other, unclassified] = fields;
+  const sigsegvChildren = result.sigsegvCount;
+  const otherChildren = result.otherFailureCount ?? 0;
+  const unclassifiedChildren = result.unclassifiedFailureCount ?? 0;
+  const childFailures = sigsegvChildren + otherChildren + unclassifiedChildren;
+  return clean + failed === processed &&
+    sigsegv <= failed &&
+    sigsegv <= sigsegvChildren &&
+    (sigsegv === 0) === (sigsegvChildren === 0) &&
+    resolved === sigsegv + clean &&
+    resolved + unresolved === processed &&
+    other <= failed &&
+    other <= otherChildren &&
+    (other === 0) === (otherChildren === 0) &&
+    unclassified <= failed &&
+    unclassified <= unclassifiedChildren &&
+    (unclassified === 0) === (unclassifiedChildren === 0) &&
+    childFailures >= failed &&
+    unresolved <= other + unclassified;
+}
+
+function hasCompleteReproWaveCoverage(result) {
+  if (!validReproWaveCounts(result)) return false;
+  const requested = result.requestedWaves ?? result.wavesRequested;
+  return Number.isSafeInteger(requested) && requested > 0 &&
+    Number.isSafeInteger(result.completedWaves) && result.completedWaves >= 0 &&
+    result.processedWaves === result.completedWaves &&
+    result.completedWaves === requested;
+}
+
+function canSupportCleanReproConclusion(result) {
+  return hasCompleteReproWaveCoverage(result) &&
+    reproCompletionStatus(result) === "complete" &&
+    result.sigsegvUnresolvedWaveCount === 0;
+}
+
 function validIndividualCounts(result) {
   return Number.isSafeInteger(result?.runs) && result.runs > 0 &&
     Number.isSafeInteger(result?.failures) && result.failures >= 0 &&
@@ -92,11 +141,25 @@ function reproCompletionStatus(result) {
   return result?.partial ? "partial" : "complete";
 }
 
-function reproStatsCell(failures, n, status) {
-  if (failures === 0 && n === 0) return "no accepted runs";
-  if (!validBinomialCounts(failures, n)) return `${failures}/${n} (invalid count; no interval)`;
-  if (status === "complete") return statsCell(failures, n);
-  return `${failures}/${n} = ${pct(failures / n)} (descriptive only; ${status} structure)`;
+function reproWaveStatsCell(result) {
+  if (!validReproWaveCounts(result)) {
+    return "interval unavailable (legacy or invalid wave counts)";
+  }
+  const failures = result.sigsegvWaveCount;
+  const n = result.sigsegvResolvedWaveCount;
+  const unresolved = result.sigsegvUnresolvedWaveCount;
+  const status = reproCompletionStatus(result);
+  if (n === 0) return `0/0 resolved waves (${unresolved} unresolved; no interval)`;
+  if (status !== "complete") {
+    return `${failures}/${n} = ${pct(failures / n)} (descriptive only; ${status} structure)`;
+  }
+  if (!hasCompleteReproWaveCoverage(result)) {
+    return "interval unavailable (incomplete or invalid wave coverage)";
+  }
+  if (failures === 0 && unresolved > 0) {
+    return `0/${n} (no upper bound; ${unresolved} unresolved wave(s))`;
+  }
+  return statsCell(failures, n);
 }
 
 function analyzeFrequencyAb(fa) {
@@ -243,13 +306,18 @@ export function renderReport(results) {
     L.push(`| SIGSEGV | ${b.sigsegvCount ?? "invalid/missing"} |`);
     L.push(`| Other failures | ${b.otherFailureCount} |`);
     if ((b.unclassifiedFailureCount ?? 0) > 0) L.push(`| Unclassified failures (summary only) | ${b.unclassifiedFailureCount} |`);
-    L.push(`| Child failure rate | ${failureCount === null ? "invalid/missing counts; no interval" : reproStatsCell(failureCount, b.totalChildInvocations, completionStatus)} |`);
+    L.push(`| Child failures (descriptive only) | ${failureCount === null ? "invalid/missing" : `${failureCount}/${b.totalChildInvocations}`} |`);
+    L.push(`| SIGSEGV-positive waves | ${validReproWaveCounts(b) ? b.sigsegvWaveCount : "invalid/missing"} |`);
+    L.push(`| Unresolved SIGSEGV endpoint waves | ${validReproWaveCounts(b) ? b.sigsegvUnresolvedWaveCount : "invalid/missing"} |`);
+    L.push(`| SIGSEGV wave rate / 95% CI | ${reproWaveStatsCell(b)} |`);
     L.push(`| Time to first failure | ${fmtSec(b.firstFailureAfterSec)} |`);
     L.push(`| Duration | ${fmtSec(b.durationSec)} |`);
     L.push(`| Frequency (${b.frequency?.method ?? "n/a"}) | avg ${fmtMHz(b.frequency?.avgMHz)}, max ${fmtMHz(b.frequency?.maxMHz)} |`);
     L.push("");
-    L.push(`Raw log: \`${b.log}\`. Wave-level failures are kept distinct from`);
-    L.push("individual child-process failures throughout this report.");
+    L.push(`Raw log: \`${b.log}\`. Concurrent children within a wave are correlated,`);
+    L.push("so child-process counts are descriptive and the interval treats resolved");
+    L.push("sequential waves as the trials. That interval assumes those waves are");
+    L.push("independent and stationary.");
     L.push("");
   } else {
     L.push("Not run (or no data collected).\n");
@@ -261,8 +329,8 @@ export function renderReport(results) {
   if (r.groups?.length) {
     L.push("Groups were discovered from sysfs topology, not hardcoded.");
     L.push("");
-    L.push("| Group | CPUs | Children | Waves | Child failures | Rate / 95% CI | Eff. freq (avg/max) |");
-    L.push("| --- | --- | --- | --- | --- | --- | --- |");
+    L.push("| Group | CPUs | Children | Waves | Child failures (descriptive) | SIGSEGV waves / resolved-wave rate (95% CI) | Unresolved waves | Eff. freq (avg/max) |");
+    L.push("| --- | --- | --- | --- | --- | --- | --- | --- |");
     for (const g of r.groups) {
       const f = reproFailureCount(g);
       const n = g.totalChildInvocations ?? 0;
@@ -270,19 +338,18 @@ export function renderReport(results) {
       const statusNote = completionStatus === "partial"
         ? " (log truncated; partial data)"
         : completionStatus === "inconsistent" ? " (structurally inconsistent; descriptive only)" : "";
-      const rate = f === null
-        ? "invalid/missing counts; no interval"
-        : f === 0 && n === 0
-        ? "—"
-        : !validBinomialCounts(f, n)
-          ? "invalid count; no interval"
-          : completionStatus === "complete"
-            ? `${pct(f / n)} ${ci(f, n)}`
-            : `${pct(f / n)} (descriptive only; ${completionStatus})`;
+      const waveCountsValid = validReproWaveCounts(g);
       L.push(
-        `| ${g.name} | ${g.cpus} | ${g.children} | ${g.processedWaves ?? g.completedWaves ?? "?"}/${g.wavesRequested} processed (${g.failedWaves ?? "?"} failed)${statusNote} | ${f ?? "invalid"}/${n}${(g.unclassifiedFailureCount ?? 0) > 0 ? ` (${g.unclassifiedFailureCount} unclassified)` : ""} | ${rate} | ${fmtMHz(g.frequency?.avgMHz)} / ${fmtMHz(g.frequency?.maxMHz)} |`,
+        `| ${g.name} | ${g.cpus} | ${g.children} | ${g.processedWaves ?? g.completedWaves ?? "?"}/${g.wavesRequested} processed (${g.failedWaves ?? "?"} failed)${statusNote} | ${f ?? "invalid"}/${n}${(g.unclassifiedFailureCount ?? 0) > 0 ? ` (${g.unclassifiedFailureCount} unclassified)` : ""} | ${reproWaveStatsCell(g)} | ${waveCountsValid ? g.sigsegvUnresolvedWaveCount : "invalid/missing"} | ${fmtMHz(g.frequency?.avgMHz)} / ${fmtMHz(g.frequency?.maxMHz)} |`,
       );
     }
+    L.push("");
+    L.push("Resolved-wave intervals assume sequential waves are independent and");
+    L.push("stationary. Rates from groups with different children-per-wave are not");
+    L.push("directly comparable because the chance of at least one SIGSEGV changes");
+    L.push("with the number of concurrent children.");
+    L.push("Excluding unresolved waves can also bias a resolved-wave interval; their");
+    L.push("count is shown rather than silently treating them as negative trials.");
     L.push("");
   } else {
     L.push("Not run (or no data collected).\n");
@@ -456,7 +523,7 @@ export function renderReport(results) {
   L.push("## Limitations");
   L.push("");
   L.push("- Zero observed failures never prove a zero failure rate. A clean");
-  L.push("  CPU/group only excludes rates above its 95% upper bound");
+  L.push("  CPU or resolved-wave sample only excludes rates above its 95% upper bound");
   L.push("  (1 - 0.05^(1/n); approximately 3/n for large n).");
   L.push("- Observed failure rates can drift between batches; comparisons use");
   L.push("  exact tests on paired batches where possible, but small samples");
@@ -504,7 +571,7 @@ function renderConclusions(r) {
         r.baseline.totalChildInvocations,
       );
       if (!added) hasInvalidCountEvidence = true;
-      if (added && reproCompletionStatus(r.baseline) !== "complete") hasIncompleteReproEvidence = true;
+      if (added && !canSupportCleanReproConclusion(r.baseline)) hasIncompleteReproEvidence = true;
     } else {
       hasInvalidCountEvidence = true;
     }
@@ -518,7 +585,7 @@ function renderConclusions(r) {
         g.totalChildInvocations,
       );
       if (!added) hasInvalidCountEvidence = true;
-      if (added && reproCompletionStatus(g) !== "complete") hasIncompleteReproEvidence = true;
+      if (added && !canSupportCleanReproConclusion(g)) hasIncompleteReproEvidence = true;
     } else {
       hasInvalidCountEvidence = true;
     }
@@ -530,6 +597,9 @@ function renderConclusions(r) {
       hasInvalidCountEvidence = true;
     }
   }
+  if ((r.individual?.length ?? 0) > 0 && r.individualStatus?.status !== "complete") {
+    hasIncompleteReproEvidence = true;
+  }
   if (totalSig > 0) {
     const unresolved = totalUnclassified > 0 ? ` Another ${totalUnclassified} failure(s) were visible only in wave summaries and could not be classified.` : "";
     C.push(`- **The problem reproduced**: ${totalSig} SIGSEGV(s) across ${totalRuns} child-process runs in this diagnostic session.${unresolved}`);
@@ -538,7 +608,7 @@ function renderConclusions(r) {
   } else if (totalRuns > 0 && !hasIncompleteReproEvidence) {
     C.push(`- **No failure reproduced** across ${totalRuns} child-process observations spanning different phases/configurations. No pooled rate bound is valid across these heterogeneous strata; use the phase-, group-, and CPU-specific bounds above. This does not rule out the defect; see Limitations.`);
   } else if (totalRuns > 0) {
-    C.push(`- No failure was observed in ${totalRuns} accepted child-process observations, but partial or structurally inconsistent repro evidence prevents a clean non-reproduction conclusion or rate bound.`);
+    C.push(`- No failure was observed in ${totalRuns} accepted child-process observations, but partial, structurally inconsistent, unresolved, or legacy repro evidence prevents a clean non-reproduction conclusion or rate bound.`);
   } else if (hasInvalidCountEvidence) {
     C.push("- No trustworthy workload reproduction conclusion is available because impossible failure-count evidence was excluded.");
   } else {
@@ -587,7 +657,7 @@ function renderConclusions(r) {
   const cleanGroups = (r.groups ?? []).filter(
     (g) =>
       validReproCounts(g) &&
-      reproCompletionStatus(g) === "complete" &&
+      canSupportCleanReproConclusion(g) &&
       (g.sigsegvCount ?? 0) === 0 &&
       (g.otherFailureCount ?? 0) === 0 &&
       (g.unclassifiedFailureCount ?? 0) === 0 &&
@@ -595,10 +665,11 @@ function renderConclusions(r) {
   );
   const unresolvedGroups = (r.groups ?? []).filter(
     (g) => validReproCounts(g) && (g.sigsegvCount ?? 0) === 0 &&
-      ((g.otherFailureCount ?? 0) > 0 || (g.unclassifiedFailureCount ?? 0) > 0),
+      (!canSupportCleanReproConclusion(g) ||
+        (g.otherFailureCount ?? 0) > 0 || (g.unclassifiedFailureCount ?? 0) > 0),
   );
   if (failingGroups.length > 0) {
-    C.push(`- **Group isolation**: SIGSEGV in group(s) ${failingGroups.map((g) => `${g.name} (${g.cpus})`).join(", ")}; clean group(s): ${cleanGroups.length > 0 ? cleanGroups.map((g) => `${g.name} (${g.cpus})`).join(", ") : "none"}${unresolvedGroups.length > 0 ? `; unresolved non-SIGSEGV/unclassified failures in: ${unresolvedGroups.map((g) => `${g.name} (${g.cpus})`).join(", ")}` : ""}.`);
+    C.push(`- **Group isolation**: SIGSEGV in group(s) ${failingGroups.map((g) => `${g.name} (${g.cpus})`).join(", ")}; clean group(s): ${cleanGroups.length > 0 ? cleanGroups.map((g) => `${g.name} (${g.cpus})`).join(", ") : "none"}${unresolvedGroups.length > 0 ? `; no clean group conclusion for: ${unresolvedGroups.map((g) => `${g.name} (${g.cpus})`).join(", ")}` : ""}.`);
   }
 
   // 3. Frequency effect: the prespecified two-group contrast (turbo-on vs

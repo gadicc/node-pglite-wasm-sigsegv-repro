@@ -67,6 +67,11 @@ export function parseReproLog(text, expectations = {}) {
     sigsegvCount: 0,
     otherFailureCount: 0,
     unclassifiedFailureCount: 0,
+    sigsegvWaveCount: 0,
+    sigsegvResolvedWaveCount: 0,
+    sigsegvUnresolvedWaveCount: 0,
+    otherFailureWaveCount: 0,
+    unclassifiedFailureWaveCount: 0,
     firstFailureAfterSec: null,
     durationSec: null,
     finalLine: null,
@@ -306,6 +311,7 @@ export function parseReproLog(text, expectations = {}) {
   }
 
   const accepted = occurrences.filter((occurrence) => occurrence.accepted);
+  const waveEvidence = new Map();
   for (const occurrence of accepted) {
     out.waves.push({ wave: occurrence.wave, passed: occurrence.passed, of: occurrence.of });
     out.processedWaves += 1;
@@ -315,6 +321,8 @@ export function parseReproLog(text, expectations = {}) {
     else out.failedWaves += 1;
 
     const expectedFailures = occurrence.of - occurrence.passed;
+    const evidence = { sigsegv: 0, other: 0, unclassified: 0 };
+    waveEvidence.set(occurrence.wave, evidence);
     const detailsByChild = new Map();
     for (const detail of occurrence.details) {
       const previous = detailsByChild.get(detail.child);
@@ -355,6 +363,7 @@ export function parseReproLog(text, expectations = {}) {
         occurrence.line,
       );
       out.unclassifiedFailureCount += expectedFailures;
+      evidence.unclassified = expectedFailures;
       out.notes.push(
         `wave=${occurrence.wave} child details conflict with its summary; all ${expectedFailures} failure(s) remain unclassified`,
       );
@@ -369,6 +378,7 @@ export function parseReproLog(text, expectations = {}) {
     }
     const unclassifiedFailures = expectedFailures - classifiedFailures;
     out.unclassifiedFailureCount += unclassifiedFailures;
+    evidence.unclassified = unclassifiedFailures;
     if (unclassifiedFailures > 0) {
       out.notes.push(
         `wave=${occurrence.wave} summary reports ${expectedFailures} failure(s), but only ${classifiedFailures} child detail line(s) were usable`,
@@ -377,8 +387,33 @@ export function parseReproLog(text, expectations = {}) {
   }
 
   for (const failure of out.failures) {
-    if (failure.signal === "SIGSEGV") out.sigsegvCount += 1;
-    else out.otherFailureCount += 1;
+    const evidence = waveEvidence.get(failure.wave);
+    if (failure.signal === "SIGSEGV") {
+      out.sigsegvCount += 1;
+      evidence.sigsegv += 1;
+    } else {
+      out.otherFailureCount += 1;
+      evidence.other += 1;
+    }
+  }
+  for (const occurrence of accepted) {
+    const evidence = waveEvidence.get(occurrence.wave);
+    if (evidence.other > 0) out.otherFailureWaveCount += 1;
+    if (evidence.unclassified > 0) out.unclassifiedFailureWaveCount += 1;
+    if (evidence.sigsegv > 0) {
+      // A single confirmed SIGSEGV resolves the binary endpoint for its
+      // entire wave, even when other child outcomes in that wave are not
+      // classifiable. Concurrent children are deliberately not independent
+      // trials for the rate estimate.
+      out.sigsegvWaveCount += 1;
+      out.sigsegvResolvedWaveCount += 1;
+    } else if (occurrence.passed === occurrence.of) {
+      // Only a summary-clean wave is a resolved negative. Other failures and
+      // missing child detail cannot be silently counted as non-SIGSEGV.
+      out.sigsegvResolvedWaveCount += 1;
+    } else {
+      out.sigsegvUnresolvedWaveCount += 1;
+    }
   }
   const footer = footers[0] ?? null;
   if (footer) {

@@ -2757,6 +2757,9 @@ check("baseline sigsegv count", r.baseline.sigsegvCount === 2);
 check("bundle path is relative", r.outDir === ".");
 check("baseline other failures", r.baseline.otherFailureCount === 1);
 check("baseline invocations", r.baseline.totalChildInvocations === 20);
+check("wave-level clustered counts propagated", r.baseline.sigsegvWaveCount === 2 &&
+  r.baseline.sigsegvResolvedWaveCount === 5 && r.baseline.sigsegvUnresolvedWaveCount === 0 &&
+  r.groups[1].sigsegvWaveCount === 2 && r.groups[0].sigsegvResolvedWaveCount === 5);
 check("baseline completion structure", r.baseline.completionStatus === "complete" && r.baseline.issues.length === 0);
 check("worst cpu is 19", r.worstCpu === 19);
 check("individual tally", r.individual.length === 2 && r.individual[1].sigsegv === 6 && r.individual[0].failures === 0);
@@ -2772,7 +2775,7 @@ check("root checks merged", Boolean(r.rootChecks) && r.rootChecks["cctk.txt"].in
 process.exit(failures === 0 ? 0 : 1);
 EOF
 if node "$TMP/check-results.mjs" "$B/results.json"; then
-  pass=$((pass + 16))
+  pass=$((pass + 17))
 else
   fail=$((fail + 1))
 fi

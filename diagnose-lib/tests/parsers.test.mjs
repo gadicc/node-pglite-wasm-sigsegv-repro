@@ -36,6 +36,11 @@ test("parseReproLog: epoch-prefixed log with failures", () => {
   assert.equal(r.totalChildInvocations, 20);
   assert.equal(r.sigsegvCount, 2);
   assert.equal(r.otherFailureCount, 1);
+  assert.equal(r.sigsegvWaveCount, 2);
+  assert.equal(r.sigsegvResolvedWaveCount, 5);
+  assert.equal(r.sigsegvUnresolvedWaveCount, 0);
+  assert.equal(r.otherFailureWaveCount, 1);
+  assert.equal(r.unclassifiedFailureWaveCount, 0);
   assert.equal(r.failures.length, 3);
   assert.equal(r.failures[0].child, 3);
   assert.equal(r.failures[0].signal, "SIGSEGV");
@@ -80,6 +85,9 @@ test("parseReproLog: truncated log recovers wave counts from wave rows", () => {
   assert.equal(r.sigsegvCount, 1);
   assert.equal(r.otherFailureCount, 0);
   assert.equal(r.unclassifiedFailureCount, 0);
+  assert.equal(r.sigsegvWaveCount, 1);
+  assert.equal(r.sigsegvResolvedWaveCount, 2);
+  assert.equal(r.sigsegvUnresolvedWaveCount, 0);
   assert.equal(r.firstFailureAfterSec, 12);
   assert.equal(r.durationSec, 12);
   assert.equal(r.completionStatus, "partial");
@@ -117,6 +125,10 @@ test("parseReproLog: truncated failed wave accounts for missing child details", 
   assert.equal(r.sigsegvCount, 0);
   assert.equal(r.otherFailureCount, 0);
   assert.equal(r.unclassifiedFailureCount, 4);
+  assert.equal(r.sigsegvWaveCount, 0);
+  assert.equal(r.sigsegvResolvedWaveCount, 0);
+  assert.equal(r.sigsegvUnresolvedWaveCount, 1);
+  assert.equal(r.unclassifiedFailureWaveCount, 1);
   assert.equal(r.firstFailureAfterSec, 12);
   assert.ok(r.notes.some((note) => note.includes("only 0 child detail")));
 });
@@ -431,6 +443,36 @@ test("parseReproLog: structural record order and timestamp provenance are strict
   assert.match(mixed.issues.map(({ code }) => code).join(" "), /mixed-timestamps.*decreasing-timestamp/);
 });
 
+test("parseReproLog: other-only waves are unresolved for the SIGSEGV endpoint", () => {
+  const r = parseReproLog([
+    "node=v25.2.1 v8=14.1 platform=linux arch=x64 children=2 waves=2",
+    "wave=1 passed=1/2",
+    "child=1 code=13 signal=null elapsedMs=4",
+    "wave=2 passed=0/2",
+    "failedWaves=2 completedWaves=2 requestedWaves=2",
+  ].join("\n"));
+  assert.equal(r.otherFailureWaveCount, 1);
+  assert.equal(r.unclassifiedFailureWaveCount, 1);
+  assert.equal(r.sigsegvWaveCount, 0);
+  assert.equal(r.sigsegvResolvedWaveCount, 0);
+  assert.equal(r.sigsegvUnresolvedWaveCount, 2);
+});
+
+test("parseReproLog: a mixed SIGSEGV and unclassified wave is one resolved positive", () => {
+  const r = parseReproLog([
+    "node=v25.2.1 v8=14.1 platform=linux arch=x64 children=2 waves=1",
+    "wave=1 passed=0/2",
+    "child=1 code=null signal=SIGSEGV elapsedMs=4",
+    "failedWaves=1 completedWaves=1 requestedWaves=1",
+  ].join("\n"));
+  assert.equal(r.sigsegvCount, 1);
+  assert.equal(r.unclassifiedFailureCount, 1);
+  assert.equal(r.sigsegvWaveCount, 1);
+  assert.equal(r.sigsegvResolvedWaveCount, 1);
+  assert.equal(r.sigsegvUnresolvedWaveCount, 0);
+  assert.equal(r.unclassifiedFailureWaveCount, 1);
+});
+
 test("renderReport: partial baseline and group data are marked as truncated", () => {
   const baseline = {
     children: 2,
@@ -514,10 +556,16 @@ test("renderReport: inconsistent clean-looking repro rows stay descriptive", () 
       processedWaves: 2,
       completedWaves: 2,
       failedWaves: 0,
+      fullyPassedWaves: 2,
       totalChildInvocations: 4,
       sigsegvCount: 0,
       otherFailureCount: 0,
       unclassifiedFailureCount: 0,
+      sigsegvWaveCount: 0,
+      sigsegvResolvedWaveCount: 2,
+      sigsegvUnresolvedWaveCount: 0,
+      otherFailureWaveCount: 0,
+      unclassifiedFailureWaveCount: 0,
       completionStatus: "inconsistent",
       issues: [{ code: "footer-row-count-mismatch", message: "footer disagrees with rows" }],
       log: "logs/baseline/run1.log",
@@ -529,10 +577,16 @@ test("renderReport: inconsistent clean-looking repro rows stay descriptive", () 
       wavesRequested: 2,
       processedWaves: 2,
       failedWaves: 0,
+      fullyPassedWaves: 2,
       totalChildInvocations: 4,
       sigsegvCount: 0,
       otherFailureCount: 0,
       unclassifiedFailureCount: 0,
+      sigsegvWaveCount: 0,
+      sigsegvResolvedWaveCount: 2,
+      sigsegvUnresolvedWaveCount: 0,
+      otherFailureWaveCount: 0,
+      unclassifiedFailureWaveCount: 0,
       completionStatus: "inconsistent",
     }],
   });
@@ -598,9 +652,9 @@ test("renderReport: impossible failure counts never throw or get an interval", (
     }],
   });
   assert.match(md, /SIGSEGV \| 3/);
-  assert.match(md, /Child failure rate \| invalid\/missing counts; no interval/);
-  assert.match(md, /bad-counts.*invalid\/2.*invalid\/missing counts; no interval/);
-  assert.match(md, /zero-denominator.*invalid\/0.*invalid\/missing counts; no interval/);
+  assert.match(md, /Child failures \(descriptive only\) \| invalid\/missing/);
+  assert.match(md, /bad-counts.*invalid\/2.*interval unavailable/);
+  assert.match(md, /zero-denominator.*invalid\/0.*interval unavailable/);
   assert.match(md, /invalid\/inconsistent counts; no interval/);
   assert.match(md, /inconsistent failure counts; excluded from conclusions/);
   assert.match(md, /impossible failure-count evidence was excluded/);
@@ -625,7 +679,7 @@ test("renderReport: impossible failure counts never throw or get an interval", (
     },
   });
   assert.match(missingPrimary, /SIGSEGV \| invalid\/missing/);
-  assert.match(missingPrimary, /invalid\/missing counts; no interval/);
+  assert.match(missingPrimary, /Child failures \(descriptive only\) \| invalid\/missing/);
   assert.match(missingPrimary, /impossible failure-count evidence was excluded/);
   assert.doesNotMatch(missingPrimary, /NaN\/1/);
   assert.doesNotMatch(missingPrimary, /\*\*No failure reproduced\*\*/);
@@ -658,10 +712,16 @@ test("renderReport: clean heterogeneous phases do not get a pooled rate bound", 
       processedWaves: 5,
       completedWaves: 5,
       failedWaves: 0,
+      fullyPassedWaves: 5,
       totalChildInvocations: 10,
       sigsegvCount: 0,
       otherFailureCount: 0,
       unclassifiedFailureCount: 0,
+      sigsegvWaveCount: 0,
+      sigsegvResolvedWaveCount: 5,
+      sigsegvUnresolvedWaveCount: 0,
+      otherFailureWaveCount: 0,
+      unclassifiedFailureWaveCount: 0,
       partial: false,
       log: "logs/baseline/run1.log",
     },
@@ -671,18 +731,178 @@ test("renderReport: clean heterogeneous phases do not get a pooled rate bound", 
       children: 2,
       wavesRequested: 10,
       processedWaves: 10,
+      completedWaves: 10,
       failedWaves: 0,
+      fullyPassedWaves: 10,
       totalChildInvocations: 20,
       sigsegvCount: 0,
       otherFailureCount: 0,
       unclassifiedFailureCount: 0,
+      sigsegvWaveCount: 0,
+      sigsegvResolvedWaveCount: 10,
+      sigsegvUnresolvedWaveCount: 0,
+      otherFailureWaveCount: 0,
+      unclassifiedFailureWaveCount: 0,
     }],
     individual: [{ cpu: 0, runs: 30, failures: 0, sigsegv: 0, invalidRuns: [], failedRuns: [] }],
     individualStatus: { status: "complete", reasons: [] },
   });
   assert.match(md, /No pooled rate bound is valid/);
   assert.match(md, /phase-, group-, and CPU-specific bounds/);
+  assert.match(md, /SIGSEGV wave rate \/ 95% CI \| 0\/5 \(95% upper < 45\.1%\)/);
   assert.doesNotMatch(md, /pooled per-run rate/);
+});
+
+test("renderReport: identical child SIGSEGV counts have different clustered wave intervals", () => {
+  const common = {
+    children: 4,
+    requestedWaves: 10,
+    wavesRequested: 10,
+    processedWaves: 10,
+    completedWaves: 10,
+    totalChildInvocations: 40,
+    sigsegvCount: 4,
+    otherFailureCount: 0,
+    unclassifiedFailureCount: 0,
+    sigsegvResolvedWaveCount: 10,
+    sigsegvUnresolvedWaveCount: 0,
+    otherFailureWaveCount: 0,
+    unclassifiedFailureWaveCount: 0,
+    completionStatus: "complete",
+  };
+  const md = renderReport({
+    collectedAt: "2026-08-02T00:00:00.000Z",
+    config: {},
+    environment: {},
+    baseline: {
+      ...common,
+      failedWaves: 1,
+      fullyPassedWaves: 9,
+      sigsegvWaveCount: 1,
+      log: "logs/baseline/run1.log",
+    },
+    groups: [{
+      ...common,
+      name: "spread",
+      cpus: "0-3",
+      failedWaves: 4,
+      fullyPassedWaves: 6,
+      sigsegvWaveCount: 4,
+    }],
+  });
+  assert.match(md, /SIGSEGV wave rate \/ 95% CI \| 1\/10 = 10\.0% \[1\.8%, 40\.4%\]/);
+  assert.match(md, /spread.*4\/10 = 40\.0% \[16\.8%, 68\.7%\]/);
+  assert.match(md, /Concurrent children within a wave are correlated/);
+  assert.match(md, /different children-per-wave are not\s+directly comparable/);
+});
+
+test("renderReport: legacy or impossible wave fields never fall back to child intervals", () => {
+  const md = renderReport({
+    collectedAt: "2026-08-02T00:00:00.000Z",
+    config: {},
+    environment: {},
+    baseline: {
+      children: 2,
+      requestedWaves: 5,
+      processedWaves: 5,
+      completedWaves: 5,
+      failedWaves: 0,
+      totalChildInvocations: 10,
+      sigsegvCount: 0,
+      otherFailureCount: 0,
+      unclassifiedFailureCount: 0,
+      completionStatus: "complete",
+      log: "logs/baseline/run1.log",
+    },
+    groups: [{
+      name: "forged",
+      cpus: "0-1",
+      children: 2,
+      wavesRequested: 1,
+      processedWaves: 1,
+      completedWaves: 1,
+      failedWaves: 1,
+      fullyPassedWaves: 0,
+      totalChildInvocations: 2,
+      sigsegvCount: 1,
+      otherFailureCount: 0,
+      unclassifiedFailureCount: 0,
+      // Forged cross-layer evidence: a child SIGSEGV cannot coexist with
+      // zero positive waves, nor can an unresolved wave lack other or
+      // unclassified evidence.
+      sigsegvWaveCount: 0,
+      sigsegvResolvedWaveCount: 0,
+      sigsegvUnresolvedWaveCount: 1,
+      otherFailureWaveCount: 0,
+      unclassifiedFailureWaveCount: 0,
+      completionStatus: "complete",
+    }],
+  });
+  assert.equal((md.match(/interval unavailable \(legacy or invalid wave counts\)/g) ?? []).length, 2);
+  assert.doesNotMatch(md, /0\/10 \(95% upper/);
+  assert.doesNotMatch(md, /\*\*No failure reproduced\*\*/);
+});
+
+test("renderReport: partial positive wave evidence reproduces but gets no interval", () => {
+  const md = renderReport({
+    collectedAt: "2026-08-02T00:00:00.000Z",
+    config: {},
+    environment: {},
+    baseline: {
+      children: 2,
+      requestedWaves: 5,
+      processedWaves: 1,
+      completedWaves: 1,
+      failedWaves: 1,
+      fullyPassedWaves: 0,
+      totalChildInvocations: 2,
+      sigsegvCount: 1,
+      otherFailureCount: 0,
+      unclassifiedFailureCount: 1,
+      sigsegvWaveCount: 1,
+      sigsegvResolvedWaveCount: 1,
+      sigsegvUnresolvedWaveCount: 0,
+      otherFailureWaveCount: 0,
+      unclassifiedFailureWaveCount: 1,
+      completionStatus: "partial",
+      partial: true,
+      log: "logs/baseline/run1.log",
+    },
+  });
+  assert.match(md, /1\/1 = 100\.0% \(descriptive only; partial structure\)/);
+  assert.match(md, /\*\*The problem reproduced\*\*/);
+  assert.doesNotMatch(md, /1\/1 = 100\.0% \[/);
+});
+
+test("renderReport: unresolved waves preclude a clean claim and zero bound", () => {
+  const md = renderReport({
+    collectedAt: "2026-08-02T00:00:00.000Z",
+    config: {},
+    environment: {},
+    baseline: {
+      children: 2,
+      requestedWaves: 2,
+      processedWaves: 2,
+      completedWaves: 2,
+      failedWaves: 1,
+      fullyPassedWaves: 1,
+      totalChildInvocations: 4,
+      sigsegvCount: 0,
+      otherFailureCount: 1,
+      unclassifiedFailureCount: 0,
+      sigsegvWaveCount: 0,
+      sigsegvResolvedWaveCount: 1,
+      sigsegvUnresolvedWaveCount: 1,
+      otherFailureWaveCount: 1,
+      unclassifiedFailureWaveCount: 0,
+      completionStatus: "complete",
+      log: "logs/baseline/run1.log",
+    },
+  });
+  assert.match(md, /0\/1 \(no upper bound; 1 unresolved wave\(s\)\)/);
+  assert.match(md, /Workload failures occurred/);
+  assert.doesNotMatch(md, /0\/1 \(95% upper/);
+  assert.doesNotMatch(md, /\*\*No failure reproduced\*\*/);
 });
 
 test("renderReport: incomplete individual prefixes are descriptive but cannot localize", () => {

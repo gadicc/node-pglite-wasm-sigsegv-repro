@@ -208,15 +208,23 @@ interrupted archive is recovered before phase execution on the next resume.
 
 ### Interpreting the report
 
-Rates are reported with Wilson 95% confidence intervals; the concentration
-of failures across CPUs is assessed with a permutation test (chi-square
-statistic over the per-CPU counts, seeded shuffles — never a Fisher test on
-an outcome-defined grouping); the frequency legs get an exact
-comparison on SIGSEGV counts over valid runs plus, separately labelled, the
+Per-CPU rates and baseline/group **wave** rates are reported with Wilson 95%
+confidence intervals. CPU localization is descriptive because its sequential
+batches are not exchangeable; the frequency legs get an exact comparison on
+SIGSEGV counts over valid runs plus, separately labelled, the
 binomial probability of the
-clean leg *under an assumed fixed baseline rate*. Wave failures are kept
-distinct from individual child-process failures. Baseline and group logs are
-also reconciled against their stored child/wave configuration and exit status;
+clean leg *under an assumed fixed baseline rate*. Concurrent children in a
+wave share timing, load, and machine state, so they are correlated rather than
+independent trials: child failure totals are descriptive, while a wave is
+positive if it contains at least one confirmed SIGSEGV, negative only when all
+children passed, and otherwise unresolved. Wave-rate intervals use only
+resolved sequential waves and assume those waves are independent and
+stationary. Excluding unresolved waves can bias the resulting interval, so
+their count is displayed explicitly. Rates are not directly comparable when
+the number of concurrent children differs, because that changes the chance
+that at least one child fails. Wave failures are kept distinct from individual
+child-process failures. Baseline and group logs are also reconciled against
+their stored child/wave configuration and exit status;
 malformed, duplicated, missing, or contradictory structure is retained only as
 descriptive evidence and cannot support a clean conclusion or rate bound. The
 conclusions section states only what this run supports: whether the problem
