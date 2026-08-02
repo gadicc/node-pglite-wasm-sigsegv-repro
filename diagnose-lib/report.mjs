@@ -14,7 +14,6 @@ import {
   zeroFailureUpperBound,
   fisherExact2x2,
   binomZeroProbability,
-  permutationCpuTest,
 } from "./stats.mjs";
 
 function pct(x, digits = 1) {
@@ -221,7 +220,9 @@ export function renderReport(results) {
   L.push("## Phase 4: individual CPU isolation");
   L.push("");
   if (r.individual?.length) {
-    L.push("One child process pinned to one logical CPU per run.");
+    L.push("One child process pinned to one logical CPU per run. CPU batches");
+    L.push("run sequentially, so localization is descriptive/exploratory and");
+    L.push("may be confounded by time or thermal drift.");
     L.push("A CPU with zero failures is **not** proven good; the 95% upper");
     L.push("bound shows which per-run failure rates its sample excludes.");
     L.push("");
@@ -360,11 +361,10 @@ export function renderReport(results) {
   L.push("- Observed failure rates can drift between batches; comparisons use");
   L.push("  exact tests on paired batches where possible, but small samples");
   L.push("  remain weak evidence.");
-  L.push("- The clean-CPU contrast behind CPU localization is a permutation");
-  L.push("  test across all tested CPUs (chi-square statistic, fixed seed), not");
-  L.push("  a Fisher test on a post-hoc failing-vs-clean grouping — that");
-  L.push("  grouping is defined by the outcomes, so testing it would separate");
-  L.push("  by construction.");
+  L.push("- Per-CPU batches run sequentially in CPU-number order. CPU identity");
+  L.push("  is therefore confounded with time, temperature, and workload drift;");
+  L.push("  localization is descriptive and no exchangeability-based p-value is");
+  L.push("  reported. Confirm candidates with a randomized/interleaved design.");
   L.push("- `scaling_cur_freq` under reports effective clocks on some");
   L.push("  intel_pstate/HWP systems; when available, turbostat samples are");
   L.push("  preferred and the method is recorded per measurement.");
@@ -409,10 +409,9 @@ function renderConclusions(r) {
     C.push("- No workload results were collected.");
   }
 
-  // 2. Localization to CPUs / groups. The statistical claim is an omnibus
-  // permutation test across ALL tested CPUs — never a Fisher test on a
-  // failing-vs-clean partition defined after seeing the outcomes, which
-  // would separate by construction and ignore the CPU search multiplicity.
+  // 2. Localization to CPUs / groups. Individual CPU batches run in fixed,
+  // sequential order, so CPU labels are not exchangeable with respect to
+  // temporal/thermal drift. Keep this descriptive; do not attach a p-value.
   const testedCpus = (r.individual ?? []).filter((c) => c.runs > 0);
   const failingCpus = testedCpus.filter((c) => c.sigsegv > 0);
   const cleanCpus = testedCpus.filter((c) => c.sigsegv === 0);
@@ -424,15 +423,12 @@ function renderConclusions(r) {
     } else if (testedCpus.length > 1) {
       line += "; every other tested CPU also observed at least one failure";
     }
-    if (testedCpus.length > 1) {
-      const perm = permutationCpuTest(testedCpus.map((c) => ({ failures: c.sigsegv, runs: c.runs })));
-      line += `. Permutation test across all ${testedCpus.length} tested CPUs (chi-square statistic, ${perm.iterations} seeded shuffles): p = ${perm.p.toExponential(2)}`;
-    } else {
-      line += ". Only one CPU was tested, so no cross-CPU concentration test is possible";
-    }
+    line += testedCpus.length > 1
+      ? ". This is exploratory localization only because CPU batches were sequential, not randomized or interleaved"
+      : ". Only one CPU was tested, so no cross-CPU comparison is possible";
     C.push(`${line}.`);
   } else if (testedCpus.length > 0) {
-    C.push("- CPU localization: no failures observed on any tested CPU; the cross-CPU concentration test is not applicable (zero total failures).");
+    C.push("- CPU localization: no failures observed on any tested CPU; sequential per-CPU results remain descriptive only.");
   }
   const failingGroups = (r.groups ?? []).filter((g) => (g.sigsegvCount ?? 0) > 0);
   const cleanGroups = (r.groups ?? []).filter(

@@ -791,8 +791,8 @@ fi
 
 grep -q "CPU localization" "$B/report.md"
 check_eq "report contains localization conclusion" "0" "$?"
-grep -q "Permutation test across all 2 tested CPUs (chi-square statistic, 20000 seeded shuffles): p = " "$B/report.md"
-check_eq "report contains permutation localization test" "0" "$?"
+grep -q "Permutation test" "$B/report.md"
+check_eq "report omits invalid permutation localization test" "1" "$?"
 grep -q "statistically significant (Fisher exact" "$B/report.md"
 check_eq "post-selected Fisher significance claim is gone" "1" "$?"
 grep -q "documented pattern" "$B/report.md"

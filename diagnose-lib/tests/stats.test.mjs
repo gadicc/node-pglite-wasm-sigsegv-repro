@@ -6,7 +6,6 @@ import {
   fisherExact2x2,
   binomZeroProbability,
   summarize,
-  permutationCpuTest,
 } from "../stats.mjs";
 
 const closeTo = (actual, expected, tol = 1e-6) =>
@@ -80,60 +79,4 @@ test("summarize: bundles rate, CI, and zero-failure bound", () => {
   const s2 = summarize(6, 20);
   assert.equal(s2.zeroFailureUpper95, undefined);
   closeTo(s2.rate, 0.3, 1e-12);
-});
-
-test("permutationCpuTest: fixed seed makes the result deterministic", () => {
-  const counts = [
-    { failures: 6, runs: 20 },
-    { failures: 0, runs: 20 },
-  ];
-  const a = permutationCpuTest(counts, 2000);
-  const b = permutationCpuTest(counts, 2000);
-  assert.equal(a.p, b.p);
-  assert.equal(a.statistic, b.statistic);
-  assert.equal(a.iterations, 2000);
-  assert.ok(a.p > 0 && a.p <= 1);
-});
-
-test("permutationCpuTest: strongly separated CPUs give a small p", () => {
-  const { p, statistic } = permutationCpuTest([
-    { failures: 12, runs: 20 },
-    { failures: 0, runs: 20 },
-    { failures: 0, runs: 20 },
-    { failures: 0, runs: 20 },
-  ]);
-  assert.ok(statistic > 0);
-  assert.ok(p < 0.05, `expected small p, got ${p}`);
-});
-
-test("permutationCpuTest: homogeneous CPUs give p = 1", () => {
-  // Every CPU at the same rate: the observed statistic is 0, so every
-  // permutation is at least as extreme.
-  const { p, statistic } = permutationCpuTest([
-    { failures: 3, runs: 20 },
-    { failures: 3, runs: 20 },
-    { failures: 3, runs: 20 },
-    { failures: 3, runs: 20 },
-  ]);
-  assert.equal(statistic, 0);
-  assert.equal(p, 1);
-});
-
-test("permutationCpuTest: edge cases do not throw", () => {
-  // Zero total failures.
-  assert.equal(permutationCpuTest([{ failures: 0, runs: 10 }, { failures: 0, runs: 10 }]).p, 1);
-  // A single tested CPU.
-  assert.equal(permutationCpuTest([{ failures: 2, runs: 10 }]).p, 1);
-  // Two CPUs, mild contrast.
-  const two = permutationCpuTest([{ failures: 1, runs: 5 }, { failures: 0, runs: 5 }], 500);
-  assert.ok(two.p > 0 && two.p <= 1);
-});
-
-test("permutationCpuTest: rejects invalid input", () => {
-  assert.throws(() => permutationCpuTest([{ failures: 5, runs: 2 }]));
-  assert.throws(() => permutationCpuTest([{ failures: -1, runs: 10 }]));
-  assert.throws(() => permutationCpuTest([{ failures: 1.5, runs: 10 }]));
-  assert.throws(() => permutationCpuTest([{ failures: 1 }]));
-  assert.throws(() => permutationCpuTest([{ failures: 1, runs: 10 }], 0));
-  assert.throws(() => permutationCpuTest([{ failures: 1, runs: 10 }], 2.5));
 });
