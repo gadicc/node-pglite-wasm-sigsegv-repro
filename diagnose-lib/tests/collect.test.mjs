@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { summarizeFreqSamples } from "../collect.mjs";
+import { summarizeFreqSamples, collect, collectIndividual, collectFreqAb } from "../collect.mjs";
 
 // Representative capture from `turbostat --quiet --interval 1` (no --Summary):
 // the header repeats every interval, the "- -" row is the whole-system
@@ -85,4 +85,69 @@ test("summarizeFreqSamples: missing samples file is reported unavailable", () =>
   const missing = summarizeFreqSamples(dir, "exp", new Set([2]));
   assert.equal(missing.available, false);
   assert.equal(missing.samples, undefined);
+});
+
+test("collectIndividual: only SIGSEGV is a failure; other nonzero exits are invalid runs", () => {
+  const rows = [
+    ["7", "1", "0", "2"],
+    ["7", "2", "139", "2"],
+    ["7", "3", "1", "2"],
+    ["7", "4", "126", "0"],
+    ["7", "5", "127", "0"],
+  ];
+  const [rec] = collectIndividual(rows);
+  assert.equal(rec.runs, 2); // clean + SIGSEGV only
+  assert.equal(rec.failures, 1);
+  assert.equal(rec.sigsegv, 1);
+  assert.equal(rec.otherFailures, 0); // zero by construction
+  assert.deepEqual(rec.failedRuns.map((f) => f.rc), [139]);
+  assert.equal(rec.failedRuns[0].signal, "SIGSEGV");
+  assert.deepEqual(rec.invalidRuns.map((f) => f.rc), [1, 126, 127]);
+  assert.deepEqual(rec.invalidRuns.map((f) => f.signal), ["exit 1", "exit 126", "exit 127"]);
+  assert.deepEqual(rec.invalidRuns.map((f) => f.run), [3, 4, 5]);
+});
+
+test("collectFreqAb: legs count only clean/SIGSEGV rows as valid runs", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "collect-test-"));
+  tmpDirs.push(dir);
+  const rows = [
+    ["A1", "1", "139", "2"],
+    ["A1", "2", "0", "2"],
+    ["A1", "3", "1", "2"],
+    ["A1", "4", "126", "0"],
+    ["B", "1", "0", "3"],
+    ["B", "2", "134", "3"], // SIGABRT: another signal, still not the endpoint
+  ];
+  const res = collectFreqAb(dir, rows, { CPU: "19", LEG_A1_NO_TURBO: "0", LEG_B_NO_TURBO: "1" });
+  const [a1, b] = res.legs;
+  assert.equal(a1.runs, 2);
+  assert.equal(a1.failures, 1);
+  assert.equal(a1.sigsegv, 1);
+  assert.equal(a1.otherFailures, 0);
+  assert.deepEqual(a1.invalidRuns.map((f) => f.rc), [1, 126]);
+  assert.equal(b.runs, 1);
+  assert.equal(b.failures, 0);
+  assert.deepEqual(b.invalidRuns.map((f) => f.signal), ["SIGABRT"]);
+});
+
+test("collect: worstCpu ranks by SIGSEGV, ignoring non-SIGSEGV exits", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "collect-test-"));
+  tmpDirs.push(dir);
+  mkdirSync(path.join(dir, "results"));
+  // CPU 3 "fails" every run with a launcher-style exit 1; CPU 4 has one real
+  // SIGSEGV. Only CPU 4 may be ranked worst.
+  writeFileSync(
+    path.join(dir, "results", "individual.tsv"),
+    "3\t1\t1\t2\n3\t2\t1\t2\n3\t3\t1\t2\n3\t4\t1\t2\n" +
+      "4\t1\t139\t2\n4\t2\t0\t2\n4\t3\t0\t2\n4\t4\t0\t2\n",
+  );
+  const r = collect(dir);
+  assert.equal(r.worstCpu, 4);
+  const cpu3 = r.individual.find((c) => c.cpu === 3);
+  assert.equal(cpu3.runs, 0);
+  assert.equal(cpu3.failures, 0);
+  assert.equal(cpu3.invalidRuns.length, 4);
+  const cpu4 = r.individual.find((c) => c.cpu === 4);
+  assert.equal(cpu4.runs, 4);
+  assert.equal(cpu4.sigsegv, 1);
 });

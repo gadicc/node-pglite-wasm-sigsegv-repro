@@ -178,49 +178,51 @@ function signalFromRc(rc) {
   return null;
 }
 
-function collectIndividual(rows) {
+// The primary endpoint of every run-based phase is SIGSEGV (rc 139): a run
+// is either clean (rc 0) or a failure (rc 139). Any other exit — launcher
+// failure of taskset/node itself (126/127), wrapper error, another signal —
+// is not a valid workload observation: it is recorded in invalidRuns and
+// excluded from `runs`, so `failures` == `sigsegv` and `otherFailures` stays
+// 0 by construction (the field is kept for schema stability).
+function addRunOutcome(rec, runS, rcS, elapsedS) {
+  const rc = Number(rcS);
+  const detail = {
+    run: Number(runS),
+    rc,
+    signal: signalFromRc(rc) ?? `exit ${rc}`,
+    elapsedSec: num(elapsedS),
+  };
+  if (rc !== 0 && rc !== 139) {
+    rec.invalidRuns.push(detail);
+    return;
+  }
+  rec.runs += 1;
+  if (rc === 139) {
+    rec.failures += 1;
+    rec.sigsegv += 1;
+    rec.failedRuns.push(detail);
+  }
+}
+
+export function collectIndividual(rows) {
   const byCpu = new Map();
   for (const row of rows) {
     const [cpuS, runS, rcS, elapsedS] = row;
     const cpu = Number(cpuS);
-    const rc = Number(rcS);
     if (!byCpu.has(cpu)) {
-      byCpu.set(cpu, { cpu, runs: 0, failures: 0, sigsegv: 0, otherFailures: 0, launchErrors: 0, failedRuns: [] });
+      byCpu.set(cpu, { cpu, runs: 0, failures: 0, sigsegv: 0, otherFailures: 0, invalidRuns: [], failedRuns: [] });
     }
-    const rec = byCpu.get(cpu);
-    rec.runs += 1;
-    if (rc === 0) continue;
-    // 126/127 = launch failure of taskset/node itself, not a workload failure.
-    if (rc === 126 || rc === 127) {
-      rec.launchErrors += 1;
-      rec.runs -= 1; // not a valid observation
-      continue;
-    }
-    rec.failures += 1;
-    const sig = signalFromRc(rc);
-    if (sig === "SIGSEGV") rec.sigsegv += 1;
-    else rec.otherFailures += 1;
-    rec.failedRuns.push({ run: Number(runS), rc, signal: sig ?? `exit ${rc}`, elapsedSec: num(elapsedS) });
+    addRunOutcome(byCpu.get(cpu), runS, rcS, elapsedS);
   }
   return [...byCpu.values()].sort((a, b) => a.cpu - b.cpu);
 }
 
-function collectFreqAb(outDir, rows, meta) {
+export function collectFreqAb(outDir, rows, meta) {
   const legs = new Map();
   for (const row of rows) {
     const [leg, runS, rcS, elapsedS] = row;
-    if (!legs.has(leg)) legs.set(leg, { leg, runs: 0, failures: 0, sigsegv: 0, otherFailures: 0, failedRuns: [] });
-    const rec = legs.get(leg);
-    const rc = Number(rcS);
-    if (rc === 126 || rc === 127) continue;
-    rec.runs += 1;
-    if (rc !== 0) {
-      rec.failures += 1;
-      const sig = signalFromRc(rc);
-      if (sig === "SIGSEGV") rec.sigsegv += 1;
-      else rec.otherFailures += 1;
-      rec.failedRuns.push({ run: Number(runS), rc, signal: sig ?? `exit ${rc}`, elapsedSec: num(elapsedS) });
-    }
+    if (!legs.has(leg)) legs.set(leg, { leg, runs: 0, failures: 0, sigsegv: 0, otherFailures: 0, invalidRuns: [], failedRuns: [] });
+    addRunOutcome(legs.get(leg), runS, rcS, elapsedS);
   }
   const cpu = num(meta.CPU);
   const result = {
@@ -336,9 +338,11 @@ export function collect(outDir) {
   const individualRows = readTsv(path.join(resultsDir, "individual.tsv"));
   if (individualRows.length > 0) {
     results.individual = collectIndividual(individualRows);
+    // Rank by the SIGSEGV endpoint over valid runs (ties: more SIGSEGVs,
+    // then lower CPU number); invalid runs are already excluded from `runs`.
     const worst = results.individual
       .filter((r) => r.runs > 0)
-      .sort((a, b) => b.failures / b.runs - a.failures / a.runs || b.failures - a.failures || a.cpu - b.cpu)[0];
+      .sort((a, b) => b.sigsegv / b.runs - a.sigsegv / a.runs || b.sigsegv - a.sigsegv || a.cpu - b.cpu)[0];
     results.worstCpu = worst ? worst.cpu : null;
   } else {
     results.worstCpu = null;

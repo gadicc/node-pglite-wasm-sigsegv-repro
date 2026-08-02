@@ -1019,10 +1019,12 @@ individual_cpu_result_is_complete() {
 }
 
 # ------------------------------------------------------------------
-# Worst CPU from individual.tsv (highest failure rate, ties: more failures).
+# Worst CPU from individual.tsv (highest SIGSEGV rate over valid runs, ties:
+# more SIGSEGVs). Only rc 0 (clean) and rc 139 (SIGSEGV) are valid runs;
+# every other exit is excluded, aligning old-bundle resumes with collect.mjs.
 worst_cpu() {
   awk -F'\t' '
-    { rc=$3; if (rc==126 || rc==127) next; n[$1]++; if (rc!=0) f[$1]++ }
+    { rc=$3; if (rc!=0 && rc!=139) next; n[$1]++; if (rc==139) f[$1]++ }
     END {
       best=-1; bestr=-1; bestf=0
       for (c in n) {

@@ -481,6 +481,19 @@ check_eq "launcher exit is rejected as individual evidence" "1" "$([[ $? -ne 0 ]
   individual_cpu_result_is_complete "$INDIVIDUAL_VALID" 19 0 4 1
 ) > /dev/null 2>&1
 check_eq "individual row deficit is rejected" "1" "$([[ $? -ne 0 ]] && echo 1 || echo 0)"
+
+# worst_cpu must rank by the SIGSEGV endpoint only: CPU 3 fails every run
+# with a launcher-style exit 1, CPU 4 has one real SIGSEGV.
+WORST_CPU_DIR="$TMP/worst-cpu-bundle"
+mkdir -p "$WORST_CPU_DIR/results"
+printf '3\t1\t1\t2\n3\t2\t1\t2\n4\t1\t139\t2\n4\t2\t0\t2\n' > "$WORST_CPU_DIR/results/individual.tsv"
+worst_cpu_out="$(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$WORST_CPU_DIR"
+  worst_cpu
+)"
+check_eq "worst_cpu counts only SIGSEGV exits" "4" "$worst_cpu_out"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
@@ -681,7 +694,8 @@ pcores	pcore	0-7	-	4	5	logs/groups/pcores.log	group-pcores	0
 ecluster-64	ecluster	16-19	64	4	5	logs/groups/ecluster-64.log	group-ecluster-64	1
 EOF
 
-# CPU 8: 20 clean runs; CPU 19: 6 SIGSEGV in 20 runs.
+# CPU 8: 20 clean runs; CPU 19: 6 SIGSEGV in 20 runs plus one launch error
+# (rc 126) that must be excluded from the run counts as an invalid run.
 : > "$B/results/individual.tsv"
 for i in $(seq 1 20); do
   printf '8\t%s\t0\t2\n' "$i" >> "$B/results/individual.tsv"
@@ -693,7 +707,10 @@ for i in $(seq 1 20); do
     printf '19\t%s\t0\t2\n' "$i" >> "$B/results/individual.tsv"
   fi
 done
+printf '19\t21\t126\t0\n' >> "$B/results/individual.tsv"
 
+# Leg B also carries one launch-error row (rc 126): excluded from the valid
+# runs the frequency inference is based on.
 cat > "$B/results/frequency-ab.tsv" << EOF
 A1	1	139	2
 A1	2	0	2
@@ -703,6 +720,7 @@ B	1	0	3
 B	2	0	3
 B	3	0	3
 B	4	0	3
+B	5	126	0
 A2	1	139	2
 A2	2	139	2
 A2	3	0	2
@@ -756,16 +774,18 @@ check("baseline other failures", r.baseline.otherFailureCount === 1);
 check("baseline invocations", r.baseline.totalChildInvocations === 20);
 check("worst cpu is 19", r.worstCpu === 19);
 check("individual tally", r.individual.length === 2 && r.individual[1].sigsegv === 6 && r.individual[0].failures === 0);
+check("individual invalid runs excluded", r.individual[1].runs === 20 && r.individual[1].invalidRuns.length === 1 && r.individual[1].invalidRuns[0].rc === 126);
 check("gdb signature match", r.gdb.captures.length === 1 && r.gdb.captures[0].matchesKnownSignature === true);
 check("gdb capture file trimmed", r.gdb.captures[0].mappings === undefined);
 check("freq ab restored + legs", r.frequencyAb.restored === true && r.frequencyAb.legs.length === 3);
 check("freq leg B measured clock", r.frequencyAb.legs[1].frequency.avgMHz === 2100);
+check("freq leg B invalid run excluded", r.frequencyAb.legs[1].runs === 4 && r.frequencyAb.legs[1].invalidRuns.length === 1);
 check("group failure tally", r.groups.length === 2 && r.groups[1].sigsegvCount === 2 && r.groups[0].sigsegvCount === 0);
 check("root checks merged", Boolean(r.rootChecks) && r.rootChecks["cctk.txt"].includes("IntelTME=Disabled"));
 process.exit(failures === 0 ? 0 : 1);
 EOF
 if node "$TMP/check-results.mjs" "$B/results.json"; then
-  pass=$((pass + 11))
+  pass=$((pass + 13))
 else
   fail=$((fail + 1))
 fi
@@ -776,6 +796,8 @@ grep -q "documented pattern" "$B/report.md"
 check_eq "report contains signature conclusion" "0" "$?"
 grep -q "Fisher exact" "$B/report.md"
 check_eq "report contains Fisher test" "0" "$?"
+grep -q "1 invalid run(s) excluded (non-SIGSEGV exits)" "$B/report.md"
+check_eq "report notes excluded invalid runs" "0" "$?"
 grep -q "TME" "$B/report.md"
 check_eq "report contains TME rule-out" "0" "$?"
 grep -q "battery" "$B/report.md"

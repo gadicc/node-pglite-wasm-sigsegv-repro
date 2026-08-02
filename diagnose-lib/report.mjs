@@ -200,7 +200,7 @@ export function renderReport(results) {
     for (const c of r.individual) {
       const notes = [];
       if (c.cpu === r.worstCpu && c.failures > 0) notes.push("highest observed rate");
-      if (c.launchErrors > 0) notes.push(`${c.launchErrors} launch error(s) excluded`);
+      if (c.invalidRuns?.length > 0) notes.push(`${c.invalidRuns.length} invalid run(s) excluded (non-SIGSEGV exits)`);
       if (c.failedRuns?.length) {
         notes.push(`failed runs: ${c.failedRuns.map((f) => `#${f.run} (${f.signal})`).join(", ")}`);
       }
@@ -221,23 +221,28 @@ export function renderReport(results) {
     L.push(`Test CPU: ${fa.cpu} (highest observed failure rate). Original`);
     L.push(`settings saved first; restored after the phase: ${fa.restored ? "yes" : "**NO — check intel_pstate/no_turbo and scaling_max_freq**"}.`);
     L.push("");
-    L.push("| Leg | no_turbo | scaling_max_freq | Runs | Failures | Rate / bound | Eff. freq (avg/max) |");
+    L.push("Failures are SIGSEGV (exit 139) only; any other nonzero exit is an");
+    L.push("invalid run, excluded from the run counts below.");
+    L.push("");
+    L.push("| Leg | no_turbo | scaling_max_freq | Valid runs | SIGSEGV | Rate / bound | Eff. freq (avg/max) |");
     L.push("| --- | --- | --- | --- | --- | --- | --- |");
     for (const leg of fa.legs) {
+      const inv = leg.invalidRuns?.length ?? 0;
       L.push(
-        `| ${leg.leg} | ${leg.noTurbo ?? "—"} | ${leg.scalingMaxKhz ? `${Math.round(leg.scalingMaxKhz / 1000)} MHz` : "—"} | ${leg.runs} | ${leg.failures} | ${statsCell(leg.failures, leg.runs)} | ${fmtMHz(leg.frequency?.avgMHz)} / ${fmtMHz(leg.frequency?.maxMHz)} |`,
+        `| ${leg.leg} | ${leg.noTurbo ?? "—"} | ${leg.scalingMaxKhz ? `${Math.round(leg.scalingMaxKhz / 1000)} MHz` : "—"} | ${leg.runs} | ${leg.failures}${inv > 0 ? ` (+${inv} invalid excluded)` : ""} | ${statsCell(leg.failures, leg.runs)} | ${fmtMHz(leg.frequency?.avgMHz)} / ${fmtMHz(leg.frequency?.maxMHz)} |`,
       );
     }
     L.push("");
     const aLegs = fa.legs.filter((l) => l.noTurbo === 0);
     const bLegs = fa.legs.filter((l) => l.noTurbo === 1);
-    const aF = aLegs.reduce((s, l) => s + l.failures, 0);
+    const aF = aLegs.reduce((s, l) => s + l.sigsegv, 0);
     const aN = aLegs.reduce((s, l) => s + l.runs, 0);
-    const bF = bLegs.reduce((s, l) => s + l.failures, 0);
+    const bF = bLegs.reduce((s, l) => s + l.sigsegv, 0);
     const bN = bLegs.reduce((s, l) => s + l.runs, 0);
+    const invalid = fa.legs.reduce((s, l) => s + (l.invalidRuns?.length ?? 0), 0);
     if (aN > 0 && bN > 0) {
       const p = fisherExact2x2(aF, aN - aF, bF, bN - bF);
-      L.push(`Fisher exact test, turbo-on legs (${aF}/${aN}) vs turbo-off leg (${bF}/${bN}): two-sided p = ${p.toExponential(2)}.`);
+      L.push(`Fisher exact test on SIGSEGV counts over valid runs, turbo-on legs (${aF}/${aN}) vs turbo-off leg (${bF}/${bN}): two-sided p = ${p.toExponential(2)}.${invalid > 0 ? ` ${invalid} invalid run(s) excluded (non-SIGSEGV exits).` : ""}`);
       if (bF === 0 && aF > 0) {
         const assumed = aF / aN;
         L.push(``);
@@ -366,25 +371,29 @@ function renderConclusions(r) {
     C.push(`- **Group isolation**: failures in group(s) ${failingGroups.map((g) => `${g.name} (${g.cpus})`).join(", ")}; clean group(s): ${cleanGroups.length > 0 ? cleanGroups.map((g) => `${g.name} (${g.cpus})`).join(", ") : "none"}.`);
   }
 
-  // 3. Frequency effect
+  // 3. Frequency effect: the prespecified two-group contrast (turbo-on vs
+  // turbo-off) uses SIGSEGV counts over valid runs only; non-SIGSEGV exits
+  // are invalid runs and never enter the test.
   if (r.frequencyAb) {
     const fa = r.frequencyAb;
     const aLegs = fa.legs.filter((l) => l.noTurbo === 0);
     const bLegs = fa.legs.filter((l) => l.noTurbo === 1);
-    const aF = aLegs.reduce((s, l) => s + l.failures, 0);
+    const aF = aLegs.reduce((s, l) => s + l.sigsegv, 0);
     const aN = aLegs.reduce((s, l) => s + l.runs, 0);
-    const bF = bLegs.reduce((s, l) => s + l.failures, 0);
+    const bF = bLegs.reduce((s, l) => s + l.sigsegv, 0);
     const bN = bLegs.reduce((s, l) => s + l.runs, 0);
+    const invalid = fa.legs.reduce((s, l) => s + (l.invalidRuns?.length ?? 0), 0);
+    const invalidNote = invalid > 0 ? ` ${invalid} invalid run(s) excluded (non-SIGSEGV exits).` : "";
     if (aN > 0 && bN > 0) {
       const p = fisherExact2x2(aF, aN - aF, bF, bN - bF);
       if (aF > 0 && bF === 0 && p < 0.05) {
-        C.push(`- **Frequency dependence**: turbo-on legs failed ${aF}/${aN} while the turbo-off leg was clean (0/${bN}); Fisher exact p = ${p.toExponential(2)}. Lower frequency suppressed the failure in this session, consistent with a frequency/voltage margin rather than hard logic.`);
+        C.push(`- **Frequency dependence**: turbo-on legs produced SIGSEGV in ${aF}/${aN} valid runs while the turbo-off leg was clean (0/${bN}); Fisher exact p = ${p.toExponential(2)}. Lower frequency suppressed the failure in this session, consistent with a frequency/voltage margin rather than hard logic.${invalidNote}`);
       } else if (aF === 0 && bF === 0) {
-        C.push("- Frequency A/B/A: no failures in any leg; the test is uninformative for frequency dependence (the defect did not reproduce at baseline during the legs).");
+        C.push(`- Frequency A/B/A: no failures in any leg; the test is uninformative for frequency dependence (the defect did not reproduce at baseline during the legs).${invalidNote}`);
       } else if (bF > 0) {
-        C.push(`- Frequency A/B/A: failures occurred even with turbo disabled (${bF}/${bN} vs ${aF}/${aN} with turbo on; Fisher exact p = ${p.toExponential(2)}). Downclocking alone did not suppress the failure in this session.`);
+        C.push(`- Frequency A/B/A: SIGSEGV occurred even with turbo disabled (${bF}/${bN} vs ${aF}/${aN} valid runs with turbo on; Fisher exact p = ${p.toExponential(2)}). Downclocking alone did not suppress the failure in this session.${invalidNote}`);
       } else {
-        C.push(`- Frequency A/B/A: turbo-on ${aF}/${aN}, turbo-off ${bF}/${bN}; Fisher exact p = ${p.toExponential(2)} — inconclusive at this sample size.`);
+        C.push(`- Frequency A/B/A: turbo-on ${aF}/${aN}, turbo-off ${bF}/${bN} (SIGSEGV over valid runs); Fisher exact p = ${p.toExponential(2)} — inconclusive at this sample size.${invalidNote}`);
       }
     }
   } else {
