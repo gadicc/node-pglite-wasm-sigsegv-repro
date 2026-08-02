@@ -8,6 +8,7 @@ import {
   collect,
   collectFreqAb,
   collectIndividual,
+  resolveExpectedCpu,
   summarizeFreqSamples,
 } from "../collect.mjs";
 
@@ -37,6 +38,14 @@ const LEGACY_SUMMARY_SAMPLES = `Avg_MHz Busy% Bzy_MHz TSC_MHz IRQ CPU%c1
 `;
 
 const tmpDirs = [];
+function writeFixedCpuConfig(dir, cpu = 19) {
+  writeFileSync(
+    path.join(dir, "results", "meta.env"),
+    `MODE=quick\nBASELINE_CHILDREN=4\nBASELINE_WAVES=5\nGROUP_WAVES=5\n` +
+      `INDIVIDUAL_RUNS=1\nGDB_MAX_RUNS=6\nSKIP_GDB=0\nCPU_TARGET=${cpu}\n`,
+  );
+}
+
 function writeCapture(samples, method = "turbostat") {
   const dir = mkdtempSync(path.join(tmpdir(), "collect-test-"));
   tmpDirs.push(dir);
@@ -177,6 +186,7 @@ test("collect: terminal GDB metadata distinguishes no-fault from failure", () =>
   tmpDirs.push(noFaultDir);
   mkdirSync(path.join(noFaultDir, "results"));
   mkdirSync(path.join(noFaultDir, "state"));
+  writeFixedCpuConfig(noFaultDir);
   writeFileSync(path.join(noFaultDir, "results", "gdb.meta"), "CPU=19\nMAX_RUNS=6\nEXIT_CODE=3\n");
   writeFileSync(path.join(noFaultDir, "state", "phase-gdb.done"), "");
   const noFault = collect(noFaultDir);
@@ -187,6 +197,7 @@ test("collect: terminal GDB metadata distinguishes no-fault from failure", () =>
   const failedDir = mkdtempSync(path.join(tmpdir(), "collect-test-"));
   tmpDirs.push(failedDir);
   mkdirSync(path.join(failedDir, "results"));
+  writeFixedCpuConfig(failedDir);
   writeFileSync(path.join(failedDir, "results", "gdb.meta"), "CPU=19\nMAX_RUNS=6\nEXIT_CODE=5\n");
   const failed = collect(failedDir);
   assert.equal(failed.gdb.status, "failed");
@@ -198,6 +209,7 @@ test("collect: GDB no-fault accounting excludes runner errors from the denominat
   mkdirSync(path.join(dir, "results"));
   mkdirSync(path.join(dir, "state"));
   mkdirSync(path.join(dir, "gdb"));
+  writeFixedCpuConfig(dir);
   writeFileSync(
     path.join(dir, "results", "gdb.meta"),
     "CPU=19\nMAX_RUNS=6\nEXIT_CODE=3\nATTEMPTED_RUNS=6\nCLEAN_RUNS=1\nCAPTURED_RUNS=0\nERROR_RUNS=5\n",
@@ -226,12 +238,82 @@ test("collect: malformed or contradictory GDB run counts are incomplete", () => 
     tmpDirs.push(dir);
     mkdirSync(path.join(dir, "results"));
     mkdirSync(path.join(dir, "state"));
+    writeFixedCpuConfig(dir);
     writeFileSync(path.join(dir, "results", "gdb.meta"), `CPU=19\nMAX_RUNS=6\nEXIT_CODE=${exitCode}\n${counts}`);
     writeFileSync(path.join(dir, "state", "phase-gdb.done"), "");
     const result = collect(dir);
     assert.equal(result.gdb.status, "incomplete");
     assert.match(result.gdb.reason, reason);
   }
+});
+
+test("resolveExpectedCpu distinguishes fixed, automatic, absent, and invalid targets", () => {
+  const fixed = {
+    status: "complete",
+    cpuTargetConfig: { status: "complete", policy: "fixed", cpu: 19 },
+  };
+  assert.deepEqual(resolveExpectedCpu(fixed, { status: "invalid" }, null), {
+    status: "resolved", policy: "fixed", cpu: 19, reason: null,
+  });
+
+  const automatic = {
+    status: "complete",
+    cpuTargetConfig: { status: "complete", policy: "auto", cpu: null, legacyDefault: true },
+  };
+  assert.deepEqual(resolveExpectedCpu(automatic, { status: "complete" }, 7), {
+    status: "resolved", policy: "auto", cpu: 7, reason: null,
+  });
+  assert.equal(resolveExpectedCpu(automatic, { status: "complete" }, null).status, "none");
+  assert.equal(resolveExpectedCpu(automatic, { status: "skipped" }, null).status, "none");
+  assert.equal(resolveExpectedCpu(automatic, { status: "incomplete" }, 7).status, "unavailable");
+  assert.equal(resolveExpectedCpu(automatic, { status: "invalid" }, 7).status, "unavailable");
+  assert.equal(resolveExpectedCpu({ ...automatic, status: "invalid" }, { status: "complete" }, 7).status, "invalid");
+});
+
+test("collector binds non-skipped GDB evidence while strict skips remain policy-independent", () => {
+  const mismatch = mkdtempSync(path.join(tmpdir(), "collect-test-"));
+  tmpDirs.push(mismatch);
+  mkdirSync(path.join(mismatch, "results"));
+  mkdirSync(path.join(mismatch, "state"));
+  writeFixedCpuConfig(mismatch, 18);
+  writeFileSync(path.join(mismatch, "results", "gdb.meta"), "CPU=19\nMAX_RUNS=6\nEXIT_CODE=3\n");
+  writeFileSync(path.join(mismatch, "state", "phase-gdb.done"), "");
+  let result = collect(mismatch);
+  assert.equal(result.gdb.status, "incomplete");
+  assert.match(result.gdb.reason, /does not match/);
+
+  const skipped = mkdtempSync(path.join(tmpdir(), "collect-test-"));
+  tmpDirs.push(skipped);
+  mkdirSync(path.join(skipped, "results"));
+  mkdirSync(path.join(skipped, "state"));
+  writeFileSync(path.join(skipped, "results", "meta.env"), "malformed config\n");
+  writeFileSync(path.join(skipped, "results", "gdb.meta"), "SKIPPED=1\nSKIP_REASON=--skip-gdb\n");
+  writeFileSync(path.join(skipped, "state", "phase-gdb.done"), "");
+  result = collect(skipped);
+  assert.equal(result.gdb.status, "skipped");
+
+  writeFileSync(path.join(skipped, "results", "gdb.meta"), "CPU=19\nSKIPPED=1\nSKIP_REASON=crafted\n");
+  result = collect(skipped);
+  assert.equal(result.gdb.status, "incomplete");
+  assert.match(result.gdb.reason, /non-skip evidence/);
+
+  for (const metadata of [
+    "CPU=19\nMAX_RUNS=6\nEXIT_CODE=3\nSKIPPED=0\nSKIP_REASON=crafted\n",
+    "CPU=19\nMAX_RUNS=6\nEXIT_CODE=3\nSKIPPED=garbage\n",
+    "CPU=19\nMAX_RUNS=6\nEXIT_CODE=3\nSKIP_REASON=crafted\n",
+  ]) {
+    writeFileSync(path.join(skipped, "results", "gdb.meta"), metadata);
+    result = collect(skipped);
+    assert.equal(result.gdb.status, "incomplete", metadata);
+    assert.match(result.gdb.reason, /skip metadata is malformed/, metadata);
+  }
+
+  writeFileSync(path.join(skipped, "results", "gdb.meta"), "SKIPPED=1\nSKIP_REASON=--skip-gdb\n");
+  mkdirSync(path.join(skipped, "gdb"));
+  writeFileSync(path.join(skipped, "gdb", "leftover.txt"), "clean transcript\n");
+  result = collect(skipped);
+  assert.equal(result.gdb.status, "incomplete");
+  assert.match(result.gdb.reason, /retained GDB transcripts/);
 });
 
 test("assessIndividual: exact completion and partial prefixes have explicit status", () => {

@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { collect } from "../collect.mjs";
 import { inspectFrequencyEvidence } from "../frequency-evidence.mjs";
+import { renderReport } from "../report.mjs";
 
 const tmpDirs = [];
 after(() => {
@@ -23,6 +24,11 @@ function writeFixture({ cap = false, generation = "0123456789abcdef0123456789abc
   mkdirSync(path.join(dir, "freq"));
   mkdirSync(path.join(dir, "state"));
   writeFileSync(path.join(dir, "state", "phase-frequency.done"), "");
+  writeFileSync(
+    path.join(dir, "results", "meta.env"),
+    "MODE=quick\nBASELINE_CHILDREN=4\nBASELINE_WAVES=5\nGROUP_WAVES=5\n" +
+      "INDIVIDUAL_RUNS=1\nGDB_MAX_RUNS=1\nSKIP_GDB=1\nCPU_TARGET=19\n",
+  );
 
   const rows = "A1\t1\t139\t2\nB\t1\t0\t3\nA2\t1\t0\t2\n";
   const method = "scaling_cur_freq\n";
@@ -86,6 +92,49 @@ function writeFixture({ cap = false, generation = "0123456789abcdef0123456789abc
   return dir;
 }
 
+function writeAutoEvidence(dir, state) {
+  const failed = state === "failed" || state === "incomplete" || state === "invalid";
+  const skipped = state === "skipped";
+  const mode = skipped ? "quick" : "default";
+  writeFileSync(
+    path.join(dir, "results", "meta.env"),
+    `MODE=${mode}\nBASELINE_CHILDREN=1\nBASELINE_WAVES=1\nGROUP_WAVES=1\n` +
+      "INDIVIDUAL_RUNS=1\nGDB_MAX_RUNS=1\nSKIP_GDB=0\nCPU_TARGET=auto\n",
+  );
+  mkdirSync(path.join(dir, "logs", "groups"), { recursive: true });
+  const plan = "all-cpus\tuniform\t19\t-\t1\t1\tlogs/groups/all-cpus.log\tgroup-all-cpus";
+  const planDigest = digest(`${plan}\n`);
+  const log = failed
+    ? "node=v25.2.1 v8=test platform=linux arch=x64 children=1 waves=1\n" +
+      "wave=1 passed=0/1\nchild=1 code=null signal=SIGSEGV elapsedMs=2\n" +
+      "failedWaves=1 completedWaves=1 requestedWaves=1\n"
+    : "node=v25.2.1 v8=test platform=linux arch=x64 children=1 waves=1\n" +
+      "wave=1 passed=1/1\nfailedWaves=0 completedWaves=1 requestedWaves=1\n";
+  writeFileSync(path.join(dir, "logs", "groups", "all-cpus.log"), log);
+  writeFileSync(path.join(dir, "results", "groups.tsv"), `${plan}\t${failed ? 1 : 0}\n`);
+  writeFileSync(path.join(dir, "results", "groups.meta"),
+    `VERSION=1\nEXPECTED_ROWS=1\nGROUP_WAVES=1\nPLAN_DIGEST=${planDigest}\nCOMPLETED=1\n`);
+  writeFileSync(path.join(dir, "state", "phase-groups.done"), "");
+
+  if (skipped) {
+    writeFileSync(path.join(dir, "results", "individual.tsv"), "");
+    writeFileSync(path.join(dir, "results", "individual.meta"),
+      `VERSION=2\nTARGET_CPUS=\nRUNS_PER_CPU=1\nTARGET_POLICY=quick-skip\n` +
+      `GROUP_PLAN_DIGEST=${planDigest}\nSKIPPED=1\nCOMPLETED=1\n` +
+      "SKIP_REASON=no-failing-group-in-quick-mode\n");
+  } else {
+    writeFileSync(path.join(dir, "results", "individual.tsv"), `19\t1\t${failed ? 139 : 0}\t2\n`);
+    writeFileSync(path.join(dir, "results", "individual.meta"),
+      `VERSION=2\nTARGET_CPUS=19\nRUNS_PER_CPU=1\n` +
+      `TARGET_POLICY=${failed ? "failed-groups" : "all-group-cpus"}\n` +
+      `GROUP_PLAN_DIGEST=${planDigest}\nSKIPPED=0\nCOMPLETED=${state === "incomplete" ? 0 : 1}\n`);
+  }
+  if (state !== "incomplete") writeFileSync(path.join(dir, "state", "phase-individual.done"), "");
+  if (state === "invalid") {
+    writeFileSync(path.join(dir, "results", "individual.tsv"), "19\t01\t139\t2\n");
+  }
+}
+
 test("frequency envelope accepts a complete generation and marks cap not requested", () => {
   const dir = writeFixture();
   const inspected = inspectFrequencyEvidence(dir);
@@ -94,6 +143,114 @@ test("frequency envelope accepts a complete generation and marks cap not request
   const result = collect(dir);
   assert.equal(result.frequencyAb.cpu, 19);
   assert.equal(result.frequencyCap, undefined);
+});
+
+test("frequency expected-CPU state distinguishes unchecked, resolved, and unavailable", () => {
+  const dir = writeFixture({ cap: true });
+  assert.equal(inspectFrequencyEvidence(dir).frequencyAbStatus.status, "complete");
+  assert.equal(inspectFrequencyEvidence(dir, {
+    expectedCpuState: { status: "resolved", cpu: 19 },
+  }).frequencyAbStatus.status, "complete");
+
+  const mismatch = inspectFrequencyEvidence(dir, {
+    expectedCpuState: { status: "resolved", cpu: 18 },
+  });
+  assert.equal(mismatch.frequencyAbStatus.status, "incomplete");
+  assert.match(mismatch.frequencyAbStatus.reasons.join("; "), /does not match/);
+  assert.equal(mismatch.frequencyCapStatus.status, "incomplete");
+
+  const unavailable = inspectFrequencyEvidence(dir, {
+    expectedCpuState: { status: "unavailable", reason: "validated individual CPU is unavailable" },
+  });
+  assert.equal(unavailable.frequencyAbStatus.status, "incomplete");
+  assert.match(unavailable.frequencyAbStatus.reasons.join("; "), /validated individual CPU is unavailable/);
+  assert.equal(unavailable.frequencyCapStatus.status, "incomplete");
+
+  const malformed = inspectFrequencyEvidence(dir, { expectedCpu: "019" });
+  assert.equal(malformed.frequencyAbStatus.status, "incomplete");
+  assert.match(malformed.frequencyAbStatus.reasons.join("; "), /expected CPU target is malformed/);
+});
+
+test("an unresolved target leaves an untouched frequency phase not-run", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "frequency-evidence-empty-target-"));
+  tmpDirs.push(dir);
+  const result = inspectFrequencyEvidence(dir, {
+    expectedCpuState: { status: "none", reason: "no failing individual CPU" },
+  });
+  assert.equal(result.frequencyAbStatus.status, "not-run");
+  assert.equal(result.frequencyCapStatus.status, "not-run");
+});
+
+test("collector binds fixed frequency evidence to strict stored CPU_TARGET", () => {
+  for (const [stored, accepted] of [
+    ["19", true], ["18", false], ["auto", false], ["01", false],
+    ["-1", false], ["1.0", false], ["70000", false], [null, false],
+  ]) {
+    const dir = writeFixture({ cap: true });
+    const file = path.join(dir, "results", "meta.env");
+    let text = readFileSync(file, "utf8").replace(/^CPU_TARGET=.*\n/m, "");
+    if (stored !== null) text += `CPU_TARGET=${stored}\n`;
+    writeFileSync(file, text);
+    const result = collect(dir);
+    assert.equal(result.frequencyAbStatus.status, accepted ? "complete" : "incomplete", String(stored));
+    assert.equal(Boolean(result.frequencyAb), accepted, String(stored));
+    assert.equal(Boolean(result.frequencyCap), accepted, String(stored));
+  }
+
+  const duplicate = writeFixture();
+  writeFileSync(
+    path.join(duplicate, "results", "meta.env"),
+    `${readFileSync(path.join(duplicate, "results", "meta.env"), "utf8")}CPU_TARGET=19\n`,
+  );
+  const result = collect(duplicate);
+  assert.equal(result.frequencyAbStatus.status, "incomplete");
+  assert.equal(result.frequencyAb, undefined);
+  assert.equal(result.config.cpuTargetPolicy, "invalid");
+});
+
+test("collector resolves automatic frequency and GDB CPUs only from authoritative individual evidence", () => {
+  const matching = writeFixture();
+  writeAutoEvidence(matching, "failed");
+  writeFileSync(path.join(matching, "results", "gdb.meta"), "CPU=19\nMAX_RUNS=1\nEXIT_CODE=3\n");
+  writeFileSync(path.join(matching, "state", "phase-gdb.done"), "");
+  let result = collect(matching);
+  assert.equal(result.cpuSelectionStatus.status, "resolved");
+  assert.equal(result.cpuSelectionStatus.cpu, 19);
+  assert.equal(result.frequencyAbStatus.status, "complete");
+  assert.equal(result.gdb.status, "no-fault");
+
+  writeFileSync(
+    path.join(matching, "results", "frequency-ab.meta"),
+    readFileSync(path.join(matching, "results", "frequency-ab.meta"), "utf8").replace("CPU=19", "CPU=18"),
+  );
+  writeFileSync(path.join(matching, "results", "gdb.meta"), "CPU=18\nMAX_RUNS=1\nEXIT_CODE=3\n");
+  result = collect(matching);
+  assert.equal(result.frequencyAbStatus.status, "incomplete");
+  assert.equal(result.frequencyAb, undefined);
+  assert.equal(result.gdb.status, "incomplete");
+  assert.match(result.gdb.reason, /does not match/);
+
+  for (const state of ["clean", "skipped", "incomplete", "invalid"]) {
+    const dir = writeFixture({ cap: true });
+    writeAutoEvidence(dir, state);
+    writeFileSync(path.join(dir, "results", "gdb.meta"), "CPU=19\nMAX_RUNS=1\nEXIT_CODE=3\n");
+    writeFileSync(path.join(dir, "state", "phase-gdb.done"), "");
+    const unresolved = collect(dir);
+    assert.notEqual(unresolved.cpuSelectionStatus.status, "resolved", state);
+    assert.equal(unresolved.frequencyAbStatus.status, "incomplete", state);
+    assert.equal(unresolved.frequencyAb, undefined, state);
+    assert.equal(unresolved.frequencyCap, undefined, state);
+    assert.equal(unresolved.gdb.status, "incomplete", state);
+    assert.match(unresolved.gdb.reason, /automatic CPU selection/, state);
+  }
+});
+
+test("fixed-target reports describe the stored policy rather than a post-selected worst CPU", () => {
+  const dir = writeFixture();
+  const result = collect(dir);
+  const report = renderReport(result);
+  assert.match(report, /fixed by the stored CPU selection policy/);
+  assert.doesNotMatch(report, /Test CPU: 19 \(highest observed failure rate\)/);
 });
 
 test("frequency cap status is not-run for an untouched bundle", () => {

@@ -434,7 +434,10 @@ export function renderReport(results) {
   L.push("");
   if (r.frequencyAb) {
     const fa = r.frequencyAb;
-    L.push(`Test CPU: ${fa.cpu} (highest observed failure rate). Original`);
+    const selectionNote = r.cpuSelectionStatus?.policy === "fixed"
+      ? "fixed by the stored CPU selection policy"
+      : "highest observed individual failure rate";
+    L.push(`Test CPU: ${fa.cpu} (${selectionNote}). Original`);
     L.push(`settings saved first; restored after the phase: ${fa.restored ? "yes" : "**NO — check intel_pstate/no_turbo and scaling_max_freq**"}.`);
     L.push("");
     L.push("Failures are SIGSEGV (exit 139) only; any other nonzero exit is an");

@@ -40,6 +40,21 @@ const RUN_CONFIG_KEYS = new Set([
   "INDIVIDUAL_RUNS", "GDB_MAX_RUNS", "SKIP_GDB", "CPU_TARGET",
 ]);
 
+function storedCpuTargetConfig(values, duplicateConfig) {
+  if (duplicateConfig.has("CPU_TARGET")) {
+    return { status: "invalid", policy: null, cpu: null, reason: "stored CPU_TARGET is duplicated" };
+  }
+  const value = values.CPU_TARGET;
+  if (value === undefined || value === "auto") {
+    return { status: "complete", policy: "auto", cpu: null, legacyDefault: value === undefined, reason: null };
+  }
+  const cpu = canonicalUint(value);
+  if (cpu === null || cpu > 65535) {
+    return { status: "invalid", policy: null, cpu: null, reason: "stored CPU_TARGET is not auto or a canonical CPU in 0..65535" };
+  }
+  return { status: "complete", policy: "fixed", cpu, legacyDefault: false, reason: null };
+}
+
 function readStoredRunMetadata(outDir) {
   const values = {};
   const reasons = [];
@@ -106,6 +121,7 @@ function readStoredRunMetadata(outDir) {
   const children = canonicalUint(values.BASELINE_CHILDREN);
   const waves = canonicalUint(values.BASELINE_WAVES);
   const groupWaves = duplicateConfig.has("GROUP_WAVES") ? null : canonicalUint(values.GROUP_WAVES);
+  const cpuTargetConfig = storedCpuTargetConfig(values, duplicateConfig);
   if (children === null || children < 1) {
     reasons.push("stored BASELINE_CHILDREN is missing or not a canonical safe positive integer");
   }
@@ -115,16 +131,44 @@ function readStoredRunMetadata(outDir) {
   if (groupWaves === null || groupWaves < 1) {
     reasons.push("stored GROUP_WAVES is missing or not a canonical safe positive integer");
   }
+  if (cpuTargetConfig.status !== "complete") reasons.push(cpuTargetConfig.reason);
   return {
     values,
     baselineChildren: children !== null && children > 0 ? children : null,
     baselineWaves: waves !== null && waves > 0 ? waves : null,
     groupWaves: groupWaves !== null && groupWaves > 0 ? groupWaves : null,
+    cpuTargetConfig,
     status: reasons.length > 0 ? "invalid" : "complete",
     reasons: [...new Set(reasons)],
     bundleRootSafe,
     resultsDirSafe,
   };
+}
+
+export function resolveExpectedCpu(runMetaState, individualStatus, worstCpu) {
+  if (runMetaState.status !== "complete" || runMetaState.cpuTargetConfig?.status !== "complete") {
+    return {
+      status: "invalid",
+      policy: null,
+      cpu: null,
+      reason: "stored run configuration cannot authorize a CPU target",
+    };
+  }
+  const target = runMetaState.cpuTargetConfig;
+  if (target.policy === "fixed") {
+    return { status: "resolved", policy: "fixed", cpu: target.cpu, reason: null };
+  }
+  if (individualStatus.status === "skipped") {
+    return { status: "none", policy: "auto", cpu: null, reason: "automatic CPU selection has no target because individual isolation was skipped" };
+  }
+  if (individualStatus.status !== "complete") {
+    return { status: "unavailable", policy: "auto", cpu: null, reason: "automatic CPU selection requires complete provenance-valid individual evidence" };
+  }
+  const cpu = Number.isSafeInteger(worstCpu) && worstCpu >= 0 && worstCpu <= 65535 ? worstCpu : null;
+  if (cpu === null) {
+    return { status: "none", policy: "auto", cpu: null, reason: "automatic CPU selection found no failing individual CPU" };
+  }
+  return { status: "resolved", policy: "auto", cpu, reason: null };
 }
 
 function readTsv(file) {
@@ -609,7 +653,14 @@ export function collectFreqAb(outDir, rows, meta) {
   return result;
 }
 
-export function assessGdb(meta, phaseDone, captures, transcriptCount, metaState = { errors: [] }) {
+export function assessGdb(
+  meta,
+  phaseDone,
+  captures,
+  transcriptCount,
+  metaState = { errors: [] },
+  expectedCpuState = undefined,
+) {
   const hasMeta = Object.keys(meta).length > 0;
   if (!hasMeta && !metaState.present && !phaseDone && transcriptCount === 0) {
     return { status: "not-run", reason: null };
@@ -617,10 +668,32 @@ export function assessGdb(meta, phaseDone, captures, transcriptCount, metaState 
   if (metaState.errors?.length > 0) {
     return { status: "incomplete", reason: metaState.errors.join("; ") };
   }
-  if (meta.SKIPPED === "1") {
+  const hasSkipFlag = Object.hasOwn(meta, "SKIPPED");
+  const hasSkipReason = Object.hasOwn(meta, "SKIP_REASON");
+  if (hasSkipFlag || hasSkipReason) {
+    if (meta.SKIPPED !== "1" || !meta.SKIP_REASON ||
+        Object.keys(meta).some((key) => key !== "SKIPPED" && key !== "SKIP_REASON")) {
+      return { status: "incomplete", reason: "GDB skip metadata is malformed or contains non-skip evidence" };
+    }
     if (!phaseDone) return { status: "incomplete", reason: "skip metadata has no phase completion marker" };
-    if (captures.length > 0) return { status: "incomplete", reason: "skip metadata conflicts with captured faults" };
+    if (transcriptCount > 0) return { status: "incomplete", reason: "skip metadata conflicts with retained GDB transcripts" };
     return { status: "skipped", reason: meta.SKIP_REASON ?? null };
+  }
+
+  const cpu = canonicalUint(meta.CPU);
+  if (cpu === null || cpu > 65535) {
+    return { status: "incomplete", reason: "GDB CPU is missing or invalid" };
+  }
+  if (expectedCpuState !== undefined) {
+    if (expectedCpuState.status !== "resolved") {
+      return {
+        status: "incomplete",
+        reason: expectedCpuState.reason ?? "no validated CPU target authorizes this GDB evidence",
+      };
+    }
+    if (cpu !== expectedCpuState.cpu) {
+      return { status: "incomplete", reason: "GDB CPU does not match the expected target" };
+    }
   }
 
   const countKeys = ["ATTEMPTED_RUNS", "CLEAN_RUNS", "CAPTURED_RUNS", "ERROR_RUNS"];
@@ -719,12 +792,12 @@ export function collect(outDir) {
       groupWaves: runMetaState.groupWaves ?? null,
       individualRuns: num(meta.INDIVIDUAL_RUNS),
       gdbMaxRuns: num(meta.GDB_MAX_RUNS),
-      cpuTarget:
-        meta.CPU_TARGET === undefined || meta.CPU_TARGET === "auto"
-          ? null
-          : num(meta.CPU_TARGET),
-      cpuTargetPolicy:
-        meta.CPU_TARGET === undefined || meta.CPU_TARGET === "auto" ? "auto" : "fixed",
+      cpuTarget: runMetaState.cpuTargetConfig?.status === "complete"
+        ? runMetaState.cpuTargetConfig.cpu
+        : null,
+      cpuTargetPolicy: runMetaState.cpuTargetConfig?.status === "complete"
+        ? runMetaState.cpuTargetConfig.policy
+        : "invalid",
       frequencyAb: meta.FREQUENCY_AB === "1",
       skipGdb: meta.SKIP_GDB === "1",
       completedPhases: (meta.COMPLETED_PHASES ?? "").split(",").filter(Boolean),
@@ -842,9 +915,11 @@ export function collect(outDir) {
       .sort((a, b) => b.sigsegv / b.runs - a.sigsegv / a.runs || b.sigsegv - a.sigsegv || a.cpu - b.cpu)[0];
     results.worstCpu = worst ? worst.cpu : null;
   } else results.worstCpu = null;
+  const expectedCpuState = resolveExpectedCpu(runMetaState, individualStatus, results.worstCpu);
+  results.cpuSelectionStatus = expectedCpuState;
 
   // --- frequency A/B/A ---
-  const frequencyEvidence = inspectFrequencyEvidence(outDir);
+  const frequencyEvidence = inspectFrequencyEvidence(outDir, { expectedCpuState });
   const freqAbRows = frequencyEvidence.frequencyAbRows;
   const freqAbMeta = frequencyEvidence.frequencyAbMeta;
   results.frequencyAbStatus = frequencyEvidence.frequencyAbStatus;
@@ -892,6 +967,7 @@ export function collect(outDir) {
     captures,
     transcriptCount,
     gdbMetaState,
+    expectedCpuState,
   );
   if (gdbStatus.status !== "not-run") {
     const identical =

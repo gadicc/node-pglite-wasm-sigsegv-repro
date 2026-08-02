@@ -168,7 +168,35 @@ function validateRows(rowsState, expectedLegs, runs, label, reasons) {
   }
 }
 
-function validateAb(metaState, rowsState, artifacts, phaseDone, expectedCpu, layoutErrors) {
+function normalizeExpectedCpuState(options) {
+  if (Object.hasOwn(options, "expectedCpuState")) {
+    const state = options.expectedCpuState;
+    if (state?.status === "resolved") {
+      const cpu = canonicalSafeInteger(String(state.cpu));
+      if (cpu !== null && cpu <= 65535) return { status: "resolved", cpu, reason: null };
+      return { status: "invalid", cpu: null, reason: "the expected CPU target is malformed" };
+    }
+    if (["none", "unavailable", "invalid"].includes(state?.status)) {
+      return {
+        status: state.status,
+        cpu: null,
+        reason: typeof state.reason === "string" && state.reason !== ""
+          ? state.reason
+          : "no validated CPU target authorizes this frequency evidence",
+      };
+    }
+    return { status: "invalid", cpu: null, reason: "the expected CPU target state is malformed" };
+  }
+  if (Object.hasOwn(options, "expectedCpu")) {
+    const cpu = canonicalSafeInteger(String(options.expectedCpu));
+    return cpu !== null && cpu <= 65535
+      ? { status: "resolved", cpu, reason: null }
+      : { status: "invalid", cpu: null, reason: "the expected CPU target is malformed" };
+  }
+  return { status: "unchecked", cpu: null, reason: null };
+}
+
+function validateAb(metaState, rowsState, artifacts, phaseDone, expectedCpuState, layoutErrors) {
   const meta = metaState.values;
   const hasArtifacts = metaState.present || rowsState.present || artifacts.some((entry) => entry.present) || phaseDone;
   if (!hasArtifacts) return { status: "not-run", reasons: [] };
@@ -178,7 +206,11 @@ function validateAb(metaState, rowsState, artifacts, phaseDone, expectedCpu, lay
   if (!GENERATION_RE.test(meta.GENERATION ?? "")) reasons.push("GENERATION is missing or invalid");
   const cpu = canonicalSafeInteger(meta.CPU);
   if (cpu === null || cpu > 65535) reasons.push("CPU is missing or invalid");
-  if (expectedCpu !== null && cpu !== expectedCpu) reasons.push("frequency CPU does not match the expected target");
+  if (expectedCpuState.status === "resolved" && cpu !== expectedCpuState.cpu) {
+    reasons.push("frequency CPU does not match the expected target");
+  } else if (expectedCpuState.status !== "resolved" && expectedCpuState.status !== "unchecked") {
+    reasons.push(expectedCpuState.reason);
+  }
   const runs = canonicalSafeInteger(meta.RUNS_PER_LEG, true);
   if (runs === null) reasons.push("RUNS_PER_LEG is missing or invalid");
   if (meta.SAVED_NO_TURBO !== "0") reasons.push("SAVED_NO_TURBO must be 0");
@@ -273,7 +305,7 @@ export function inspectFrequencyEvidence(outDir, options = {}) {
   const phaseDone = options.ignorePhaseMarker === true
     ? marker.errors.length === 0
     : marker.present && marker.errors.length === 0;
-  const expectedCpu = options.expectedCpu === undefined ? null : canonicalSafeInteger(String(options.expectedCpu));
+  const expectedCpuState = normalizeExpectedCpuState(options);
   const blockedResults = !rootState.safe || !resultsState.safe;
   const blockedFreq = !rootState.safe || !freqState.safe;
   const abMetaState = blockedResults
@@ -293,7 +325,7 @@ export function inspectFrequencyEvidence(outDir, options = {}) {
       abArtifacts[i].errors.push(`${["A1", "B", "A2"][(i - 1) / 2]} frequency method is invalid`);
     }
   }
-  const frequencyAbStatus = validateAb(abMetaState, abRowsState, abArtifacts, phaseDone, expectedCpu, layoutErrors);
+  const frequencyAbStatus = validateAb(abMetaState, abRowsState, abArtifacts, phaseDone, expectedCpuState, layoutErrors);
 
   const capMetaState = blockedResults
     ? { ...unavailableFile("frequency-cap metadata parent is unsafe"), values: {} }
