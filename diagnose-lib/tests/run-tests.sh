@@ -148,6 +148,26 @@ COMPLETED=1
 EOF
 }
 
+write_individual_v3_meta() {
+  local bundle="$1" targets="$2" runs="$3" policy="$4" plan_digest="$5"
+  local skipped="$6" completed="$7" reason="${8:-}"
+  local rows_sha rows_bytes row_count
+  rows_sha="$(sha256sum "$bundle/results/individual.tsv" | awk '{print $1}')"
+  rows_bytes="$(stat -c %s "$bundle/results/individual.tsv")"
+  row_count="$(awk 'END { print NR + 0 }' "$bundle/results/individual.tsv")"
+  {
+    printf 'VERSION=3\nGENERATION=%s\n' 0123456789abcdef0123456789abcdef
+    printf 'TARGET_CPUS=%s\nRUNS_PER_CPU=%s\n' "$targets" "$runs"
+    printf 'TARGET_POLICY=%s\nGROUP_PLAN_DIGEST=%s\n' "$policy" "$plan_digest"
+    printf 'SKIPPED=%s\nCOMPLETED=%s\n' "$skipped" "$completed"
+    [[ -z "$reason" ]] || printf 'SKIP_REASON=%s\n' "$reason"
+    if [[ "$completed" == 1 ]]; then
+      printf 'ROWS_SHA256=%s\nROWS_BYTES=%s\nROW_COUNT=%s\n' \
+        "$rows_sha" "$rows_bytes" "$row_count"
+    fi
+  } > "$bundle/results/individual.meta"
+}
+
 prepare_frequency_publish_stage() {
   local stage="$1" cap_requested="$2"
   mkdir -p "$stage/results" "$stage/freq"
@@ -4618,9 +4638,9 @@ SKIP_GDB=0
 CPU_TARGET=auto
 COMPLETED_PHASES=individual,gdb
 EOF
-printf 'VERSION=1\nTARGET_CPUS=%s\nRUNS_PER_CPU=1\nSKIPPED=0\nCOMPLETED=1\n' \
-  "$TEST_ONLINE_CPU" > "$CPU_EVIDENCE_RB/results/individual.meta"
 printf '%s\t1\t139\t1\n' "$TEST_ONLINE_CPU" > "$CPU_EVIDENCE_RB/results/individual.tsv"
+write_individual_v3_meta "$CPU_EVIDENCE_RB" "$TEST_ONLINE_CPU" 1 \
+  failed-groups "$(printf '0%.0s' {1..64})" 0 1
 printf 'CPU=%s\nMAX_RUNS=6\nEXIT_CODE=3\n' "$TEST_ONLINE_CPU" > "$CPU_EVIDENCE_RB/results/gdb.meta"
 touch "$CPU_EVIDENCE_RB/state/phase-individual.done" "$CPU_EVIDENCE_RB/state/phase-gdb.done"
 (
@@ -5142,12 +5162,62 @@ skipped_individual_rc=$?
 check_eq "skipped individual phase publishes explicit terminal metadata" "1" \
   "$([[ $skipped_individual_rc -eq 0 && -f "$INDIVIDUAL_SKIPPED/state/phase-individual.done" && ! -s "$INDIVIDUAL_SKIPPED/results/individual.tsv" ]] && grep -q '^SKIPPED=1$' "$INDIVIDUAL_SKIPPED/results/individual.meta" && grep -q '^COMPLETED=1$' "$INDIVIDUAL_SKIPPED/results/individual.meta" && echo 1 || echo 0)"
 
+STALE_INDIVIDUAL_GENERATION=dddddddddddddddddddddddddddddddd
+INDIVIDUAL_FRESH_AFTER_REDO="$TMP/individual-fresh-after-redo"
+mkdir -p "$INDIVIDUAL_FRESH_AFTER_REDO"/{results,state}
+printf '19\t1\t0\t2\n' > "$INDIVIDUAL_FRESH_AFTER_REDO/results/individual.tsv"
+printf 'COMPLETED_PHASES=\n' > "$INDIVIDUAL_FRESH_AFTER_REDO/results/meta.env"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$INDIVIDUAL_FRESH_AFTER_REDO"
+  STATE_DIR="$INDIVIDUAL_FRESH_AFTER_REDO/state"
+  META_FILE="$INDIVIDUAL_FRESH_AFTER_REDO/results/meta.env"
+  INDIVIDUAL_TARGET_CPUS=19
+  INDIVIDUAL_TARGET_POLICY=failed-groups
+  INDIVIDUAL_GROUP_PLAN_DIGEST="$(printf '0%.0s' {1..64})"
+  INDIVIDUAL_RUNS=1
+  INDIVIDUAL_META_GENERATION="$STALE_INDIVIDUAL_GENERATION"
+  INDIVIDUAL_META_ROWS_SHA256="$(printf 'a%.0s' {1..64})"
+  INDIVIDUAL_META_ROWS_BYTES=999
+  INDIVIDUAL_META_ROW_COUNT=999
+  phase_individual
+) > /dev/null 2>&1
+fresh_individual_rc=$?
+fresh_generation="$(sed -n 's/^GENERATION=//p' "$INDIVIDUAL_FRESH_AFTER_REDO/results/individual.meta")"
+check_eq "new individual phase never reuses a stale pre-redo generation" "1" \
+  "$([[ $fresh_individual_rc -eq 0 && "$fresh_generation" =~ ^[a-f0-9]{32}$ && "$fresh_generation" != "$STALE_INDIVIDUAL_GENERATION" ]] && echo 1 || echo 0)"
+
+INDIVIDUAL_FRESH_SKIP_AFTER_REDO="$TMP/individual-fresh-skip-after-redo"
+mkdir -p "$INDIVIDUAL_FRESH_SKIP_AFTER_REDO"/{results,state}
+printf 'COMPLETED_PHASES=\n' > "$INDIVIDUAL_FRESH_SKIP_AFTER_REDO/results/meta.env"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$INDIVIDUAL_FRESH_SKIP_AFTER_REDO"
+  STATE_DIR="$INDIVIDUAL_FRESH_SKIP_AFTER_REDO/state"
+  META_FILE="$INDIVIDUAL_FRESH_SKIP_AFTER_REDO/results/meta.env"
+  INDIVIDUAL_TARGET_POLICY=quick-skip
+  INDIVIDUAL_GROUP_PLAN_DIGEST="$(printf '0%.0s' {1..64})"
+  INDIVIDUAL_RUNS=5
+  INDIVIDUAL_META_GENERATION="$STALE_INDIVIDUAL_GENERATION"
+  INDIVIDUAL_META_ROWS_SHA256="$(printf 'a%.0s' {1..64})"
+  INDIVIDUAL_META_ROWS_BYTES=999
+  INDIVIDUAL_META_ROW_COUNT=999
+  phase_individual_skipped
+) > /dev/null 2>&1
+fresh_skip_rc=$?
+fresh_skip_generation="$(sed -n 's/^GENERATION=//p' "$INDIVIDUAL_FRESH_SKIP_AFTER_REDO/results/individual.meta")"
+check_eq "new skipped individual phase never reuses a stale pre-redo generation" "1" \
+  "$([[ $fresh_skip_rc -eq 0 && "$fresh_skip_generation" =~ ^[a-f0-9]{32}$ && "$fresh_skip_generation" != "$STALE_INDIVIDUAL_GENERATION" ]] && echo 1 || echo 0)"
+
 # worst_cpu must rank by the SIGSEGV endpoint only: CPU 3 fails every run
 # with a launcher-style exit 1, CPU 4 has one real SIGSEGV.
 WORST_CPU_DIR="$TMP/worst-cpu-bundle"
 mkdir -p "$WORST_CPU_DIR"/{results,state}
 printf '3\t1\t1\t2\n3\t2\t1\t2\n4\t1\t139\t2\n4\t2\t0\t2\n' > "$WORST_CPU_DIR/results/individual.tsv"
-printf 'VERSION=1\nTARGET_CPUS=3-4\nRUNS_PER_CPU=2\nSKIPPED=0\nCOMPLETED=1\n' > "$WORST_CPU_DIR/results/individual.meta"
+write_individual_v3_meta "$WORST_CPU_DIR" 3-4 2 failed-groups \
+  "$(printf '0%.0s' {1..64})" 0 1
 touch "$WORST_CPU_DIR/state/phase-individual.done"
 worst_cpu_out="$(
   DIAG_SOURCE_ONLY=1
@@ -5157,6 +5227,8 @@ worst_cpu_out="$(
 )"
 check_eq "worst_cpu rejects an invalid completed individual phase" "" "$worst_cpu_out"
 printf '3\t1\t0\t2\n3\t2\t0\t2\n4\t1\t139\t2\n4\t2\t0\t2\n' > "$WORST_CPU_DIR/results/individual.tsv"
+write_individual_v3_meta "$WORST_CPU_DIR" 3-4 2 failed-groups \
+  "$(printf '0%.0s' {1..64})" 0 1
 worst_cpu_out="$(
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
@@ -5164,6 +5236,30 @@ worst_cpu_out="$(
   worst_cpu
 )"
 check_eq "worst_cpu ranks only a fully validated individual phase" "4" "$worst_cpu_out"
+
+INDIVIDUAL_FIFO_BASE="$TMP/individual-fifo-base"
+mkdir -p "$INDIVIDUAL_FIFO_BASE"/{results,state}
+printf '19\t1\t139\t1\n' > "$INDIVIDUAL_FIFO_BASE/results/individual.tsv"
+write_individual_v3_meta "$INDIVIDUAL_FIFO_BASE" 19 1 failed-groups \
+  "$(printf '0%.0s' {1..64})" 0 1
+: > "$INDIVIDUAL_FIFO_BASE/state/phase-individual.done"
+individual_fifo_guards=1
+for relative in results/individual.tsv results/individual.meta state/phase-individual.done; do
+  fifo_bundle="$TMP/individual-fifo-${relative//\//-}"
+  cp -a "$INDIVIDUAL_FIFO_BASE" "$fifo_bundle"
+  rm "$fifo_bundle/$relative"
+  mkfifo "$fifo_bundle/$relative"
+  timeout 2 bash -c '
+    DIAG_SOURCE_ONLY=1
+    source "$1/diagnose.sh"
+    OUT_DIR="$2"
+    individual_phase_result_is_complete
+  ' _ "$REPO_ROOT" "$fifo_bundle" > /dev/null 2>&1
+  fifo_rc=$?
+  [[ "$fifo_rc" != 0 && "$fifo_rc" != 124 ]] || individual_fifo_guards=0
+done
+check_eq "individual completion reads reject FIFO marker, metadata, and rows without blocking" \
+  "1" "$individual_fifo_guards"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
@@ -6002,17 +6098,11 @@ check_eq "full-mode runner targets every validated stored-plan CPU after a group
   "$full_runner_cpus|$full_runner_policy|$([[ "$full_runner_digest" =~ ^[a-f0-9]{64}$ ]] && echo 1 || echo 0)"
 
 FULL_TARGET_RESUME="$TMP/full-target-resume"
-mkdir -p "$FULL_TARGET_RESUME/results"
+mkdir -p "$FULL_TARGET_RESUME"/{results,state}
 for cpu in 16 17 18 19; do printf '%s\t1\t0\t1\n' "$cpu"; done > "$FULL_TARGET_RESUME/results/individual.tsv"
-cat > "$FULL_TARGET_RESUME/results/individual.meta" << EOF
-VERSION=2
-TARGET_CPUS=16-19
-RUNS_PER_CPU=1
-TARGET_POLICY=failed-groups
-GROUP_PLAN_DIGEST=$full_runner_digest
-SKIPPED=0
-COMPLETED=1
-EOF
+write_individual_v3_meta "$FULL_TARGET_RESUME" 16-19 1 failed-groups \
+  "$full_runner_digest" 0 1
+: > "$FULL_TARGET_RESUME/state/phase-individual.done"
 full_stale_resume="$(
  (
   DIAG_SOURCE_ONLY=1
@@ -6029,8 +6119,8 @@ full_stale_resume="$(
 check_eq "full-mode resume rejects self-consistent failed-group-only evidence" "1|0" "$full_stale_resume"
 
 for cpu in 0 1 2 3 16 17 18 19; do printf '%s\t1\t0\t1\n' "$cpu"; done > "$FULL_TARGET_RESUME/results/individual.tsv"
-sed -i 's/^TARGET_CPUS=.*/TARGET_CPUS=0-3,16-19/; s/^TARGET_POLICY=.*/TARGET_POLICY=all-group-cpus/' \
-  "$FULL_TARGET_RESUME/results/individual.meta"
+write_individual_v3_meta "$FULL_TARGET_RESUME" 0-3,16-19 1 all-group-cpus \
+  "$full_runner_digest" 0 1
 full_current_resume="$(
  (
   DIAG_SOURCE_ONLY=1
@@ -6227,15 +6317,7 @@ for i in $(seq 1 20); do
     printf '19\t%s\t0\t2\n' "$i" >> "$B/results/individual.tsv"
   fi
 done
-cat > "$B/results/individual.meta" << EOF
-VERSION=2
-TARGET_CPUS=16-19
-RUNS_PER_CPU=20
-TARGET_POLICY=failed-groups
-GROUP_PLAN_DIGEST=$groups_plan_digest
-SKIPPED=0
-COMPLETED=1
-EOF
+write_individual_v3_meta "$B" 16-19 20 failed-groups "$groups_plan_digest" 0 1
 
 # Leg B also carries one launch-error row (rc 126): excluded from the valid
 # runs the frequency inference is based on.

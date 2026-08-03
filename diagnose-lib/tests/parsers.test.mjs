@@ -1038,6 +1038,30 @@ test("renderReport: incomplete individual prefixes are descriptive but cannot lo
   assert.doesNotMatch(md, /highest observed rate/);
 });
 
+test("renderReport: bounded failed-run details disclose exact omissions", () => {
+  const md = renderReport({
+    collectedAt: "2026-08-02T00:00:00.000Z",
+    config: {},
+    environment: {},
+    worstCpu: 4,
+    individualStatus: { status: "complete", reasons: [], failedRunDetailsTruncated: true },
+    individual: [{
+      cpu: 4,
+      runs: 3,
+      failures: 3,
+      sigsegv: 3,
+      invalidRuns: [],
+      failedRuns: [
+        { run: 1, signal: "SIGSEGV" },
+        { run: 2, signal: "SIGSEGV" },
+      ],
+      failedRunsOmitted: 1,
+    }],
+  });
+  assert.match(md, /failed runs: #1 \(SIGSEGV\), #2 \(SIGSEGV\)/);
+  assert.match(md, /2 failed-run detail\(s\) retained; 1 omitted by the bounded collector/);
+});
+
 test("renderReport: incomplete frequency artifacts are excluded from conclusions", () => {
   const md = renderReport({
     collectedAt: "2026-08-02T00:00:00.000Z",

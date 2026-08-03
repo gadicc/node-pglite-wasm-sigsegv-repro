@@ -25,6 +25,7 @@ ulimit -c 0
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 LIB="$SCRIPT_DIR/diagnose-lib"
+DIAG_INDIVIDUAL_NODE_BIN="$(command -v node || true)"
 # shellcheck source=diagnose-lib/common.sh
 source "$LIB/common.sh"
 # shellcheck source=diagnose-lib/bundle-lock.sh
@@ -2525,12 +2526,18 @@ phase_individual() {
   fi
   if [[ -e "$meta" || -L "$meta" ]]; then
     individual_meta_read "$meta" &&
-      [[ "$INDIVIDUAL_META_VERSION" == 2 && "$INDIVIDUAL_META_SKIPPED" == 0 &&
+      [[ ("$INDIVIDUAL_META_VERSION" == 2 || "$INDIVIDUAL_META_VERSION" == 3) &&
+        "$INDIVIDUAL_META_SKIPPED" == 0 &&
         "$INDIVIDUAL_META_TARGET_CPUS" == "$INDIVIDUAL_TARGET_CPUS" &&
         "$INDIVIDUAL_META_RUNS" == "$INDIVIDUAL_RUNS" &&
         "$INDIVIDUAL_META_TARGET_POLICY" == "$INDIVIDUAL_TARGET_POLICY" &&
         "$INDIVIDUAL_META_GROUP_PLAN_DIGEST" == "$INDIVIDUAL_GROUP_PLAN_DIGEST" ]] ||
       diag_die "existing individual.meta does not match this resumable phase; preserve it and use --redo individual"
+  else
+    # A completed-phase check earlier in this shell may have populated these
+    # globals from evidence that --redo subsequently archived. Only an extant,
+    # successfully read resumable V3 metadata file may preserve its generation.
+    individual_meta_reset_generation
   fi
   individual_meta_write "$INDIVIDUAL_TARGET_CPUS" "$INDIVIDUAL_RUNS" 0 0 ""
   mkdir -p "$OUT_DIR/logs/individual"
@@ -2541,7 +2548,9 @@ phase_individual() {
     idx=$((idx + 1))
     # Intra-phase resume: skip CPUs already fully recorded; top up CPUs
     # with partial records by running only the deficit.
-    existing="$(individual_cpu_row_count "$tsv" "$cpu")"
+    existing="$(individual_cpu_row_count \
+      "$tsv" "$cpu" "$INDIVIDUAL_TARGET_CPUS" "$INDIVIDUAL_RUNS")" ||
+      diag_die "individual results changed or became invalid while resuming; preserve them and use --redo individual"
     if ((existing >= INDIVIDUAL_RUNS)); then
       diag_log "cpu $cpu [$idx/$total]: already recorded ($existing runs), skipping"
       continue
@@ -2557,10 +2566,11 @@ phase_individual() {
     run_individual_logged "$cpu" "$deficit" "$tsv" "$((existing + 1))" \
       "$OUT_DIR/logs/individual/cpu-${cpu}.log" || wrapper_rc=$?
     individual_rows_are_valid "$tsv" "$INDIVIDUAL_TARGET_CPUS" "$INDIVIDUAL_RUNS" 0 &&
-      individual_cpu_batch_matches_wrapper "$tsv" "$cpu" "$existing" "$INDIVIDUAL_RUNS" "$wrapper_rc" ||
+      individual_cpu_batch_matches_wrapper "$tsv" "$cpu" "$existing" "$INDIVIDUAL_RUNS" "$wrapper_rc" \
+        "$INDIVIDUAL_TARGET_CPUS" ||
       diag_die "cpu $cpu did not produce $deficit valid clean/SIGSEGV result(s) (wrapper rc=$wrapper_rc); phase remains resumable"
   done
-  individual_rows_are_valid "$tsv" "$INDIVIDUAL_TARGET_CPUS" "$INDIVIDUAL_RUNS" 1 ||
+  individual_rows_binding_read "$tsv" "$INDIVIDUAL_TARGET_CPUS" "$INDIVIDUAL_RUNS" 1 ||
     diag_die "individual results are incomplete or invalid; preserve them and use --redo individual if they cannot be resumed"
   individual_meta_write "$INDIVIDUAL_TARGET_CPUS" "$INDIVIDUAL_RUNS" 0 1 ""
   mark_done individual
@@ -2591,47 +2601,27 @@ individual_cpulist_is_canonical() {
 # Each target CPU must contain the exact ordered prefix 1..N, never more than
 # the configured total; require_complete=1 additionally requires N=total.
 individual_rows_are_valid() {
-  local tsv="$1" targets="$2" expected_total="$3" require_complete="$4" target_csv
-  [[ -f "$tsv" && ! -L "$tsv" ]] || return 1
+  local tsv="$1" targets="$2" expected_total="$3" require_complete="$4"
   diag_is_safe_positive_uint "$expected_total" && [[ "$require_complete" =~ ^[01]$ ]] || return 1
   individual_cpulist_is_canonical "$targets" || return 1
-  target_csv="$(cpu_list_sorted "$targets" | paste -sd, -)"
-  awk -F'\t' -v targets="$target_csv" -v expected="$expected_total" -v complete="$require_complete" '
-    function uint(s) { return s ~ /^(0|[1-9][0-9]*)$/ }
-    BEGIN {
-      n = split(targets, target, ",")
-      for (i = 1; i <= n; i++) allowed[target[i]] = 1
-    }
-    {
-      if (NF != 4 || !uint($1) || !uint($2) || !uint($3) || !uint($4) ||
-          !($1 in allowed) || ($3 != "0" && $3 != "139")) bad = 1
-      else {
-        count[$1]++
-        if (($2 + 0) != count[$1] || count[$1] > expected) bad = 1
-      }
-    }
-    END {
-      if (complete) for (cpu in allowed) if ((count[cpu] + 0) != expected) bad = 1
-      exit bad ? 1 : 0
-    }
-  ' "$tsv"
+  [[ -n "$DIAG_INDIVIDUAL_NODE_BIN" ]] || return 1
+  "$DIAG_INDIVIDUAL_NODE_BIN" "$LIB/individual-evidence.mjs" rows \
+    "$tsv" "$targets" "$expected_total" "$require_complete"
 }
 
 individual_cpu_row_count() {
-  local tsv="$1" cpu="$2"
-  awk -F'\t' -v cpu="$cpu" '$1 == cpu { count++ } END { print count + 0 }' "$tsv"
+  local tsv="$1" cpu="$2" targets="${3:-$2}" expected_total="${4:-9007199254740991}"
+  [[ -n "$DIAG_INDIVIDUAL_NODE_BIN" ]] || return 1
+  "$DIAG_INDIVIDUAL_NODE_BIN" "$LIB/individual-evidence.mjs" count \
+    "$tsv" "$targets" "$expected_total" "$cpu"
 }
 
 individual_cpu_batch_matches_wrapper() {
-  local tsv="$1" cpu="$2" before="$3" expected_total="$4" wrapper_rc="$5"
+  local tsv="$1" cpu="$2" before="$3" expected_total="$4" wrapper_rc="$5" targets="${6:-$2}"
   [[ "$wrapper_rc" == "0" || "$wrapper_rc" == "1" ]] || return 1
-  awk -F'\t' -v cpu="$cpu" -v before="$before" -v expected="$expected_total" -v wrapper="$wrapper_rc" '
-    $1 == cpu && $2 > before { count++; if ($3 == 139) new_sigsegv++ }
-    END {
-      wrapper_ok = (wrapper == 0 && new_sigsegv == 0) || (wrapper == 1 && new_sigsegv > 0)
-      exit (count == expected - before && wrapper_ok) ? 0 : 1
-    }
-  ' "$tsv"
+  [[ -n "$DIAG_INDIVIDUAL_NODE_BIN" ]] || return 1
+  "$DIAG_INDIVIDUAL_NODE_BIN" "$LIB/individual-evidence.mjs" batch \
+    "$tsv" "$targets" "$expected_total" "$cpu" "$before" "$wrapper_rc"
 }
 
 INDIVIDUAL_META_VERSION=""
@@ -2642,9 +2632,20 @@ INDIVIDUAL_META_COMPLETED=""
 INDIVIDUAL_META_SKIP_REASON=""
 INDIVIDUAL_META_TARGET_POLICY=""
 INDIVIDUAL_META_GROUP_PLAN_DIGEST=""
+INDIVIDUAL_META_GENERATION=""
+INDIVIDUAL_META_ROWS_SHA256=""
+INDIVIDUAL_META_ROWS_BYTES=""
+INDIVIDUAL_META_ROW_COUNT=""
+
+individual_meta_reset_generation() {
+  INDIVIDUAL_META_GENERATION=""
+  INDIVIDUAL_META_ROWS_SHA256=""
+  INDIVIDUAL_META_ROWS_BYTES=""
+  INDIVIDUAL_META_ROW_COUNT=""
+}
 
 individual_meta_read() {
-  local file="$1" line key value
+  local file="$1" output line key value
   local -A seen=()
   INDIVIDUAL_META_VERSION=""
   INDIVIDUAL_META_TARGET_CPUS=""
@@ -2654,9 +2655,14 @@ individual_meta_read() {
   INDIVIDUAL_META_SKIP_REASON=""
   INDIVIDUAL_META_TARGET_POLICY=""
   INDIVIDUAL_META_GROUP_PLAN_DIGEST=""
-  [[ -f "$file" && ! -L "$file" ]] || return 1
+  INDIVIDUAL_META_GENERATION=""
+  INDIVIDUAL_META_ROWS_SHA256=""
+  INDIVIDUAL_META_ROWS_BYTES=""
+  INDIVIDUAL_META_ROW_COUNT=""
+  [[ -n "$DIAG_INDIVIDUAL_NODE_BIN" ]] || return 1
+  output="$("$DIAG_INDIVIDUAL_NODE_BIN" "$LIB/individual-evidence.mjs" meta "$file")" || return 1
   while IFS= read -r line || [[ -n "$line" ]]; do
-    [[ "$line" =~ ^([A-Z_]+)=(.*)$ ]] || return 1
+    [[ "$line" =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]] || return 1
     key="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"
     [[ -z "${seen[$key]:-}" ]] || return 1
     seen[$key]=1
@@ -2669,33 +2675,20 @@ individual_meta_read() {
       SKIP_REASON) INDIVIDUAL_META_SKIP_REASON="$value" ;;
       TARGET_POLICY) INDIVIDUAL_META_TARGET_POLICY="$value" ;;
       GROUP_PLAN_DIGEST) INDIVIDUAL_META_GROUP_PLAN_DIGEST="$value" ;;
+      GENERATION) INDIVIDUAL_META_GENERATION="$value" ;;
+      ROWS_SHA256) INDIVIDUAL_META_ROWS_SHA256="$value" ;;
+      ROWS_BYTES) INDIVIDUAL_META_ROWS_BYTES="$value" ;;
+      ROW_COUNT) INDIVIDUAL_META_ROW_COUNT="$value" ;;
+      SKIP_REASON_PRESENT)
+        [[ "$value" =~ ^[01]$ ]] || return 1
+        [[ "$value" == 0 ]] || INDIVIDUAL_META_SKIP_REASON=present
+        ;;
       *) return 1 ;;
     esac
-  done < "$file"
-  [[ -n "${seen[VERSION]:-}" && -n "${seen[TARGET_CPUS]:-}" && -n "${seen[RUNS_PER_CPU]:-}" &&
-    -n "${seen[SKIPPED]:-}" && -n "${seen[COMPLETED]:-}" ]] || return 1
-  [[ "$INDIVIDUAL_META_VERSION" == 1 || "$INDIVIDUAL_META_VERSION" == 2 ]] || return 1
-  [[ "$INDIVIDUAL_META_SKIPPED" =~ ^[01]$ &&
-    "$INDIVIDUAL_META_COMPLETED" =~ ^[01]$ ]] || return 1
-  diag_is_safe_positive_uint "$INDIVIDUAL_META_RUNS" || return 1
-  if [[ "$INDIVIDUAL_META_VERSION" == 1 ]]; then
-    [[ -z "${seen[TARGET_POLICY]:-}" && -z "${seen[GROUP_PLAN_DIGEST]:-}" ]] || return 1
-  else
-    [[ -n "${seen[TARGET_POLICY]:-}" && -n "${seen[GROUP_PLAN_DIGEST]:-}" &&
-      "$INDIVIDUAL_META_GROUP_PLAN_DIGEST" =~ ^[a-f0-9]{64}$ ]] || return 1
-    [[ "$INDIVIDUAL_META_TARGET_POLICY" == failed-groups ||
-      "$INDIVIDUAL_META_TARGET_POLICY" == all-group-cpus ||
-      "$INDIVIDUAL_META_TARGET_POLICY" == quick-skip ]] || return 1
-  fi
-  if [[ "$INDIVIDUAL_META_SKIPPED" == 1 ]]; then
-    [[ -z "$INDIVIDUAL_META_TARGET_CPUS" && "$INDIVIDUAL_META_COMPLETED" == 1 &&
-      -n "$INDIVIDUAL_META_SKIP_REASON" ]] || return 1
-    [[ "$INDIVIDUAL_META_VERSION" == 1 || "$INDIVIDUAL_META_TARGET_POLICY" == quick-skip ]] || return 1
-  else
-    [[ -z "$INDIVIDUAL_META_SKIP_REASON" ]] || return 1
-    individual_cpulist_is_canonical "$INDIVIDUAL_META_TARGET_CPUS" || return 1
-    [[ "$INDIVIDUAL_META_VERSION" == 1 || "$INDIVIDUAL_META_TARGET_POLICY" != quick-skip ]] || return 1
-  fi
+  done <<< "$output"
+  [[ ${#seen[@]} == 12 && -n "${seen[VERSION]:-}" && -n "${seen[TARGET_CPUS]:-}" &&
+    -n "${seen[RUNS_PER_CPU]:-}" && -n "${seen[SKIPPED]:-}" &&
+    -n "${seen[COMPLETED]:-}" && -n "${seen[SKIP_REASON_PRESENT]:-}" ]] || return 1
 }
 
 individual_meta_write() {
@@ -2706,22 +2699,88 @@ individual_meta_write() {
     diag_die "cannot publish individual metadata without a valid target policy"
   [[ "$INDIVIDUAL_GROUP_PLAN_DIGEST" =~ ^[a-f0-9]{64}$ ]] ||
     diag_die "cannot publish individual metadata without a valid group plan digest"
+  if [[ -z "$INDIVIDUAL_META_GENERATION" ]]; then
+    INDIVIDUAL_META_GENERATION="$("$DIAG_INDIVIDUAL_NODE_BIN" -e 'process.stdout.write(require("node:crypto").randomBytes(16).toString("hex"))')" ||
+      diag_die "cannot generate individual evidence generation"
+  fi
+  [[ "$INDIVIDUAL_META_GENERATION" =~ ^[a-f0-9]{32}$ ]] ||
+    diag_die "cannot publish individual metadata with an invalid generation"
+  if [[ "$completed" == 1 ]]; then
+    [[ "$INDIVIDUAL_META_ROWS_SHA256" =~ ^[a-f0-9]{64}$ ]] &&
+      { [[ "$INDIVIDUAL_META_ROWS_BYTES" == 0 ]] || diag_is_safe_positive_uint "$INDIVIDUAL_META_ROWS_BYTES"; } &&
+      { [[ "$INDIVIDUAL_META_ROW_COUNT" == 0 ]] || diag_is_safe_positive_uint "$INDIVIDUAL_META_ROW_COUNT"; } ||
+      diag_die "cannot publish completed individual metadata without a valid row binding"
+  fi
   tmp="$(mktemp "$OUT_DIR/results/.individual.meta.XXXXXX")" || diag_die "cannot create individual metadata"
   {
-    printf 'VERSION=2\nTARGET_CPUS=%s\nRUNS_PER_CPU=%s\n' "$targets" "$runs"
+    printf 'VERSION=3\nGENERATION=%s\nTARGET_CPUS=%s\nRUNS_PER_CPU=%s\n' \
+      "$INDIVIDUAL_META_GENERATION" "$targets" "$runs"
     printf 'TARGET_POLICY=%s\nGROUP_PLAN_DIGEST=%s\n' \
       "$INDIVIDUAL_TARGET_POLICY" "$INDIVIDUAL_GROUP_PLAN_DIGEST"
     printf 'SKIPPED=%s\nCOMPLETED=%s\n' "$skipped" "$completed"
     [[ -z "$reason" ]] || printf 'SKIP_REASON=%s\n' "$reason"
+    if [[ "$completed" == 1 ]]; then
+      printf 'ROWS_SHA256=%s\nROWS_BYTES=%s\nROW_COUNT=%s\n' \
+        "$INDIVIDUAL_META_ROWS_SHA256" "$INDIVIDUAL_META_ROWS_BYTES" \
+        "$INDIVIDUAL_META_ROW_COUNT"
+    fi
   } > "$tmp" || diag_die "cannot write individual metadata"
   mv -T -- "$tmp" "$OUT_DIR/results/individual.meta" || diag_die "cannot publish individual metadata"
 }
 
+individual_rows_binding_read() {
+  local tsv="$1" targets="$2" runs="$3" require_complete="$4" output line key value
+  local -A seen=()
+  output="$("$DIAG_INDIVIDUAL_NODE_BIN" "$LIB/individual-evidence.mjs" binding \
+    "$tsv" "$targets" "$runs" "$require_complete")" || return 1
+  INDIVIDUAL_META_ROWS_SHA256=""
+  INDIVIDUAL_META_ROWS_BYTES=""
+  INDIVIDUAL_META_ROW_COUNT=""
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]] || return 1
+    key="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"
+    [[ -z "${seen[$key]:-}" ]] || return 1
+    seen[$key]=1
+    case "$key" in
+      ROWS_SHA256) INDIVIDUAL_META_ROWS_SHA256="$value" ;;
+      ROWS_BYTES) INDIVIDUAL_META_ROWS_BYTES="$value" ;;
+      ROW_COUNT) INDIVIDUAL_META_ROW_COUNT="$value" ;;
+      *) return 1 ;;
+    esac
+  done <<< "$output"
+  [[ ${#seen[@]} == 3 && "$INDIVIDUAL_META_ROWS_SHA256" =~ ^[a-f0-9]{64}$ ]] &&
+    { [[ "$INDIVIDUAL_META_ROWS_BYTES" == 0 ]] || diag_is_safe_positive_uint "$INDIVIDUAL_META_ROWS_BYTES"; } &&
+    { [[ "$INDIVIDUAL_META_ROW_COUNT" == 0 ]] || diag_is_safe_positive_uint "$INDIVIDUAL_META_ROW_COUNT"; }
+}
+
+individual_empty_rows_binding_read() {
+  local tsv="$1" output line key value
+  local -A seen=()
+  output="$("$DIAG_INDIVIDUAL_NODE_BIN" "$LIB/individual-evidence.mjs" empty-binding "$tsv")" || return 1
+  INDIVIDUAL_META_ROWS_SHA256=""
+  INDIVIDUAL_META_ROWS_BYTES=""
+  INDIVIDUAL_META_ROW_COUNT=""
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]] || return 1
+    key="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"
+    [[ -z "${seen[$key]:-}" ]] || return 1
+    seen[$key]=1
+    case "$key" in
+      ROWS_SHA256) INDIVIDUAL_META_ROWS_SHA256="$value" ;;
+      ROWS_BYTES) INDIVIDUAL_META_ROWS_BYTES="$value" ;;
+      ROW_COUNT) INDIVIDUAL_META_ROW_COUNT="$value" ;;
+      *) return 1 ;;
+    esac
+  done <<< "$output"
+  [[ ${#seen[@]} == 3 && "$INDIVIDUAL_META_ROWS_SHA256" =~ ^[a-f0-9]{64}$ &&
+    "$INDIVIDUAL_META_ROWS_BYTES" == 0 && "$INDIVIDUAL_META_ROW_COUNT" == 0 ]]
+}
+
 individual_phase_matches_expected_targets() {
-  local should_run="$1" meta="$OUT_DIR/results/individual.meta"
+  local should_run="$1"
   [[ "$should_run" =~ ^[01]$ ]] || return 1
-  individual_meta_read "$meta" || return 1
-  [[ "$INDIVIDUAL_META_VERSION" == 2 &&
+  individual_evidence_read || return 1
+  [[ "$INDIVIDUAL_META_VERSION" == 3 &&
     "$INDIVIDUAL_META_RUNS" == "$INDIVIDUAL_RUNS" &&
     "$INDIVIDUAL_META_TARGET_POLICY" == "$INDIVIDUAL_TARGET_POLICY" &&
     "$INDIVIDUAL_META_GROUP_PLAN_DIGEST" == "$INDIVIDUAL_GROUP_PLAN_DIGEST" ]] || return 1
@@ -2733,13 +2792,65 @@ individual_phase_matches_expected_targets() {
   fi
 }
 
+INDIVIDUAL_EVIDENCE_STATUS=""
+INDIVIDUAL_EVIDENCE_WORST_CPU=""
+individual_evidence_read() {
+  local output line key value
+  local -A seen=()
+  output="$("$DIAG_INDIVIDUAL_NODE_BIN" "$LIB/individual-evidence.mjs" bundle "$OUT_DIR")" || return 1
+  INDIVIDUAL_EVIDENCE_STATUS=""
+  INDIVIDUAL_EVIDENCE_WORST_CPU=""
+  INDIVIDUAL_META_SKIP_REASON=""
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]] || return 1
+    key="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"
+    [[ -z "${seen[$key]:-}" ]] || return 1
+    seen[$key]=1
+    case "$key" in
+      STATUS) INDIVIDUAL_EVIDENCE_STATUS="$value" ;;
+      VERSION) INDIVIDUAL_META_VERSION="$value" ;;
+      TARGET_CPUS) INDIVIDUAL_META_TARGET_CPUS="$value" ;;
+      RUNS_PER_CPU) INDIVIDUAL_META_RUNS="$value" ;;
+      SKIPPED) INDIVIDUAL_META_SKIPPED="$value" ;;
+      COMPLETED) INDIVIDUAL_META_COMPLETED="$value" ;;
+      TARGET_POLICY) INDIVIDUAL_META_TARGET_POLICY="$value" ;;
+      GROUP_PLAN_DIGEST) INDIVIDUAL_META_GROUP_PLAN_DIGEST="$value" ;;
+      GENERATION) INDIVIDUAL_META_GENERATION="$value" ;;
+      ROWS_SHA256) INDIVIDUAL_META_ROWS_SHA256="$value" ;;
+      ROWS_BYTES) INDIVIDUAL_META_ROWS_BYTES="$value" ;;
+      ROW_COUNT) INDIVIDUAL_META_ROW_COUNT="$value" ;;
+      SKIP_REASON_PRESENT)
+        [[ "$value" =~ ^[01]$ ]] || return 1
+        [[ "$value" == 0 ]] || INDIVIDUAL_META_SKIP_REASON=present
+        ;;
+      WORST_CPU) INDIVIDUAL_EVIDENCE_WORST_CPU="$value" ;;
+      *) return 1 ;;
+    esac
+  done <<< "$output"
+  [[ ${#seen[@]} == 14 && "$INDIVIDUAL_EVIDENCE_STATUS" =~ ^(not-run|incomplete|invalid|skipped|complete)$ ]]
+}
+
 individual_phase_result_is_complete() {
-  local meta="$OUT_DIR/results/individual.meta" tsv="$OUT_DIR/results/individual.tsv"
-  individual_meta_read "$meta" && [[ "$INDIVIDUAL_META_COMPLETED" == 1 ]] || return 1
-  if [[ "$INDIVIDUAL_META_SKIPPED" == 1 ]]; then
-    [[ ! -s "$tsv" ]]
+  individual_evidence_read &&
+    [[ "$INDIVIDUAL_META_VERSION" == 3 && "$INDIVIDUAL_META_COMPLETED" == 1 &&
+      ("$INDIVIDUAL_EVIDENCE_STATUS" == complete || "$INDIVIDUAL_EVIDENCE_STATUS" == skipped) ]]
+}
+
+individual_phase_is_complete_and_matches_expected() {
+  local should_run="$1"
+  [[ "$should_run" =~ ^[01]$ ]] || return 1
+  individual_evidence_read || return 1
+  [[ "$INDIVIDUAL_META_VERSION" == 3 && "$INDIVIDUAL_META_COMPLETED" == 1 &&
+    ("$INDIVIDUAL_EVIDENCE_STATUS" == complete || "$INDIVIDUAL_EVIDENCE_STATUS" == skipped) &&
+    "$INDIVIDUAL_META_RUNS" == "$INDIVIDUAL_RUNS" &&
+    "$INDIVIDUAL_META_TARGET_POLICY" == "$INDIVIDUAL_TARGET_POLICY" &&
+    "$INDIVIDUAL_META_GROUP_PLAN_DIGEST" == "$INDIVIDUAL_GROUP_PLAN_DIGEST" ]] || return 1
+  if [[ "$should_run" == 1 ]]; then
+    [[ "$INDIVIDUAL_EVIDENCE_STATUS" == complete && "$INDIVIDUAL_META_SKIPPED" == 0 &&
+      "$INDIVIDUAL_META_TARGET_CPUS" == "$INDIVIDUAL_TARGET_CPUS" ]]
   else
-    individual_rows_are_valid "$tsv" "$INDIVIDUAL_META_TARGET_CPUS" "$INDIVIDUAL_META_RUNS" 1
+    [[ "$INDIVIDUAL_EVIDENCE_STATUS" == skipped && "$INDIVIDUAL_META_SKIPPED" == 1 &&
+      -z "$INDIVIDUAL_META_TARGET_CPUS" ]]
   fi
 }
 
@@ -2747,11 +2858,16 @@ phase_individual_skipped() {
   local tsv="$OUT_DIR/results/individual.tsv" meta="$OUT_DIR/results/individual.meta"
   [[ ! -e "$meta" && ! -L "$meta" ]] ||
     diag_die "existing individual metadata conflicts with a skipped phase; preserve it and use --redo individual"
+  # A skipped phase always publishes a new envelope. Do not reuse a generation
+  # left in this shell by completed evidence that a redo just archived.
+  individual_meta_reset_generation
   if [[ -e "$tsv" || -L "$tsv" ]]; then
-    [[ -f "$tsv" && ! -L "$tsv" && ! -s "$tsv" ]] ||
+    individual_empty_rows_binding_read "$tsv" ||
       diag_die "existing individual results conflict with a skipped phase; preserve them and use --redo individual"
   else
     : > "$tsv"
+    individual_empty_rows_binding_read "$tsv" ||
+      diag_die "cannot validate empty individual results for a skipped phase"
   fi
   individual_meta_write "" "$INDIVIDUAL_RUNS" 1 1 no-failing-group-in-quick-mode
   mark_done individual
@@ -2761,18 +2877,9 @@ phase_individual_skipped() {
 # Worst CPU from a fully validated individual phase (highest SIGSEGV rate,
 # ties: more SIGSEGVs, then lower CPU id).
 worst_cpu() {
-  individual_phase_result_is_complete || return 0
-  [[ "$INDIVIDUAL_META_SKIPPED" == 0 ]] || return 0
-  awk -F'\t' '
-    { rc=$3; if (rc!=0 && rc!=139) next; n[$1]++; if (rc==139) f[$1]++ }
-    END {
-      best=-1; bestr=-1; bestf=0
-      for (c in n) {
-        r=(f[c]+0)/n[c]
-        if (r>bestr || (r==bestr && (f[c]+0)>bestf) || (r==bestr && (f[c]+0)==bestf && c+0<best+0)) { best=c; bestr=r; bestf=f[c]+0 }
-      }
-      if (best>=0 && bestf>0) print best
-    }' "$OUT_DIR/results/individual.tsv" 2> /dev/null || true
+  individual_evidence_read || return 0
+  [[ "$INDIVIDUAL_META_VERSION" == 3 && "$INDIVIDUAL_EVIDENCE_STATUS" == complete ]] || return 0
+  printf '%s\n' "$INDIVIDUAL_EVIDENCE_WORST_CPU"
 }
 
 # ------------------------------------------------------------------
@@ -4057,8 +4164,7 @@ main() {
     individual_should_run=1
   fi
   if phase_is_done individual; then
-    individual_phase_result_is_complete &&
-      individual_phase_matches_expected_targets "$individual_should_run" ||
+    individual_phase_is_complete_and_matches_expected "$individual_should_run" ||
       diag_die "completed individual phase does not match the validated group target policy; preserve it and resume with --redo individual"
     diag_log "phase 4/7 individual: already done, skipping (resume)"
   else
@@ -4075,7 +4181,7 @@ main() {
   local target_cpu=""
   if [[ -n "$WORST_CPU_OVERRIDE" ]]; then
     target_cpu="$WORST_CPU_OVERRIDE"
-  elif [[ -s "$OUT_DIR/results/individual.tsv" ]]; then
+  else
     target_cpu="$(worst_cpu)"
   fi
   if [[ -n "$target_cpu" ]] && ! diag_cpulist_contains "$ONLINE_CPUS" "$target_cpu"; then

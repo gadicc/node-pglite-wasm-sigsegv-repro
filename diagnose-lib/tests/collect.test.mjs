@@ -9,6 +9,7 @@ import {
   collectFreqAb,
   collectIndividual,
   resolveExpectedCpu,
+  selectWorstIndividualCpu,
   summarizeFreqSamples,
 } from "../collect.mjs";
 
@@ -132,6 +133,15 @@ test("collectIndividual: only SIGSEGV is a failure; other nonzero exits are inva
   assert.deepEqual(rec.invalidRuns.map((f) => f.rc), [1, 126, 127]);
   assert.deepEqual(rec.invalidRuns.map((f) => f.signal), ["exit 1", "exit 126", "exit 127"]);
   assert.deepEqual(rec.invalidRuns.map((f) => f.run), [3, 4, 5]);
+});
+
+test("selectWorstIndividualCpu compares near-safe-integer rates exactly", () => {
+  const maximum = Number.MAX_SAFE_INTEGER;
+  const half = Math.floor(maximum / 2);
+  assert.equal(selectWorstIndividualCpu([
+    { cpu: 3, runs: maximum, sigsegv: half },
+    { cpu: 4, runs: maximum - 4, sigsegv: half - 1 },
+  ]), 4);
 });
 
 test("collectFreqAb: legs count only clean/SIGSEGV rows as valid runs", () => {

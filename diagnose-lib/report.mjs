@@ -472,6 +472,9 @@ export function renderReport(results) {
       if (c.failedRuns?.length) {
         notes.push(`failed runs: ${c.failedRuns.map((f) => `#${f.run} (${f.signal})`).join(", ")}`);
       }
+      if ((c.failedRunsOmitted ?? 0) > 0) {
+        notes.push(`${c.failedRuns?.length ?? 0} failed-run detail(s) retained; ${c.failedRunsOmitted} omitted by the bounded collector`);
+      }
       L.push(
         `| ${c.cpu} | ${c.runs} | ${c.failures} | ${countsValid ? statsCell(c.failures, c.runs) : "invalid/inconsistent counts; no interval"} | ${notes.join("; ") || "—"} |`,
       );

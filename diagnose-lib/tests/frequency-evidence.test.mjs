@@ -117,17 +117,21 @@ function writeAutoEvidence(dir, state) {
   writeFileSync(path.join(dir, "state", "phase-groups.done"), "");
 
   if (skipped) {
-    writeFileSync(path.join(dir, "results", "individual.tsv"), "");
+    const rows = "";
+    writeFileSync(path.join(dir, "results", "individual.tsv"), rows);
     writeFileSync(path.join(dir, "results", "individual.meta"),
-      `VERSION=2\nTARGET_CPUS=\nRUNS_PER_CPU=1\nTARGET_POLICY=quick-skip\n` +
+      `VERSION=3\nGENERATION=${"a".repeat(32)}\nTARGET_CPUS=\nRUNS_PER_CPU=1\nTARGET_POLICY=quick-skip\n` +
       `GROUP_PLAN_DIGEST=${planDigest}\nSKIPPED=1\nCOMPLETED=1\n` +
-      "SKIP_REASON=no-failing-group-in-quick-mode\n");
+      `SKIP_REASON=no-failing-group-in-quick-mode\nROWS_SHA256=${digest(rows)}\nROWS_BYTES=0\nROW_COUNT=0\n`);
   } else {
-    writeFileSync(path.join(dir, "results", "individual.tsv"), `19\t1\t${failed ? 139 : 0}\t2\n`);
+    const rows = `19\t1\t${failed ? 139 : 0}\t2\n`;
+    writeFileSync(path.join(dir, "results", "individual.tsv"), rows);
     writeFileSync(path.join(dir, "results", "individual.meta"),
-      `VERSION=2\nTARGET_CPUS=19\nRUNS_PER_CPU=1\n` +
+      `VERSION=3\nGENERATION=${"a".repeat(32)}\nTARGET_CPUS=19\nRUNS_PER_CPU=1\n` +
       `TARGET_POLICY=${failed ? "failed-groups" : "all-group-cpus"}\n` +
-      `GROUP_PLAN_DIGEST=${planDigest}\nSKIPPED=0\nCOMPLETED=${state === "incomplete" ? 0 : 1}\n`);
+      `GROUP_PLAN_DIGEST=${planDigest}\nSKIPPED=0\nCOMPLETED=${state === "incomplete" ? 0 : 1}\n` +
+      (state === "incomplete" ? "" :
+        `ROWS_SHA256=${digest(rows)}\nROWS_BYTES=${Buffer.byteLength(rows)}\nROW_COUNT=1\n`));
   }
   if (state !== "incomplete") writeFileSync(path.join(dir, "state", "phase-individual.done"), "");
   if (state === "invalid") {

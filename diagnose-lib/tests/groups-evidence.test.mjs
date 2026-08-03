@@ -185,26 +185,32 @@ test("collector binds full-mode individual evidence to every stored group-plan C
     `${cpu}\t1\t0\t1`,
     `${cpu}\t2\t${cpu === 7 ? 139 : 0}\t1`,
   ]).join("\n")}\n`;
-  const individualMeta = (targets, policy) => [
-    "VERSION=2",
+  const individualMeta = (targets, policy, rows) => [
+    "VERSION=3",
+    `GENERATION=${"a".repeat(32)}`,
     `TARGET_CPUS=${targets}`,
     "RUNS_PER_CPU=2",
     `TARGET_POLICY=${policy}`,
     `GROUP_PLAN_DIGEST=${groupsPlanDigest(plan)}`,
     "SKIPPED=0",
     "COMPLETED=1",
+    `ROWS_SHA256=${createHash("sha256").update(rows).digest("hex")}`,
+    `ROWS_BYTES=${Buffer.byteLength(rows)}`,
+    `ROW_COUNT=${rows.trimEnd().split("\n").length}`,
     "",
   ].join("\n");
 
-  writeFileSync(path.join(dir, "results", "individual.tsv"), individualRows([0, 1, 2, 3, 4, 5, 6, 7]));
-  writeFileSync(path.join(dir, "results", "individual.meta"), individualMeta("0-7", "all-group-cpus"));
+  const completeRows = individualRows([0, 1, 2, 3, 4, 5, 6, 7]);
+  writeFileSync(path.join(dir, "results", "individual.tsv"), completeRows);
+  writeFileSync(path.join(dir, "results", "individual.meta"), individualMeta("0-7", "all-group-cpus", completeRows));
   const complete = collect(dir);
   assert.equal(complete.groupsStatus.status, "complete");
   assert.equal(complete.individualStatus.status, "complete");
   assert.deepEqual(complete.individual.map(({ cpu }) => cpu), [0, 1, 2, 3, 4, 5, 6, 7]);
 
-  writeFileSync(path.join(dir, "results", "individual.tsv"), individualRows([4, 5, 6, 7]));
-  writeFileSync(path.join(dir, "results", "individual.meta"), individualMeta("4-7", "failed-groups"));
+  const staleRows = individualRows([4, 5, 6, 7]);
+  writeFileSync(path.join(dir, "results", "individual.tsv"), staleRows);
+  writeFileSync(path.join(dir, "results", "individual.meta"), individualMeta("4-7", "failed-groups", staleRows));
   const stale = collect(dir);
   assert.equal(stale.individualStatus.status, "invalid");
   assert.match(stale.individualStatus.reasons.join("; "), /does not match/);
@@ -233,6 +239,50 @@ test("collector rejects individual evidence from a different group target policy
   assert.match(result.individualStatus.reasons.join("; "), /does not match/);
   assert.equal(result.individual, undefined);
   assert.equal(result.worstCpu, null);
+});
+
+test("collector preserves matching V1/V2 individual evidence descriptively without authorization", () => {
+  const dir = bundle();
+  writeFileSync(path.join(dir, "state", "phase-individual.done"), "");
+  const rows = [4, 5, 6, 7].flatMap((cpu) => [
+    `${cpu}\t1\t${cpu === 4 ? 139 : 0}\t1`,
+    `${cpu}\t2\t0\t1`,
+  ]).join("\n") + "\n";
+  writeFileSync(path.join(dir, "results", "individual.tsv"), rows);
+
+  writeFileSync(path.join(dir, "results", "individual.meta"), [
+    "VERSION=2",
+    "TARGET_CPUS=4-7",
+    "RUNS_PER_CPU=2",
+    "TARGET_POLICY=failed-groups",
+    `GROUP_PLAN_DIGEST=${groupsPlanDigest(plan)}`,
+    "SKIPPED=0",
+    "COMPLETED=1",
+    "",
+  ].join("\n"));
+  const version2 = collect(dir);
+  assert.equal(version2.individualStatus.status, "incomplete");
+  assert.match(version2.individualStatus.reasons.join("; "), /version 2.*descriptive only/);
+  assert.deepEqual(version2.individual.map(({ cpu }) => cpu), [4, 5, 6, 7]);
+  assert.equal(version2.individual[0].sigsegv, 1);
+  assert.equal(version2.worstCpu, null);
+  assert.equal(version2.cpuSelectionStatus.status, "unavailable");
+
+  writeFileSync(path.join(dir, "results", "individual.meta"), [
+    "VERSION=1",
+    "TARGET_CPUS=4-7",
+    "RUNS_PER_CPU=2",
+    "SKIPPED=0",
+    "COMPLETED=1",
+    "",
+  ].join("\n"));
+  const version1 = collect(dir);
+  assert.equal(version1.individualStatus.status, "incomplete");
+  assert.match(version1.individualStatus.reasons.join("; "), /version 1.*descriptive only/);
+  assert.deepEqual(version1.individual.map(({ cpu }) => cpu), [4, 5, 6, 7]);
+  assert.equal(version1.individual[0].sigsegv, 1);
+  assert.equal(version1.worstCpu, null);
+  assert.equal(version1.cpuSelectionStatus.status, "unavailable");
 });
 
 test("groups envelope distinguishes absent, marker-only, missing, and exact interrupted prefixes", () => {
