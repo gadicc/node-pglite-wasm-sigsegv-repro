@@ -170,6 +170,34 @@ write_derived_output_fixture() {
   done
 }
 
+write_frequency_snapshot_node_wrapper() {
+  local path="$1"
+  cat > "$path" <<'EOF'
+#!/usr/bin/env bash
+output="$("$REAL_NODE_BIN" "$@")"
+rc=$?
+((rc == 0)) || exit "$rc"
+if [[ "$2" == "$SNAPSHOT_KIND" && "$3" == "$SNAPSHOT_SOURCE" &&
+  ! -e "$SNAPSHOT_ONCE" ]]; then
+  case "$SNAPSHOT_REPLACEMENT" in
+    fifo)
+      rm -f -- "$SNAPSHOT_SOURCE"
+      mkfifo "$SNAPSHOT_SOURCE"
+      chmod 0600 "$SNAPSHOT_SOURCE"
+      ;;
+    symlink)
+      mv -T -- "$SNAPSHOT_SOURCE" "$SNAPSHOT_TARGET"
+      ln -s "$SNAPSHOT_TARGET" "$SNAPSHOT_SOURCE"
+      ;;
+    *) exit 91 ;;
+  esac
+  : > "$SNAPSHOT_ONCE"
+fi
+printf '%s\n' "$output"
+EOF
+  chmod 0700 "$path"
+}
+
 derived_outputs_absent() {
   local bundle="$1" name
   for name in manifest.txt privacy-review.txt results.json report.md; do
@@ -2122,7 +2150,7 @@ check_eq "frequency applicability is evaluated after durable recovery" "0" "$?"
 
 frequency_recovery_line="$(awk '/frequency_recover_prior_state \|\| recovery_rc=/ { print NR; exit }' "$REPO_ROOT/frequency-ab.sh")"
 frequency_cap_semantic_line="$(awk '/diag_require_uint "--cap"/ { print NR; exit }' "$REPO_ROOT/frequency-ab.sh")"
-frequency_dependency_line="$(awk '/for dep in node runuser setsid sha256sum sync taskset/ { print NR; exit }' "$REPO_ROOT/frequency-ab.sh")"
+frequency_dependency_line="$(awk '/for dep in dd find node runuser setsid sha256sum sync taskset/ { print NR; exit }' "$REPO_ROOT/frequency-ab.sh")"
 frequency_bundle_gate_line="$(awk '/\[\[ -d "\$BUNDLE" \]\]/ { print NR; exit }' "$REPO_ROOT/frequency-ab.sh")"
 frequency_child_gate_line="$(awk '/^frequency_workload_script_available \|\|/ { print NR; exit }' "$REPO_ROOT/frequency-ab.sh")"
 frequency_no_turbo_gate_line="$(awk '/\[\[ -e "\$NO_TURBO_PATH" \]\]/ { print NR; exit }' "$REPO_ROOT/frequency-ab.sh")"
@@ -2171,7 +2199,8 @@ printf 'pending\n' > "$FREQUENCY_MISSING_PUBLISHER_DEP/setting"
   }
   recovery_rc=0
   frequency_recover_prior_state || recovery_rc=$?
-  [[ "$recovery_rc" == 11 && "$recovery_order" == "restore,dependency-runuser," &&
+  [[ "$recovery_rc" == 11 &&
+    "$recovery_order" == "restore,dependency-dd,dependency-find,dependency-node,dependency-runuser," &&
     "$(cat "$FREQUENCY_MISSING_PUBLISHER_DEP/setting")" == restored &&
     -d "$FREQUENCY_STAGE_DIR" && -f "$FREQUENCY_STAGE_RECORD" ]] &&
     ! compgen -G "$FREQUENCY_MISSING_PUBLISHER_DEP/stage.unpublished.*" > /dev/null
@@ -2480,6 +2509,22 @@ if ((EUID != 0)); then
   check_eq "nonreplaceable derived output is rejected before manifest or evidence mutation" "1" \
     "$([[ $nonreplaceable_derived_rc -ne 0 && -f "$NONREPLACEABLE_DERIVED_BUNDLE/manifest.txt" && -d "$NONREPLACEABLE_DERIVED_BUNDLE/report.md" && "$(cat "$NONREPLACEABLE_DERIVED_BUNDLE/results/frequency-ab.tsv")" == "old evidence" && -f "$NONREPLACEABLE_DERIVED_BUNDLE/state/phase-frequency.done" && -f "$NONREPLACEABLE_DERIVED_STAGE/results/frequency-ab.tsv" ]] && echo 1 || echo 0)"
 
+  UNSAFE_FREQUENCY_STATE="$TMP/frequency-unsafe-state-preflight"
+  mkdir -p "$UNSAFE_FREQUENCY_STATE/bundle"/{results,freq} \
+    "$UNSAFE_FREQUENCY_STATE/state-target"
+  ln -s "$UNSAFE_FREQUENCY_STATE/state-target" "$UNSAFE_FREQUENCY_STATE/bundle/state"
+  touch "$UNSAFE_FREQUENCY_STATE/state-target/phase-frequency.done"
+  prepare_frequency_publish_stage "$UNSAFE_FREQUENCY_STATE/stage" 0
+  write_derived_output_fixture "$UNSAFE_FREQUENCY_STATE/bundle"
+  bash "$LIB/publish-frequency-output.sh" "$UNSAFE_FREQUENCY_STATE/stage" \
+    "$UNSAFE_FREQUENCY_STATE/bundle" > /dev/null 2>&1
+  unsafe_frequency_state_rc=$?
+  check_eq "frequency directory and marker preflight precedes derived invalidation" "1" \
+    "$([[ $unsafe_frequency_state_rc -ne 0 &&
+      -f "$UNSAFE_FREQUENCY_STATE/state-target/phase-frequency.done" &&
+      -f "$UNSAFE_FREQUENCY_STATE/stage/results/frequency-ab.tsv" ]] &&
+      derived_outputs_present "$UNSAFE_FREQUENCY_STATE/bundle" && echo 1 || echo 0)"
+
   UNTERMINATED_CONTROL_BUNDLE="$TMP/frequency-unterminated-control-bundle"
   UNTERMINATED_CONTROL_STAGE="$TMP/frequency-unterminated-control-stage"
   mkdir -p "$UNTERMINATED_CONTROL_BUNDLE/results" "$UNTERMINATED_CONTROL_BUNDLE/freq" \
@@ -2500,6 +2545,80 @@ if ((EUID != 0)); then
   nul_control_rc=$?
   check_eq "NUL-terminated 70-byte publication control fails canonical preflight" "1" \
     "$([[ $nul_control_rc -ne 0 && "$(stat -Lc '%s' "$UNTERMINATED_CONTROL_STAGE/publish-control.meta")" == 70 && -f "$UNTERMINATED_CONTROL_BUNDLE/state/phase-frequency.done" && -f "$UNTERMINATED_CONTROL_STAGE/results/frequency-ab.tsv" ]] && echo 1 || echo 0)"
+
+  FREQUENCY_CONTROL_SNAPSHOT="$TMP/frequency-control-snapshot"
+  mkdir -p "$FREQUENCY_CONTROL_SNAPSHOT/bundle"/{results,freq,state} \
+    "$FREQUENCY_CONTROL_SNAPSHOT/fake-bin"
+  prepare_frequency_publish_stage "$FREQUENCY_CONTROL_SNAPSHOT/stage" 0
+  cp "$FREQUENCY_CONTROL_SNAPSHOT/stage/publish-control.meta" \
+    "$FREQUENCY_CONTROL_SNAPSHOT/original-control.meta"
+  touch "$FREQUENCY_CONTROL_SNAPSHOT/bundle/state/phase-frequency.done"
+  write_derived_output_fixture "$FREQUENCY_CONTROL_SNAPSHOT/bundle"
+  write_frequency_snapshot_node_wrapper "$FREQUENCY_CONTROL_SNAPSHOT/fake-bin/node"
+  real_node_bin="$(command -v node)"
+  PATH="$FREQUENCY_CONTROL_SNAPSHOT/fake-bin:$PATH" REAL_NODE_BIN="$real_node_bin" \
+    SNAPSHOT_SOURCE="$FREQUENCY_CONTROL_SNAPSHOT/stage/publish-control.meta" \
+    SNAPSHOT_ONCE="$FREQUENCY_CONTROL_SNAPSHOT/control-mutated" SNAPSHOT_KIND=control \
+    SNAPSHOT_REPLACEMENT=fifo timeout 10 bash "$LIB/publish-frequency-output.sh" \
+    "$FREQUENCY_CONTROL_SNAPSHOT/stage" \
+    "$FREQUENCY_CONTROL_SNAPSHOT/bundle" > /dev/null 2>&1
+  control_snapshot_rc=$?
+  control_snapshot_bounded=0
+  [[ $control_snapshot_rc -ne 0 && $control_snapshot_rc -ne 124 &&
+      -e "$FREQUENCY_CONTROL_SNAPSHOT/control-mutated" &&
+      -p "$FREQUENCY_CONTROL_SNAPSHOT/stage/publish-control.meta" &&
+      ! -e "$FREQUENCY_CONTROL_SNAPSHOT/stage/publish-journal.tsv" &&
+      ! -e "$FREQUENCY_CONTROL_SNAPSHOT/bundle/.frequency-publish.pending" &&
+      -f "$FREQUENCY_CONTROL_SNAPSHOT/bundle/state/phase-frequency.done" ]] &&
+      derived_outputs_present "$FREQUENCY_CONTROL_SNAPSHOT/bundle" &&
+      control_snapshot_bounded=1
+  rm -f "$FREQUENCY_CONTROL_SNAPSHOT/stage/publish-control.meta"
+  cp "$FREQUENCY_CONTROL_SNAPSHOT/original-control.meta" \
+    "$FREQUENCY_CONTROL_SNAPSHOT/stage/publish-control.meta"
+  chmod 0600 "$FREQUENCY_CONTROL_SNAPSHOT/stage/publish-control.meta"
+  bash "$LIB/publish-frequency-output.sh" "$FREQUENCY_CONTROL_SNAPSHOT/stage" \
+    "$FREQUENCY_CONTROL_SNAPSHOT/bundle" > /dev/null 2>&1
+  control_snapshot_finish_rc=$?
+  check_eq "fd-bound control parsing cannot be redirected to a replacement FIFO" "1" \
+    "$([[ $control_snapshot_bounded -eq 1 && $control_snapshot_finish_rc -eq 0 &&
+      ! -e "$FREQUENCY_CONTROL_SNAPSHOT/stage" ]] && echo 1 || echo 0)"
+
+  FREQUENCY_JOURNAL_SNAPSHOT="$TMP/frequency-journal-snapshot"
+  mkdir -p "$FREQUENCY_JOURNAL_SNAPSHOT/bundle"/{results,freq,state} \
+    "$FREQUENCY_JOURNAL_SNAPSHOT/fake-bin"
+  prepare_frequency_publish_stage "$FREQUENCY_JOURNAL_SNAPSHOT/stage" 0
+  DIAG_TEST_FREQUENCY_PUBLISH_KILL_AT=journal-prepared \
+    bash "$LIB/publish-frequency-output.sh" "$FREQUENCY_JOURNAL_SNAPSHOT/stage" \
+    "$FREQUENCY_JOURNAL_SNAPSHOT/bundle" > /dev/null 2>&1
+  journal_snapshot_kill_rc=$?
+  write_frequency_snapshot_node_wrapper "$FREQUENCY_JOURNAL_SNAPSHOT/fake-bin/node"
+  PATH="$FREQUENCY_JOURNAL_SNAPSHOT/fake-bin:$PATH" REAL_NODE_BIN="$real_node_bin" \
+    SNAPSHOT_SOURCE="$FREQUENCY_JOURNAL_SNAPSHOT/stage/publish-journal.tsv" \
+    SNAPSHOT_ONCE="$FREQUENCY_JOURNAL_SNAPSHOT/journal-mutated" SNAPSHOT_KIND=journal \
+    SNAPSHOT_REPLACEMENT=symlink \
+    SNAPSHOT_TARGET="$FREQUENCY_JOURNAL_SNAPSHOT/original-journal.tsv" \
+    timeout 10 bash "$LIB/publish-frequency-output.sh" "$FREQUENCY_JOURNAL_SNAPSHOT/stage" \
+    "$FREQUENCY_JOURNAL_SNAPSHOT/bundle" > /dev/null 2>&1
+  journal_snapshot_rc=$?
+  journal_snapshot_bounded=0
+  [[ $journal_snapshot_kill_rc -ne 0 && $journal_snapshot_rc -ne 0 &&
+      $journal_snapshot_rc -ne 124 &&
+      -e "$FREQUENCY_JOURNAL_SNAPSHOT/journal-mutated" &&
+      -L "$FREQUENCY_JOURNAL_SNAPSHOT/stage/publish-journal.tsv" &&
+      -f "$FREQUENCY_JOURNAL_SNAPSHOT/original-journal.tsv" &&
+      -f "$FREQUENCY_JOURNAL_SNAPSHOT/bundle/.frequency-publish.pending/transaction.id" &&
+      -f "$FREQUENCY_JOURNAL_SNAPSHOT/stage/results/frequency-ab.tsv" ]] &&
+      journal_snapshot_bounded=1
+  rm -f "$FREQUENCY_JOURNAL_SNAPSHOT/stage/publish-journal.tsv"
+  mv -T "$FREQUENCY_JOURNAL_SNAPSHOT/original-journal.tsv" \
+    "$FREQUENCY_JOURNAL_SNAPSHOT/stage/publish-journal.tsv"
+  chmod 0600 "$FREQUENCY_JOURNAL_SNAPSHOT/stage/publish-journal.tsv"
+  bash "$LIB/publish-frequency-output.sh" "$FREQUENCY_JOURNAL_SNAPSHOT/stage" \
+    "$FREQUENCY_JOURNAL_SNAPSHOT/bundle" > /dev/null 2>&1
+  journal_snapshot_finish_rc=$?
+  check_eq "fd-bound journal parsing rejects pathname replacement without reopening it" "1" \
+    "$([[ $journal_snapshot_bounded -eq 1 && $journal_snapshot_finish_rc -eq 0 &&
+      ! -e "$FREQUENCY_JOURNAL_SNAPSHOT/stage" ]] && echo 1 || echo 0)"
 
   CAP_DELETE_BUNDLE="$TMP/frequency-cap-delete-retry-bundle"
   CAP_DELETE_STAGE="$TMP/frequency-cap-delete-retry-stage"
@@ -2532,6 +2651,449 @@ if ((EUID != 0)); then
   done
   check_eq "SIGKILL after one stale cap deletion retries from durable control" "1" \
     "$([[ $cap_delete_kill_rc -ne 0 && $cap_files_after_kill -eq 3 && $control_survived -eq 1 && ! -e "$CAP_DELETE_BUNDLE/state/phase-frequency.done" && $cap_delete_retry_rc -eq 0 && $cap_files_after_retry -eq 0 && ! -e "$CAP_DELETE_STAGE" ]] && echo 1 || echo 0)"
+
+  FREQUENCY_TX_CUTS="$TMP/frequency-journal-cut-points"
+  mkdir -p "$FREQUENCY_TX_CUTS"
+  frequency_cut_points_ok=1
+  for cut in derived-invalidated state-synced binding-pending work-ready \
+    journal-prepared-pending journal-prepared commands-copying artifact-copying \
+    first-artifact-installed \
+    commands-published journal-committed-pending journal-committed \
+    first-source-cleaned binding-removed first-stage-dir-removed journal-removed; do
+    cut_root="$FREQUENCY_TX_CUTS/$cut"
+    cut_stage="$cut_root/stage"
+    cut_bundle="$cut_root/bundle"
+    mkdir -p "$cut_bundle/results" "$cut_bundle/freq" "$cut_bundle/state"
+    prepare_frequency_publish_stage "$cut_stage" 0
+    printf 'old command\n' > "$cut_bundle/commands.log"
+    printf 'old evidence\n' > "$cut_bundle/results/frequency-ab.tsv"
+    touch "$cut_bundle/state/phase-frequency.done"
+    write_derived_output_fixture "$cut_bundle"
+    DIAG_TEST_FREQUENCY_PUBLISH_KILL_AT="$cut" \
+      bash "$LIB/publish-frequency-output.sh" "$cut_stage" "$cut_bundle" \
+      > /dev/null 2>&1
+    cut_kill_rc=$?
+    if [[ $cut_kill_rc -eq 0 ]] ||
+      compgen -G "$cut_bundle/.frequency-commands.*" > /dev/null; then
+      frequency_cut_points_ok=0
+      continue
+    fi
+    case "$cut" in
+      derived-invalidated)
+        derived_outputs_absent "$cut_bundle" &&
+          [[ -f "$cut_bundle/state/phase-frequency.done" &&
+          "$(cat "$cut_bundle/results/frequency-ab.tsv")" == 'old evidence' &&
+          ! -e "$cut_stage/publish-journal.tsv" &&
+          ! -e "$cut_bundle/.frequency-publish.pending" ]] ||
+          frequency_cut_points_ok=0
+        ;;
+      state-synced)
+        derived_outputs_absent "$cut_bundle" &&
+          [[ ! -e "$cut_bundle/state/phase-frequency.done" &&
+          ! -e "$cut_stage/publish-journal.tsv" &&
+          ! -e "$cut_bundle/.frequency-publish.pending" ]] ||
+          frequency_cut_points_ok=0
+        ;;
+      binding-pending)
+        [[ ! -e "$cut_bundle/manifest.txt" &&
+          ! -e "$cut_bundle/state/phase-frequency.done" &&
+          ! -e "$cut_stage/publish-journal.tsv" &&
+          -f "$cut_bundle/.frequency-publish.pending/transaction.id.pending" &&
+          ! -e "$cut_bundle/.frequency-publish.pending/transaction.id" ]] ||
+          frequency_cut_points_ok=0
+        ;;
+      work-ready)
+        [[ ! -e "$cut_bundle/manifest.txt" &&
+          ! -e "$cut_bundle/state/phase-frequency.done" &&
+          ! -e "$cut_stage/publish-journal.tsv" &&
+          -f "$cut_bundle/.frequency-publish.pending/transaction.id" ]] ||
+          frequency_cut_points_ok=0
+        ;;
+      journal-prepared-pending)
+        [[ ! -e "$cut_bundle/manifest.txt" &&
+          ! -e "$cut_bundle/state/phase-frequency.done" &&
+          ! -e "$cut_stage/publish-journal.tsv" &&
+          -f "$cut_stage/publish-journal.pending" &&
+          -f "$cut_bundle/.frequency-publish.pending/transaction.id" ]] ||
+          frequency_cut_points_ok=0
+        ;;
+      journal-prepared)
+        [[ ! -e "$cut_bundle/manifest.txt" &&
+          ! -e "$cut_bundle/state/phase-frequency.done" &&
+          -f "$cut_stage/publish-journal.tsv" &&
+          -f "$cut_bundle/.frequency-publish.pending/transaction.id" ]] ||
+          frequency_cut_points_ok=0
+        ;;
+      *)
+        [[ ! -e "$cut_bundle/manifest.txt" &&
+          ! -e "$cut_bundle/state/phase-frequency.done" ]] ||
+          frequency_cut_points_ok=0
+        ;;
+    esac
+    if [[ "$cut" == work-ready ]]; then
+      printf 'wrong artifact candidate\n' \
+        > "$cut_bundle/results/.artifact.frequency-ab.tsv.frequency-publish.pending"
+      printf 'wrong command candidate\n' \
+        > "$cut_bundle/.commands.log.frequency-publish.pending"
+      chmod 0600 "$cut_bundle/results/.artifact.frequency-ab.tsv.frequency-publish.pending" \
+        "$cut_bundle/.commands.log.frequency-publish.pending"
+    fi
+    if [[ "$cut" == artifact-copying &&
+      ! -f "$cut_bundle/results/.artifact.frequency-ab.tsv.frequency-publish.pending.copying" ]]; then
+      frequency_cut_points_ok=0
+    fi
+    bash "$LIB/publish-frequency-output.sh" "$cut_stage" "$cut_bundle" \
+      > /dev/null 2>&1
+    cut_retry_rc=$?
+    if [[ $cut_retry_rc -ne 0 || -e "$cut_stage" ||
+      -e "$cut_bundle/.frequency-publish.pending" ||
+      -e "$cut_bundle/.commands.log.frequency-publish.pending" ||
+      -e "$cut_bundle/results/.artifact.frequency-ab.tsv.frequency-publish.pending" ||
+      -e "$cut_bundle/results/.artifact.frequency-ab.tsv.frequency-publish.pending.copying" ||
+      "$(grep -c '^new command$' "$cut_bundle/commands.log")" != 1 ||
+      "$(cat "$cut_bundle/results/frequency-ab.tsv")" != 'new A/B/A evidence' ]] ||
+      ! derived_outputs_absent "$cut_bundle"; then
+      frequency_cut_points_ok=0
+    fi
+  done
+  check_eq "journaled frequency publication converges after every durable cut point" "1" \
+    "$frequency_cut_points_ok"
+
+  FREQUENCY_STATE_SYNC="$TMP/frequency-state-sync-failure"
+  mkdir -p "$FREQUENCY_STATE_SYNC/bundle"/{results,freq,state} \
+    "$FREQUENCY_STATE_SYNC/fake-bin"
+  prepare_frequency_publish_stage "$FREQUENCY_STATE_SYNC/stage" 0
+  printf 'old evidence\n' > "$FREQUENCY_STATE_SYNC/bundle/results/frequency-ab.tsv"
+  touch "$FREQUENCY_STATE_SYNC/bundle/state/phase-frequency.done"
+  write_derived_output_fixture "$FREQUENCY_STATE_SYNC/bundle"
+  real_sync_bin="$(command -v sync)"
+  cat > "$FREQUENCY_STATE_SYNC/fake-bin/sync" <<'EOF'
+#!/usr/bin/env bash
+last=""
+for last in "$@"; do :; done
+if [[ "$last" == "${FAIL_SYNC_PATH:-}" ]]; then exit 1; fi
+exec "$REAL_SYNC_BIN" "$@"
+EOF
+  chmod 0700 "$FREQUENCY_STATE_SYNC/fake-bin/sync"
+  PATH="$FREQUENCY_STATE_SYNC/fake-bin:$PATH" REAL_SYNC_BIN="$real_sync_bin" \
+    FAIL_SYNC_PATH="$FREQUENCY_STATE_SYNC/bundle/state" \
+    bash "$LIB/publish-frequency-output.sh" "$FREQUENCY_STATE_SYNC/stage" \
+    "$FREQUENCY_STATE_SYNC/bundle" > /dev/null 2>&1
+  frequency_state_sync_rc=$?
+  state_sync_retained=0
+  [[ $frequency_state_sync_rc -eq 1 &&
+    ! -e "$FREQUENCY_STATE_SYNC/stage/publish-journal.tsv" &&
+    ! -e "$FREQUENCY_STATE_SYNC/bundle/.frequency-publish.pending" &&
+    ! -e "$FREQUENCY_STATE_SYNC/bundle/state/phase-frequency.done" &&
+    "$(cat "$FREQUENCY_STATE_SYNC/bundle/results/frequency-ab.tsv")" == 'old evidence' ]] &&
+    derived_outputs_absent "$FREQUENCY_STATE_SYNC/bundle" && state_sync_retained=1
+  bash "$LIB/publish-frequency-output.sh" "$FREQUENCY_STATE_SYNC/stage" \
+    "$FREQUENCY_STATE_SYNC/bundle" > /dev/null 2>&1
+  frequency_state_sync_retry_rc=$?
+  check_eq "frequency marker unlink is directory-synced before fence or evidence mutation" "1" \
+    "$([[ $state_sync_retained -eq 1 && $frequency_state_sync_retry_rc -eq 0 &&
+      ! -e "$FREQUENCY_STATE_SYNC/stage" &&
+      "$(cat "$FREQUENCY_STATE_SYNC/bundle/results/frequency-ab.tsv")" == 'new A/B/A evidence' ]] && echo 1 || echo 0)"
+
+  FREQUENCY_PENDING_BINDING="$TMP/frequency-malformed-pending-binding"
+  mkdir -p "$FREQUENCY_PENDING_BINDING/bundle"/{results,freq,state}
+  prepare_frequency_publish_stage "$FREQUENCY_PENDING_BINDING/stage" 0
+  DIAG_TEST_FREQUENCY_PUBLISH_KILL_AT=binding-pending \
+    bash "$LIB/publish-frequency-output.sh" "$FREQUENCY_PENDING_BINDING/stage" \
+    "$FREQUENCY_PENDING_BINDING/bundle" > /dev/null 2>&1
+  pending_binding_kill_rc=$?
+  cp "$FREQUENCY_PENDING_BINDING/bundle/.frequency-publish.pending/transaction.id.pending" \
+    "$FREQUENCY_PENDING_BINDING/original.pending"
+  printf 'malformed pending binding\n' \
+    > "$FREQUENCY_PENDING_BINDING/bundle/.frequency-publish.pending/transaction.id.pending"
+  bash "$LIB/publish-frequency-output.sh" "$FREQUENCY_PENDING_BINDING/stage" \
+    "$FREQUENCY_PENDING_BINDING/bundle" > /dev/null 2>&1
+  malformed_pending_rc=$?
+  malformed_pending_preserved=0
+  [[ $pending_binding_kill_rc -ne 0 && $malformed_pending_rc -eq 1 &&
+    "$(cat "$FREQUENCY_PENDING_BINDING/bundle/.frequency-publish.pending/transaction.id.pending")" == 'malformed pending binding' &&
+    ! -e "$FREQUENCY_PENDING_BINDING/stage/publish-journal.tsv" &&
+    -f "$FREQUENCY_PENDING_BINDING/stage/results/frequency-ab.tsv" ]] &&
+    malformed_pending_preserved=1
+  cp "$FREQUENCY_PENDING_BINDING/original.pending" \
+    "$FREQUENCY_PENDING_BINDING/bundle/.frequency-publish.pending/transaction.id.pending"
+  chmod 0600 "$FREQUENCY_PENDING_BINDING/bundle/.frequency-publish.pending/transaction.id.pending"
+  bash "$LIB/publish-frequency-output.sh" "$FREQUENCY_PENDING_BINDING/stage" \
+    "$FREQUENCY_PENDING_BINDING/bundle" > /dev/null 2>&1
+  pending_binding_finish_rc=$?
+  check_eq "frequency recovery preserves and rejects a noncanonical pending binding" "1" \
+    "$([[ $malformed_pending_preserved -eq 1 && $pending_binding_finish_rc -eq 0 &&
+      ! -e "$FREQUENCY_PENDING_BINDING/stage" &&
+      ! -e "$FREQUENCY_PENDING_BINDING/bundle/.frequency-publish.pending" ]] && echo 1 || echo 0)"
+
+  FREQUENCY_DEVICE_GUARD="$TMP/frequency-candidate-device-guard"
+  mkdir -p "$FREQUENCY_DEVICE_GUARD/results"
+  printf 'candidate\n' > "$FREQUENCY_DEVICE_GUARD/results/candidate"
+  chmod 0600 "$FREQUENCY_DEVICE_GUARD/results/candidate"
+  (
+    source "$LIB/publish-frequency-transaction.sh"
+    stat() {
+      local last="${!#}"
+      case "$last" in
+        "$FREQUENCY_DEVICE_GUARD/results/candidate") printf '101\n' ;;
+        "$FREQUENCY_DEVICE_GUARD/results") printf '202\n' ;;
+        *) command stat "$@" ;;
+      esac
+    }
+    frequency_tx_same_device "$FREQUENCY_DEVICE_GUARD/results/candidate" \
+      "$FREQUENCY_DEVICE_GUARD/results/final"
+  ) > /dev/null 2>&1
+  frequency_device_guard_rc=$?
+  check_eq "frequency candidate device guard rejects a cross-device publication" "1" \
+    "$([[ $frequency_device_guard_rc -ne 0 &&
+      "$(cat "$FREQUENCY_DEVICE_GUARD/results/candidate")" == candidate ]] && echo 1 || echo 0)"
+
+  frequency_bounds_ok=1
+  for bound_case in \
+    'results/frequency-ab.meta:65537' \
+    'results/frequency-ab.tsv:16777217' \
+    'freq/freq-ab-A1.samples:67108865' \
+    'commands.log:16777217'; do
+    bound_rel="${bound_case%%:*}"
+    bound_size="${bound_case#*:}"
+    bound_root="$TMP/frequency-bound-${bound_rel//\//-}"
+    mkdir -p "$bound_root/bundle"/{results,freq,state}
+    prepare_frequency_publish_stage "$bound_root/stage" 0
+    mkdir -p "$(dirname -- "$bound_root/stage/$bound_rel")"
+    truncate -s "$bound_size" "$bound_root/stage/$bound_rel"
+    chmod 0600 "$bound_root/stage/$bound_rel"
+    touch "$bound_root/bundle/state/phase-frequency.done"
+    write_derived_output_fixture "$bound_root/bundle"
+    bash "$LIB/publish-frequency-output.sh" "$bound_root/stage" "$bound_root/bundle" \
+      > /dev/null 2>&1
+    bound_rc=$?
+    if [[ $bound_rc -ne 76 || -e "$bound_root/stage/publish-journal.tsv" ||
+      -e "$bound_root/bundle/.frequency-publish.pending" ]] ||
+      ! derived_outputs_present "$bound_root/bundle" ||
+      [[ ! -e "$bound_root/bundle/state/phase-frequency.done" ]]; then
+      frequency_bounds_ok=0
+    fi
+  done
+  check_eq "frequency publication enforces bounded artifact and command payloads" "1" \
+    "$frequency_bounds_ok"
+
+  FREQUENCY_UNKNOWN_STAGE="$TMP/frequency-unknown-stage-entry"
+  FREQUENCY_UNKNOWN_BUNDLE="$TMP/frequency-unknown-stage-bundle"
+  mkdir -p "$FREQUENCY_UNKNOWN_BUNDLE"/{results,freq,state}
+  prepare_frequency_publish_stage "$FREQUENCY_UNKNOWN_STAGE" 0
+  printf 'unknown\n' > "$FREQUENCY_UNKNOWN_STAGE/results/.unexpected"
+  chmod 0600 "$FREQUENCY_UNKNOWN_STAGE/results/.unexpected"
+  touch "$FREQUENCY_UNKNOWN_BUNDLE/state/phase-frequency.done"
+  write_derived_output_fixture "$FREQUENCY_UNKNOWN_BUNDLE"
+  bash "$LIB/publish-frequency-output.sh" "$FREQUENCY_UNKNOWN_STAGE" \
+    "$FREQUENCY_UNKNOWN_BUNDLE" > /dev/null 2>&1
+  frequency_unknown_rc=$?
+  check_eq "frequency fixed-name inventory rejects unknown entries before journaling" "1" \
+    "$([[ $frequency_unknown_rc -eq 76 &&
+      ! -e "$FREQUENCY_UNKNOWN_STAGE/publish-journal.tsv" &&
+      -e "$FREQUENCY_UNKNOWN_BUNDLE/state/phase-frequency.done" ]] &&
+      derived_outputs_present "$FREQUENCY_UNKNOWN_BUNDLE" && echo 1 || echo 0)"
+
+  FREQUENCY_FIND_FAIL="$TMP/frequency-find-failure"
+  mkdir -p "$FREQUENCY_FIND_FAIL/bundle"/{results,freq,state} \
+    "$FREQUENCY_FIND_FAIL/fake-bin"
+  prepare_frequency_publish_stage "$FREQUENCY_FIND_FAIL/stage" 0
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$FREQUENCY_FIND_FAIL/fake-bin/find"
+  chmod 0700 "$FREQUENCY_FIND_FAIL/fake-bin/find"
+  touch "$FREQUENCY_FIND_FAIL/bundle/state/phase-frequency.done"
+  write_derived_output_fixture "$FREQUENCY_FIND_FAIL/bundle"
+  PATH="$FREQUENCY_FIND_FAIL/fake-bin:$PATH" \
+    bash "$LIB/publish-frequency-output.sh" "$FREQUENCY_FIND_FAIL/stage" \
+    "$FREQUENCY_FIND_FAIL/bundle" > /dev/null 2>&1
+  frequency_find_fail_rc=$?
+  check_eq "frequency inventory find failure is checked before journaling" "1" \
+    "$([[ $frequency_find_fail_rc -eq 76 &&
+      ! -e "$FREQUENCY_FIND_FAIL/stage/publish-journal.tsv" &&
+      -e "$FREQUENCY_FIND_FAIL/bundle/state/phase-frequency.done" ]] &&
+      derived_outputs_present "$FREQUENCY_FIND_FAIL/bundle" && echo 1 || echo 0)"
+
+  FREQUENCY_FIFO_STAGE="$TMP/frequency-nonblocking-stage"
+  FREQUENCY_FIFO_BUNDLE="$TMP/frequency-nonblocking-bundle"
+  mkdir -p "$FREQUENCY_FIFO_BUNDLE"/{results,freq,state}
+  prepare_frequency_publish_stage "$FREQUENCY_FIFO_STAGE" 0
+  rm -f "$FREQUENCY_FIFO_STAGE/results/frequency-ab.tsv"
+  mkfifo "$FREQUENCY_FIFO_STAGE/results/frequency-ab.tsv"
+  chmod 0600 "$FREQUENCY_FIFO_STAGE/results/frequency-ab.tsv"
+  timeout 5 bash "$LIB/publish-frequency-output.sh" "$FREQUENCY_FIFO_STAGE" \
+    "$FREQUENCY_FIFO_BUNDLE" > /dev/null 2>&1
+  frequency_fifo_rc=$?
+  check_eq "frequency publisher rejects special staged sources without blocking" "1" \
+    "$([[ $frequency_fifo_rc -eq 76 &&
+      ! -e "$FREQUENCY_FIFO_STAGE/publish-journal.tsv" ]] && echo 1 || echo 0)"
+
+  FREQUENCY_IO_HELPER="$TMP/frequency-io-helper"
+  mkdir -p "$FREQUENCY_IO_HELPER"
+  printf 'stable source\n' > "$FREQUENCY_IO_HELPER/source"
+  frequency_io_copy_output="$(node "$LIB/publish-frequency-io.mjs" copy \
+    "$FREQUENCY_IO_HELPER/source" "$FREQUENCY_IO_HELPER/copy" 64)"
+  frequency_io_copy_rc=$?
+  mkfifo "$FREQUENCY_IO_HELPER/fifo"
+  timeout 5 node "$LIB/publish-frequency-io.mjs" hash \
+    "$FREQUENCY_IO_HELPER/fifo" 64 > /dev/null 2>&1
+  frequency_io_fifo_hash_rc=$?
+  timeout 5 node "$LIB/publish-frequency-io.mjs" copy \
+    "$FREQUENCY_IO_HELPER/fifo" "$FREQUENCY_IO_HELPER/fifo-copy" 64 > /dev/null 2>&1
+  frequency_io_fifo_copy_rc=$?
+  timeout 5 node "$LIB/publish-frequency-io.mjs" control \
+    "$FREQUENCY_IO_HELPER/fifo" > /dev/null 2>&1
+  frequency_io_fifo_control_rc=$?
+  timeout 5 node "$LIB/publish-frequency-io.mjs" journal \
+    "$FREQUENCY_IO_HELPER/fifo" > /dev/null 2>&1
+  frequency_io_fifo_journal_rc=$?
+  frequency_io_expected_sha="$(sha256sum "$FREQUENCY_IO_HELPER/source")"
+  frequency_io_expected_sha="${frequency_io_expected_sha%% *}"
+  check_eq "fd-bound frequency I/O reports exact copy size and rejects FIFOs without blocking" "1" \
+    "$([[ $frequency_io_copy_rc -eq 0 &&
+      "$frequency_io_copy_output" == $'14\t'"$frequency_io_expected_sha" &&
+      "$(stat -Lc '%s:%a:%h' "$FREQUENCY_IO_HELPER/copy")" == '14:600:1' &&
+      $frequency_io_fifo_hash_rc -ne 0 && $frequency_io_fifo_hash_rc -ne 124 &&
+      $frequency_io_fifo_copy_rc -ne 0 && $frequency_io_fifo_copy_rc -ne 124 &&
+      $frequency_io_fifo_control_rc -ne 0 && $frequency_io_fifo_control_rc -ne 124 &&
+      $frequency_io_fifo_journal_rc -ne 0 && $frequency_io_fifo_journal_rc -ne 124 &&
+      ! -e "$FREQUENCY_IO_HELPER/fifo-copy" ]] && echo 1 || echo 0)"
+
+  FREQUENCY_TX_TAMPER="$TMP/frequency-journal-third-value"
+  mkdir -p "$FREQUENCY_TX_TAMPER/bundle"/{results,freq,state}
+  prepare_frequency_publish_stage "$FREQUENCY_TX_TAMPER/stage" 0
+  printf 'old evidence\n' > "$FREQUENCY_TX_TAMPER/bundle/results/frequency-ab.tsv"
+  printf 'old command\n' > "$FREQUENCY_TX_TAMPER/bundle/commands.log"
+  DIAG_TEST_FREQUENCY_PUBLISH_KILL_AT=first-artifact-installed \
+    bash "$LIB/publish-frequency-output.sh" "$FREQUENCY_TX_TAMPER/stage" \
+    "$FREQUENCY_TX_TAMPER/bundle" > /dev/null 2>&1
+  frequency_tamper_kill_rc=$?
+  printf 'third value\n' > "$FREQUENCY_TX_TAMPER/bundle/results/frequency-ab.tsv"
+  bash "$LIB/publish-frequency-output.sh" "$FREQUENCY_TX_TAMPER/stage" \
+    "$FREQUENCY_TX_TAMPER/bundle" > /dev/null 2>&1
+  frequency_tamper_first_rc=$?
+  bash "$LIB/publish-frequency-output.sh" "$FREQUENCY_TX_TAMPER/stage" \
+    "$FREQUENCY_TX_TAMPER/bundle" > /dev/null 2>&1
+  frequency_tamper_second_rc=$?
+  frequency_tamper_retained=0
+  [[ $frequency_tamper_kill_rc -ne 0 && $frequency_tamper_first_rc -eq 1 &&
+    $frequency_tamper_second_rc -eq 1 &&
+    -f "$FREQUENCY_TX_TAMPER/stage/publish-journal.tsv" &&
+    -f "$FREQUENCY_TX_TAMPER/stage/results/frequency-ab.tsv" &&
+    "$(cat "$FREQUENCY_TX_TAMPER/bundle/results/frequency-ab.tsv")" == 'third value' ]] &&
+    frequency_tamper_retained=1
+  cp "$FREQUENCY_TX_TAMPER/stage/results/frequency-ab.tsv" \
+    "$FREQUENCY_TX_TAMPER/bundle/results/frequency-ab.tsv"
+  bash "$LIB/publish-frequency-output.sh" "$FREQUENCY_TX_TAMPER/stage" \
+    "$FREQUENCY_TX_TAMPER/bundle" > /dev/null 2>&1
+  frequency_tamper_repair_rc=$?
+  check_eq "journal rejects repeatable third-value tamper then resumes from matching new evidence" "1" \
+    "$([[ $frequency_tamper_retained -eq 1 && $frequency_tamper_repair_rc -eq 0 &&
+      ! -e "$FREQUENCY_TX_TAMPER/stage" &&
+      "$(grep -c '^new command$' "$FREQUENCY_TX_TAMPER/bundle/commands.log")" == 1 ]] && echo 1 || echo 0)"
+
+  FREQUENCY_TX_COMMITTED="$TMP/frequency-journal-committed-cleanup"
+  mkdir -p "$FREQUENCY_TX_COMMITTED/bundle"/{results,freq,state}
+  prepare_frequency_publish_stage "$FREQUENCY_TX_COMMITTED/stage" 0
+  printf 'old command\n' > "$FREQUENCY_TX_COMMITTED/bundle/commands.log"
+  DIAG_TEST_FREQUENCY_PUBLISH_KILL_AT=journal-committed \
+    bash "$LIB/publish-frequency-output.sh" "$FREQUENCY_TX_COMMITTED/stage" \
+    "$FREQUENCY_TX_COMMITTED/bundle" > /dev/null 2>&1
+  committed_kill_rc=$?
+  printf 'post-commit writer\n' >> "$FREQUENCY_TX_COMMITTED/bundle/commands.log"
+  bash "$LIB/publish-frequency-output.sh" "$FREQUENCY_TX_COMMITTED/stage" \
+    "$FREQUENCY_TX_COMMITTED/bundle" > /dev/null 2>&1
+  committed_cleanup_rc=$?
+  check_eq "COMMITTED retry performs cleanup only without revalidating or appending commands" "1" \
+    "$([[ $committed_kill_rc -ne 0 && $committed_cleanup_rc -eq 0 &&
+      ! -e "$FREQUENCY_TX_COMMITTED/stage" &&
+      ! -e "$FREQUENCY_TX_COMMITTED/bundle/.frequency-publish.pending" &&
+      "$(grep -c '^new command$' "$FREQUENCY_TX_COMMITTED/bundle/commands.log")" == 1 &&
+      "$(grep -c '^post-commit writer$' "$FREQUENCY_TX_COMMITTED/bundle/commands.log")" == 1 ]] && echo 1 || echo 0)"
+
+  FREQUENCY_FOREIGN_FENCE="$TMP/frequency-foreign-generation-fence"
+  mkdir -p "$FREQUENCY_FOREIGN_FENCE/bundle"/{results,freq,state}
+  prepare_frequency_publish_stage "$FREQUENCY_FOREIGN_FENCE/stage" 0
+  DIAG_TEST_FREQUENCY_PUBLISH_KILL_AT=journal-committed \
+    bash "$LIB/publish-frequency-output.sh" "$FREQUENCY_FOREIGN_FENCE/stage" \
+    "$FREQUENCY_FOREIGN_FENCE/bundle" > /dev/null 2>&1
+  foreign_fence_kill_rc=$?
+  cp "$FREQUENCY_FOREIGN_FENCE/bundle/.frequency-publish.pending/transaction.id" \
+    "$FREQUENCY_FOREIGN_FENCE/original-transaction.id"
+  foreign_bundle_id="$(stat -Lc '%d:%i' "$FREQUENCY_FOREIGN_FENCE/bundle")"
+  printf 'TRANSACTION\tffffffffffffffffffffffffffffffff\nBUNDLE_ID\t%s\n' \
+    "$foreign_bundle_id" \
+    > "$FREQUENCY_FOREIGN_FENCE/bundle/.frequency-publish.pending/transaction.id"
+  printf 'foreign candidate\n' \
+    > "$FREQUENCY_FOREIGN_FENCE/bundle/.commands.log.frequency-publish.pending"
+  chmod 0600 "$FREQUENCY_FOREIGN_FENCE/bundle/.frequency-publish.pending/transaction.id" \
+    "$FREQUENCY_FOREIGN_FENCE/bundle/.commands.log.frequency-publish.pending"
+  bash "$LIB/publish-frequency-output.sh" "$FREQUENCY_FOREIGN_FENCE/stage" \
+    "$FREQUENCY_FOREIGN_FENCE/bundle" > /dev/null 2>&1
+  foreign_fence_retry_rc=$?
+  foreign_fence_preserved=0
+  [[ $foreign_fence_kill_rc -ne 0 && $foreign_fence_retry_rc -eq 1 &&
+    "$(sed -n 's/^TRANSACTION\t//p' "$FREQUENCY_FOREIGN_FENCE/bundle/.frequency-publish.pending/transaction.id")" == ffffffffffffffffffffffffffffffff &&
+    "$(cat "$FREQUENCY_FOREIGN_FENCE/bundle/.commands.log.frequency-publish.pending")" == 'foreign candidate' &&
+    -f "$FREQUENCY_FOREIGN_FENCE/stage/publish-journal.tsv" &&
+    -f "$FREQUENCY_FOREIGN_FENCE/stage/results/frequency-ab.tsv" ]] &&
+    foreign_fence_preserved=1
+  cp "$FREQUENCY_FOREIGN_FENCE/original-transaction.id" \
+    "$FREQUENCY_FOREIGN_FENCE/bundle/.frequency-publish.pending/transaction.id"
+  chmod 0600 "$FREQUENCY_FOREIGN_FENCE/bundle/.frequency-publish.pending/transaction.id"
+  bash "$LIB/publish-frequency-output.sh" "$FREQUENCY_FOREIGN_FENCE/stage" \
+    "$FREQUENCY_FOREIGN_FENCE/bundle" > /dev/null 2>&1
+  foreign_fence_finish_rc=$?
+  check_eq "COMMITTED cleanup preserves a foreign generation fence and its candidates" "1" \
+    "$([[ $foreign_fence_preserved -eq 1 && $foreign_fence_finish_rc -eq 0 &&
+      ! -e "$FREQUENCY_FOREIGN_FENCE/stage" &&
+      ! -e "$FREQUENCY_FOREIGN_FENCE/bundle/.frequency-publish.pending" ]] && echo 1 || echo 0)"
+
+  FREQUENCY_TX_RETRYABLE="$TMP/frequency-journal-retryable-validation"
+  mkdir -p "$FREQUENCY_TX_RETRYABLE/bundle"/{results,freq,state}
+  prepare_frequency_publish_stage "$FREQUENCY_TX_RETRYABLE/stage" 0
+  DIAG_TEST_FREQUENCY_PUBLISH_KILL_AT=journal-prepared \
+    bash "$LIB/publish-frequency-output.sh" "$FREQUENCY_TX_RETRYABLE/stage" \
+    "$FREQUENCY_TX_RETRYABLE/bundle" > /dev/null 2>&1
+  retryable_kill_rc=$?
+  chmod 0755 "$FREQUENCY_TX_RETRYABLE/stage"
+  bash "$LIB/publish-frequency-output.sh" "$FREQUENCY_TX_RETRYABLE/stage" \
+    "$FREQUENCY_TX_RETRYABLE/bundle" > /dev/null 2>&1
+  retryable_validation_rc=$?
+  retryable_retained=0
+  [[ $retryable_kill_rc -ne 0 && $retryable_validation_rc -eq 1 &&
+    -f "$FREQUENCY_TX_RETRYABLE/stage/publish-journal.tsv" &&
+    -f "$FREQUENCY_TX_RETRYABLE/bundle/.frequency-publish.pending/transaction.id" ]] &&
+    retryable_retained=1
+  chmod 0700 "$FREQUENCY_TX_RETRYABLE/stage"
+  bash "$LIB/publish-frequency-output.sh" "$FREQUENCY_TX_RETRYABLE/stage" \
+    "$FREQUENCY_TX_RETRYABLE/bundle" > /dev/null 2>&1
+  retryable_finish_rc=$?
+  check_eq "post-journal validation failures stay retryable and retain the exact transaction" "1" \
+    "$([[ $retryable_retained -eq 1 && $retryable_finish_rc -eq 0 &&
+      ! -e "$FREQUENCY_TX_RETRYABLE/stage" &&
+      ! -e "$FREQUENCY_TX_RETRYABLE/bundle/.frequency-publish.pending" ]] && echo 1 || echo 0)"
+
+  FREQUENCY_TX_PARENT="$TMP/frequency-nonwritable-parent"
+  FREQUENCY_TX_PARENT_STAGE="$TMP/frequency-nonwritable-parent-stage"
+  mkdir -p "$FREQUENCY_TX_PARENT/bundle"/{results,freq,state}
+  prepare_frequency_publish_stage "$FREQUENCY_TX_PARENT_STAGE" 0
+  chmod 0555 "$FREQUENCY_TX_PARENT"
+  bash "$LIB/publish-frequency-output.sh" "$FREQUENCY_TX_PARENT_STAGE" \
+    "$FREQUENCY_TX_PARENT/bundle" > /dev/null 2>&1
+  nonwritable_parent_rc=$?
+  chmod 0700 "$FREQUENCY_TX_PARENT"
+  check_eq "frequency transaction needs only bundle write access, not parent write access" "1" \
+    "$([[ $nonwritable_parent_rc -eq 0 && ! -e "$FREQUENCY_TX_PARENT_STAGE" &&
+      ! -e "$FREQUENCY_TX_PARENT/bundle/.frequency-publish.pending" ]] && echo 1 || echo 0)"
+
+  FREQUENCY_FENCE_BUNDLE="$TMP/frequency-publisher-fence-resume"
+  cp -a "$CPU_POLICY_RB" "$FREQUENCY_FENCE_BUNDLE"
+  mkdir -m 0700 "$FREQUENCY_FENCE_BUNDLE/.frequency-publish.pending"
+  frequency_fence_output="$(
+    "$REPO_ROOT/diagnose.sh" --resume "$FREQUENCY_FENCE_BUNDLE" --dry-run --yes 2>&1
+  )"
+  frequency_fence_rc=$?
+  check_eq "diagnose refuses a bundle fenced by a frequency publication" "1" \
+    "$([[ $frequency_fence_rc -ne 0 && "$frequency_fence_output" == *'frequency publication transaction is pending'* ]] && echo 1 || echo 0)"
 
   COMMAND_LINK_BUNDLE="$TMP/frequency-command-link-bundle"
   COMMAND_LINK_STAGE="$TMP/frequency-command-link-stage"
@@ -2806,6 +3368,12 @@ else
   ok "busy frequency recovery retains its exact stage and record for retry [skipped while tests run as root]"
   ok "frequency staging record rejects control-character ambiguity [skipped while tests run as root]"
   ok "unrecorded deterministic stage is explicitly handed off [skipped while tests run as root]"
+  ok "journaled frequency publication converges after every durable cut point [skipped while tests run as root]"
+  ok "journal rejects repeatable third-value tamper then resumes from matching new evidence [skipped while tests run as root]"
+  ok "COMMITTED retry performs cleanup only without revalidating or appending commands [skipped while tests run as root]"
+  ok "post-journal validation failures stay retryable and retain the exact transaction [skipped while tests run as root]"
+  ok "frequency transaction needs only bundle write access, not parent write access [skipped while tests run as root]"
+  ok "diagnose refuses a bundle fenced by a frequency publication [skipped while tests run as root]"
 fi
 
 if ((EUID != 0)); then
@@ -2846,6 +3414,17 @@ if ((EUID != 0)); then
   root_busy_retry_rc=$?
   check_eq "root-check publication retries after the bundle lock is released" "1" \
     "$([[ $root_busy_retry_rc -eq 0 && ! -e "$ROOT_BUSY/stage" ]] && derived_outputs_absent "$ROOT_BUSY/real/bundle" && node "$LIB/root-checks-evidence.mjs" --validate-complete "$ROOT_BUSY/real/bundle" > /dev/null 2>&1 && echo 1 || echo 0)"
+
+  ROOT_FREQUENCY_FENCE="$TMP/root-checks-frequency-fence"
+  root_publish_stage_prepare "$ROOT_FREQUENCY_FENCE/stage"
+  mkdir -p "$ROOT_FREQUENCY_FENCE/bundle/.frequency-publish.pending"
+  bash "$LIB/publish-root-checks-output.sh" "$ROOT_FREQUENCY_FENCE/stage" \
+    "$ROOT_FREQUENCY_FENCE/bundle" > /dev/null 2>&1
+  root_frequency_fence_rc=$?
+  check_eq "root-check publisher refuses a pending frequency transaction" "1" \
+    "$([[ $root_frequency_fence_rc -eq 75 &&
+      -f "$ROOT_FREQUENCY_FENCE/stage/root-checks.meta" &&
+      -d "$ROOT_FREQUENCY_FENCE/bundle/.frequency-publish.pending" ]] && echo 1 || echo 0)"
 
   ROOT_PUBLISH="$TMP/root-checks-publish"
   root_publish_stage_prepare "$ROOT_PUBLISH/stage"
@@ -2965,6 +3544,7 @@ if ((EUID != 0)); then
 else
   ok "busy root-checks publisher returns 75 without mutating stage or bundle [skipped while tests run as root]"
   ok "root-check publication retries after the bundle lock is released [skipped while tests run as root]"
+  ok "root-check publisher refuses a pending frequency transaction [skipped while tests run as root]"
   ok "root-checks publisher invalidates derived outputs before replacing evidence [skipped while tests run as root]"
   ok "killed root-check publication exposes no mixed or hash-mismatched snapshot [skipped while tests run as root]"
   ok "root-check publication retry completes one validated generation [skipped while tests run as root]"

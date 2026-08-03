@@ -133,7 +133,7 @@ frequency_command_available() {
 
 frequency_output_recovery_requirements_available() {
   local dep
-  for dep in runuser sha256sum sync; do
+  for dep in dd find node runuser sha256sum sync; do
     frequency_command_available "$dep" || {
       diag_warn "cannot retry pending frequency publication: missing required command: $dep"
       return 1
@@ -143,6 +143,12 @@ frequency_output_recovery_requirements_available() {
     ! -L "$SCRIPT_DIR/diagnose-lib/publish-frequency-output.sh" &&
     -r "$SCRIPT_DIR/diagnose-lib/publish-frequency-output.sh" ]] || {
     diag_warn "cannot retry pending frequency publication: publisher helper is missing or unsafe"
+    return 1
+  }
+  [[ -f "$SCRIPT_DIR/diagnose-lib/publish-frequency-io.mjs" &&
+    ! -L "$SCRIPT_DIR/diagnose-lib/publish-frequency-io.mjs" &&
+    -r "$SCRIPT_DIR/diagnose-lib/publish-frequency-io.mjs" ]] || {
+    diag_warn "cannot retry pending frequency publication: publisher I/O helper is missing or unsafe"
     return 1
   }
 }
@@ -541,7 +547,7 @@ if [[ -n "$CAP_KHZ" ]]; then
   ((CAP_KHZ >= 100000)) || diag_die "--cap must be >= 100000 kHz"
 fi
 
-for dep in node runuser setsid sha256sum sync taskset; do
+for dep in dd find node runuser setsid sha256sum sync taskset; do
   command -v "$dep" > /dev/null 2>&1 || diag_die "missing required command: $dep"
 done
 

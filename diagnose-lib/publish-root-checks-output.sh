@@ -35,6 +35,11 @@ bundle="$2"
 lock_rc=0
 diag_bundle_lock_acquire "$bundle" || lock_rc=$?
 ((lock_rc == 0)) || exit "$lock_rc"
+[[ ! -e "$bundle/.frequency-publish.pending" &&
+  ! -L "$bundle/.frequency-publish.pending" ]] || {
+  echo "error: refusing root-check publication while a frequency transaction is pending" >&2
+  exit 75
+}
 
 # Root has already handed staging to the invoking user. All validation and
 # every destination mutation below are now serialized under that user's lock.

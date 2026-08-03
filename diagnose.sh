@@ -3869,6 +3869,9 @@ main() {
     local resume_lock_rc=0
     diag_bundle_lock_acquire "$OUT_DIR" || resume_lock_rc=$?
     ((resume_lock_rc == 0)) || return "$resume_lock_rc"
+    [[ ! -e "$OUT_DIR/.frequency-publish.pending" &&
+      ! -L "$OUT_DIR/.frequency-publish.pending" ]] ||
+      diag_die "a frequency publication transaction is pending; retry frequency-ab.sh before resuming diagnostics"
     META_FILE="$OUT_DIR/results/meta.env"
     STATE_DIR="$OUT_DIR/state"
     bundle_mutable_graph_validate
