@@ -127,19 +127,41 @@ frequency_quarantine_stage() {
   frequency_stage_record_clear
 }
 
+frequency_command_available() {
+  command -v "$1" > /dev/null 2>&1
+}
+
+frequency_output_recovery_requirements_available() {
+  local dep
+  for dep in runuser sha256sum sync; do
+    frequency_command_available "$dep" || {
+      diag_warn "cannot retry pending frequency publication: missing required command: $dep"
+      return 1
+    }
+  done
+  [[ -f "$SCRIPT_DIR/diagnose-lib/publish-frequency-output.sh" &&
+    ! -L "$SCRIPT_DIR/diagnose-lib/publish-frequency-output.sh" &&
+    -r "$SCRIPT_DIR/diagnose-lib/publish-frequency-output.sh" ]] || {
+    diag_warn "cannot retry pending frequency publication: publisher helper is missing or unsafe"
+    return 1
+  }
+}
+
 frequency_publish_outputs() {
   [[ -n "$FREQUENCY_STAGE_DIR" ]] || return 0
   ((FREQUENCY_OUTPUTS_PUBLISHED == 0)) || return 0
 
-  local dir rel file tag
+  local dir rel file tag metadata
   for dir in "$FREQUENCY_STAGE_DIR" "$FREQUENCY_STAGE_DIR/results" "$FREQUENCY_STAGE_DIR/freq"; do
     [[ -d "$dir" && ! -L "$dir" ]] || {
       diag_warn "frequency output staging directory became unsafe; partial evidence remains in $FREQUENCY_STAGE_DIR"
-      return 1
+      return 76
     }
-    [[ "$(stat -Lc '%u:%g:%a' -- "$dir" 2> /dev/null)" == "0:0:700" ]] || {
+    metadata="$(stat -Lc '%u:%g:%a' -- "$dir" 2> /dev/null)" || return 1
+    [[ "$metadata" == "0:0:700" ||
+      "$metadata" == "$INVOKING_UID:$INVOKING_GID:700" ]] || {
       diag_warn "frequency output staging directory has unsafe ownership or mode; partial evidence remains in $FREQUENCY_STAGE_DIR"
-      return 1
+      return 76
     }
   done
 
@@ -161,11 +183,13 @@ frequency_publish_outputs() {
     file="$FREQUENCY_STAGE_DIR/$rel"
     [[ -f "$file" && ! -L "$file" ]] || {
       diag_warn "unsafe staged frequency artifact $rel; partial evidence remains in $FREQUENCY_STAGE_DIR"
-      return 1
+      return 76
     }
-    [[ "$(stat -Lc '%u:%g:%a:%h' -- "$file" 2> /dev/null)" == "0:0:600:1" ]] || {
+    metadata="$(stat -Lc '%u:%g:%a:%h' -- "$file" 2> /dev/null)" || return 1
+    [[ "$metadata" == "0:0:600:1" ||
+      "$metadata" == "$INVOKING_UID:$INVOKING_GID:600:1" ]] || {
       diag_warn "staged frequency artifact $rel has unsafe ownership, mode, or links; partial evidence remains in $FREQUENCY_STAGE_DIR"
-      return 1
+      return 76
     }
   done
 
@@ -225,8 +249,21 @@ frequency_recover_pending_outputs() {
   fi
   frequency_stage_record_read pending_bundle || {
     diag_warn "durable frequency staging record is malformed or unsafe"
+    if diag_restore_private_file_is_safe \
+      "$FREQUENCY_STAGE_RECORD" "$FREQUENCY_STATE_UID" "$FREQUENCY_STATE_GID"; then
+      frequency_output_recovery_requirements_available || return 1
+      frequency_quarantine_stage "malformed durable frequency staging record" || return 1
+      FREQUENCY_STAGE_DIR="/tmp/node-pglite-frequency-uid-$INVOKING_UID"
+      FREQUENCY_OUTPUTS_PUBLISHED=0
+      return 0
+    fi
     return 1
   }
+
+  # Restoring saved system settings never depends on the unprivileged output
+  # publisher. Check its dependencies only after the restore has completed and
+  # only when an exact recorded stage actually needs publication.
+  frequency_output_recovery_requirements_available || return 1
 
   BUNDLE="$pending_bundle"
   FREQUENCY_OUTPUTS_PUBLISHED=0
@@ -261,9 +298,19 @@ frequency_recover_pending_outputs() {
   fi
 
   BUNDLE="$requested_bundle"
-  frequency_quarantine_stage "could not republish frequency evidence left by a killed invocation" || return 1
-  FREQUENCY_STAGE_DIR="/tmp/node-pglite-frequency-uid-$INVOKING_UID"
+  if ((publish_rc == 76)); then
+    frequency_quarantine_stage "unsafe or malformed frequency evidence left by a killed invocation" || return 1
+    FREQUENCY_STAGE_DIR="/tmp/node-pglite-frequency-uid-$INVOKING_UID"
+    FREQUENCY_OUTPUTS_PUBLISHED=0
+    return 0
+  fi
+
+  # Missing helpers and unusable or absent recorded destinations are
+  # retryable. Keep the exact stage and durable destination record together;
+  # the next invocation can retry after the environment is repaired.
   FREQUENCY_OUTPUTS_PUBLISHED=0
+  diag_warn "could not republish pending frequency evidence; retained its exact stage and record for retry"
+  return 1
 }
 
 frequency_initial_no_turbo_read() {
@@ -276,6 +323,10 @@ frequency_initial_no_turbo_read() {
   ((${#lines[@]} == 1)) || return 1
   [[ "${lines[0]}" == 0 || "${lines[0]}" == 1 ]] || return 1
   output_ref="${lines[0]}"
+}
+
+frequency_workload_script_available() {
+  [[ -f "$SCRIPT_DIR/child.mjs" && ! -L "$SCRIPT_DIR/child.mjs" ]]
 }
 
 # A killed prior invocation may have left no_turbo=1 together with durable
@@ -394,27 +445,13 @@ CAP_KHZ=""
 while (($#)); do
   case "$1" in
     --cap)
-      CAP_KHZ="${2:?--cap needs a kHz value}"
+      (($# >= 2)) || usage
+      CAP_KHZ="$2"
       shift 2
       ;;
     *) usage ;;
   esac
 done
-
-diag_require_uint "cpu" "$CPU"
-diag_require_safe_positive_uint "runs-per-leg" "$RUNS"
-[[ "$CPU" =~ ^(0|[1-9][0-9]*)$ && ${#CPU} -le 15 ]] ||
-  diag_die "cpu must be a canonical safe non-negative integer"
-((CPU <= 65535)) || diag_die "cpu must be <= 65535"
-if [[ -n "$CAP_KHZ" ]]; then
-  diag_require_uint "--cap" "$CAP_KHZ"
-  [[ "$CAP_KHZ" =~ ^[1-9][0-9]*$ && ${#CAP_KHZ} -le 15 ]] ||
-    diag_die "--cap must be a canonical safe positive integer"
-  ((CAP_KHZ >= 100000)) || diag_die "--cap must be >= 100000 kHz"
-fi
-[[ -d "$BUNDLE" ]] || diag_die "bundle directory '$BUNDLE' does not exist"
-BUNDLE="$(diag_canonical_dir "$BUNDLE")"
-[[ -f child.mjs ]] || diag_die "child.mjs not found; run from the repository checkout"
 
 if ((EUID != 0)); then
   echo "error: this script changes intel_pstate settings; run it with sudo." >&2
@@ -422,25 +459,13 @@ if ((EUID != 0)); then
   exit 4
 fi
 
-for dep in flock node runuser setsid sha256sum stat sync taskset; do
+# These commands are part of the secure settings-recovery bootstrap itself.
+# Output-publisher and new-run dependencies are checked only after restore.
+for dep in flock id readlink stat; do
   command -v "$dep" > /dev/null 2>&1 || diag_die "missing required command: $dep"
 done
 
 NO_TURBO_PATH="/sys/devices/system/cpu/intel_pstate/no_turbo"
-if [[ ! -e "$NO_TURBO_PATH" ]]; then
-  diag_die "intel_pstate/no_turbo not present; A/B/A not applicable on this system"
-fi
-
-POLICY="$(readlink -f "/sys/devices/system/cpu/cpu${CPU}/cpufreq" 2> /dev/null || echo "")"
-[[ -n "$POLICY" ]] || diag_warn "no cpufreq policy found for cpu $CPU"
-CAP_SCALING_MAX_PATH=""
-CAP_PREFLIGHT_SCALING_MAX=""
-CAP_REQUESTED=0
-[[ -n "$CAP_KHZ" ]] && CAP_REQUESTED=1
-
-DIAG_BUNDLE_ROOT="$BUNDLE"
-DIAG_REPO_ROOT="$SCRIPT_DIR"
-
 [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]] ||
   diag_die "run through sudo from a non-root account so bundle output can be published without root privileges"
 diag_require_uint "SUDO_UID" "${SUDO_UID:-}"
@@ -500,6 +525,43 @@ case "$recovery_rc" in
   11) diag_die "refusing to start while prior frequency staging cannot be safely recovered" ;;
   *) diag_die "could not recover prior frequency experiment state" ;;
 esac
+
+# Everything below is exclusively a semantic prerequisite or applicability
+# decision for a new experiment. Pending recovery above must happen even when
+# any of these checks rejects the requested run.
+diag_require_uint "cpu" "$CPU"
+diag_require_safe_positive_uint "runs-per-leg" "$RUNS"
+[[ "$CPU" =~ ^(0|[1-9][0-9]*)$ && ${#CPU} -le 15 ]] ||
+  diag_die "cpu must be a canonical safe non-negative integer"
+((CPU <= 65535)) || diag_die "cpu must be <= 65535"
+if [[ -n "$CAP_KHZ" ]]; then
+  diag_require_uint "--cap" "$CAP_KHZ"
+  [[ "$CAP_KHZ" =~ ^[1-9][0-9]*$ && ${#CAP_KHZ} -le 15 ]] ||
+    diag_die "--cap must be a canonical safe positive integer"
+  ((CAP_KHZ >= 100000)) || diag_die "--cap must be >= 100000 kHz"
+fi
+
+for dep in node runuser setsid sha256sum sync taskset; do
+  command -v "$dep" > /dev/null 2>&1 || diag_die "missing required command: $dep"
+done
+
+[[ -d "$BUNDLE" ]] || diag_die "bundle directory '$BUNDLE' does not exist"
+BUNDLE="$(diag_canonical_dir "$BUNDLE")"
+frequency_workload_script_available ||
+  diag_die "child.mjs not found in the repository checkout"
+cd "$SCRIPT_DIR"
+[[ -e "$NO_TURBO_PATH" ]] ||
+  diag_die "intel_pstate/no_turbo not present; A/B/A not applicable on this system"
+
+POLICY="$(readlink -f "/sys/devices/system/cpu/cpu${CPU}/cpufreq" 2> /dev/null || echo "")"
+[[ -n "$POLICY" ]] || diag_warn "no cpufreq policy found for cpu $CPU"
+CAP_SCALING_MAX_PATH=""
+CAP_PREFLIGHT_SCALING_MAX=""
+CAP_REQUESTED=0
+[[ -n "$CAP_KHZ" ]] && CAP_REQUESTED=1
+
+DIAG_BUNDLE_ROOT="$BUNDLE"
+DIAG_REPO_ROOT="$SCRIPT_DIR"
 
 # Validate the recovered state before any check or mutation associated with a
 # new experiment. Refusal happens before saving a new restore entry, changing
@@ -582,8 +644,6 @@ frequency_publish_control_write \
   diag_die "could not durably record the frequency publication inventory"
 frequency_stage_record_write "$BUNDLE" ||
   diag_die "could not durably record the frequency output staging transaction"
-
-cd "$SCRIPT_DIR"
 
 TSV="$FREQUENCY_STAGE_DIR/results/frequency-ab.tsv"
 META="$FREQUENCY_STAGE_DIR/results/frequency-ab.meta"

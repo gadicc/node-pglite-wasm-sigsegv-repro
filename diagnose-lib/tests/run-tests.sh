@@ -2120,6 +2120,72 @@ printf '1\n' > "$FREQUENCY_INITIAL/no-turbo"
 ) > /dev/null 2>&1
 check_eq "frequency applicability is evaluated after durable recovery" "0" "$?"
 
+frequency_recovery_line="$(awk '/frequency_recover_prior_state \|\| recovery_rc=/ { print NR; exit }' "$REPO_ROOT/frequency-ab.sh")"
+frequency_cap_semantic_line="$(awk '/diag_require_uint "--cap"/ { print NR; exit }' "$REPO_ROOT/frequency-ab.sh")"
+frequency_dependency_line="$(awk '/for dep in node runuser setsid sha256sum sync taskset/ { print NR; exit }' "$REPO_ROOT/frequency-ab.sh")"
+frequency_bundle_gate_line="$(awk '/\[\[ -d "\$BUNDLE" \]\]/ { print NR; exit }' "$REPO_ROOT/frequency-ab.sh")"
+frequency_child_gate_line="$(awk '/^frequency_workload_script_available \|\|/ { print NR; exit }' "$REPO_ROOT/frequency-ab.sh")"
+frequency_no_turbo_gate_line="$(awk '/\[\[ -e "\$NO_TURBO_PATH" \]\]/ { print NR; exit }' "$REPO_ROOT/frequency-ab.sh")"
+frequency_legacy_gate_line="$(awk '/^LEGACY_RESTORE_FILE=/ { print NR; exit }' "$REPO_ROOT/frequency-ab.sh")"
+frequency_restore_rules_line="$(awk '/^declare -a restore_rules=/ { print NR; exit }' "$REPO_ROOT/frequency-ab.sh")"
+frequency_ordering_ok=0
+if [[ -n "$frequency_recovery_line" && -n "$frequency_cap_semantic_line" &&
+  -n "$frequency_dependency_line" && -n "$frequency_bundle_gate_line" &&
+  -n "$frequency_child_gate_line" && -n "$frequency_no_turbo_gate_line" &&
+  -n "$frequency_legacy_gate_line" && -n "$frequency_restore_rules_line" ]] &&
+  ((frequency_restore_rules_line < frequency_recovery_line &&
+    frequency_recovery_line < frequency_cap_semantic_line &&
+    frequency_recovery_line < frequency_dependency_line &&
+    frequency_recovery_line < frequency_bundle_gate_line &&
+    frequency_recovery_line < frequency_child_gate_line &&
+    frequency_recovery_line < frequency_no_turbo_gate_line &&
+    frequency_recovery_line < frequency_legacy_gate_line)); then
+  frequency_ordering_ok=1
+fi
+check_eq "frequency restore/stage recovery precedes every new-run-only gate" "1" "$frequency_ordering_ok"
+
+FREQUENCY_MISSING_PUBLISHER_DEP="$TMP/frequency-missing-publisher-dependency"
+mkdir -m 0700 "$FREQUENCY_MISSING_PUBLISHER_DEP" \
+  "$FREQUENCY_MISSING_PUBLISHER_DEP/stage" "$FREQUENCY_MISSING_PUBLISHER_DEP/state"
+printf '/missing/recorded/bundle\n' > "$FREQUENCY_MISSING_PUBLISHER_DEP/state/output-stage.pending"
+chmod 0600 "$FREQUENCY_MISSING_PUBLISHER_DEP/state/output-stage.pending"
+printf 'pending\n' > "$FREQUENCY_MISSING_PUBLISHER_DEP/setting"
+(
+  FREQUENCY_AB_SOURCE_ONLY=1
+  source "$REPO_ROOT/frequency-ab.sh"
+  INVOKING_UID="$(id -u)"
+  INVOKING_GID="$(id -g)"
+  FREQUENCY_STATE_UID="$INVOKING_UID"
+  FREQUENCY_STATE_GID="$INVOKING_GID"
+  FREQUENCY_STAGE_DIR="$FREQUENCY_MISSING_PUBLISHER_DEP/stage"
+  FREQUENCY_STAGE_RECORD="$FREQUENCY_MISSING_PUBLISHER_DEP/state/output-stage.pending"
+  BUNDLE="$FREQUENCY_MISSING_PUBLISHER_DEP/missing-requested-bundle"
+  recovery_order=""
+  diag_recover_pending_restore() {
+    recovery_order="${recovery_order}restore,"
+    printf 'restored\n' > "$FREQUENCY_MISSING_PUBLISHER_DEP/setting"
+  }
+  frequency_command_available() {
+    recovery_order="${recovery_order}dependency-$1,"
+    [[ "$1" != runuser ]]
+  }
+  recovery_rc=0
+  frequency_recover_prior_state || recovery_rc=$?
+  [[ "$recovery_rc" == 11 && "$recovery_order" == "restore,dependency-runuser," &&
+    "$(cat "$FREQUENCY_MISSING_PUBLISHER_DEP/setting")" == restored &&
+    -d "$FREQUENCY_STAGE_DIR" && -f "$FREQUENCY_STAGE_RECORD" ]] &&
+    ! compgen -G "$FREQUENCY_MISSING_PUBLISHER_DEP/stage.unpublished.*" > /dev/null
+) > /dev/null 2>&1
+check_eq "settings restore precedes missing publisher dependencies and retains exact stage" "0" "$?"
+
+(
+  cd "$TMP"
+  FREQUENCY_AB_SOURCE_ONLY=1
+  source "$REPO_ROOT/frequency-ab.sh"
+  frequency_workload_script_available && [[ "$PWD" != "$SCRIPT_DIR" ]]
+) > /dev/null 2>&1
+check_eq "frequency workload path is repository-absolute outside the checkout" "0" "$?"
+
 printf '1\n' > "$FREQUENCY_INITIAL/no-turbo"
 (
   FREQUENCY_AB_SOURCE_ONLY=1
@@ -2594,6 +2660,95 @@ if ((EUID != 0)); then
   exec {busy_recovery_fd}<&-
   check_eq "busy frequency recovery retains its exact stage and record for retry" "1" \
     "$([[ $busy_recovery_rc -eq 75 && -f "$BUSY_RECOVERY/stage/results/frequency-ab.tsv" && -f "$BUSY_RECOVERY/state/output-stage.pending" ]] && derived_outputs_present "$BUSY_RECOVERY/old-bundle" && ! compgen -G "$BUSY_RECOVERY/stage.unpublished.*" > /dev/null && echo 1 || echo 0)"
+
+  MISSING_DEST_RECOVERY="$TMP/frequency-missing-recorded-destination"
+  mkdir -p "$MISSING_DEST_RECOVERY/state"
+  prepare_frequency_publish_stage "$MISSING_DEST_RECOVERY/stage" 0
+  (
+    FREQUENCY_AB_SOURCE_ONLY=1
+    source "$REPO_ROOT/frequency-ab.sh"
+    INVOKING_UID="$(id -u)"
+    INVOKING_GID="$(id -g)"
+    FREQUENCY_STATE_UID="$INVOKING_UID"
+    FREQUENCY_STATE_GID="$INVOKING_GID"
+    SUDO_USER="$(id -un)"
+    FREQUENCY_STAGE_DIR="$MISSING_DEST_RECOVERY/stage"
+    FREQUENCY_STAGE_RECORD="$MISSING_DEST_RECOVERY/state/output-stage.pending"
+    BUNDLE="$MISSING_DEST_RECOVERY/missing-requested-bundle"
+    runuser() {
+      [[ "$1" == -u && "$3" == -- ]] || return 1
+      shift 3
+      "$@"
+    }
+    frequency_stage_record_write "$MISSING_DEST_RECOVERY/recorded-bundle"
+    recovery_rc=0
+    frequency_recover_prior_state || recovery_rc=$?
+    [[ "$recovery_rc" == 11 && "$BUNDLE" == "$MISSING_DEST_RECOVERY/missing-requested-bundle" ]]
+  ) > /dev/null 2>&1
+  missing_dest_first_rc=$?
+  missing_dest_retained=0
+  [[ $missing_dest_first_rc -eq 0 &&
+    -f "$MISSING_DEST_RECOVERY/stage/results/frequency-ab.tsv" &&
+    -f "$MISSING_DEST_RECOVERY/state/output-stage.pending" ]] &&
+    ! compgen -G "$MISSING_DEST_RECOVERY/stage.unpublished.*" > /dev/null &&
+    missing_dest_retained=1
+  mkdir -p "$MISSING_DEST_RECOVERY/recorded-bundle"
+  (
+    FREQUENCY_AB_SOURCE_ONLY=1
+    source "$REPO_ROOT/frequency-ab.sh"
+    INVOKING_UID="$(id -u)"
+    INVOKING_GID="$(id -g)"
+    FREQUENCY_STATE_UID="$INVOKING_UID"
+    FREQUENCY_STATE_GID="$INVOKING_GID"
+    SUDO_USER="$(id -un)"
+    FREQUENCY_STAGE_DIR="$MISSING_DEST_RECOVERY/stage"
+    FREQUENCY_STAGE_RECORD="$MISSING_DEST_RECOVERY/state/output-stage.pending"
+    BUNDLE="$MISSING_DEST_RECOVERY/still-missing-requested-bundle"
+    runuser() {
+      [[ "$1" == -u && "$3" == -- ]] || return 1
+      shift 3
+      "$@"
+    }
+    frequency_recover_prior_state
+    [[ "$BUNDLE" == "$MISSING_DEST_RECOVERY/still-missing-requested-bundle" ]]
+  ) > /dev/null 2>&1
+  missing_dest_retry_rc=$?
+  check_eq "missing recorded destination retains exact stage then publishes before bad requested-bundle gates" "1" \
+    "$([[ $missing_dest_retained -eq 1 && $missing_dest_retry_rc -eq 0 &&
+      ! -e "$MISSING_DEST_RECOVERY/stage" &&
+      ! -e "$MISSING_DEST_RECOVERY/state/output-stage.pending" &&
+      -f "$MISSING_DEST_RECOVERY/recorded-bundle/results/frequency-ab.tsv" ]] && echo 1 || echo 0)"
+
+  MALFORMED_RECOVERY="$TMP/frequency-malformed-stage-recovery"
+  mkdir -p "$MALFORMED_RECOVERY/state" "$MALFORMED_RECOVERY/recorded-bundle"
+  prepare_frequency_publish_stage "$MALFORMED_RECOVERY/stage" 0
+  printf 'malformed\n' > "$MALFORMED_RECOVERY/stage/publish-control.meta"
+  chmod 0600 "$MALFORMED_RECOVERY/stage/publish-control.meta"
+  (
+    FREQUENCY_AB_SOURCE_ONLY=1
+    source "$REPO_ROOT/frequency-ab.sh"
+    INVOKING_UID="$(id -u)"
+    INVOKING_GID="$(id -g)"
+    FREQUENCY_STATE_UID="$INVOKING_UID"
+    FREQUENCY_STATE_GID="$INVOKING_GID"
+    SUDO_USER="$(id -un)"
+    FREQUENCY_STAGE_DIR="$MALFORMED_RECOVERY/stage"
+    FREQUENCY_STAGE_RECORD="$MALFORMED_RECOVERY/state/output-stage.pending"
+    BUNDLE="$MALFORMED_RECOVERY/requested-bundle"
+    runuser() {
+      [[ "$1" == -u && "$3" == -- ]] || return 1
+      shift 3
+      "$@"
+    }
+    frequency_stage_record_write "$MALFORMED_RECOVERY/recorded-bundle"
+    frequency_recover_prior_state
+  ) > /dev/null 2>&1
+  malformed_recovery_rc=$?
+  check_eq "malformed recorded staging is quarantined instead of retried" "1" \
+    "$([[ $malformed_recovery_rc -eq 0 &&
+      ! -e "$MALFORMED_RECOVERY/stage" &&
+      ! -e "$MALFORMED_RECOVERY/state/output-stage.pending" ]] &&
+      compgen -G "$MALFORMED_RECOVERY/stage.unpublished.*" > /dev/null && echo 1 || echo 0)"
 
   FORGED_RECOVERY="$TMP/frequency-forged-stage-record"
   mkdir -p "$FORGED_RECOVERY/state"

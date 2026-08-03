@@ -4,6 +4,10 @@
 # may change at any time, so all final opens and renames use only user authority.
 set -Eeuo pipefail
 
+# Exit 76 identifies an unsafe or malformed staging payload. Callers may
+# quarantine that exact stage; ordinary environment/destination failures stay
+# retryable and use a different nonzero status.
+
 publisher_lib_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=publish-common.sh
 source "$publisher_lib_dir/publish-common.sh"
@@ -21,7 +25,7 @@ stage="$1"
 bundle="$2"
 [[ -d "$stage" && ! -L "$stage" ]] || {
   echo "error: unsafe frequency staging directory" >&2
-  exit 1
+  exit 76
 }
 [[ -d "$bundle" && ! -L "$bundle" && -w "$bundle" ]] || {
   echo "error: diagnostics bundle is not a writable real directory" >&2
@@ -37,7 +41,7 @@ diag_bundle_lock_acquire "$bundle" || lock_rc=$?
 # lock contention and can be retried by the invoking user.
 [[ "$(stat -Lc '%u:%a' -- "$stage" 2> /dev/null)" == "$EUID:700" ]] || {
   echo "error: frequency staging directory has unsafe ownership or mode" >&2
-  exit 1
+  exit 76
 }
 [[ -d "$bundle" && ! -L "$bundle" && -w "$bundle" ]] || {
   echo "error: diagnostics bundle changed after its writer lock was acquired" >&2
@@ -76,11 +80,11 @@ cap_cleanup_authorized=0
 if [[ -e "$publish_control" || -L "$publish_control" ]]; then
   [[ -f "$publish_control" && ! -L "$publish_control" ]] || {
     echo "error: unsafe frequency publication control" >&2
-    exit 1
+    exit 76
   }
   [[ "$(stat -Lc '%u:%a:%h:%s' -- "$publish_control" 2> /dev/null)" == "$EUID:600:1:70" ]] || {
     echo "error: frequency publication control has unsafe ownership, mode, links, or size" >&2
-    exit 1
+    exit 76
   }
   declare -a control_lines=()
   mapfile -t control_lines < "$publish_control" || {
@@ -91,7 +95,7 @@ if [[ -e "$publish_control" || -L "$publish_control" ]]; then
     "${control_lines[1]}" =~ ^GENERATION=[0-9a-f]{32}$ &&
     "${control_lines[2]}" =~ ^CAP_REQUESTED=([01])$ ]] || {
     echo "error: malformed frequency publication control" >&2
-    exit 1
+    exit 76
   }
   control_generation="${control_lines[1]#GENERATION=}"
   control_cap_requested="${control_lines[2]#CAP_REQUESTED=}"
@@ -111,14 +115,14 @@ if [[ -e "$publish_control" || -L "$publish_control" ]]; then
   [[ "$control_expected_sha" =~ ^[0-9a-f]{64}$ &&
     "$control_actual_sha" == "$control_expected_sha" ]] || {
     echo "error: frequency publication control is not canonical byte-for-byte" >&2
-    exit 1
+    exit 76
   }
   if [[ "$control_cap_requested" == 0 ]]; then
     cap_cleanup_authorized=1
     for rel in "${cap_relative_files[@]}"; do
       [[ ! -e "$stage/$rel" && ! -L "$stage/$rel" ]] || {
         echo "error: no-cap publication control conflicts with staged cap artifacts" >&2
-        exit 1
+        exit 76
       }
     done
   fi
@@ -130,11 +134,11 @@ for rel in "${relative_files[@]}"; do
   [[ -e "$source_file" || -L "$source_file" ]] || continue
   [[ -f "$source_file" && ! -L "$source_file" ]] || {
     echo "error: unsafe staged frequency artifact: $rel" >&2
-    exit 1
+    exit 76
   }
   [[ "$(stat -Lc '%u:%a:%h' -- "$source_file" 2> /dev/null)" == "$EUID:600:1" ]] || {
     echo "error: staged frequency artifact has unsafe ownership, mode, or links: $rel" >&2
-    exit 1
+    exit 76
   }
   destination="$bundle/$rel"
   [[ ! -e "$destination" || -f "$destination" || -L "$destination" ]] || {
@@ -158,11 +162,11 @@ fi
 staged_commands="$stage/commands.log"
 [[ -f "$staged_commands" && ! -L "$staged_commands" ]] || {
   echo "error: staged command log is unsafe" >&2
-  exit 1
+  exit 76
 }
 [[ "$(stat -Lc '%u:%a:%h' -- "$staged_commands" 2> /dev/null)" == "$EUID:600:1" ]] || {
   echo "error: staged command log has unsafe ownership, mode, or links" >&2
-  exit 1
+  exit 76
 }
 
 commands_destination="$bundle/commands.log"
