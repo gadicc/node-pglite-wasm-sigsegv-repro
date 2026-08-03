@@ -325,6 +325,83 @@ cleanup_busy_rc=$?
 check_eq "normal cleanup preserves retryable publisher contention status" "75" \
   "$cleanup_busy_rc"
 
+CLEANUP_DRAIN_FAIL_LOG="$TMP/cleanup-drain-fail.log"
+(
+  diag_workload_stop() { printf 'workload\n' >> "$CLEANUP_DRAIN_FAIL_LOG"; return 125; }
+  diag_freq_sampler_stop() { printf 'sampler\n' >> "$CLEANUP_DRAIN_FAIL_LOG"; return 125; }
+  diag_restore_now() { printf 'restore\n' >> "$CLEANUP_DRAIN_FAIL_LOG"; }
+  diag_cleanup_artifacts() { printf 'publish\n' >> "$CLEANUP_DRAIN_FAIL_LOG"; }
+  diag_restore_lock_release() { printf 'unlock\n' >> "$CLEANUP_DRAIN_FAIL_LOG"; }
+  diag_cleanup_exit 0
+) > /dev/null 2>&1
+cleanup_drain_fail_rc=$?
+check_eq "failed writer drain blocks restore, publication, and restore-lock release" \
+  $'125:workload\nsampler' \
+  "$cleanup_drain_fail_rc:$(cat "$CLEANUP_DRAIN_FAIL_LOG")"
+
+CLEANUP_SIGNAL_DRAIN_FAIL_LOG="$TMP/cleanup-signal-drain-fail.log"
+(
+  diag_workload_stop() { printf 'workload\n' >> "$CLEANUP_SIGNAL_DRAIN_FAIL_LOG"; return 125; }
+  diag_freq_sampler_stop() { printf 'sampler\n' >> "$CLEANUP_SIGNAL_DRAIN_FAIL_LOG"; return 125; }
+  diag_restore_now() { printf 'restore\n' >> "$CLEANUP_SIGNAL_DRAIN_FAIL_LOG"; }
+  diag_cleanup_artifacts() { printf 'publish\n' >> "$CLEANUP_SIGNAL_DRAIN_FAIL_LOG"; }
+  diag_restore_lock_release() { printf 'unlock\n' >> "$CLEANUP_SIGNAL_DRAIN_FAIL_LOG"; }
+  diag_cleanup_signal SIGTERM 143
+) > /dev/null 2>&1
+cleanup_signal_drain_fail_rc=$?
+check_eq "signal cleanup preserves signal status while retaining failed-drain recovery authority" \
+  $'143:workload\nsampler' \
+  "$cleanup_signal_drain_fail_rc:$(cat "$CLEANUP_SIGNAL_DRAIN_FAIL_LOG")"
+
+FREQUENCY_DRAIN_FAIL_LOG="$TMP/frequency-drain-fail.log"
+FREQUENCY_DRAIN_FAIL_TSV="$TMP/frequency-drain-fail.tsv"
+(
+  DIAG_WORKLOAD_PID=""
+  DIAG_SAMPLER_PID=""
+  diag_freq_sampler_start() {
+    printf 'sampler-start\n' >> "$FREQUENCY_DRAIN_FAIL_LOG"
+    DIAG_SAMPLER_PID=456
+  }
+  diag_process_group_start() {
+    printf 'workload-start\n' >> "$FREQUENCY_DRAIN_FAIL_LOG"
+    DIAG_WORKLOAD_PID=123
+  }
+  diag_process_group_wait() {
+    printf 'workload-wait\n' >> "$FREQUENCY_DRAIN_FAIL_LOG"
+    return 125
+  }
+  diag_process_group_stop() {
+    printf 'workload-stop\n' >> "$FREQUENCY_DRAIN_FAIL_LOG"
+    return 125
+  }
+  diag_freq_sampler_stop() {
+    printf 'sampler-stop\n' >> "$FREQUENCY_DRAIN_FAIL_LOG"
+    DIAG_SAMPLER_PID=""
+  }
+  diag_run_single_runs "$FREQUENCY_DRAIN_FAIL_TSV" A1 0 3
+) > /dev/null 2>&1
+frequency_drain_fail_rc=$?
+check_eq "frequency legs stop after the first operational drain failure" \
+  $'125:1:sampler-start\nworkload-start\nworkload-wait\nworkload-stop\nsampler-stop' \
+  "$frequency_drain_fail_rc:$(wc -l < "$FREQUENCY_DRAIN_FAIL_TSV"):$(cat "$FREQUENCY_DRAIN_FAIL_LOG")"
+
+FREQUENCY_START_FAIL_LOG="$TMP/frequency-start-fail.log"
+FREQUENCY_START_FAIL_TSV="$TMP/frequency-start-fail.tsv"
+(
+  diag_freq_sampler_start() {
+    printf 'sampler-start\n' >> "$FREQUENCY_START_FAIL_LOG"
+    return 125
+  }
+  diag_process_group_start() {
+    printf 'workload-start\n' >> "$FREQUENCY_START_FAIL_LOG"
+  }
+  diag_run_single_runs "$FREQUENCY_START_FAIL_TSV" A1 0 3
+) > /dev/null 2>&1
+frequency_start_fail_rc=$?
+check_eq "frequency sampler start failure prevents every workload launch" \
+  "125:absent:sampler-start" \
+  "$frequency_start_fail_rc:$([[ -e "$FREQUENCY_START_FAIL_TSV" ]] && echo present || echo absent):$(cat "$FREQUENCY_START_FAIL_LOG")"
+
 WORKLOAD_SIGNAL_DIR="$TMP/workload-signal"
 mkdir -p "$WORKLOAD_SIGNAL_DIR/bin"
 printf '0\n' > "$WORKLOAD_SIGNAL_DIR/no_turbo"
@@ -354,6 +431,78 @@ workload_signal_gone=0
 [[ -n "$workload_signal_pid" ]] && ! kill -0 "$workload_signal_pid" 2> /dev/null && workload_signal_gone=1
 check_eq "SIGTERM interrupts external workload and promptly restores" "1" \
   "$([[ $workload_signal_rc -eq 143 && "$(cat "$WORKLOAD_SIGNAL_DIR/no_turbo")" == 0 && $workload_signal_elapsed -le 5 && $workload_signal_gone -eq 1 ]] && echo 1 || echo 0)"
+
+test_process_is_live() {
+  local pid="$1" stat_line rest state
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  IFS= read -r stat_line 2> /dev/null < "/proc/$pid/stat" || return 1
+  rest="${stat_line##*) }"
+  state="${rest%% *}"
+  [[ "$state" != Z && "$state" != X && "$state" != x ]]
+}
+
+test_process_is_zombie() {
+  local pid="$1" stat_line rest state
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  IFS= read -r stat_line 2> /dev/null < "/proc/$pid/stat" || return 1
+  rest="${stat_line##*) }"
+  state="${rest%% *}"
+  [[ "$state" == Z || "$state" == X || "$state" == x ]]
+}
+
+test_process_identity_is_live() {
+  local pid="$1" expected_start="$2" stat_line rest
+  local -a fields=()
+  [[ "$pid" =~ ^[0-9]+$ && "$expected_start" =~ ^[0-9]+$ ]] || return 1
+  IFS= read -r stat_line 2> /dev/null < "/proc/$pid/stat" || return 1
+  rest="${stat_line##*) }"
+  read -ra fields <<< "$rest"
+  ((${#fields[@]} >= 20)) || return 1
+  [[ "${fields[19]}" == "$expected_start" ]] || return 1
+  case "${fields[0]}" in Z | X | x) return 1 ;; esac
+}
+
+test_process_group_is_live() {
+  local expected_pgrp="$1" stat_path stat_line rest
+  local -a fields=()
+  [[ "$expected_pgrp" =~ ^[0-9]+$ ]] || return 1
+  for stat_path in /proc/[0-9]*/stat; do
+    IFS= read -r stat_line 2> /dev/null < "$stat_path" || continue
+    rest="${stat_line##*) }"
+    fields=()
+    read -ra fields <<< "$rest"
+    ((${#fields[@]} >= 3)) || continue
+    [[ "${fields[2]}" == "$expected_pgrp" ]] || continue
+    case "${fields[0]}" in Z | X | x) continue ;; esac
+    return 0
+  done
+  return 1
+}
+
+test_process_cpu_ticks() {
+  local pid="$1" stat_line rest
+  local -a fields=()
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  IFS= read -r stat_line 2> /dev/null < "/proc/$pid/stat" || return 1
+  rest="${stat_line##*) }"
+  read -ra fields <<< "$rest"
+  ((${#fields[@]} >= 13)) || return 1
+  printf '%s\n' "$((10#${fields[11]} + 10#${fields[12]}))"
+}
+
+test_supervision_watchdog_for_leader() {
+  local leader="$1" child cmdline
+  [[ "$leader" =~ ^[0-9]+$ &&
+    -r "/proc/$leader/task/$leader/children" ]] || return 1
+  for child in $(< "/proc/$leader/task/$leader/children"); do
+    cmdline="$(tr '\0' ' ' < "/proc/$child/cmdline" 2> /dev/null || true)"
+    if [[ "$cmdline" == *supervise-process-group.sh*--watch* ]]; then
+      printf '%s\n' "$child"
+      return 0
+    fi
+  done
+  return 1
+}
 
 echo "== tracked process groups and pipeline statuses =="
 PROCESS_GROUP_DIR="$TMP/process-group"
@@ -394,26 +543,315 @@ check_eq "tracked wait clears the active group" "" "$DIAG_WORKLOAD_PID"
 PROCESS_GROUP_EXIT_DIR="$TMP/process-group-exited-leader"
 mkdir -p "$PROCESS_GROUP_EXIT_DIR"
 DIAG_WORKLOAD_PID=""
-diag_process_group_start bash "$FIX/process-group-child.sh" "$PROCESS_GROUP_EXIT_DIR" exit
+diag_process_group_start bash "$FIX/process-group-child.sh" \
+  "$PROCESS_GROUP_EXIT_DIR" exit "$PROCESS_GROUP_EXIT_DIR/exit.gate"
+exited_leader_pid="$DIAG_WORKLOAD_PID"
 for ((i = 0; i < 100; i++)); do
-  [[ -s "$PROCESS_GROUP_EXIT_DIR/child.pid" ]] && break
+  [[ -s "$PROCESS_GROUP_EXIT_DIR/leader.pid" &&
+    -s "$PROCESS_GROUP_EXIT_DIR/child.pid" ]] && break
   sleep 0.01
 done
 exited_leader_child="$(cat "$PROCESS_GROUP_EXIT_DIR/child.pid" 2> /dev/null || true)"
+exited_leader_watchdog="$(test_supervision_watchdog_for_leader "$exited_leader_pid" || true)"
+exited_leader_watchdog_start="$(diag_process_start_ticks "$exited_leader_watchdog" 2> /dev/null || true)"
+exited_leader_lease_open=0
+for exited_leader_fd_path in "/proc/$exited_leader_pid/fd/"*; do
+  exited_leader_fd="${exited_leader_fd_path##*/}"
+  [[ "$exited_leader_fd" =~ ^[0-9]+$ ]] && ((exited_leader_fd >= 3)) &&
+    [[ -p "$exited_leader_fd_path" ]] &&
+    exited_leader_lease_open=1
+done
+: > "$PROCESS_GROUP_EXIT_DIR/exit.gate"
 exited_leader_rc=0
 diag_process_group_wait || exited_leader_rc=$?
 for ((i = 0; i < 40; i++)); do
-  [[ -z "$exited_leader_child" ]] || ! kill -0 "$exited_leader_child" 2> /dev/null || {
+  [[ -z "$exited_leader_child" ]] || ! test_process_is_live "$exited_leader_child" || {
     sleep 0.05
     continue
   }
   break
 done
+exited_leader_watchdog_gone=0
+for ((i = 0; i < 100; i++)); do
+  if ! test_process_identity_is_live \
+    "$exited_leader_watchdog" "$exited_leader_watchdog_start"; then
+    exited_leader_watchdog_gone=1
+    break
+  fi
+  sleep 0.05
+done
 exited_leader_clean=0
-[[ $exited_leader_rc -eq 0 && -n "$exited_leader_child" ]] &&
-  ! kill -0 "$exited_leader_child" 2> /dev/null &&
+[[ $exited_leader_rc -eq 0 && -n "$exited_leader_child" &&
+  $exited_leader_lease_open -eq 1 && $exited_leader_watchdog_gone -eq 1 ]] &&
+  ! test_process_is_live "$exited_leader_child" &&
   [[ -z "$DIAG_WORKLOAD_PID" ]] && exited_leader_clean=1
-check_eq "tracked wait drains descendants left by an exited leader" "1" "$exited_leader_clean"
+check_eq "tracked wait delegates exited-leader descendants to the lease-bound watchdog" \
+  "1" "$exited_leader_clean"
+
+echo "== parent-death process supervision =="
+supervision_statuses=""
+for supervision_expected_rc in 0 7 125 139; do
+  DIAG_WORKLOAD_PID=""
+  diag_process_group_start bash -c 'exit "$1"' supervised-status "$supervision_expected_rc"
+  supervision_actual_rc=0
+  diag_process_group_wait || supervision_actual_rc=$?
+  supervision_statuses+="${supervision_statuses:+,}$supervision_actual_rc"
+done
+check_eq "exec supervision preserves payload exit statuses" "0,7,125,139" \
+  "$supervision_statuses"
+
+SUPERVISION_STDERR="$TMP/supervision-payload.stderr"
+DIAG_WORKLOAD_PID=""
+diag_process_group_start bash -c 'printf "payload stderr survived\n" >&2' \
+  2> "$SUPERVISION_STDERR"
+supervision_stderr_rc=0
+diag_process_group_wait || supervision_stderr_rc=$?
+check_eq "watchdog descriptor closure does not redirect payload stderr" "1" \
+  "$([[ $supervision_stderr_rc -eq 0 && "$(cat "$SUPERVISION_STDERR")" == 'payload stderr survived' ]] && echo 1 || echo 0)"
+
+DIAG_WORKLOAD_PID=""
+diag_process_group_start bash -c 'kill -TERM "$BASHPID"'
+supervision_signal_rc=0
+diag_process_group_wait || supervision_signal_rc=$?
+check_eq "exec supervision preserves payload signal status" "143" \
+  "$supervision_signal_rc"
+
+SUPERVISION_EOF_READY="$TMP/supervision-lease-eof.ready"
+DIAG_WORKLOAD_PID=""
+diag_process_group_start bash -c '
+  ready_file=$1
+  for fd_path in /proc/$BASHPID/fd/*; do
+    payload_fd=${fd_path##*/}
+    [[ "$payload_fd" =~ ^[0-9]+$ ]] && ((payload_fd >= 3)) || continue
+    { exec {payload_fd}>&-; } 2> /dev/null || true
+  done
+  : > "$ready_file"
+  /bin/sleep 1
+' supervised-lease-eof "$SUPERVISION_EOF_READY"
+supervision_eof_leader="$DIAG_WORKLOAD_PID"
+for _ in {1..200}; do
+  [[ -e "$SUPERVISION_EOF_READY" ]] && break
+  sleep 0.005
+done
+supervision_eof_watchdog="$(test_supervision_watchdog_for_leader \
+  "$supervision_eof_leader" || true)"
+supervision_eof_watchdog_start="$(diag_process_start_ticks \
+  "$supervision_eof_watchdog" 2> /dev/null || true)"
+supervision_eof_ticks_before="$(test_process_cpu_ticks \
+  "$supervision_eof_watchdog" 2> /dev/null || true)"
+sleep 0.4
+supervision_eof_ticks_after="$(test_process_cpu_ticks \
+  "$supervision_eof_watchdog" 2> /dev/null || true)"
+supervision_eof_bounded=0
+if [[ "$supervision_eof_ticks_before" =~ ^[0-9]+$ &&
+  "$supervision_eof_ticks_after" =~ ^[0-9]+$ ]] &&
+  ((supervision_eof_ticks_after - supervision_eof_ticks_before <= 10)) &&
+  test_process_is_live "$supervision_eof_leader"; then
+  supervision_eof_bounded=1
+fi
+supervision_eof_rc=0
+diag_process_group_wait || supervision_eof_rc=$?
+supervision_eof_watchdog_gone=0
+for _ in {1..100}; do
+  if ! test_process_identity_is_live \
+    "$supervision_eof_watchdog" "$supervision_eof_watchdog_start"; then
+    supervision_eof_watchdog_gone=1
+    break
+  fi
+  sleep 0.05
+done
+check_eq "lease EOF polling remains bounded while the payload stays live" "1" \
+  "$([[ $supervision_eof_bounded -eq 1 && $supervision_eof_rc -eq 0 &&
+    $supervision_eof_watchdog_gone -eq 1 ]] && echo 1 || echo 0)"
+
+arming_races_clean=0
+for arming_iteration in {1..8}; do
+  ARMING_ROOT="$TMP/supervision-arming-$arming_iteration"
+  mkdir -p "$ARMING_ROOT"
+  bash "$FIX/supervision-hold-parent.sh" "$ARMING_ROOT/parent" \
+    bash "$FIX/supervision-launch-parent.sh" "$REPO_ROOT" \
+    "$ARMING_ROOT/leader" "$ARMING_ROOT/payload" > /dev/null 2>&1 &
+  arming_holder=$!
+  for _ in {1..200}; do
+    [[ -s "$ARMING_ROOT/parent" && -s "$ARMING_ROOT/leader" ]] && break
+    sleep 0.005
+  done
+  arming_parent="$(cat "$ARMING_ROOT/parent" 2> /dev/null || true)"
+  arming_leader="$(cat "$ARMING_ROOT/leader" 2> /dev/null || true)"
+  kill -KILL "$arming_parent" 2> /dev/null || true
+  arming_parent_zombie=0
+  for _ in {1..200}; do
+    test_process_is_zombie "$arming_parent" && {
+      arming_parent_zombie=1
+      break
+    }
+    sleep 0.005
+  done
+  for _ in {1..600}; do
+    test_process_group_is_live "$arming_leader" || break
+    sleep 0.01
+  done
+  arming_group_live=0
+  test_process_group_is_live "$arming_leader" && arming_group_live=1
+  if [[ $arming_parent_zombie -eq 1 && $arming_group_live -eq 0 ]]; then
+    arming_races_clean=$((arming_races_clean + 1))
+  fi
+  ((arming_group_live == 0)) || kill -KILL -- "-$arming_leader" 2> /dev/null || true
+  kill -CONT "$arming_holder" 2> /dev/null || true
+  wait "$arming_holder" 2> /dev/null || true
+done
+check_eq "SIGKILL during the post-fork arming window leaves no payload group" \
+  "8" "$arming_races_clean"
+
+SUPERVISION_ROOT="$TMP/supervision-parent-death"
+SUPERVISION_BUNDLE="$SUPERVISION_ROOT/bundle"
+SUPERVISION_RESTORE_LOCK="$SUPERVISION_ROOT/restore.lock"
+SUPERVISION_RUN_LOG="$SUPERVISION_ROOT/run.log"
+SUPERVISION_COMMANDS_LOG="$SUPERVISION_ROOT/commands.log"
+SUPERVISION_READY="$SUPERVISION_ROOT/ready"
+mkdir -p "$SUPERVISION_BUNDLE" "$SUPERVISION_READY"
+: > "$SUPERVISION_RUN_LOG"
+: > "$SUPERVISION_COMMANDS_LOG"
+bash "$FIX/supervision-hold-parent.sh" "$SUPERVISION_READY/parent.pid" \
+  bash "$FIX/supervision-parent.sh" "$REPO_ROOT" "$SUPERVISION_BUNDLE" \
+  "$SUPERVISION_RESTORE_LOCK" "$SUPERVISION_RUN_LOG" \
+  "$SUPERVISION_COMMANDS_LOG" "$SUPERVISION_READY" > /dev/null 2>&1 &
+supervision_holder=$!
+for _ in {1..400}; do
+  [[ -s "$SUPERVISION_READY/parent.pid" &&
+    -s "$SUPERVISION_READY/parent.ready" &&
+    -s "$SUPERVISION_READY/workload.ready" &&
+    -s "$SUPERVISION_READY/sampler.ready" ]] && break
+  sleep 0.01
+done
+supervision_parent="$(cat "$SUPERVISION_READY/parent.pid" 2> /dev/null || true)"
+supervision_workload="$(sed -n 's/^WORKLOAD=//p' "$SUPERVISION_READY/parent.ready" 2> /dev/null)"
+supervision_sampler="$(sed -n 's/^SAMPLER=//p' "$SUPERVISION_READY/parent.ready" 2> /dev/null)"
+supervision_payload_fds_ok=0
+if [[ "$(sed -n 's/^PID=//p' "$SUPERVISION_READY/workload.ready")" == "$supervision_workload" &&
+  "$(sed -n 's/^PGRP=//p' "$SUPERVISION_READY/workload.ready")" == "$supervision_workload" &&
+  "$(sed -n 's/^SESSION=//p' "$SUPERVISION_READY/workload.ready")" == "$supervision_workload" &&
+  "$(sed -n 's/^BUNDLE_FD_OPEN=//p' "$SUPERVISION_READY/workload.ready")" == 1 &&
+  "$(sed -n 's/^RESTORE_FD_OPEN=//p' "$SUPERVISION_READY/workload.ready")" == 1 &&
+  "$(sed -n 's/^RUN_FD_OPEN=//p' "$SUPERVISION_READY/workload.ready")" == 0 &&
+  "$(sed -n 's/^COMMANDS_FD_OPEN=//p' "$SUPERVISION_READY/workload.ready")" == 0 &&
+  "$(sed -n 's/^LEASE_PIPE_OPEN=//p' "$SUPERVISION_READY/workload.ready")" == 1 &&
+  "$(sed -n 's/^PID=//p' "$SUPERVISION_READY/sampler.ready")" == "$supervision_sampler" &&
+  "$(sed -n 's/^PGRP=//p' "$SUPERVISION_READY/sampler.ready")" == "$supervision_sampler" &&
+  "$(sed -n 's/^SESSION=//p' "$SUPERVISION_READY/sampler.ready")" == "$supervision_sampler" &&
+  "$(sed -n 's/^BUNDLE_FD_OPEN=//p' "$SUPERVISION_READY/sampler.ready")" == 1 &&
+  "$(sed -n 's/^RESTORE_FD_OPEN=//p' "$SUPERVISION_READY/sampler.ready")" == 1 &&
+  "$(sed -n 's/^RUN_FD_OPEN=//p' "$SUPERVISION_READY/sampler.ready")" == 0 &&
+  "$(sed -n 's/^COMMANDS_FD_OPEN=//p' "$SUPERVISION_READY/sampler.ready")" == 0 &&
+  "$(sed -n 's/^LEASE_PIPE_OPEN=//p' "$SUPERVISION_READY/sampler.ready")" == 1 ]]; then
+  supervision_payload_fds_ok=1
+fi
+check_eq "workload and sampler retain inherited fences and leases but not log descriptors" "1" \
+  "$supervision_payload_fds_ok"
+
+supervision_watchdogs_ok=1
+supervision_watchdog_pids=()
+supervision_watchdog_starts=()
+for supervision_leader in "$supervision_workload" "$supervision_sampler"; do
+  supervision_watchdog=""
+  if [[ -r "/proc/$supervision_leader/task/$supervision_leader/children" ]]; then
+    for supervision_child in $(< "/proc/$supervision_leader/task/$supervision_leader/children"); do
+      supervision_cmdline="$(tr '\0' ' ' < "/proc/$supervision_child/cmdline" 2> /dev/null || true)"
+      if [[ "$supervision_cmdline" == *supervise-process-group.sh*--watch* ]]; then
+        supervision_watchdog="$supervision_child"
+        break
+      fi
+    done
+  fi
+  [[ "$supervision_watchdog" =~ ^[0-9]+$ ]] || {
+    supervision_watchdogs_ok=0
+    continue
+  }
+  supervision_watchdog_stat="$(< "/proc/$supervision_watchdog/stat")"
+  supervision_watchdog_rest="${supervision_watchdog_stat##*) }"
+  read -ra supervision_watchdog_fields <<< "$supervision_watchdog_rest"
+  [[ "${supervision_watchdog_fields[2]}" == "$supervision_watchdog" &&
+    "${supervision_watchdog_fields[3]}" == "$supervision_watchdog" ]] ||
+    supervision_watchdogs_ok=0
+  supervision_watchdog_pids+=("$supervision_watchdog")
+  supervision_watchdog_starts+=("${supervision_watchdog_fields[19]}")
+  for supervision_fd_path in "/proc/$supervision_watchdog/fd/"*; do
+    supervision_fd_target="$(readlink -- "$supervision_fd_path" 2> /dev/null || true)"
+    case "$supervision_fd_target" in
+      "$SUPERVISION_BUNDLE"|"${SUPERVISION_RESTORE_LOCK}.guard"|"$SUPERVISION_RUN_LOG"|"$SUPERVISION_COMMANDS_LOG")
+        supervision_watchdogs_ok=0
+        ;;
+    esac
+  done
+done
+check_eq "detached watchdogs hold no bundle, restore, or log descriptors" "1" \
+  "$supervision_watchdogs_ok"
+
+workload_counter_before="$(wc -l < "$SUPERVISION_READY/workload.counter")"
+sampler_counter_before="$(wc -l < "$SUPERVISION_READY/sampler.counter")"
+kill -KILL "$supervision_parent" 2> /dev/null || true
+supervision_parent_zombie=0
+for _ in {1..200}; do
+  test_process_is_zombie "$supervision_parent" && {
+    supervision_parent_zombie=1
+    break
+  }
+  sleep 0.005
+done
+
+exec {supervision_bundle_probe}< "$SUPERVISION_BUNDLE"
+exec {supervision_restore_probe}<> "${SUPERVISION_RESTORE_LOCK}.guard"
+supervision_bundle_busy=0
+supervision_restore_busy=0
+flock -n -x "$supervision_bundle_probe" 2> /dev/null || supervision_bundle_busy=1
+flock -n -x "$supervision_restore_probe" 2> /dev/null || supervision_restore_busy=1
+
+supervision_released=0
+for _ in {1..700}; do
+  if flock -n -x "$supervision_bundle_probe" 2> /dev/null &&
+    flock -n -x "$supervision_restore_probe" 2> /dev/null; then
+    supervision_released=1
+    break
+  fi
+  sleep 0.01
+done
+workload_counter_after="$(wc -l < "$SUPERVISION_READY/workload.counter")"
+sampler_counter_after="$(wc -l < "$SUPERVISION_READY/sampler.counter")"
+sleep 0.1
+supervision_counters_stopped=0
+if [[ "$(wc -l < "$SUPERVISION_READY/workload.counter")" == "$workload_counter_after" &&
+  "$(wc -l < "$SUPERVISION_READY/sampler.counter")" == "$sampler_counter_after" ]]; then
+  supervision_counters_stopped=1
+fi
+flock -u "$supervision_bundle_probe" 2> /dev/null || true
+flock -u "$supervision_restore_probe" 2> /dev/null || true
+exec {supervision_bundle_probe}<&-
+exec {supervision_restore_probe}>&-
+kill -CONT "$supervision_holder" 2> /dev/null || true
+wait "$supervision_holder" 2> /dev/null || true
+for supervision_leader in "$supervision_workload" "$supervision_sampler"; do
+  test_process_is_live "$supervision_leader" &&
+    kill -KILL -- "-$supervision_leader" 2> /dev/null || true
+done
+supervision_watchdogs_gone=1
+for supervision_watchdog_i in "${!supervision_watchdog_pids[@]}"; do
+  for _ in {1..100}; do
+    test_process_identity_is_live \
+      "${supervision_watchdog_pids[$supervision_watchdog_i]}" \
+      "${supervision_watchdog_starts[$supervision_watchdog_i]}" || break
+    sleep 0.05
+  done
+  test_process_identity_is_live \
+    "${supervision_watchdog_pids[$supervision_watchdog_i]}" \
+    "${supervision_watchdog_starts[$supervision_watchdog_i]}" &&
+    supervision_watchdogs_gone=0
+done
+check_eq "unreaped parent SIGKILL retains bundle and restore fences until writer groups stop" "1" \
+  "$([[ $supervision_parent_zombie -eq 1 && $supervision_bundle_busy -eq 1 &&
+    $supervision_restore_busy -eq 1 && $supervision_released -eq 1 &&
+    $supervision_counters_stopped -eq 1 && $supervision_watchdogs_gone -eq 1 &&
+    $workload_counter_after -ge $workload_counter_before &&
+    $sampler_counter_after -ge $sampler_counter_before ]] && echo 1 || echo 0)"
 
 PIPELINE_DIR="$TMP/pipeline-status"
 mkdir -p "$PIPELINE_DIR/bin" "$PIPELINE_DIR/out"
@@ -748,6 +1186,65 @@ diag_restore_lock_release
 check_eq "dead experiment lock is reclaimed for SIGKILL recovery" "1" \
   "$([[ $stale_ready_seen -eq 1 && $stale_recovery_rc -eq 0 ]] && echo 1 || echo 0)"
 rm -f "$stale_fifo"
+
+RESTORE_FENCE_DIR="$TMP/restore-fence-overlap"
+RESTORE_FENCE_LOCK="$RESTORE_FENCE_DIR/active.lock"
+RESTORE_FENCE_READY="$RESTORE_FENCE_DIR/ready"
+mkdir -p "$RESTORE_FENCE_READY"
+chmod 0700 "$RESTORE_FENCE_DIR"
+bash -c '
+  set -u
+  source "$1"
+  diag_restore_lock_acquire "$2" "$3" "$4"
+  diag_process_group_start bash -c '\''
+    trap "" TERM
+    printf "%s\n" "$BASHPID" > "$1"
+    while :; do sleep 1; done
+  '\'' restore-fence-writer "$5/writer"
+  for _ in {1..200}; do [[ -s "$5/writer" ]] && break; sleep 0.005; done
+  {
+    printf "PARENT=%s\n" "$BASHPID"
+    printf "GROUP=%s\n" "$DIAG_WORKLOAD_PID"
+  } > "$5/owner"
+  while :; do sleep 1; done
+' _ "$LIB/common.sh" "$RESTORE_FENCE_LOCK" "$test_uid" "$test_gid" \
+  "$RESTORE_FENCE_READY" > /dev/null 2>&1 &
+restore_fence_parent=$!
+for _ in {1..300}; do
+  [[ -s "$RESTORE_FENCE_READY/owner" && -s "$RESTORE_FENCE_READY/writer" ]] && break
+  sleep 0.01
+done
+restore_fence_group="$(sed -n 's/^GROUP=//p' "$RESTORE_FENCE_READY/owner" 2> /dev/null)"
+kill -KILL "$restore_fence_parent" 2> /dev/null || true
+restore_fence_busy=0
+if diag_restore_lock_acquire "$RESTORE_FENCE_LOCK" "$test_uid" "$test_gid" 2> /dev/null; then
+  diag_restore_lock_release
+else
+  restore_fence_busy=1
+fi
+wait "$restore_fence_parent" 2> /dev/null || true
+restore_fence_recovered=0
+for _ in {1..200}; do
+  if diag_restore_lock_acquire "$RESTORE_FENCE_LOCK" "$test_uid" "$test_gid" 2> /dev/null; then
+    restore_fence_recovered=1
+    break
+  fi
+  sleep 0.025
+done
+restore_fence_fd_retained=0
+if ((restore_fence_recovered == 1)) &&
+  [[ -n "$DIAG_RESTORE_LOCK_FD" &&
+    -e "/proc/$BASHPID/fd/$DIAG_RESTORE_LOCK_FD" &&
+    "/proc/$BASHPID/fd/$DIAG_RESTORE_LOCK_FD" -ef "${RESTORE_FENCE_LOCK}.guard" ]]; then
+  restore_fence_fd_retained=1
+fi
+((restore_fence_recovered == 0)) || diag_restore_lock_release
+restore_fence_group_live=0
+test_process_group_is_live "$restore_fence_group" && restore_fence_group_live=1
+check_eq "retained restore flock fences SIGKILL recovery until inherited writer groups exit" "1" \
+  "$([[ $restore_fence_busy -eq 1 && $restore_fence_recovered -eq 1 &&
+    $restore_fence_fd_retained -eq 1 && $restore_fence_group_live -eq 0 &&
+    ! -e "$RESTORE_FENCE_LOCK" ]] && echo 1 || echo 0)"
 
 echo "== diagnostics bundle writer lock =="
 BUNDLE_LOCK_ROOT="$TMP/bundle-writer-lock"
@@ -5178,6 +5675,61 @@ grep -Eq 'No failure reproduced|0/6 \(95% upper' "$B3/report.md"
 check_eq "metadata-mismatched repro evidence cannot support clean claims" "1" "$([[ $? -ne 0 ]] && echo 1 || echo 0)"
 
 echo "== finalization failure handling =="
+MAIN_CLEANUP_DRAIN_FAIL_LOG="$TMP/main-cleanup-drain-fail.log"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$TMP/main-cleanup-drain-fail-bundle"
+  mkdir -p "$OUT_DIR"
+  diag_process_group_stop() { printf 'workload\n' >> "$MAIN_CLEANUP_DRAIN_FAIL_LOG"; return 125; }
+  diag_freq_sampler_stop() { printf 'sampler\n' >> "$MAIN_CLEANUP_DRAIN_FAIL_LOG"; return 125; }
+  derived_manifest_revoke() { printf 'revoke\n' >> "$MAIN_CLEANUP_DRAIN_FAIL_LOG"; }
+  derived_candidate_cleanup_tracked() { printf 'candidates\n' >> "$MAIN_CLEANUP_DRAIN_FAIL_LOG"; }
+  privacy_review_temp_cleanup() { printf 'privacy\n' >> "$MAIN_CLEANUP_DRAIN_FAIL_LOG"; }
+  redo_marker_temp_cleanup() { printf 'redo\n' >> "$MAIN_CLEANUP_DRAIN_FAIL_LOG"; }
+  bundle_log_fds_close() { printf 'logs-close\n' >> "$MAIN_CLEANUP_DRAIN_FAIL_LOG"; }
+  diag_bundle_lock_release() { printf 'unlock\n' >> "$MAIN_CLEANUP_DRAIN_FAIL_LOG"; }
+  diagnose_cleanup_exit 0
+) > /dev/null 2>&1
+main_cleanup_drain_fail_rc=$?
+check_eq "main EXIT cleanup mutates nothing and retains bundle authority after drain failure" \
+  $'125:workload\nsampler' \
+  "$main_cleanup_drain_fail_rc:$(cat "$MAIN_CLEANUP_DRAIN_FAIL_LOG")"
+
+MAIN_SIGNAL_DRAIN_FAIL_LOG="$TMP/main-signal-drain-fail.log"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$TMP/main-signal-drain-fail-bundle"
+  diag_process_group_stop() { printf 'workload\n' >> "$MAIN_SIGNAL_DRAIN_FAIL_LOG"; return 125; }
+  diag_freq_sampler_stop() { printf 'sampler\n' >> "$MAIN_SIGNAL_DRAIN_FAIL_LOG"; return 125; }
+  derived_manifest_revoke() { printf 'revoke\n' >> "$MAIN_SIGNAL_DRAIN_FAIL_LOG"; }
+  derived_candidate_cleanup_tracked() { printf 'candidates\n' >> "$MAIN_SIGNAL_DRAIN_FAIL_LOG"; }
+  meta_set() { printf 'meta\n' >> "$MAIN_SIGNAL_DRAIN_FAIL_LOG"; }
+  finalize_report() { printf 'finalize\n' >> "$MAIN_SIGNAL_DRAIN_FAIL_LOG"; }
+  bundle_log_fds_close() { printf 'logs-close\n' >> "$MAIN_SIGNAL_DRAIN_FAIL_LOG"; }
+  diag_bundle_lock_release() { printf 'unlock\n' >> "$MAIN_SIGNAL_DRAIN_FAIL_LOG"; }
+  on_interrupt SIGTERM
+) > /dev/null 2>&1
+main_signal_drain_fail_rc=$?
+check_eq "main signal cleanup preserves signal status without mutation or finalization after drain failure" \
+  $'143:workload\nsampler' \
+  "$main_signal_drain_fail_rc:$(cat "$MAIN_SIGNAL_DRAIN_FAIL_LOG")"
+
+MAIN_COMPLETE_DRAIN_FAIL_LOG="$TMP/main-complete-drain-fail.log"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  diag_process_group_stop() { printf 'workload\n' >> "$MAIN_COMPLETE_DRAIN_FAIL_LOG"; return 125; }
+  diag_freq_sampler_stop() { printf 'sampler\n' >> "$MAIN_COMPLETE_DRAIN_FAIL_LOG"; return 125; }
+  finalize_report() { printf 'finalize\n' >> "$MAIN_COMPLETE_DRAIN_FAIL_LOG"; }
+  complete_diagnostic
+) > /dev/null 2>&1
+main_complete_drain_fail_rc=$?
+check_eq "terminal completion refuses finalization after drain failure" \
+  $'1:workload\nsampler' \
+  "$main_complete_drain_fail_rc:$(cat "$MAIN_COMPLETE_DRAIN_FAIL_LOG")"
+
 # collect.mjs cannot write results.json into a missing bundle directory.
 FINALIZE_FAIL_LOG="$TMP/finalize-fail.log"
 FINALIZE_FAIL_OUTPUT="$TMP/finalize-fail.output"

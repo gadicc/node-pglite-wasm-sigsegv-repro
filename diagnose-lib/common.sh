@@ -16,6 +16,13 @@
 : "${DIAG_BUNDLE_ROOT:=}"
 : "${DIAG_REPO_ROOT:=}"
 
+# Resolve this once while the source path is still meaningful. Privileged
+# callers must never honor an inherited environment override for executable
+# helper code.
+DIAG_SUPERVISE_PROCESS_GROUP="$({
+  cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P
+})/supervise-process-group.sh"
+
 diag_redact_log_text() {
   local text="$1"
   if [[ -n "$DIAG_BUNDLE_ROOT" ]]; then text="${text//"$DIAG_BUNDLE_ROOT"/<bundle>}"; fi
@@ -221,6 +228,8 @@ DIAG_RESTORE_ARMED=0
 declare -a DIAG_RESTORE_RULES=()
 DIAG_RESTORE_LOCK_FILE=""
 DIAG_RESTORE_LOCK_TOKEN=""
+DIAG_RESTORE_LOCK_GUARD_FILE=""
+DIAG_RESTORE_LOCK_FD=""
 
 diag_restore_private_dir_prepare() {
   # usage: diag_restore_private_dir_prepare <dir> <owner-uid> <owner-gid>
@@ -263,6 +272,19 @@ diag_process_start_ticks() {
   printf '%s\n' "$ticks"
 }
 
+diag_process_identity_is_live() {
+  # usage: diag_process_identity_is_live <pid> <expected-start-ticks>
+  local pid="$1" expected_ticks="$2" stat_line rest
+  local -a fields=()
+  diag_is_uint "$pid" && diag_is_uint "$expected_ticks" || return 1
+  IFS= read -r stat_line 2> /dev/null < "/proc/$pid/stat" || return 1
+  rest="${stat_line##*) }"
+  read -ra fields <<< "$rest"
+  ((${#fields[@]} >= 20)) || return 1
+  [[ "${fields[19]}" == "$expected_ticks" ]] || return 1
+  case "${fields[0]}" in Z | X | x) return 1 ;; esac
+}
+
 diag_restore_lock_owner_is_live() {
   local lock_file="$1" pid ticks extra current_ticks
   # Status: 0 live owner, 1 valid but dead/reused owner, 2 malformed record.
@@ -273,12 +295,12 @@ diag_restore_lock_owner_is_live() {
 }
 
 diag_restore_lock_acquire() {
-  # The short-lived flock serializes stale-lock recovery. The durable active
-  # record contains this shell's PID and process start time; unlike an open FD,
-  # it is not inherited by workload children and can be reclaimed after
-  # SIGKILL without weakening live-run concurrency refusal.
+  # The retained guard flock serializes stale-record recovery and is inherited
+  # by writer groups. After a parent SIGKILL, successors therefore remain
+  # fenced until every old writer exits; the durable PID/start record then
+  # authorizes stale-owner recovery.
   local lock_file="$1" owner_uid="$2" owner_gid="$3"
-  [[ -z "$DIAG_RESTORE_LOCK_FILE" ]] || return 1
+  [[ -z "$DIAG_RESTORE_LOCK_FILE" && -z "$DIAG_RESTORE_LOCK_FD" ]] || return 1
   local guard_file="${lock_file}.guard" guard_fd="" tmp="" start_ticks
   local owner_pid="$BASHPID"
   diag_restore_private_file_prepare "$guard_file" "$owner_uid" "$owner_gid" || return 1
@@ -346,12 +368,22 @@ diag_restore_lock_acquire() {
   fi
   DIAG_RESTORE_LOCK_FILE="$lock_file"
   DIAG_RESTORE_LOCK_TOKEN="$owner_pid $start_ticks"
-  exec {guard_fd}>&-
+  DIAG_RESTORE_LOCK_GUARD_FILE="$guard_file"
+  DIAG_RESTORE_LOCK_FD="$guard_fd"
 }
 
 diag_restore_lock_release() {
-  [[ -n "$DIAG_RESTORE_LOCK_FILE" ]] || return 0
-  local actual=""
+  if [[ -z "$DIAG_RESTORE_LOCK_FILE" && -z "$DIAG_RESTORE_LOCK_FD" ]]; then
+    return 0
+  fi
+  local actual="" lock_fd="$DIAG_RESTORE_LOCK_FD" release_rc=0
+  [[ -n "$DIAG_RESTORE_LOCK_FILE" && -n "$DIAG_RESTORE_LOCK_GUARD_FILE" ]] &&
+    diag_is_uint "$lock_fd" && ((lock_fd >= 3)) &&
+    [[ -e "/proc/$BASHPID/fd/$lock_fd" &&
+      "/proc/$BASHPID/fd/$lock_fd" -ef "$DIAG_RESTORE_LOCK_GUARD_FILE" ]] || {
+    diag_warn "restore lock authority is incomplete or changed; refusing release"
+    return 1
+  }
   if [[ -f "$DIAG_RESTORE_LOCK_FILE" && ! -L "$DIAG_RESTORE_LOCK_FILE" ]]; then
     IFS= read -r actual < "$DIAG_RESTORE_LOCK_FILE" || true
   fi
@@ -360,8 +392,13 @@ diag_restore_lock_release() {
     return 1
   fi
   rm -f -- "$DIAG_RESTORE_LOCK_FILE" || return 1
+  flock -u "$lock_fd" || release_rc=1
+  { exec {lock_fd}>&-; } 2> /dev/null || release_rc=1
   DIAG_RESTORE_LOCK_FILE=""
   DIAG_RESTORE_LOCK_TOKEN=""
+  DIAG_RESTORE_LOCK_GUARD_FILE=""
+  DIAG_RESTORE_LOCK_FD=""
+  return "$release_rc"
 }
 
 diag_restore_rules_set() {
@@ -530,8 +567,19 @@ diag_require_not_symlink() {
 diag_cleanup_now() {
   # A workload and sampler may still be using a setting we are about to
   # restore. Stop and reap both first, then perform the verified restore.
-  diag_workload_stop
-  diag_freq_sampler_stop
+  local stop_rc=0 current_rc=0
+  diag_workload_stop || {
+    current_rc=$?
+    ((stop_rc == 0)) && stop_rc=$current_rc
+  }
+  diag_freq_sampler_stop || {
+    current_rc=$?
+    ((stop_rc == 0)) && stop_rc=$current_rc
+  }
+  if ((stop_rc != 0)); then
+    diag_warn "tracked process groups could not be confirmed stopped; retaining settings and recovery authority"
+    return "$stop_rc"
+  fi
   diag_restore_now
 }
 
@@ -545,20 +593,20 @@ diag_cleanup_exit() {
   local rc="$1" cleanup_rc=0 artifact_rc=0
   trap - EXIT INT TERM
   if diag_cleanup_now; then
-    :
-  else
-    cleanup_rc=$?
-  fi
-  diag_cleanup_artifacts || artifact_rc=$?
-  if ((artifact_rc != 0)); then
-    if ((cleanup_rc == 0 && artifact_rc == 75)); then
-      cleanup_rc=75
-    else
+    diag_cleanup_artifacts || artifact_rc=$?
+    if ((artifact_rc != 0)); then
+      if ((artifact_rc == 75)); then
+        cleanup_rc=75
+      else
+        cleanup_rc=1
+      fi
+    fi
+    if ! diag_restore_lock_release; then
       cleanup_rc=1
     fi
-  fi
-  if ! diag_restore_lock_release; then
-    cleanup_rc=1
+  else
+    cleanup_rc=$?
+    diag_warn "cleanup was incomplete; skipping artifact publication and retaining the restore lock"
   fi
   ((rc == 0 && cleanup_rc != 0)) && rc=$cleanup_rc
   exit "$rc"
@@ -568,9 +616,12 @@ diag_cleanup_signal() {
   local name="$1" rc="$2"
   trap - EXIT INT TERM
   diag_warn "received $name"
-  diag_cleanup_now || true
-  diag_cleanup_artifacts || true
-  diag_restore_lock_release || true
+  if diag_cleanup_now; then
+    diag_cleanup_artifacts || true
+    diag_restore_lock_release || true
+  else
+    diag_warn "cleanup after $name was incomplete; skipping artifact publication and retaining the restore lock"
+  fi
   exit "$rc"
 }
 
@@ -598,66 +649,168 @@ diag_register_restore_trap() {
 DIAG_SAMPLER_PID=""
 DIAG_WORKLOAD_PID=""
 : "${DIAG_OPERATIONAL_ERROR_RC:=125}"
+declare -gA DIAG_SUPERVISED_GROUP_START_TICKS=()
 
-diag_process_group_start() {
-  # Start one externally managed command in a private session. In these
-  # non-interactive scripts the background child is not already a process-
-  # group leader, so setsid preserves its PID as the new process-group ID.
-  [[ -z "$DIAG_WORKLOAD_PID" ]] || {
-    diag_warn "refusing to replace tracked process group $DIAG_WORKLOAD_PID"
+diag_supervised_group_start() {
+  # usage: diag_supervised_group_start <pid-variable> <label> <command> [args...]
+  local pid_name="$1" label="$2"
+  shift 2
+  [[ "$pid_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && $# -gt 0 ]] ||
+    return "$DIAG_OPERATIONAL_ERROR_RC"
+  local -n pid_ref="$pid_name"
+  [[ -z "${pid_ref:-}" ]] || {
+    diag_warn "refusing to replace tracked $label process group $pid_ref"
     return "$DIAG_OPERATIONAL_ERROR_RC"
   }
-  setsid "$@" &
-  DIAG_WORKLOAD_PID=$!
+
+  # With job control disabled, the asynchronous setsid child cannot already
+  # be a process-group leader; its PID therefore remains the private PGID/SID.
+  # Refuse the interactive-shell case rather than let util-linux setsid fork
+  # behind the PID that this shell records.
+  [[ $- != *m* ]] || {
+    diag_warn "cannot supervise $label while shell job control is enabled"
+    return "$DIAG_OPERATIONAL_ERROR_RC"
+  }
+  [[ -f "$DIAG_SUPERVISE_PROCESS_GROUP" && ! -L "$DIAG_SUPERVISE_PROCESS_GROUP" ]] || {
+    diag_warn "process supervision helper is missing or unsafe"
+    return "$DIAG_OPERATIONAL_ERROR_RC"
+  }
+
+  local parent_pid="$BASHPID" parent_start="" close_fd
+  parent_start="$(diag_process_start_ticks "$parent_pid")" ||
+    return "$DIAG_OPERATIONAL_ERROR_RC"
+  local -a helper_args=(--parent "$parent_pid" "$parent_start")
+  local -a watchdog_fds=(
+    "${DIAG_BUNDLE_LOCK_FD:-}"
+    "${DIAG_RESTORE_LOCK_FD:-}"
+    "${RUN_LOG_FD:-}"
+    "${COMMANDS_LOG_FD:-}"
+  )
+  local -a payload_fds=("${RUN_LOG_FD:-}" "${COMMANDS_LOG_FD:-}")
+  for close_fd in "${watchdog_fds[@]}"; do
+    [[ -n "$close_fd" ]] || continue
+    diag_is_uint "$close_fd" && ((close_fd >= 3)) &&
+      [[ -e "/proc/$BASHPID/fd/$close_fd" ]] || {
+        diag_warn "refusing to supervise $label with an invalid inherited descriptor"
+        return "$DIAG_OPERATIONAL_ERROR_RC"
+      }
+    helper_args+=(--watchdog-close-fd "$close_fd")
+  done
+  for close_fd in "${payload_fds[@]}"; do
+    [[ -n "$close_fd" ]] || continue
+    helper_args+=(--payload-close-fd "$close_fd")
+  done
+
+  local leader_pid leader_start
+  setsid /bin/bash "$DIAG_SUPERVISE_PROCESS_GROUP" \
+    "${helper_args[@]}" -- "$@" &
+  leader_pid=$!
+  leader_start="$(diag_process_start_ticks "$leader_pid")" || {
+    # The exec wrapper normally remains present through its synchronous
+    # watchdog handshake. If procfs cannot bind that identity, fail closed
+    # after reaping it rather than exposing an untracked process group.
+    wait "$leader_pid" 2> /dev/null || true
+    diag_warn "could not bind the $label process-group leader identity"
+    return "$DIAG_OPERATIONAL_ERROR_RC"
+  }
+  pid_ref="$leader_pid"
+  DIAG_SUPERVISED_GROUP_START_TICKS["$pid_name"]="$leader_start"
 }
 
-diag_process_group_wait() {
-  [[ -n "$DIAG_WORKLOAD_PID" ]] || return "$DIAG_OPERATIONAL_ERROR_RC"
-  local pid="$DIAG_WORKLOAD_PID" rc=0 i
+diag_supervised_group_drain() {
+  # usage: diag_supervised_group_drain <pgid> <label> [polls]
+  # Numeric group checks are observation-only. Once the bound leader is gone,
+  # only its detached identity/lease-bound watchdog may signal descendants.
+  local pgid="$1" label="$2" polls="${3:-100}" i
+  diag_is_uint "$pgid" && diag_is_uint "$polls" ||
+    return "$DIAG_OPERATIONAL_ERROR_RC"
+  for ((i = 0; i < polls; i++)); do
+    kill -0 -- "-$pgid" 2> /dev/null || return 0
+    sleep 0.05
+  done
+  diag_warn "tracked $label process group remained live after its leader exited"
+  return "$DIAG_OPERATIONAL_ERROR_RC"
+}
+
+diag_supervised_group_wait() {
+  # usage: diag_supervised_group_wait <pid-variable> <label>
+  local pid_name="$1" label="$2"
+  [[ "$pid_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
+    return "$DIAG_OPERATIONAL_ERROR_RC"
+  local -n pid_ref="$pid_name"
+  [[ -n "${pid_ref:-}" ]] || return "$DIAG_OPERATIONAL_ERROR_RC"
+  local pid="$pid_ref" rc=0 drain_rc=0
   wait "$pid" || rc=$?
-  # A wrapper can exit after its direct command ends while a descendant is
-  # still alive in the private group (notably an inferior launched by a
-  # foreground timeout). Do not discard the only handle to that descendant.
-  if kill -0 -- "-$pid" 2> /dev/null; then
-    diag_warn "tracked process leader exited with descendants still running; stopping them"
-    kill -TERM -- "-$pid" 2> /dev/null || true
-    for ((i = 0; i < 40; i++)); do
-      kill -0 -- "-$pid" 2> /dev/null || break
-      sleep 0.05
-    done
-    if kill -0 -- "-$pid" 2> /dev/null; then
-      diag_warn "tracked descendants did not stop after SIGTERM; sending SIGKILL"
-      kill -KILL -- "-$pid" 2> /dev/null || true
-    fi
-  fi
+  diag_supervised_group_drain "$pid" "$label" 100 || drain_rc=$?
+  ((drain_rc == 0)) || return "$DIAG_OPERATIONAL_ERROR_RC"
   # A signal trap may already have stopped and cleared this group.
-  [[ "$DIAG_WORKLOAD_PID" != "$pid" ]] || DIAG_WORKLOAD_PID=""
+  if [[ "${pid_ref:-}" == "$pid" ]]; then
+    pid_ref=""
+    unset "DIAG_SUPERVISED_GROUP_START_TICKS[$pid_name]"
+  fi
   return "$rc"
 }
 
-diag_process_group_stop() {
-  [[ -n "$DIAG_WORKLOAD_PID" ]] || return 0
-  local pid="$DIAG_WORKLOAD_PID" watchdog
+diag_supervised_group_stop() {
+  # usage: diag_supervised_group_stop <pid-variable> <label> [grace-polls]
+  local pid_name="$1" label="$2" grace_polls="${3:-40}"
+  [[ "$pid_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
+    return "$DIAG_OPERATIONAL_ERROR_RC"
+  diag_is_uint "$grace_polls" || return "$DIAG_OPERATIONAL_ERROR_RC"
+  local -n pid_ref="$pid_name"
+  [[ -n "${pid_ref:-}" ]] || return 0
+  local pid="$pid_ref" expected_start="${DIAG_SUPERVISED_GROUP_START_TICKS[$pid_name]:-}"
+  local watchdog drain_rc=0
+  diag_is_uint "$expected_start" || {
+    diag_warn "refusing to signal $label without its exact leader identity"
+    return "$DIAG_OPERATIONAL_ERROR_RC"
+  }
   # Signal the entire pipeline/process tree. Reap the leader concurrently
-  # with the bounded watchdog: polling only the leader mistakes a zombie for
-  # a live workload and cannot detect descendants left behind by an exited
-  # leader.
-  kill -TERM -- "-$pid" 2> /dev/null || kill -TERM "$pid" 2> /dev/null || true
+  # with the bounded escalation helper. Every parent-side signal is guarded
+  # by the original PID/start-time identity. If the leader is gone, the
+  # detached lease-bound watchdog alone owns descendant termination.
+  if diag_process_identity_is_live "$pid" "$expected_start"; then
+    kill -TERM -- "-$pid" 2> /dev/null || kill -TERM "$pid" 2> /dev/null || true
+  fi
   (
-    local i
-    for ((i = 0; i < 40; i++)); do
+    local i inherited_fd
+    # This short-lived escalation watchdog is not a bundle writer. Do not let
+    # a parent SIGKILL turn it into a stray holder of any retained descriptor.
+    for inherited_fd in \
+      "${DIAG_BUNDLE_LOCK_FD:-}" "${DIAG_RESTORE_LOCK_FD:-}" \
+      "${RUN_LOG_FD:-}" "${COMMANDS_LOG_FD:-}"; do
+      [[ -n "$inherited_fd" && -e "/proc/$BASHPID/fd/$inherited_fd" ]] || continue
+      { exec {inherited_fd}>&-; } 2> /dev/null || true
+    done
+    for ((i = 0; i < grace_polls; i++)); do
       kill -0 -- "-$pid" 2> /dev/null || exit 0
+      diag_process_identity_is_live "$pid" "$expected_start" || exit 0
       sleep 0.05
     done
-    diag_warn "workload process group did not stop after SIGTERM; sending SIGKILL"
-    kill -KILL -- "-$pid" 2> /dev/null || kill -KILL "$pid" 2> /dev/null || true
+    if diag_process_identity_is_live "$pid" "$expected_start"; then
+      diag_warn "$label process group did not stop after SIGTERM; sending SIGKILL"
+      kill -KILL -- "-$pid" 2> /dev/null || kill -KILL "$pid" 2> /dev/null || true
+    fi
   ) &
   watchdog=$!
   wait "$pid" 2> /dev/null || true
   wait "$watchdog" 2> /dev/null || true
-  # Close the race where the leader exited just as a descendant was forked.
-  kill -KILL -- "-$pid" 2> /dev/null || true
-  DIAG_WORKLOAD_PID=""
+  diag_supervised_group_drain "$pid" "$label" 100 || drain_rc=$?
+  ((drain_rc == 0)) || return "$DIAG_OPERATIONAL_ERROR_RC"
+  pid_ref=""
+  unset "DIAG_SUPERVISED_GROUP_START_TICKS[$pid_name]"
+}
+
+diag_process_group_start() {
+  diag_supervised_group_start DIAG_WORKLOAD_PID workload "$@"
+}
+
+diag_process_group_wait() {
+  diag_supervised_group_wait DIAG_WORKLOAD_PID workload
+}
+
+diag_process_group_stop() {
+  diag_supervised_group_stop DIAG_WORKLOAD_PID workload 40
 }
 
 diag_workload_stop() {
@@ -678,11 +831,11 @@ diag_freq_sampler_start() {
   : > "$samples"
   if diag_turbostat_usable; then
     printf 'turbostat\n' > "$DIAG_FREQ_DIR/${tag}.method"
-    turbostat --quiet --interval 1 >> "$samples" 2> /dev/null &
-    DIAG_SAMPLER_PID=$!
+    diag_supervised_group_start DIAG_SAMPLER_PID "frequency sampler" \
+      turbostat --quiet --interval 1 >> "$samples" 2> /dev/null
   else
     printf 'scaling_cur_freq\n' > "$DIAG_FREQ_DIR/${tag}.method"
-    (
+    diag_supervised_group_start DIAG_SAMPLER_PID "frequency sampler" bash -c '
       while :; do
         now="$(date +%s)"
         for f in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq; do
@@ -693,27 +846,12 @@ diag_freq_sampler_start() {
         done
         sleep 1
       done
-    ) >> "$samples" 2> /dev/null &
-    DIAG_SAMPLER_PID=$!
+    ' diag-frequency-sampler >> "$samples" 2> /dev/null
   fi
 }
 
 diag_freq_sampler_stop() {
-  if [[ -n "$DIAG_SAMPLER_PID" ]]; then
-    kill "$DIAG_SAMPLER_PID" 2> /dev/null || true
-    local i
-    for ((i = 0; i < 20; i++)); do
-      kill -0 "$DIAG_SAMPLER_PID" 2> /dev/null || break
-      sleep 0.05
-    done
-    # Do not let an uncooperative sampler indefinitely block restoration.
-    if kill -0 "$DIAG_SAMPLER_PID" 2> /dev/null; then
-      diag_warn "frequency sampler did not stop after SIGTERM; sending SIGKILL"
-      kill -KILL "$DIAG_SAMPLER_PID" 2> /dev/null || true
-    fi
-    wait "$DIAG_SAMPLER_PID" 2> /dev/null || true
-    DIAG_SAMPLER_PID=""
-  fi
+  diag_supervised_group_stop DIAG_SAMPLER_PID "frequency sampler" 20
 }
 
 # Run single-child workload legs on one pinned CPU, appending
@@ -725,7 +863,8 @@ diag_run_single_runs() {
   local tsv="$1" leg="$2" cpu="$3" runs="$4"
   shift 4
   local i rc start elapsed
-  diag_freq_sampler_start "freq-ab-${leg}"
+  diag_freq_sampler_start "freq-ab-${leg}" ||
+    return "$DIAG_OPERATIONAL_ERROR_RC"
   for ((i = 1; i <= runs; i++)); do
     start=$SECONDS
     if ! diag_process_group_start "$@" taskset -c "$cpu" node child.mjs > /dev/null 2>&1; then
@@ -742,8 +881,20 @@ diag_run_single_runs() {
     elif ((i % 5 == 0)); then
       diag_log "  leg $leg run $i/$runs: ok"
     fi
+    if ((rc == DIAG_OPERATIONAL_ERROR_RC)); then
+      # Operational supervision failure is not experimental evidence. Stop
+      # both tracked groups as far as safely possible and retain any handles
+      # that still cannot be drained for the EXIT cleanup to retry.
+      diag_process_group_stop || true
+      diag_freq_sampler_stop || true
+      return "$DIAG_OPERATIONAL_ERROR_RC"
+    fi
   done
-  diag_freq_sampler_stop
+  [[ -z "$DIAG_WORKLOAD_PID" ]] || {
+    diag_freq_sampler_stop || true
+    return "$DIAG_OPERATIONAL_ERROR_RC"
+  }
+  diag_freq_sampler_stop || return "$DIAG_OPERATIONAL_ERROR_RC"
 }
 
 diag_frequency_rows_are_complete() {

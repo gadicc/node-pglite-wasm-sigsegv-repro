@@ -2408,7 +2408,10 @@ phase_baseline() {
   diag_log "baseline: $BASELINE_CHILDREN children x $BASELINE_WAVES waves, STOP_ON_FAILURE=0"
   diag_freq_sampler_start baseline
   run_repro_logged "$OUT_DIR/$logf" "-" "$BASELINE_CHILDREN" "$BASELINE_WAVES"
-  diag_freq_sampler_stop
+  diag_freq_sampler_stop ||
+    diag_die "baseline sampler could not be confirmed stopped; refusing evidence publication"
+  [[ -z "$DIAG_WORKLOAD_PID" ]] ||
+    diag_die "baseline workload group could not be confirmed stopped; refusing evidence publication"
   {
     printf 'CHILDREN=%s\n' "$BASELINE_CHILDREN"
     printf 'WAVES=%s\n' "$BASELINE_WAVES"
@@ -2441,7 +2444,10 @@ phase_groups() {
     diag_log "group $((i + 1))/$total: $name cpus=$cpus children=$children waves=$GROUP_WAVES"
     diag_freq_sampler_start "$freq_tag"
     run_repro_logged "$OUT_DIR/$logf" "$cpus" "$children" "$GROUP_WAVES"
-    diag_freq_sampler_stop
+    diag_freq_sampler_stop ||
+      diag_die "group $name sampler could not be confirmed stopped; refusing evidence publication"
+    [[ -z "$DIAG_WORKLOAD_PID" ]] ||
+      diag_die "group $name workload could not be confirmed stopped; refusing evidence publication"
     repro_result_is_complete "$OUT_DIR/$logf" "$children" "$GROUP_WAVES" "$REPRO_RC" ||
       diag_die "group $name did not produce a complete $GROUP_WAVES-wave result (rc=$REPRO_RC); preserve it and resume with --redo groups"
     [[ -f "$OUT_DIR/results/groups.tsv" && ! -L "$OUT_DIR/results/groups.tsv" ]] ||
@@ -3609,7 +3615,24 @@ finalization_fail() {
   return 1
 }
 
+diagnose_stop_tracked_groups() {
+  local stop_rc=0 current_rc=0
+  diag_process_group_stop || {
+    current_rc=$?
+    ((stop_rc == 0)) && stop_rc=$current_rc
+  }
+  diag_freq_sampler_stop || {
+    current_rc=$?
+    ((stop_rc == 0)) && stop_rc=$current_rc
+  }
+  return "$stop_rc"
+}
+
 finalize_report() {
+  if [[ -n "${DIAG_WORKLOAD_PID:-}" || -n "${DIAG_SAMPLER_PID:-}" ]]; then
+    DERIVED_FINALIZATION_ERROR="tracked writer groups are not confirmed stopped"
+    return 1
+  fi
   derived_generation_begin || {
     finalization_fail "cannot open a safe derived-output generation"
     return 1
@@ -3695,6 +3718,8 @@ finalize_report() {
 
 complete_diagnostic() {
   # Success is terminal-only and follows the durable readiness token.
+  diagnose_stop_tracked_groups ||
+    diag_die "tracked process groups could not be confirmed stopped; refusing finalization"
   if ! finalize_report; then
     diag_die "${DERIVED_FINALIZATION_ERROR:-derived finalization failed}"
   fi
@@ -3703,8 +3728,14 @@ complete_diagnostic() {
 }
 
 diagnose_cleanup_exit() {
-  local rc="$1" artifact_safe=1
+  local rc="$1" artifact_safe=1 stop_rc=0
   trap - EXIT INT TERM
+  diagnose_stop_tracked_groups || stop_rc=$?
+  if ((stop_rc != 0)); then
+    diag_warn "tracked writer groups remain unconfirmed; retaining bundle authority and skipping all bundle cleanup"
+    ((rc == 0)) && rc=$stop_rc
+    exit "$rc"
+  fi
   if [[ -n "$OUT_DIR" && -d "$OUT_DIR" ]] &&
     ((rc != 0 || DERIVED_FINALIZATION_COMPLETE == 0)); then
     if derived_manifest_revoke; then
@@ -3717,8 +3748,6 @@ diagnose_cleanup_exit() {
     fi
   fi
   ((artifact_safe == 0)) || redo_marker_temp_cleanup
-  diag_process_group_stop
-  diag_freq_sampler_stop
   bundle_log_fds_close || rc=1
   # Children inherit the lock descriptor intentionally. Reap all writers
   # before closing our final descriptor so SIGKILL cannot expose live writes.
@@ -3727,16 +3756,19 @@ diagnose_cleanup_exit() {
 }
 
 on_interrupt() {
-  local sig="$1" signal_rc=143
+  local sig="$1" signal_rc=143 stop_rc=0
   [[ "$sig" == SIGINT ]] && signal_rc=130
   trap - EXIT INT TERM
+  diagnose_stop_tracked_groups 2> /dev/null || stop_rc=$?
+  if ((stop_rc != 0)); then
+    diag_warn "received $sig but tracked writer groups remain unconfirmed; skipping all bundle mutation and retaining bundle authority"
+    exit "$signal_rc"
+  fi
   # The readiness token is the first possible bundle mutation. If it cannot
   # be revoked durably, stop processes with terminal-only diagnostics and do
   # not touch metadata, logs, or pending artifacts behind that token.
   if ! derived_manifest_revoke; then
     bundle_log_fds_close 2> /dev/null || true
-    diag_process_group_stop 2> /dev/null || true
-    diag_freq_sampler_stop 2> /dev/null || true
     diag_bundle_lock_release 2> /dev/null || true
     echo "error: could not revoke diagnostic readiness after $sig" >&2
     exit "$signal_rc"
@@ -3745,8 +3777,6 @@ on_interrupt() {
   privacy_review_temp_cleanup 2> /dev/null || true
   redo_marker_temp_cleanup
   meta_set INTERRUPTED 1 2> /dev/null || true
-  diag_process_group_stop 2> /dev/null || true
-  diag_freq_sampler_stop 2> /dev/null || true
   if [[ -e "$STATE_DIR/redo.pending" || -L "$STATE_DIR/redo.pending" ]]; then
     diag_warn "received $sig while redo archival is pending; skipping a misleading partial report (resume this bundle to recover)"
     exit "$signal_rc"

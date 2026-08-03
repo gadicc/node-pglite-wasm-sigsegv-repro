@@ -620,7 +620,8 @@ for leg in A1 B A2; do
   printf 'LEG_%s_NO_TURBO=%s\n' "$leg" "$nt" >> "$META"
   printf 'LEG_%s_SCALING_MAX_KHZ=%s\n' "$leg" "$smax" >> "$META"
   diag_log "leg $leg: no_turbo=$nt scaling_max_freq=$smax; $RUNS runs on cpu $CPU"
-  diag_run_single_runs "$TSV" "$leg" "$CPU" "$RUNS" "${AS_USER[@]}"
+  diag_run_single_runs "$TSV" "$leg" "$CPU" "$RUNS" "${AS_USER[@]}" ||
+    diag_die "leg $leg writer groups could not be confirmed stopped; retaining settings and recovery authority"
 done
 
 diag_restore_now || diag_die "no_turbo restore failed; secure recovery state was retained"
@@ -651,7 +652,8 @@ if [[ -n "$CAP_KHZ" ]]; then
   } > "$FREQUENCY_STAGE_DIR/results/frequency-cap.meta"
   chmod 0600 "$FREQUENCY_STAGE_DIR/results/frequency-cap.meta"
   diag_log "cap leg: scaling_max_freq=$CAP_KHZ on $(basename "$POLICY"); $RUNS runs on cpu $CPU"
-  diag_run_single_runs "$TSV" "cap" "$CPU" "$RUNS" "${AS_USER[@]}"
+  diag_run_single_runs "$TSV" "cap" "$CPU" "$RUNS" "${AS_USER[@]}" ||
+    diag_die "frequency-cap writer groups could not be confirmed stopped; retaining settings and recovery authority"
   grep -P '^cap\t' "$TSV" > "$FREQUENCY_STAGE_DIR/results/frequency-cap.tsv" || true
   chmod 0600 "$FREQUENCY_STAGE_DIR/results/frequency-cap.tsv"
   sed -i '/^cap\t/d' "$TSV"

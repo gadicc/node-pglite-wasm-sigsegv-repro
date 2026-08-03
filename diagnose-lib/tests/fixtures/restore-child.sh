@@ -24,8 +24,7 @@ diag_register_restore_trap
 diag_sysfs_write "$fake_file" 1
 
 # Exercise cleanup ordering and reaping as well as the restore itself.
-sleep 300 &
-DIAG_SAMPLER_PID=$!
+diag_supervised_group_start DIAG_SAMPLER_PID "frequency sampler" sleep 300
 printf '%s\n' "$DIAG_SAMPLER_PID" > "$ready_file"
 if [[ "$action" == "exit-now" ]]; then
   exit 0

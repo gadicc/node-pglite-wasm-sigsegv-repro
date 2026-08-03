@@ -5,6 +5,7 @@ set -u
 
 ready_dir="$1"
 leader_mode="${2:-wait}"
+exit_gate="${3:-}"
 trap 'exit 0' TERM
 
 (
@@ -15,6 +16,9 @@ trap 'exit 0' TERM
 
 printf '%s\n' "$$" > "$ready_dir/leader.pid"
 if [[ "$leader_mode" == "exit" ]]; then
+  while [[ -n "$exit_gate" && ! -e "$exit_gate" ]]; do
+    sleep 0.01
+  done
   exec true
 fi
 wait
