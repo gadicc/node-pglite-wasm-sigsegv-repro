@@ -879,32 +879,20 @@ cpu_target_matches_completed_phase() {
   phase_is_done "$phase" || return 0
   case "$phase" in
     frequency) meta="$OUT_DIR/results/frequency-ab.meta" ;;
-    gdb) meta="$OUT_DIR/results/gdb.meta" ;;
+    gdb) meta="" ;;
     *) return 1 ;;
   esac
-  if [[ "$phase" == gdb ]] && gdb_meta_is_structurally_skipped "$meta"; then
-    return 0
+  if [[ "$phase" == gdb ]]; then
+    # Only the fully validated GDB envelope authorizes a CPU binding. Skip
+    # envelopes stay independent of the CPU selection policy.
+    actual="$(gdb_completed_envelope_cpu 2> /dev/null || true)"
+    [[ "$actual" == - ]] && return 0
+  else
+    actual="$(metadata_exact_value "$meta" CPU 2> /dev/null || true)"
   fi
-  actual="$(metadata_exact_value "$meta" CPU 2> /dev/null || true)"
   [[ "$actual" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
   expected="$(resolve_cpu_target_policy "$policy" 2> /dev/null || true)"
   [[ -n "$expected" && "$actual" == "$expected" ]]
-}
-
-gdb_meta_is_structurally_skipped() {
-  local meta="$1" line key value
-  local seen_skipped=0 seen_reason=0
-  [[ -f "$meta" && ! -L "$meta" ]] || return 1
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    [[ "$line" =~ ^([A-Z_]+)=(.*)$ ]] || return 1
-    key="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"
-    case "$key" in
-      SKIPPED) ((seen_skipped == 0)) || return 1; [[ "$value" == 1 ]] || return 1; seen_skipped=1 ;;
-      SKIP_REASON) ((seen_reason == 0)) || return 1; [[ -n "$value" ]] || return 1; seen_reason=1 ;;
-      *) return 1 ;;
-    esac
-  done < "$meta"
-  ((seen_skipped == 1 && seen_reason == 1))
 }
 
 validate_cpu_target_for_completed_phases() {
@@ -1161,8 +1149,18 @@ redo_path_is_allowed() {
   local phase="$1" path="$2" suffix
   redo_relative_path_is_safe "$path" || return 1
   case "$phase:$path" in
-    preflight:results/preflight.meta|preflight:env/preflight.manifest|preflight:env/cmdline.txt|preflight:env/cpuinfo-extra.txt|preflight:env/cpufreq.txt|preflight:env/cctk.txt|preflight:env/date.txt|preflight:env/dependencies.txt|preflight:env/dmi.txt|preflight:env/kernel-warnings.txt|preflight:env/lscpu.txt|preflight:env/node.txt|preflight:env/online.txt|preflight:env/os-release.txt|preflight:env/power.txt|preflight:env/summary.env|preflight:env/topology.tsv|preflight:env/uname.txt|preflight:env/undervolt.txt|preflight:env/root|baseline:results/baseline.meta|baseline:logs/baseline|baseline:freq/baseline.samples|baseline:freq/baseline.method|groups:results/groups.tsv|groups:results/groups.meta|groups:logs/groups|individual:results/individual.tsv|individual:results/individual.meta|individual:logs/individual|gdb:results/gdb.meta|gdb:gdb|gdb:logs/gdb|frequency:results/frequency-ab.tsv|frequency:results/frequency-ab.meta|frequency:results/frequency-cap.tsv|frequency:results/frequency-cap.meta) return 0 ;;
+    preflight:results/preflight.meta|preflight:env/preflight.manifest|preflight:env/cmdline.txt|preflight:env/cpuinfo-extra.txt|preflight:env/cpufreq.txt|preflight:env/cctk.txt|preflight:env/date.txt|preflight:env/dependencies.txt|preflight:env/dmi.txt|preflight:env/kernel-warnings.txt|preflight:env/lscpu.txt|preflight:env/node.txt|preflight:env/online.txt|preflight:env/os-release.txt|preflight:env/power.txt|preflight:env/summary.env|preflight:env/topology.tsv|preflight:env/uname.txt|preflight:env/undervolt.txt|preflight:env/root|baseline:results/baseline.meta|baseline:logs/baseline|baseline:freq/baseline.samples|baseline:freq/baseline.method|groups:results/groups.tsv|groups:results/groups.meta|groups:logs/groups|individual:results/individual.tsv|individual:results/individual.meta|individual:logs/individual|gdb:results/gdb.meta|gdb:results/gdb.manifest|gdb:gdb|gdb:logs/gdb|frequency:results/frequency-ab.tsv|frequency:results/frequency-ab.meta|frequency:results/frequency-cap.tsv|frequency:results/frequency-cap.meta) return 0 ;;
   esac
+  if [[ "$phase" == gdb && "$path" == results/.gdb.manifest.* ]]; then
+    suffix="${path#results/.gdb.manifest.}"
+    [[ -n "$suffix" && "$suffix" != */* ]]
+    return
+  fi
+  if [[ "$phase" == gdb && "$path" == results/.gdb.meta.* ]]; then
+    suffix="${path#results/.gdb.meta.}"
+    [[ -n "$suffix" && "$suffix" != */* ]]
+    return
+  fi
   if [[ "$phase" == groups && "$path" == freq/group-* ]]; then
     suffix="${path#freq/group-}"
     [[ -n "$suffix" && "$suffix" != */* ]]
@@ -1709,7 +1707,7 @@ apply_redo_plan() {
         groups) paths=(results/groups.tsv results/groups.meta logs/groups) ;;
         individual) paths=(results/individual.tsv results/individual.meta logs/individual) ;;
         frequency) paths=(results/frequency-ab.tsv results/frequency-ab.meta results/frequency-cap.tsv results/frequency-cap.meta) ;;
-        gdb) paths=(results/gdb.meta gdb logs/gdb) ;;
+        gdb) paths=(results/gdb.meta results/gdb.manifest gdb logs/gdb) ;;
         *) diag_die "--redo: unsupported phase '$phase'" ;;
       esac
       if [[ "$phase" == groups ]]; then
@@ -1722,6 +1720,10 @@ apply_redo_plan() {
         done
       elif [[ "$phase" == preflight ]]; then
         for artifact in "$OUT_DIR"/env/.preflight.manifest.* "$OUT_DIR"/results/.preflight.meta.*; do
+          [[ -e "$artifact" || -L "$artifact" ]] && paths+=("${artifact#"$OUT_DIR"/}")
+        done
+      elif [[ "$phase" == gdb ]]; then
+        for artifact in "$OUT_DIR"/results/.gdb.manifest.* "$OUT_DIR"/results/.gdb.meta.*; do
           [[ -e "$artifact" || -L "$artifact" ]] && paths+=("${artifact#"$OUT_DIR"/}")
         done
       fi
@@ -1765,6 +1767,10 @@ redo_marker_temp_cleanup() {
   if [[ -n "$PREFLIGHT_META_TEMP" ]]; then
     case "$PREFLIGHT_META_TEMP" in "${OUT_DIR:-}/results"/.preflight.meta.*) rm -f -- "$PREFLIGHT_META_TEMP" ;; esac
     PREFLIGHT_META_TEMP=""
+  fi
+  if [[ -n "$GDB_META_TEMP" ]]; then
+    case "$GDB_META_TEMP" in "${OUT_DIR:-}/results"/.gdb.meta.*) rm -f -- "$GDB_META_TEMP" ;; esac
+    GDB_META_TEMP=""
   fi
   privacy_review_temp_cleanup || true
 }
@@ -1946,18 +1952,20 @@ run_individual_logged() {
   diag_process_group_wait
 }
 
+# The runner log is authoritative evidence: capture-fault.sh writes only its
+# canonical ATTEMPT/COUNTS records to stdout, so that stream goes directly
+# into an exclusively created private runner.log. Human progress stays on
+# stderr (the console) and never enters the evidence file.
 run_gdb_logged() {
-  local cpu="$1" max_runs="$2" max_captures="$3" out_dir="$4" logf="$5"
+  local cpu="$1" max_runs="$2" max_captures="$3" out_dir="$4" logf="$5" generation="$6"
+  bundle_create_empty_exclusive "$logf" 0600 || return "$DIAG_OPERATIONAL_ERROR_RC"
   diag_process_group_start bash -c '
-    repo=$1 cpu=$2 max_runs=$3 max_captures=$4 out_dir=$5 logf=$6 operational_rc=$7
+    repo=$1 cpu=$2 max_runs=$3 max_captures=$4 out_dir=$5 logf=$6 generation=$7 operational_rc=$8
     cd "$repo" || exit "$operational_rc"
-    bash capture-fault.sh "$cpu" "$max_runs" "$max_captures" "$out_dir" 2>&1 |
-      tee "$logf"
-    statuses=("${PIPESTATUS[@]}")
-    ((statuses[1] == 0)) || exit "$operational_rc"
-    exit "${statuses[0]}"
+    bash capture-fault.sh "$cpu" "$max_runs" "$max_captures" "$out_dir" "$generation" \
+      > "$logf"
   ' diag-gdb "$SCRIPT_DIR" "$cpu" "$max_runs" "$max_captures" "$out_dir" "$logf" \
-    "$DIAG_OPERATIONAL_ERROR_RC" || return "$DIAG_OPERATIONAL_ERROR_RC"
+    "$generation" "$DIAG_OPERATIONAL_ERROR_RC" || return "$DIAG_OPERATIONAL_ERROR_RC"
   diag_process_group_wait
 }
 
@@ -2920,67 +2928,247 @@ GDB_ATTEMPTED_RUNS=""
 GDB_CLEAN_RUNS=""
 GDB_CAPTURED_RUNS=""
 GDB_ERROR_RUNS=""
+GDB_RUNNER_EXIT_CODE=""
+GDB_META_TEMP=""
 
-# Read the single terminal accounting record produced by capture-fault.sh.
-# The runner log is not evidence unless the record is exact, unique, last,
-# and internally reconciles with the configured attempt ceiling.
+# Read the generation-bound runner log produced by capture-fault.sh. The log
+# is evidence only when every record is exact: contiguous ATTEMPT lines bound
+# to the expected generation, CPU, and limits, one terminal COUNTS record as
+# the last line, bounded bytes and lines, and terminal counts that reconcile
+# with the configured attempt ceiling. Duplicate, overlong, nonterminal, or
+# mixed records are rejected. diagnose-lib/gdb-evidence.mjs remains the final
+# authority; this parser gates metadata publication and exit-status policy.
 gdb_run_counts_read() {
-  local logf="$1" max_runs="$2" line="" last_nonempty="" prefix_count=0
+  local logf="$1" generation="$2" cpu="$3" max_runs="$4" max_captures="$5"
+  local size line_count line run=0 clean=0 captured=0 errors=0 cap_run=0
+  local terminal="" expected outcome
   GDB_ATTEMPTED_RUNS=""
   GDB_CLEAN_RUNS=""
   GDB_CAPTURED_RUNS=""
   GDB_ERROR_RUNS=""
-  [[ -f "$logf" && ! -L "$logf" ]] && diag_is_safe_positive_uint "$max_runs" || return 1
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    [[ -n "$line" ]] && last_nonempty="$line"
-    if [[ "$line" == GDB_RUN_COUNTS* ]]; then
-      prefix_count=$((prefix_count + 1))
+  GDB_RUNNER_EXIT_CODE=""
+  [[ -f "$logf" && ! -L "$logf" ]] || return 1
+  [[ "$generation" =~ ^[0-9a-f]{32}$ &&
+    "$cpu" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+  diag_is_safe_positive_uint "$max_runs" &&
+    diag_is_safe_positive_uint "$max_captures" || return 1
+  size="$(stat -c %s -- "$logf" 2> /dev/null)" || return 1
+  [[ "$size" =~ ^[0-9]+$ ]] || return 1
+  ((size > 0 && size <= (max_runs + 1) * 513)) || return 1
+  line_count="$(wc -l < "$logf")" || return 1
+  ((line_count >= 2 && line_count <= max_runs + 1)) || return 1
+  # Canonical text only: tab and printable ASCII per line, LF-terminated.
+  LC_ALL=C grep -q $'[^ -~\t]' "$logf" && return 1
+  LC_ALL=C awk 'length($0) > 512 { exit 1 }' "$logf" || return 1
+  [[ -z "$(tail -c 1 -- "$logf")" ]] || return 1
+  while IFS= read -r line; do
+    [[ -z "$terminal" ]] || return 1
+    if [[ "$line" == $'ATTEMPT\t'* ]]; then
+      ((cap_run == 0)) || return 1
+      run=$((run + 1))
+      printf -v expected 'ATTEMPT\tGENERATION\t%s\tCPU\t%s\tMAX_RUNS\t%s\tMAX_CAPTURES\t%s\tRUN\t%s\tOUTCOME\t' \
+        "$generation" "$cpu" "$max_runs" "$max_captures" "$run"
+      [[ "$line" == "$expected"* ]] || return 1
+      outcome="${line#"$expected"}"
+      case "$outcome" in
+        clean) clean=$((clean + 1)) ;;
+        captured)
+          captured=$((captured + 1))
+          ((captured == max_captures)) && cap_run=$run
+          ;;
+        error) errors=$((errors + 1)) ;;
+        *) return 1 ;;
+      esac
+    elif [[ "$line" == $'COUNTS\t'* ]]; then
+      printf -v expected 'COUNTS\tGENERATION\t%s\tCPU\t%s\tMAX_RUNS\t%s\tMAX_CAPTURES\t%s\tATTEMPTED\t%s\tCLEAN\t%s\tCAPTURED\t%s\tERRORS\t%s\tEXIT_CODE\t' \
+        "$generation" "$cpu" "$max_runs" "$max_captures" \
+        "$run" "$clean" "$captured" "$errors"
+      [[ "$line" == "$expected"0 || "$line" == "$expected"3 ]] || return 1
+      terminal="${line#"$expected"}"
+    else
+      return 1
     fi
   done < "$logf"
-  ((prefix_count == 1)) || return 1
-  [[ "$last_nonempty" =~ ^GDB_RUN_COUNTS\ attempted=(0|[1-9][0-9]*)\ clean=(0|[1-9][0-9]*)\ captured=(0|[1-9][0-9]*)\ errors=(0|[1-9][0-9]*)$ ]] || return 1
-  GDB_ATTEMPTED_RUNS="${BASH_REMATCH[1]}"
-  GDB_CLEAN_RUNS="${BASH_REMATCH[2]}"
-  GDB_CAPTURED_RUNS="${BASH_REMATCH[3]}"
-  GDB_ERROR_RUNS="${BASH_REMATCH[4]}"
-  ((GDB_ATTEMPTED_RUNS <= max_runs)) || return 1
-  ((GDB_ATTEMPTED_RUNS == GDB_CLEAN_RUNS + GDB_CAPTURED_RUNS + GDB_ERROR_RUNS)) || return 1
+  [[ -n "$terminal" && "$terminal" =~ ^(0|3)$ ]] || return 1
+  ((run >= 1 && run <= max_runs && run == clean + captured + errors)) || return 1
+  if [[ "$terminal" == 0 ]]; then
+    ((captured >= 1 && captured <= max_captures &&
+      (run == max_runs || captured == max_captures))) || return 1
+  else
+    ((run == max_runs && captured == 0 && clean >= 1)) || return 1
+  fi
+  GDB_ATTEMPTED_RUNS="$run"
+  GDB_CLEAN_RUNS="$clean"
+  GDB_CAPTURED_RUNS="$captured"
+  GDB_ERROR_RUNS="$errors"
+  GDB_RUNNER_EXIT_CODE="$terminal"
+}
+
+# A fresh run or skip envelope starts from owned, empty transcript and runner
+# directories. Anything left behind is a prior attempt that the dispatcher
+# archives before this point; refuse to merge evidence across attempts.
+gdb_prepare_fresh_dirs() {
+  local relative path
+  for relative in gdb logs/gdb; do
+    bundle_prepare_dir "$relative" ||
+      diag_die "cannot prepare safe bundle directory '$relative'"
+    path="$OUT_DIR/$relative"
+    [[ -z "$(find "$path" -mindepth 1 -maxdepth 1 -print -quit 2> /dev/null)" ]] ||
+      diag_die "GDB directory '$relative' is not empty for a fresh attempt; preserve it and resume with --redo gdb"
+  done
+}
+
+# Publish the legacy-shaped results/gdb.meta through a private temporary
+# file, an fsync, and one atomic no-clobber rename. Usage:
+#   gdb_meta_publish RUN <cpu> <exit-code> | gdb_meta_publish SKIP <reason>
+gdb_meta_publish() {
+  local kind="$1" meta="$OUT_DIR/results/gdb.meta" tmp
+  [[ ! -e "$meta" && ! -L "$meta" ]] ||
+    diag_die "existing gdb metadata conflicts with a fresh phase; preserve it and resume with --redo gdb"
+  tmp="$(mktemp "$OUT_DIR/results/.gdb.meta.XXXXXX")" ||
+    diag_die "cannot prepare gdb metadata"
+  GDB_META_TEMP="$tmp"
+  chmod 0600 "$tmp" || diag_die "cannot protect gdb metadata"
+  case "$kind" in
+    RUN)
+      {
+        printf 'CPU=%s\n' "$2"
+        printf 'MAX_RUNS=%s\n' "$GDB_MAX_RUNS"
+        printf 'EXIT_CODE=%s\n' "$3"
+        printf 'ATTEMPTED_RUNS=%s\n' "$GDB_ATTEMPTED_RUNS"
+        printf 'CLEAN_RUNS=%s\n' "$GDB_CLEAN_RUNS"
+        printf 'CAPTURED_RUNS=%s\n' "$GDB_CAPTURED_RUNS"
+        printf 'ERROR_RUNS=%s\n' "$GDB_ERROR_RUNS"
+      } > "$tmp" || diag_die "cannot write gdb metadata"
+      ;;
+    SKIP)
+      printf 'SKIPPED=1\nSKIP_REASON=%s\n' "$2" > "$tmp" ||
+        diag_die "cannot write gdb metadata"
+      ;;
+    *) diag_die "unknown gdb metadata kind '$kind'" ;;
+  esac
+  sync -f "$tmp" || diag_die "cannot synchronize gdb metadata"
+  mv -nT -- "$tmp" "$meta" || diag_die "cannot publish gdb metadata"
+  [[ ! -e "$tmp" ]] || diag_die "another gdb metadata file appeared concurrently"
+  GDB_META_TEMP=""
+  sync -f "$OUT_DIR/results" || diag_die "cannot synchronize the gdb results directory"
+}
+
+# Build the hidden generation candidate, validate it, publish it as the
+# authoritative results/gdb.manifest without clobbering, fsync the results
+# directory, and re-validate the published envelope before the completion
+# marker exists. Usage: gdb_evidence_publish <generation> <cpu|->
+gdb_evidence_publish() {
+  local generation="$1" cpu="$2"
+  local candidate="$OUT_DIR/results/.gdb.manifest.$generation"
+  node "$LIB/gdb-evidence.mjs" build "$OUT_DIR" "$candidate" "$generation" \
+    "$cpu" "$GDB_MAX_RUNS" "$GDB_MAX_CAPTURES" ||
+    diag_die "cannot build validated gdb evidence; phase remains resumable"
+  mv -nT -- "$candidate" "$OUT_DIR/results/gdb.manifest" ||
+    diag_die "cannot publish gdb evidence manifest; phase remains resumable"
+  [[ ! -e "$candidate" ]] ||
+    diag_die "another gdb evidence manifest appeared concurrently"
+  sync -f "$OUT_DIR/results" ||
+    diag_die "cannot synchronize the gdb results directory"
+  node "$LIB/gdb-evidence.mjs" validate-before "$OUT_DIR" \
+    "$OUT_DIR/results/gdb.manifest" "$cpu" "$GDB_MAX_RUNS" "$GDB_MAX_CAPTURES" ||
+    diag_die "published gdb evidence failed validation; phase remains resumable"
+}
+
+# The completed envelope is the only authority for the recorded GDB CPU. The
+# identity record is extracted under byte bounds, then validate-complete
+# re-checks the entire envelope against that exact expectation. Prints the
+# bound CPU id, or "-" for a CPU-independent skip envelope.
+gdb_completed_envelope_cpu() {
+  local manifest="$OUT_DIR/results/gdb.manifest"
+  local size parsed cpu_count cpu skip_count kind extracted
+  [[ -f "$manifest" && ! -L "$manifest" ]] || return 1
+  diag_is_safe_positive_uint "$GDB_MAX_RUNS" || return 1
+  size="$(stat -c %s -- "$manifest" 2> /dev/null)" || return 1
+  [[ "$size" =~ ^[0-9]+$ ]] || return 1
+  ((size > 0 && size <= (GDB_MAX_RUNS + 8) * 513)) || return 1
+  parsed="$(LC_ALL=C awk -F '\t' '
+    $1 == "CONFIG" && $2 == "CPU" && NF == 3 { cpu_count += 1; cpu = $3 }
+    $1 == "SKIP" && NF == 2 { skip_count += 1; kind = $2 }
+    END { printf "%s %s %s %s\n", cpu_count + 0, cpu, skip_count + 0, kind }
+  ' "$manifest")" || return 1
+  cpu_count="${parsed%% *}"; parsed="${parsed#* }"
+  cpu="${parsed%% *}"; parsed="${parsed#* }"
+  skip_count="${parsed%% *}"; kind="${parsed#* }"
+  if [[ "$cpu_count" == 1 && "$skip_count" == 0 &&
+    "$cpu" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    extracted="$cpu"
+  elif [[ "$cpu_count" == 0 && "$skip_count" == 1 && ( "$kind" == "--skip-gdb" ||
+    "$kind" == "gdb not installed" || "$kind" == "no failing CPU identified" ) ]]; then
+    extracted="-"
+  else
+    return 1
+  fi
+  node "$LIB/gdb-evidence.mjs" validate-complete "$OUT_DIR" "$extracted" \
+    "$GDB_MAX_RUNS" "$GDB_MAX_CAPTURES" > /dev/null 2>&1 || return 1
+  printf '%s\n' "$extracted"
+}
+
+# The completed-resume gate: the marker and legacy gdb.meta are not
+# authoritative; only a fully validated generation-bound envelope completes
+# the phase.
+gdb_completed_resume_gate() {
+  gdb_completed_envelope_cpu > /dev/null 2>&1 ||
+    diag_die "completed gdb phase has missing, stale, or invalid evidence; preserve it and resume with --redo gdb"
 }
 
 phase_gdb() {
   local cpu="$1"
-  local meta="$OUT_DIR/results/gdb.meta"
-  {
-    printf 'CPU=%s\n' "$cpu"
-    printf 'MAX_RUNS=%s\n' "$GDB_MAX_RUNS"
-  } > "$meta"
-  mkdir -p "$OUT_DIR/logs/gdb"
-  diag_log_cmd bash capture-fault.sh "$cpu" "$GDB_MAX_RUNS" "$GDB_MAX_CAPTURES" "$OUT_DIR/gdb"
+  local runner_log="$OUT_DIR/logs/gdb/runner.log"
+  gdb_prepare_fresh_dirs
+  local generation
+  generation="$(node "$LIB/gdb-evidence.mjs" new-generation)" ||
+    diag_die "cannot generate a fresh gdb evidence generation"
+  [[ "$generation" =~ ^[0-9a-f]{32}$ ]] ||
+    diag_die "generated gdb evidence generation is malformed"
+  diag_log_cmd bash capture-fault.sh "$cpu" "$GDB_MAX_RUNS" "$GDB_MAX_CAPTURES" "$OUT_DIR/gdb" "$generation"
   local rc=0
   run_gdb_logged "$cpu" "$GDB_MAX_RUNS" "$GDB_MAX_CAPTURES" "$OUT_DIR/gdb" \
-    "$OUT_DIR/logs/gdb/runner.log" || rc=$?
-  printf 'EXIT_CODE=%s\n' "$rc" >> "$meta"
-  gdb_run_counts_read "$OUT_DIR/logs/gdb/runner.log" "$GDB_MAX_RUNS" ||
-    diag_die "gdb runner did not produce one valid terminal run-count record; phase remains resumable"
-  {
-    printf 'ATTEMPTED_RUNS=%s\n' "$GDB_ATTEMPTED_RUNS"
-    printf 'CLEAN_RUNS=%s\n' "$GDB_CLEAN_RUNS"
-    printf 'CAPTURED_RUNS=%s\n' "$GDB_CAPTURED_RUNS"
-    printf 'ERROR_RUNS=%s\n' "$GDB_ERROR_RUNS"
-  } >> "$meta"
-  if ! gdb_result_is_complete "$rc" "$GDB_MAX_RUNS" "$GDB_ATTEMPTED_RUNS" \
-    "$GDB_CLEAN_RUNS" "$GDB_CAPTURED_RUNS" "$GDB_ERROR_RUNS"; then
-    case "$rc" in
-      4) diag_die "gdb capture lost a required dependency; phase remains resumable" ;;
-      5) diag_die "gdb runner failed (see logs/gdb/runner.log); phase remains resumable" ;;
-      *) diag_die "gdb runner returned unexpected exit code $rc; phase remains resumable" ;;
-    esac
-  fi
+    "$runner_log" "$generation" || rc=$?
+  case "$rc" in
+    0 | 3) ;;
+    4) diag_die "gdb capture lost a required dependency; phase remains resumable" ;;
+    5) diag_die "gdb runner failed (see logs/gdb/runner.log); phase remains resumable" ;;
+    *) diag_die "gdb runner returned unexpected exit code $rc; phase remains resumable" ;;
+  esac
+  gdb_run_counts_read "$runner_log" "$generation" "$cpu" "$GDB_MAX_RUNS" "$GDB_MAX_CAPTURES" ||
+    diag_die "gdb runner did not produce one valid terminal accounting record; phase remains resumable"
+  [[ "$GDB_RUNNER_EXIT_CODE" == "$rc" ]] ||
+    diag_die "gdb runner exit status conflicts with its terminal accounting; phase remains resumable"
+  gdb_result_is_complete "$rc" "$GDB_MAX_RUNS" "$GDB_ATTEMPTED_RUNS" \
+    "$GDB_CLEAN_RUNS" "$GDB_CAPTURED_RUNS" "$GDB_ERROR_RUNS" ||
+    diag_die "gdb terminal accounting violates its run-count policy; phase remains resumable"
+  gdb_meta_publish RUN "$cpu" "$rc"
+  gdb_evidence_publish "$generation" "$cpu"
   case "$rc" in
     0) diag_log "gdb: fault captured" ;;
     3) diag_log "gdb: no fault within $GDB_MAX_RUNS runs" ;;
   esac
   mark_done gdb
+  node "$LIB/gdb-evidence.mjs" validate-complete "$OUT_DIR" "$cpu" \
+    "$GDB_MAX_RUNS" "$GDB_MAX_CAPTURES" > /dev/null 2>&1 ||
+    diag_die "completed gdb evidence failed validation; preserve it and resume with --redo gdb"
+}
+
+phase_gdb_skipped() {
+  local reason="$1"
+  gdb_prepare_fresh_dirs
+  local generation
+  generation="$(node "$LIB/gdb-evidence.mjs" new-generation)" ||
+    diag_die "cannot generate a fresh gdb evidence generation"
+  [[ "$generation" =~ ^[0-9a-f]{32}$ ]] ||
+    diag_die "generated gdb evidence generation is malformed"
+  gdb_meta_publish SKIP "$reason"
+  gdb_evidence_publish "$generation" -
+  mark_done gdb
+  node "$LIB/gdb-evidence.mjs" validate-complete "$OUT_DIR" - \
+    "$GDB_MAX_RUNS" "$GDB_MAX_CAPTURES" > /dev/null 2>&1 ||
+    diag_die "completed gdb evidence failed validation; preserve it and resume with --redo gdb"
 }
 
 gdb_result_is_complete() {
@@ -3008,7 +3196,12 @@ gdb_attempt_path_is_meaningful() {
 
 gdb_incomplete_attempt_is_meaningful() {
   phase_is_done gdb && return 1
+  local candidate
   [[ -e "$OUT_DIR/results/gdb.meta" || -L "$OUT_DIR/results/gdb.meta" ]] && return 0
+  [[ -e "$OUT_DIR/results/gdb.manifest" || -L "$OUT_DIR/results/gdb.manifest" ]] && return 0
+  for candidate in "$OUT_DIR"/results/.gdb.manifest.*; do
+    [[ -e "$candidate" || -L "$candidate" ]] && return 0
+  done
   gdb_attempt_path_is_meaningful "$OUT_DIR/gdb" && return 0
   gdb_attempt_path_is_meaningful "$OUT_DIR/logs/gdb" && return 0
   return 1
@@ -3017,7 +3210,7 @@ gdb_incomplete_attempt_is_meaningful() {
 archive_incomplete_gdb_attempt() {
   gdb_incomplete_attempt_is_meaningful || return 0
   redo_transaction_prepare
-  local path
+  local path candidate
   {
     printf 'VERSION\t2\nTXN\t%s\n' "$REDO_NEW_TXN_ID"
     redo_write_config_records
@@ -3025,8 +3218,12 @@ archive_incomplete_gdb_attempt() {
     for path in results.json report.md privacy-review.txt manifest.txt; do
       redo_record_if_present DERIVED - "$path"
     done
-    for path in results/gdb.meta gdb logs/gdb; do
+    for path in results/gdb.meta results/gdb.manifest gdb logs/gdb; do
       redo_record_if_present ARTIFACT gdb "$path"
+    done
+    for candidate in "$OUT_DIR"/results/.gdb.manifest.* "$OUT_DIR"/results/.gdb.meta.*; do
+      [[ ! -e "$candidate" && ! -L "$candidate" ]] ||
+        redo_record_if_present ARTIFACT gdb "${candidate#"$OUT_DIR"/}"
     done
   } > "$REDO_MARKER_TEMP" || diag_die "cannot write incomplete GDB archive transaction"
   redo_transaction_publish
@@ -3040,16 +3237,13 @@ phase_gdb_dispatch() {
   archive_incomplete_gdb_attempt
   if [[ "$SKIP_GDB" == "1" ]]; then
     diag_log "phase 6/7: skipped (--skip-gdb)"
-    printf 'SKIPPED=1\nSKIP_REASON=--skip-gdb\n' > "$OUT_DIR/results/gdb.meta"
-    mark_done gdb
+    phase_gdb_skipped "--skip-gdb"
   elif ! command -v gdb > /dev/null 2>&1; then
     diag_warn "phase 6/7: gdb not installed; skipping"
-    printf 'SKIPPED=1\nSKIP_REASON=gdb not installed\n' > "$OUT_DIR/results/gdb.meta"
-    mark_done gdb
+    phase_gdb_skipped "gdb not installed"
   elif [[ -z "$target_cpu" ]]; then
     diag_warn "phase 6/7: no failing CPU identified; skipping"
-    printf 'SKIPPED=1\nSKIP_REASON=no failing CPU identified\n' > "$OUT_DIR/results/gdb.meta"
-    mark_done gdb
+    phase_gdb_skipped "no failing CPU identified"
   else
     diag_log "phase 6/7: gdb signature capture on cpu $target_cpu (max $GDB_MAX_RUNS runs)"
     phase_gdb "$target_cpu"
@@ -4205,6 +4399,7 @@ main() {
 
   # ---- phase 6 ----
   if phase_is_done gdb; then
+    gdb_completed_resume_gate
     diag_log "phase 6/7 gdb: already done, skipping (resume)"
   else
     phase_gdb_dispatch "$target_cpu"
