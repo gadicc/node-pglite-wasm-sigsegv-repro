@@ -480,19 +480,31 @@ export function reconcileIndividualWithGroups(assessment, meta, groupsAssessment
       meta.TARGET_CPUS !== expected.targetCpus ||
       meta.SKIPPED !== (expected.skipped ? "1" : "0") ||
       canonicalUint(configuredRuns) === null || meta.RUNS_PER_CPU !== configuredRuns;
-    const provenanceMismatch = meta.VERSION === "3" || meta.VERSION === "2"
+    const provenanceMismatch = meta.VERSION === "4" || meta.VERSION === "3" || meta.VERSION === "2"
       ? meta.TARGET_POLICY !== expected?.targetPolicy ||
         meta.GROUP_PLAN_DIGEST !== expected?.groupPlanDigest
       : meta.VERSION !== "1";
+    // Version 4 envelopes bind the exact validated groups generation: a
+    // reproducible plan digest alone no longer authorizes redone evidence.
+    const generationMismatch = meta.VERSION === "4" &&
+      meta.GROUP_GENERATION !== expected?.groupGeneration;
     if (commonMismatch || provenanceMismatch) {
       reasons.push("individual target policy does not match the validated group evidence generation");
       status = "invalid";
       acceptedRows = [];
       acceptedSummaries = [];
-    } else if (meta.VERSION === "1" || meta.VERSION === "2") {
-      reasons.push(meta.VERSION === "2"
-        ? "version 2 individual evidence is descriptive only because its rows are not bound to a current evidence generation"
-        : "version 1 individual evidence is descriptive only because it lacks current target provenance and row-generation binding");
+    } else if (generationMismatch) {
+      reasons.push("individual evidence is not bound to the validated groups generation");
+      status = "invalid";
+      acceptedRows = [];
+      acceptedSummaries = [];
+    } else if (meta.VERSION === "1" || meta.VERSION === "2" || meta.VERSION === "3") {
+      reasons.push(
+        meta.VERSION === "3"
+          ? "version 3 individual evidence is descriptive only because it is not bound to the exact validated groups generation"
+          : meta.VERSION === "2"
+            ? "version 2 individual evidence is descriptive only because its rows are not bound to a current evidence generation"
+            : "version 1 individual evidence is descriptive only because it lacks current target provenance and row-generation binding");
       if (status !== "invalid") status = "incomplete";
     }
   }

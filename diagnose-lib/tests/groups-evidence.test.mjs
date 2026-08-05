@@ -1,6 +1,7 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import {
   copyFileSync,
   mkdirSync,
@@ -29,6 +30,7 @@ after(() => {
 
 const l2Cluster = "l2:4-7";
 const l2Name = `ecluster-l2-${createHash("sha256").update(l2Cluster).digest("hex").slice(0, 12)}`;
+const groupsGeneration = "0123456789abcdef0123456789abcdef";
 const plan = [
   ["pcores", "pcore", "0-3", "-", "4", "5", "logs/groups/pcores.log", "group-pcores"],
   [l2Name, "ecluster", "4-7", l2Cluster, "4", "5", `logs/groups/${l2Name}.log`, `group-${l2Name}`],
@@ -39,6 +41,19 @@ function rowsText(rows = plan.map((row, index) => [...row, index === 0 ? "0" : "
 }
 
 function metaText(overrides = {}) {
+  const values = {
+    VERSION: "2",
+    GENERATION: groupsGeneration,
+    EXPECTED_ROWS: "2",
+    GROUP_WAVES: "5",
+    PLAN_DIGEST: groupsPlanDigest(plan),
+    COMPLETED: "1",
+    ...overrides,
+  };
+  return `VERSION=${values.VERSION}\nGENERATION=${values.GENERATION}\nEXPECTED_ROWS=${values.EXPECTED_ROWS}\nGROUP_WAVES=${values.GROUP_WAVES}\nPLAN_DIGEST=${values.PLAN_DIGEST}\nCOMPLETED=${values.COMPLETED}\n`;
+}
+
+function metaTextV1(overrides = {}) {
   const values = {
     VERSION: "1",
     EXPECTED_ROWS: "2",
@@ -77,6 +92,7 @@ test("groups envelope accepts one ordered plan generation and retains l2 cluster
   const dir = bundle();
   const result = assessGroupsEvidence(dir, expectations);
   assert.equal(result.status, "complete");
+  assert.equal(result.meta.GENERATION, groupsGeneration);
   assert.equal(result.entries.length, 2);
   assert.equal(result.entries[1].clusterId, l2Cluster);
   const collected = collect(dir);
@@ -105,18 +121,21 @@ test("individual targets come from validated failed waves, including summary-onl
     targetPolicy: "failed-groups",
     targetCpus: "4-7",
     groupPlanDigest: groupsPlanDigest(plan),
+    groupGeneration: groupsGeneration,
     skipped: false,
   });
   assert.deepEqual(deriveIndividualTargetPolicy(result, "quick"), {
     targetPolicy: "failed-groups",
     targetCpus: "4-7",
     groupPlanDigest: groupsPlanDigest(plan),
+    groupGeneration: groupsGeneration,
     skipped: false,
   });
   assert.deepEqual(deriveIndividualTargetPolicy(result, "full"), {
     targetPolicy: "all-group-cpus",
     targetCpus: "0-7",
     groupPlanDigest: groupsPlanDigest(plan),
+    groupGeneration: groupsGeneration,
     skipped: false,
   });
 
@@ -128,6 +147,7 @@ test("individual targets come from validated failed waves, including summary-onl
     targetPolicy: "quick-skip",
     targetCpus: "",
     groupPlanDigest: groupsPlanDigest(plan),
+    groupGeneration: groupsGeneration,
     skipped: true,
   });
   assert.equal(deriveIndividualTargetPolicy(clean, "default").targetCpus, "0-7");
@@ -135,6 +155,7 @@ test("individual targets come from validated failed waves, including summary-onl
     targetPolicy: "all-group-cpus",
     targetCpus: "0-7",
     groupPlanDigest: groupsPlanDigest(plan),
+    groupGeneration: groupsGeneration,
     skipped: false,
   });
 });
@@ -152,7 +173,8 @@ test("full-mode target union deduplicates overlapping stored group ranges", () =
     [...overlappingPlan[2], "1"],
   ]));
   writeFileSync(path.join(dir, "results", "groups.meta"), [
-    "VERSION=1",
+    "VERSION=2",
+    `GENERATION=${groupsGeneration}`,
     "EXPECTED_ROWS=3",
     "GROUP_WAVES=5",
     `PLAN_DIGEST=${groupsPlanDigest(overlappingPlan)}`,
@@ -169,6 +191,7 @@ test("full-mode target union deduplicates overlapping stored group ranges", () =
     targetPolicy: "all-group-cpus",
     targetCpus: "0-7",
     groupPlanDigest: groupsPlanDigest(overlappingPlan),
+    groupGeneration: groupsGeneration,
     skipped: false,
   });
   assert.equal(deriveIndividualTargetPolicy(result, "default").targetCpus, "4-7");
@@ -185,13 +208,14 @@ test("collector binds full-mode individual evidence to every stored group-plan C
     `${cpu}\t1\t0\t1`,
     `${cpu}\t2\t${cpu === 7 ? 139 : 0}\t1`,
   ]).join("\n")}\n`;
-  const individualMeta = (targets, policy, rows) => [
-    "VERSION=3",
+  const individualMeta = (targets, policy, rows, groupGeneration = groupsGeneration) => [
+    "VERSION=4",
     `GENERATION=${"a".repeat(32)}`,
     `TARGET_CPUS=${targets}`,
     "RUNS_PER_CPU=2",
     `TARGET_POLICY=${policy}`,
     `GROUP_PLAN_DIGEST=${groupsPlanDigest(plan)}`,
+    `GROUP_GENERATION=${groupGeneration}`,
     "SKIPPED=0",
     "COMPLETED=1",
     `ROWS_SHA256=${createHash("sha256").update(rows).digest("hex")}`,
@@ -216,6 +240,20 @@ test("collector binds full-mode individual evidence to every stored group-plan C
   assert.match(stale.individualStatus.reasons.join("; "), /does not match/);
   assert.equal(stale.individual, undefined);
   assert.equal(stale.worstCpu, null);
+
+  // A redone groups phase mints a new generation for the same topology plan.
+  // Individual evidence bound only to the reproducible plan digest (a stale
+  // GROUP_GENERATION) must lose authority even though every row still parses.
+  writeFileSync(path.join(dir, "results", "individual.tsv"), completeRows);
+  writeFileSync(path.join(dir, "results", "individual.meta"),
+    individualMeta("0-7", "all-group-cpus", completeRows, "b".repeat(32)));
+  const staleGeneration = collect(dir);
+  assert.equal(staleGeneration.groupsStatus.status, "complete");
+  assert.equal(staleGeneration.individualStatus.status, "invalid");
+  assert.match(staleGeneration.individualStatus.reasons.join("; "),
+    /not bound to the validated groups generation/);
+  assert.equal(staleGeneration.individual, undefined);
+  assert.equal(staleGeneration.worstCpu, null);
 });
 
 test("collector rejects individual evidence from a different group target policy", () => {
@@ -241,7 +279,7 @@ test("collector rejects individual evidence from a different group target policy
   assert.equal(result.worstCpu, null);
 });
 
-test("collector preserves matching V1/V2 individual evidence descriptively without authorization", () => {
+test("collector preserves matching V1/V2/V3 individual evidence descriptively without authorization", () => {
   const dir = bundle();
   writeFileSync(path.join(dir, "state", "phase-individual.done"), "");
   const rows = [4, 5, 6, 7].flatMap((cpu) => [
@@ -249,6 +287,30 @@ test("collector preserves matching V1/V2 individual evidence descriptively witho
     `${cpu}\t2\t0\t1`,
   ]).join("\n") + "\n";
   writeFileSync(path.join(dir, "results", "individual.tsv"), rows);
+
+  writeFileSync(path.join(dir, "results", "individual.meta"), [
+    "VERSION=3",
+    `GENERATION=${"a".repeat(32)}`,
+    "TARGET_CPUS=4-7",
+    "RUNS_PER_CPU=2",
+    "TARGET_POLICY=failed-groups",
+    `GROUP_PLAN_DIGEST=${groupsPlanDigest(plan)}`,
+    "SKIPPED=0",
+    "COMPLETED=1",
+    `ROWS_SHA256=${createHash("sha256").update(rows).digest("hex")}`,
+    `ROWS_BYTES=${Buffer.byteLength(rows)}`,
+    `ROW_COUNT=${rows.trimEnd().split("\n").length}`,
+    "",
+  ].join("\n"));
+  const version3 = collect(dir);
+  assert.equal(version3.groupsStatus.status, "complete");
+  assert.equal(version3.individualStatus.status, "incomplete");
+  assert.match(version3.individualStatus.reasons.join("; "), /version 3.*descriptive only/);
+  assert.match(version3.individualStatus.reasons.join("; "), /not bound to the exact validated groups generation/);
+  assert.deepEqual(version3.individual.map(({ cpu }) => cpu), [4, 5, 6, 7]);
+  assert.equal(version3.individual[0].sigsegv, 1);
+  assert.equal(version3.worstCpu, null);
+  assert.equal(version3.cpuSelectionStatus.status, "unavailable");
 
   writeFileSync(path.join(dir, "results", "individual.meta"), [
     "VERSION=2",
@@ -338,16 +400,59 @@ test("fresh-target inspection short-circuits before unsafe plan paths are resolv
 
 test("groups metadata rejects malformed generations and config mismatches", () => {
   for (const meta of [
-    metaText().replace("VERSION=1", "VERSION=01"),
+    metaText().replace("VERSION=2", "VERSION=02"),
     metaText().replace("EXPECTED_ROWS=2", "EXPECTED_ROWS=02"),
     metaText().replace("GROUP_WAVES=5", "GROUP_WAVES=5e0"),
     metaText().replace(/PLAN_DIGEST=.*/, "PLAN_DIGEST=../outside"),
     metaText().replace("COMPLETED=1", "COMPLETED=true"),
-    metaText().replace("VERSION=1", "VERSION=1\nVERSION=1"),
+    metaText().replace("VERSION=2", "VERSION=2\nVERSION=2"),
   ]) {
     assert.equal(assessGroupsEvidence(bundle({ meta }), expectations).status, "invalid", meta);
   }
   assert.equal(assessGroupsEvidence(bundle(), { ...expectations, expectedGroupWaves: 6 }).status, "invalid");
+});
+
+test("version 2 groups envelopes require exactly one well-formed generation", () => {
+  for (const meta of [
+    metaText().replace(`GENERATION=${groupsGeneration}\n`, ""),
+    metaText().replace(`GENERATION=${groupsGeneration}`, "GENERATION=0123456789abcdef0123456789abcde"),
+    metaText().replace(`GENERATION=${groupsGeneration}`, `GENERATION=${groupsGeneration.toUpperCase()}`),
+    metaText().replace(`GENERATION=${groupsGeneration}`, "GENERATION=../outside"),
+    metaText().replace(`GENERATION=${groupsGeneration}`, `GENERATION=${groupsGeneration}\nGENERATION=${groupsGeneration}`),
+  ]) {
+    assert.equal(assessGroupsEvidence(bundle({ meta }), expectations).status, "invalid", meta);
+  }
+});
+
+test("legacy version 1 groups evidence stays parseable but cannot authorize conclusions", () => {
+  const legacy = assessGroupsEvidence(bundle({ meta: metaTextV1() }), expectations);
+  assert.equal(legacy.status, "incomplete");
+  assert.match(legacy.reasons.join("; "), /legacy groups metadata has no generation/);
+  assert.match(legacy.reasons.join("; "), /cannot authorize conclusions/);
+  assert.equal(deriveIndividualTargetPolicy(legacy, "quick"), null);
+  assert.equal(deriveIndividualTargetPolicy(legacy, "full"), null);
+  const collected = collect(bundle({ meta: metaTextV1() }));
+  assert.equal(collected.groupsStatus.status, "incomplete");
+  assert.equal(collected.groups, undefined);
+
+  // A version 1 envelope must not smuggle a generation into its grammar.
+  const smuggled = assessGroupsEvidence(
+    bundle({ meta: metaTextV1().replace("VERSION=1", `VERSION=1\nGENERATION=${groupsGeneration}`) }),
+    expectations,
+  );
+  assert.equal(smuggled.status, "invalid");
+});
+
+test("--individual-targets prints the exact validated groups generation", () => {
+  const dir = bundle();
+  const planFile = path.join(dir, "plan.tsv");
+  writeFileSync(planFile, `${plan.map((row) => row.join("\t")).join("\n")}\n`);
+  const script = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "groups-evidence.mjs");
+  const result = spawnSync(process.execPath, [script, "--individual-targets", dir, planFile, "5", "default"]);
+  assert.equal(result.status, 0, result.stderr.toString());
+  const output = result.stdout.toString();
+  assert.match(output, new RegExp(`^GROUP_PLAN_DIGEST=${groupsPlanDigest(plan)}$`, "m"));
+  assert.match(output, new RegExp(`^GROUP_GENERATION=${groupsGeneration}$`, "m"));
 });
 
 test("collector cannot authorize groups with duplicate stored GROUP_WAVES configuration", () => {

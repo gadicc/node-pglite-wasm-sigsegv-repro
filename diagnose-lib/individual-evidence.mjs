@@ -24,8 +24,8 @@ export const INDIVIDUAL_FAILED_RUN_DETAIL_LIMIT = 65536;
 const BUFFER_BYTES = 64 * 1024;
 const ALLOWED_META_KEYS = new Set([
   "VERSION", "TARGET_CPUS", "RUNS_PER_CPU", "SKIPPED", "COMPLETED",
-  "SKIP_REASON", "TARGET_POLICY", "GROUP_PLAN_DIGEST", "GENERATION",
-  "ROWS_SHA256", "ROWS_BYTES", "ROW_COUNT",
+  "SKIP_REASON", "TARGET_POLICY", "GROUP_PLAN_DIGEST", "GROUP_GENERATION",
+  "GENERATION", "ROWS_SHA256", "ROWS_BYTES", "ROW_COUNT",
 ]);
 
 function sameIdentity(left, right) {
@@ -564,11 +564,11 @@ export function assessIndividual(rows, meta, phaseDone, metaState = {}) {
     reasons.push("individual metadata is missing required fields");
     invalid = true;
   }
-  if (meta.VERSION !== "1" && meta.VERSION !== "2" && meta.VERSION !== "3") {
+  if (meta.VERSION !== "1" && meta.VERSION !== "2" && meta.VERSION !== "3" && meta.VERSION !== "4") {
     reasons.push("individual metadata version is missing or unsupported");
     invalid = true;
   }
-  const provenanceRequired = meta.VERSION === "2" || meta.VERSION === "3";
+  const provenanceRequired = meta.VERSION === "2" || meta.VERSION === "3" || meta.VERSION === "4";
   if (provenanceRequired) {
     if (!Object.hasOwn(meta, "TARGET_POLICY") || !Object.hasOwn(meta, "GROUP_PLAN_DIGEST")) {
       reasons.push("individual metadata is missing target provenance fields");
@@ -580,8 +580,9 @@ export function assessIndividual(rows, meta, phaseDone, metaState = {}) {
       invalid = true;
     }
   } else if (Object.hasOwn(meta, "TARGET_POLICY") || Object.hasOwn(meta, "GROUP_PLAN_DIGEST") ||
-    Object.hasOwn(meta, "GENERATION") || Object.hasOwn(meta, "ROWS_SHA256") ||
-    Object.hasOwn(meta, "ROWS_BYTES") || Object.hasOwn(meta, "ROW_COUNT")) {
+    Object.hasOwn(meta, "GROUP_GENERATION") || Object.hasOwn(meta, "GENERATION") ||
+    Object.hasOwn(meta, "ROWS_SHA256") || Object.hasOwn(meta, "ROWS_BYTES") ||
+    Object.hasOwn(meta, "ROW_COUNT")) {
     reasons.push("legacy individual metadata contains unsupported provenance fields");
     invalid = true;
   }
@@ -598,12 +599,20 @@ export function assessIndividual(rows, meta, phaseDone, metaState = {}) {
   }
 
   if (meta.VERSION === "2" && (Object.hasOwn(meta, "GENERATION") ||
-    Object.hasOwn(meta, "ROWS_SHA256") || Object.hasOwn(meta, "ROWS_BYTES") ||
-    Object.hasOwn(meta, "ROW_COUNT"))) {
+    Object.hasOwn(meta, "GROUP_GENERATION") || Object.hasOwn(meta, "ROWS_SHA256") ||
+    Object.hasOwn(meta, "ROWS_BYTES") || Object.hasOwn(meta, "ROW_COUNT"))) {
     reasons.push("version 2 individual metadata contains unsupported row binding fields");
     invalid = true;
   }
-  if (meta.VERSION === "3") {
+  if (meta.VERSION === "3" && Object.hasOwn(meta, "GROUP_GENERATION")) {
+    reasons.push("version 3 individual metadata contains an unsupported group generation field");
+    invalid = true;
+  }
+  if (meta.VERSION === "4" && !/^[a-f0-9]{32}$/.test(meta.GROUP_GENERATION ?? "")) {
+    reasons.push("individual group generation is missing or invalid");
+    invalid = true;
+  }
+  if (meta.VERSION === "3" || meta.VERSION === "4") {
     if (!/^[a-f0-9]{32}$/.test(meta.GENERATION ?? "")) {
       reasons.push("individual evidence generation is missing or invalid");
       invalid = true;
@@ -729,6 +738,7 @@ export function assessIndividual(rows, meta, phaseDone, metaState = {}) {
     generation: meta.GENERATION ?? null,
     targetPolicy: meta.TARGET_POLICY ?? null,
     groupPlanDigest: meta.GROUP_PLAN_DIGEST ?? null,
+    groupGeneration: meta.GROUP_GENERATION ?? null,
   };
   const omittedDetails = streamedRows?.failedRunDetailsOmitted ?? 0;
   if (omittedDetails !== 0 && omittedDetails !== "0") {
@@ -931,8 +941,8 @@ function validateMetaForShell(metaState) {
 function printShellMeta(values) {
   for (const key of [
     "VERSION", "TARGET_CPUS", "RUNS_PER_CPU", "SKIPPED", "COMPLETED",
-    "TARGET_POLICY", "GROUP_PLAN_DIGEST", "GENERATION", "ROWS_SHA256",
-    "ROWS_BYTES", "ROW_COUNT",
+    "TARGET_POLICY", "GROUP_PLAN_DIGEST", "GROUP_GENERATION", "GENERATION",
+    "ROWS_SHA256", "ROWS_BYTES", "ROW_COUNT",
   ]) {
     console.log(`${key}=${values[key] ?? ""}`);
   }

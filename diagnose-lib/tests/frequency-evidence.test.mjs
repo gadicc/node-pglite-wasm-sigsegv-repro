@@ -17,6 +17,10 @@ after(() => {
 
 const digest = (text) => createHash("sha256").update(text).digest("hex");
 
+// The automatic-CPU fixtures below pair a validated version 2 groups envelope
+// with version 4 individual evidence bound to its exact generation.
+const AUTO_GROUPS_GENERATION = "00112233445566778899aabbccddeeff";
+
 function writeFixture({ cap = false, generation = "0123456789abcdef0123456789abcdef" } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "frequency-evidence-"));
   tmpDirs.push(dir);
@@ -113,23 +117,23 @@ function writeAutoEvidence(dir, state) {
   writeFileSync(path.join(dir, "logs", "groups", "all-cpus.log"), log);
   writeFileSync(path.join(dir, "results", "groups.tsv"), `${plan}\t${failed ? 1 : 0}\n`);
   writeFileSync(path.join(dir, "results", "groups.meta"),
-    `VERSION=1\nEXPECTED_ROWS=1\nGROUP_WAVES=1\nPLAN_DIGEST=${planDigest}\nCOMPLETED=1\n`);
+    `VERSION=2\nGENERATION=${AUTO_GROUPS_GENERATION}\nEXPECTED_ROWS=1\nGROUP_WAVES=1\nPLAN_DIGEST=${planDigest}\nCOMPLETED=1\n`);
   writeFileSync(path.join(dir, "state", "phase-groups.done"), "");
 
   if (skipped) {
     const rows = "";
     writeFileSync(path.join(dir, "results", "individual.tsv"), rows);
     writeFileSync(path.join(dir, "results", "individual.meta"),
-      `VERSION=3\nGENERATION=${"a".repeat(32)}\nTARGET_CPUS=\nRUNS_PER_CPU=1\nTARGET_POLICY=quick-skip\n` +
-      `GROUP_PLAN_DIGEST=${planDigest}\nSKIPPED=1\nCOMPLETED=1\n` +
+      `VERSION=4\nGENERATION=${"a".repeat(32)}\nTARGET_CPUS=\nRUNS_PER_CPU=1\nTARGET_POLICY=quick-skip\n` +
+      `GROUP_PLAN_DIGEST=${planDigest}\nGROUP_GENERATION=${AUTO_GROUPS_GENERATION}\nSKIPPED=1\nCOMPLETED=1\n` +
       `SKIP_REASON=no-failing-group-in-quick-mode\nROWS_SHA256=${digest(rows)}\nROWS_BYTES=0\nROW_COUNT=0\n`);
   } else {
     const rows = `19\t1\t${failed ? 139 : 0}\t2\n`;
     writeFileSync(path.join(dir, "results", "individual.tsv"), rows);
     writeFileSync(path.join(dir, "results", "individual.meta"),
-      `VERSION=3\nGENERATION=${"a".repeat(32)}\nTARGET_CPUS=19\nRUNS_PER_CPU=1\n` +
+      `VERSION=4\nGENERATION=${"a".repeat(32)}\nTARGET_CPUS=19\nRUNS_PER_CPU=1\n` +
       `TARGET_POLICY=${failed ? "failed-groups" : "all-group-cpus"}\n` +
-      `GROUP_PLAN_DIGEST=${planDigest}\nSKIPPED=0\nCOMPLETED=${state === "incomplete" ? 0 : 1}\n` +
+      `GROUP_PLAN_DIGEST=${planDigest}\nGROUP_GENERATION=${AUTO_GROUPS_GENERATION}\nSKIPPED=0\nCOMPLETED=${state === "incomplete" ? 0 : 1}\n` +
       (state === "incomplete" ? "" :
         `ROWS_SHA256=${digest(rows)}\nROWS_BYTES=${Buffer.byteLength(rows)}\nROW_COUNT=1\n`));
   }

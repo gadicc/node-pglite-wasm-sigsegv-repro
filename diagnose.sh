@@ -67,6 +67,7 @@ REDO_RECOVERED_PENDING=0
 META_UPDATE_TEMP=""
 GROUP_PLAN_TEMP=""
 GROUP_META_TEMP=""
+GROUPS_META_GENERATION=""
 PREFLIGHT_MANIFEST_TEMP=""
 PREFLIGHT_META_TEMP=""
 PRIVACY_REVIEW_TEMP=""
@@ -1760,6 +1761,7 @@ redo_marker_temp_cleanup() {
     case "$GROUP_META_TEMP" in "${OUT_DIR:-}/results"/.groups.meta.*) rm -f -- "$GROUP_META_TEMP" ;; esac
     GROUP_META_TEMP=""
   fi
+  GROUPS_META_GENERATION=""
   if [[ -n "$PREFLIGHT_MANIFEST_TEMP" ]]; then
     case "$PREFLIGHT_MANIFEST_TEMP" in "${OUT_DIR:-}/env"/.preflight.manifest.*) rm -f -- "$PREFLIGHT_MANIFEST_TEMP" ;; esac
     PREFLIGHT_MANIFEST_TEMP=""
@@ -2010,10 +2012,20 @@ groups_evidence_is_complete() {
 
 groups_meta_publish() {
   local completed="$1" total=${#GROUP_NAME[@]}
+  # Mint one random generation per fresh phase attempt and keep it across both
+  # publishes (COMPLETED=0, then 1): individual evidence binds this exact
+  # generation, so a groups redo must never reuse an archived one.
+  if [[ -z "$GROUPS_META_GENERATION" ]]; then
+    GROUPS_META_GENERATION="$("$DIAG_INDIVIDUAL_NODE_BIN" -e 'process.stdout.write(require("node:crypto").randomBytes(16).toString("hex"))')" ||
+      diag_die "cannot generate groups evidence generation"
+  fi
+  [[ "$GROUPS_META_GENERATION" =~ ^[a-f0-9]{32}$ ]] ||
+    diag_die "cannot publish groups metadata with an invalid generation"
   GROUP_META_TEMP="$(mktemp "$OUT_DIR/results/.groups.meta.XXXXXX")" ||
     diag_die "cannot prepare groups metadata"
   {
-    printf 'VERSION=1\n'
+    printf 'VERSION=2\n'
+    printf 'GENERATION=%s\n' "$GROUPS_META_GENERATION"
     printf 'EXPECTED_ROWS=%s\n' "$total"
     printf 'GROUP_WAVES=%s\n' "$GROUP_WAVES"
     printf 'PLAN_DIGEST=%s\n' "$GROUP_PLAN_DIGEST"
@@ -2026,6 +2038,9 @@ groups_meta_publish() {
 }
 
 groups_prepare_fresh_targets() {
+  # A fresh phase attempt always mints a new groups generation; never reuse a
+  # generation left over from an archived or interrupted attempt.
+  GROUPS_META_GENERATION=""
   groups_plan_prepare
   if ! node "$LIB/groups-evidence.mjs" --check-fresh \
     "$OUT_DIR" "$GROUP_PLAN_TEMP" "$GROUP_WAVES"; then
@@ -2478,12 +2493,14 @@ phase_groups() {
 INDIVIDUAL_TARGET_CPUS=""
 INDIVIDUAL_TARGET_POLICY=""
 INDIVIDUAL_GROUP_PLAN_DIGEST=""
+INDIVIDUAL_GROUP_GENERATION=""
 compute_individual_targets() {
   local output line key value
-  local seen_policy=0 seen_targets=0 seen_digest=0
+  local seen_policy=0 seen_targets=0 seen_digest=0 seen_group_generation=0
   INDIVIDUAL_TARGET_CPUS=""
   INDIVIDUAL_TARGET_POLICY=""
   INDIVIDUAL_GROUP_PLAN_DIGEST=""
+  INDIVIDUAL_GROUP_GENERATION=""
   groups_plan_prepare
   output="$(node "$LIB/groups-evidence.mjs" --individual-targets \
     "$OUT_DIR" "$GROUP_PLAN_TEMP" "$GROUP_WAVES" "$MODE")" ||
@@ -2508,10 +2525,15 @@ compute_individual_targets() {
         [[ "$value" =~ ^[a-f0-9]{64}$ ]] || diag_die "groups target derivation produced an invalid plan digest"
         INDIVIDUAL_GROUP_PLAN_DIGEST="$value"; seen_digest=1
         ;;
+      GROUP_GENERATION)
+        ((seen_group_generation == 0)) || diag_die "groups target derivation duplicated its group generation"
+        [[ "$value" =~ ^[a-f0-9]{32}$ ]] || diag_die "groups target derivation produced an invalid group generation"
+        INDIVIDUAL_GROUP_GENERATION="$value"; seen_group_generation=1
+        ;;
       *) diag_die "groups target derivation produced an unknown field" ;;
     esac
   done <<< "$output"
-  ((seen_policy == 1 && seen_targets == 1 && seen_digest == 1)) ||
+  ((seen_policy == 1 && seen_targets == 1 && seen_digest == 1 && seen_group_generation == 1)) ||
     diag_die "groups target derivation omitted required evidence"
   if [[ "$INDIVIDUAL_TARGET_POLICY" == quick-skip ]]; then
     [[ -z "$INDIVIDUAL_TARGET_CPUS" && "$MODE" == quick ]] ||
@@ -2533,18 +2555,21 @@ phase_individual() {
     : > "$tsv"
   fi
   if [[ -e "$meta" || -L "$meta" ]]; then
+    # Resume authority requires the current strict envelope: legacy V2/V3
+    # metadata is not bound to this groups generation and fails closed.
     individual_meta_read "$meta" &&
-      [[ ("$INDIVIDUAL_META_VERSION" == 2 || "$INDIVIDUAL_META_VERSION" == 3) &&
+      [[ "$INDIVIDUAL_META_VERSION" == 4 &&
         "$INDIVIDUAL_META_SKIPPED" == 0 &&
         "$INDIVIDUAL_META_TARGET_CPUS" == "$INDIVIDUAL_TARGET_CPUS" &&
         "$INDIVIDUAL_META_RUNS" == "$INDIVIDUAL_RUNS" &&
         "$INDIVIDUAL_META_TARGET_POLICY" == "$INDIVIDUAL_TARGET_POLICY" &&
-        "$INDIVIDUAL_META_GROUP_PLAN_DIGEST" == "$INDIVIDUAL_GROUP_PLAN_DIGEST" ]] ||
+        "$INDIVIDUAL_META_GROUP_PLAN_DIGEST" == "$INDIVIDUAL_GROUP_PLAN_DIGEST" &&
+        "$INDIVIDUAL_META_GROUP_GENERATION" == "$INDIVIDUAL_GROUP_GENERATION" ]] ||
       diag_die "existing individual.meta does not match this resumable phase; preserve it and use --redo individual"
   else
     # A completed-phase check earlier in this shell may have populated these
     # globals from evidence that --redo subsequently archived. Only an extant,
-    # successfully read resumable V3 metadata file may preserve its generation.
+    # successfully read resumable V4 metadata file may preserve its generation.
     individual_meta_reset_generation
   fi
   individual_meta_write "$INDIVIDUAL_TARGET_CPUS" "$INDIVIDUAL_RUNS" 0 0 ""
@@ -2640,6 +2665,7 @@ INDIVIDUAL_META_COMPLETED=""
 INDIVIDUAL_META_SKIP_REASON=""
 INDIVIDUAL_META_TARGET_POLICY=""
 INDIVIDUAL_META_GROUP_PLAN_DIGEST=""
+INDIVIDUAL_META_GROUP_GENERATION=""
 INDIVIDUAL_META_GENERATION=""
 INDIVIDUAL_META_ROWS_SHA256=""
 INDIVIDUAL_META_ROWS_BYTES=""
@@ -2663,6 +2689,7 @@ individual_meta_read() {
   INDIVIDUAL_META_SKIP_REASON=""
   INDIVIDUAL_META_TARGET_POLICY=""
   INDIVIDUAL_META_GROUP_PLAN_DIGEST=""
+  INDIVIDUAL_META_GROUP_GENERATION=""
   INDIVIDUAL_META_GENERATION=""
   INDIVIDUAL_META_ROWS_SHA256=""
   INDIVIDUAL_META_ROWS_BYTES=""
@@ -2683,6 +2710,7 @@ individual_meta_read() {
       SKIP_REASON) INDIVIDUAL_META_SKIP_REASON="$value" ;;
       TARGET_POLICY) INDIVIDUAL_META_TARGET_POLICY="$value" ;;
       GROUP_PLAN_DIGEST) INDIVIDUAL_META_GROUP_PLAN_DIGEST="$value" ;;
+      GROUP_GENERATION) INDIVIDUAL_META_GROUP_GENERATION="$value" ;;
       GENERATION) INDIVIDUAL_META_GENERATION="$value" ;;
       ROWS_SHA256) INDIVIDUAL_META_ROWS_SHA256="$value" ;;
       ROWS_BYTES) INDIVIDUAL_META_ROWS_BYTES="$value" ;;
@@ -2694,7 +2722,7 @@ individual_meta_read() {
       *) return 1 ;;
     esac
   done <<< "$output"
-  [[ ${#seen[@]} == 12 && -n "${seen[VERSION]:-}" && -n "${seen[TARGET_CPUS]:-}" &&
+  [[ ${#seen[@]} == 13 && -n "${seen[VERSION]:-}" && -n "${seen[TARGET_CPUS]:-}" &&
     -n "${seen[RUNS_PER_CPU]:-}" && -n "${seen[SKIPPED]:-}" &&
     -n "${seen[COMPLETED]:-}" && -n "${seen[SKIP_REASON_PRESENT]:-}" ]] || return 1
 }
@@ -2707,6 +2735,8 @@ individual_meta_write() {
     diag_die "cannot publish individual metadata without a valid target policy"
   [[ "$INDIVIDUAL_GROUP_PLAN_DIGEST" =~ ^[a-f0-9]{64}$ ]] ||
     diag_die "cannot publish individual metadata without a valid group plan digest"
+  [[ "$INDIVIDUAL_GROUP_GENERATION" =~ ^[a-f0-9]{32}$ ]] ||
+    diag_die "cannot publish individual metadata without a valid groups generation"
   if [[ -z "$INDIVIDUAL_META_GENERATION" ]]; then
     INDIVIDUAL_META_GENERATION="$("$DIAG_INDIVIDUAL_NODE_BIN" -e 'process.stdout.write(require("node:crypto").randomBytes(16).toString("hex"))')" ||
       diag_die "cannot generate individual evidence generation"
@@ -2721,10 +2751,10 @@ individual_meta_write() {
   fi
   tmp="$(mktemp "$OUT_DIR/results/.individual.meta.XXXXXX")" || diag_die "cannot create individual metadata"
   {
-    printf 'VERSION=3\nGENERATION=%s\nTARGET_CPUS=%s\nRUNS_PER_CPU=%s\n' \
+    printf 'VERSION=4\nGENERATION=%s\nTARGET_CPUS=%s\nRUNS_PER_CPU=%s\n' \
       "$INDIVIDUAL_META_GENERATION" "$targets" "$runs"
-    printf 'TARGET_POLICY=%s\nGROUP_PLAN_DIGEST=%s\n' \
-      "$INDIVIDUAL_TARGET_POLICY" "$INDIVIDUAL_GROUP_PLAN_DIGEST"
+    printf 'TARGET_POLICY=%s\nGROUP_PLAN_DIGEST=%s\nGROUP_GENERATION=%s\n' \
+      "$INDIVIDUAL_TARGET_POLICY" "$INDIVIDUAL_GROUP_PLAN_DIGEST" "$INDIVIDUAL_GROUP_GENERATION"
     printf 'SKIPPED=%s\nCOMPLETED=%s\n' "$skipped" "$completed"
     [[ -z "$reason" ]] || printf 'SKIP_REASON=%s\n' "$reason"
     if [[ "$completed" == 1 ]]; then
@@ -2788,10 +2818,11 @@ individual_phase_matches_expected_targets() {
   local should_run="$1"
   [[ "$should_run" =~ ^[01]$ ]] || return 1
   individual_evidence_read || return 1
-  [[ "$INDIVIDUAL_META_VERSION" == 3 &&
+  [[ "$INDIVIDUAL_META_VERSION" == 4 &&
     "$INDIVIDUAL_META_RUNS" == "$INDIVIDUAL_RUNS" &&
     "$INDIVIDUAL_META_TARGET_POLICY" == "$INDIVIDUAL_TARGET_POLICY" &&
-    "$INDIVIDUAL_META_GROUP_PLAN_DIGEST" == "$INDIVIDUAL_GROUP_PLAN_DIGEST" ]] || return 1
+    "$INDIVIDUAL_META_GROUP_PLAN_DIGEST" == "$INDIVIDUAL_GROUP_PLAN_DIGEST" &&
+    "$INDIVIDUAL_META_GROUP_GENERATION" == "$INDIVIDUAL_GROUP_GENERATION" ]] || return 1
   if [[ "$should_run" == 1 ]]; then
     [[ "$INDIVIDUAL_META_SKIPPED" == 0 &&
       "$INDIVIDUAL_META_TARGET_CPUS" == "$INDIVIDUAL_TARGET_CPUS" ]]
@@ -2809,6 +2840,7 @@ individual_evidence_read() {
   INDIVIDUAL_EVIDENCE_STATUS=""
   INDIVIDUAL_EVIDENCE_WORST_CPU=""
   INDIVIDUAL_META_SKIP_REASON=""
+  INDIVIDUAL_META_GROUP_GENERATION=""
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ "$line" =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]] || return 1
     key="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"
@@ -2823,6 +2855,7 @@ individual_evidence_read() {
       COMPLETED) INDIVIDUAL_META_COMPLETED="$value" ;;
       TARGET_POLICY) INDIVIDUAL_META_TARGET_POLICY="$value" ;;
       GROUP_PLAN_DIGEST) INDIVIDUAL_META_GROUP_PLAN_DIGEST="$value" ;;
+      GROUP_GENERATION) INDIVIDUAL_META_GROUP_GENERATION="$value" ;;
       GENERATION) INDIVIDUAL_META_GENERATION="$value" ;;
       ROWS_SHA256) INDIVIDUAL_META_ROWS_SHA256="$value" ;;
       ROWS_BYTES) INDIVIDUAL_META_ROWS_BYTES="$value" ;;
@@ -2835,12 +2868,12 @@ individual_evidence_read() {
       *) return 1 ;;
     esac
   done <<< "$output"
-  [[ ${#seen[@]} == 14 && "$INDIVIDUAL_EVIDENCE_STATUS" =~ ^(not-run|incomplete|invalid|skipped|complete)$ ]]
+  [[ ${#seen[@]} == 15 && "$INDIVIDUAL_EVIDENCE_STATUS" =~ ^(not-run|incomplete|invalid|skipped|complete)$ ]]
 }
 
 individual_phase_result_is_complete() {
   individual_evidence_read &&
-    [[ "$INDIVIDUAL_META_VERSION" == 3 && "$INDIVIDUAL_META_COMPLETED" == 1 &&
+    [[ "$INDIVIDUAL_META_VERSION" == 4 && "$INDIVIDUAL_META_COMPLETED" == 1 &&
       ("$INDIVIDUAL_EVIDENCE_STATUS" == complete || "$INDIVIDUAL_EVIDENCE_STATUS" == skipped) ]]
 }
 
@@ -2848,11 +2881,12 @@ individual_phase_is_complete_and_matches_expected() {
   local should_run="$1"
   [[ "$should_run" =~ ^[01]$ ]] || return 1
   individual_evidence_read || return 1
-  [[ "$INDIVIDUAL_META_VERSION" == 3 && "$INDIVIDUAL_META_COMPLETED" == 1 &&
+  [[ "$INDIVIDUAL_META_VERSION" == 4 && "$INDIVIDUAL_META_COMPLETED" == 1 &&
     ("$INDIVIDUAL_EVIDENCE_STATUS" == complete || "$INDIVIDUAL_EVIDENCE_STATUS" == skipped) &&
     "$INDIVIDUAL_META_RUNS" == "$INDIVIDUAL_RUNS" &&
     "$INDIVIDUAL_META_TARGET_POLICY" == "$INDIVIDUAL_TARGET_POLICY" &&
-    "$INDIVIDUAL_META_GROUP_PLAN_DIGEST" == "$INDIVIDUAL_GROUP_PLAN_DIGEST" ]] || return 1
+    "$INDIVIDUAL_META_GROUP_PLAN_DIGEST" == "$INDIVIDUAL_GROUP_PLAN_DIGEST" &&
+    "$INDIVIDUAL_META_GROUP_GENERATION" == "$INDIVIDUAL_GROUP_GENERATION" ]] || return 1
   if [[ "$should_run" == 1 ]]; then
     [[ "$INDIVIDUAL_EVIDENCE_STATUS" == complete && "$INDIVIDUAL_META_SKIPPED" == 0 &&
       "$INDIVIDUAL_META_TARGET_CPUS" == "$INDIVIDUAL_TARGET_CPUS" ]]
@@ -2883,10 +2917,15 @@ phase_individual_skipped() {
 
 # ------------------------------------------------------------------
 # Worst CPU from a fully validated individual phase (highest SIGSEGV rate,
-# ties: more SIGSEGVs, then lower CPU id).
+# ties: more SIGSEGVs, then lower CPU id). When this shell already derived the
+# expected targets, the envelope must also bind that exact groups generation;
+# the startup CPU-policy path runs before any derivation and is caught later
+# by the phase-4 gate, so it intentionally skips that comparison.
 worst_cpu() {
   individual_evidence_read || return 0
-  [[ "$INDIVIDUAL_META_VERSION" == 3 && "$INDIVIDUAL_EVIDENCE_STATUS" == complete ]] || return 0
+  [[ "$INDIVIDUAL_META_VERSION" == 4 && "$INDIVIDUAL_EVIDENCE_STATUS" == complete ]] || return 0
+  [[ -n "$INDIVIDUAL_GROUP_GENERATION" &&
+    "$INDIVIDUAL_META_GROUP_GENERATION" != "$INDIVIDUAL_GROUP_GENERATION" ]] && return 0
   printf '%s\n' "$INDIVIDUAL_EVIDENCE_WORST_CPU"
 }
 

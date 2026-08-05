@@ -17,6 +17,7 @@ import {
   collect,
   collectFreqAb,
   collectIndividual,
+  reconcileIndividualWithGroups,
   resolveExpectedCpu,
   selectWorstIndividualCpu,
   summarizeFreqSamples,
@@ -700,6 +701,86 @@ test("collect: self-consistent individual evidence is non-authoritative without 
   assert.equal(r.individual, undefined);
   assert.equal(r.worstCpu, null);
   assert.match(r.individualStatus.reasons.join("; "), /group evidence is unavailable/);
+});
+
+// Shared groups-envelope generation for reconcile fixtures: version 4
+// individual evidence must bind this exact validated groups generation.
+const GROUPS_TEST_GENERATION = "00112233445566778899aabbccddeeff";
+
+function groupsAssessmentFor({ generation = GROUPS_TEST_GENERATION } = {}) {
+  return {
+    status: "complete",
+    meta: { GENERATION: generation, PLAN_DIGEST: "b".repeat(64) },
+    entries: [{ name: "ecluster-64", cpus: "4-7", parsed: { failedWaves: 1 } }],
+  };
+}
+
+const RECONCILE_ROWS = [
+  ["4", "1", "0", "1"], ["4", "2", "0", "1"],
+  ["5", "1", "139", "1"], ["5", "2", "0", "1"],
+  ["6", "1", "0", "1"], ["6", "2", "0", "1"],
+  ["7", "1", "0", "1"], ["7", "2", "0", "1"],
+];
+
+function reconcileMetaV4(groupGeneration, overrides = {}) {
+  return {
+    VERSION: "4",
+    GENERATION: "a".repeat(32),
+    TARGET_CPUS: "4-7",
+    RUNS_PER_CPU: "2",
+    TARGET_POLICY: "failed-groups",
+    GROUP_PLAN_DIGEST: "b".repeat(64),
+    GROUP_GENERATION: groupGeneration,
+    SKIPPED: "0",
+    COMPLETED: "1",
+    ROWS_SHA256: "e".repeat(64),
+    ROWS_BYTES: "64",
+    ROW_COUNT: "8",
+    ...overrides,
+  };
+}
+
+test("reconcile: v4 individual evidence bound to the exact groups generation is authorized", () => {
+  const meta = reconcileMetaV4(GROUPS_TEST_GENERATION);
+  const assessment = assessIndividual(RECONCILE_ROWS, meta, true);
+  assert.equal(assessment.status, "complete", assessment.reasons.join("; "));
+  const reconciled = reconcileIndividualWithGroups(assessment, meta, groupsAssessmentFor(), "quick", "2");
+  assert.equal(reconciled.status, "complete", reconciled.reasons.join("; "));
+  assert.equal(reconciled.acceptedRows.length, 8);
+});
+
+test("reconcile: a stale groups generation defeats v4 evidence despite a matching plan digest", () => {
+  const meta = reconcileMetaV4("d".repeat(32));
+  const assessment = assessIndividual(RECONCILE_ROWS, meta, true);
+  assert.equal(assessment.status, "complete", assessment.reasons.join("; "));
+  const reconciled = reconcileIndividualWithGroups(assessment, meta, groupsAssessmentFor(), "quick", "2");
+  assert.equal(reconciled.status, "invalid");
+  assert.match(reconciled.reasons.join("; "), /not bound to the validated groups generation/);
+  assert.deepEqual(reconciled.acceptedRows, []);
+  assert.deepEqual(reconciled.acceptedSummaries, []);
+});
+
+test("reconcile: v3 individual evidence beside validated v2 groups stays descriptive only", () => {
+  const meta = {
+    VERSION: "3",
+    GENERATION: "a".repeat(32),
+    TARGET_CPUS: "4-7",
+    RUNS_PER_CPU: "2",
+    TARGET_POLICY: "failed-groups",
+    GROUP_PLAN_DIGEST: "b".repeat(64),
+    SKIPPED: "0",
+    COMPLETED: "1",
+    ROWS_SHA256: "e".repeat(64),
+    ROWS_BYTES: "40",
+    ROW_COUNT: "8",
+  };
+  const assessment = assessIndividual(RECONCILE_ROWS, meta, true);
+  assert.equal(assessment.status, "complete", assessment.reasons.join("; "));
+  const reconciled = reconcileIndividualWithGroups(assessment, meta, groupsAssessmentFor(), "quick", "2");
+  assert.equal(reconciled.status, "incomplete");
+  assert.match(reconciled.reasons.join("; "),
+    /version 3 individual evidence is descriptive only because it is not bound to the exact validated groups generation/);
+  assert.equal(reconciled.acceptedRows.length, 8);
 });
 
 test("collect: a validated skip envelope still anchors to complete stored run metadata", () => {

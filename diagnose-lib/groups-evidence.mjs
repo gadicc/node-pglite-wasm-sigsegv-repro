@@ -1,17 +1,23 @@
 // Strict validation for the CPU-group phase evidence envelope. The plan is
 // ordered and its digest covers every non-outcome TSV field, so a row cannot
 // be omitted, invented, reordered, or reused from another topology/config
-// generation without invalidating the envelope.
+// generation without invalidating the envelope. Version 2 envelopes add a
+// random per-attempt GENERATION so downstream phases bind the exact validated
+// groups execution, not merely a reproducible plan digest; well-formed legacy
+// version 1 envelopes stay parseable but assess as incomplete.
 
 import { createHash } from "node:crypto";
 import { lstatSync, opendirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { parseReproLog } from "./parse-repro-log.mjs";
 
-const REQUIRED_META_KEYS = ["VERSION", "EXPECTED_ROWS", "GROUP_WAVES", "PLAN_DIGEST", "COMPLETED"];
+const META_KEYS_V1 = ["VERSION", "EXPECTED_ROWS", "GROUP_WAVES", "PLAN_DIGEST", "COMPLETED"];
+const META_KEYS_V2 = ["VERSION", "GENERATION", "EXPECTED_ROWS", "GROUP_WAVES", "PLAN_DIGEST", "COMPLETED"];
+const KNOWN_META_KEYS = new Set([...META_KEYS_V1, ...META_KEYS_V2]);
 const MAX_CONTROL_BYTES = 1024 * 1024;
 const MAX_LOG_BYTES = 64 * 1024 * 1024;
 const DIGEST_RE = /^[a-f0-9]{64}$/;
+const GENERATION_RE = /^[a-f0-9]{32}$/;
 const NAME_RE = /^[a-z][a-z0-9_-]{0,63}$/;
 const KIND_RE = /^[a-z][a-z0-9-]{0,31}$/;
 
@@ -122,7 +128,7 @@ function parseMeta(text) {
       continue;
     }
     const [, key, value] = match;
-    if (!REQUIRED_META_KEYS.includes(key)) {
+    if (!KNOWN_META_KEYS.has(key)) {
       reasons.push(`groups metadata contains unknown field ${key}`);
     } else if (Object.hasOwn(values, key)) {
       reasons.push(`groups metadata contains duplicate field ${key}`);
@@ -130,11 +136,20 @@ function parseMeta(text) {
       values[key] = value;
     }
   }
-  for (const key of REQUIRED_META_KEYS) {
-    if (!Object.hasOwn(values, key)) reasons.push(`groups metadata is missing field ${key}`);
-  }
-  if (lines.length !== REQUIRED_META_KEYS.length) {
-    reasons.push(`groups metadata must contain exactly ${REQUIRED_META_KEYS.length} records`);
+  // The exact-record grammar is version-aware: version 2 envelopes carry a
+  // random GENERATION record; legacy version 1 envelopes predate it.
+  const requiredKeys = values.VERSION === "2" ? META_KEYS_V2 : values.VERSION === "1" ? META_KEYS_V1 : null;
+  if (requiredKeys === null) {
+    for (const key of META_KEYS_V1) {
+      if (!Object.hasOwn(values, key)) reasons.push(`groups metadata is missing field ${key}`);
+    }
+  } else {
+    for (const key of requiredKeys) {
+      if (!Object.hasOwn(values, key)) reasons.push(`groups metadata is missing field ${key}`);
+    }
+    if (lines.length !== requiredKeys.length) {
+      reasons.push(`groups metadata must contain exactly ${requiredKeys.length} records`);
+    }
   }
   return { values, reasons: [...new Set(reasons)] };
 }
@@ -254,6 +269,7 @@ export function deriveIndividualTargetPolicy(groupsAssessment, mode) {
     targetPolicy,
     targetCpus: compressCpuRanges(ranges),
     groupPlanDigest: groupsAssessment.meta.PLAN_DIGEST,
+    groupGeneration: groupsAssessment.meta.GENERATION,
     skipped,
   };
 }
@@ -354,8 +370,18 @@ export function assessGroupsEvidence(outDir, expectations = {}) {
         reasons.push(...parsed.reasons);
         invalid = true;
       }
-      if (meta.VERSION !== "1") {
+      if (meta.VERSION !== "1" && meta.VERSION !== "2") {
         reasons.push("groups metadata version is missing or unsupported");
+        invalid = true;
+      }
+      if (meta.VERSION === "1") {
+        // Legacy envelopes predate random generations: they stay parseable
+        // and descriptive, but without a generation they cannot authorize
+        // conclusions, so a well-formed v1 envelope assesses as incomplete.
+        reasons.push("legacy groups metadata has no generation and cannot authorize conclusions");
+      }
+      if (meta.VERSION === "2" && !GENERATION_RE.test(meta.GENERATION ?? "")) {
+        reasons.push("groups GENERATION is missing or malformed");
         invalid = true;
       }
       expectedRows = canonicalPositiveUint(meta.EXPECTED_ROWS, 65536);
@@ -627,6 +653,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         console.log(`TARGET_POLICY=${target.targetPolicy}`);
         console.log(`TARGET_CPUS=${target.targetCpus}`);
         console.log(`GROUP_PLAN_DIGEST=${target.groupPlanDigest}`);
+        console.log(`GROUP_GENERATION=${target.groupGeneration}`);
       }
     }
   } else {

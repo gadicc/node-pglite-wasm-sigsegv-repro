@@ -3,6 +3,7 @@ import {
   linkSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   renameSync,
   rmSync,
   symlinkSync,
@@ -45,8 +46,9 @@ function writeBundle(rows = "19\t1\t139\t2\n", metadata = {}) {
   const bytes = Buffer.from(rows);
   writeFileSync(
     path.join(dir, "results", "individual.meta"),
-    `VERSION=3\nGENERATION=${metadata.generation ?? "a".repeat(32)}\nTARGET_CPUS=19\nRUNS_PER_CPU=1\n` +
+    `VERSION=${metadata.version ?? "4"}\nGENERATION=${metadata.generation ?? "a".repeat(32)}\nTARGET_CPUS=19\nRUNS_PER_CPU=1\n` +
       `TARGET_POLICY=failed-groups\nGROUP_PLAN_DIGEST=${"b".repeat(64)}\n` +
+      (metadata.version === "3" ? "" : `GROUP_GENERATION=${metadata.groupGeneration ?? "c".repeat(32)}\n`) +
       `SKIPPED=0\nCOMPLETED=1\nROWS_SHA256=${sha256(bytes)}\n` +
       `ROWS_BYTES=${bytes.length}\nROW_COUNT=1\n${metadata.extra ?? ""}`,
   );
@@ -54,11 +56,12 @@ function writeBundle(rows = "19\t1\t139\t2\n", metadata = {}) {
   return dir;
 }
 
-test("individual evidence accepts a stable V3 envelope with exact row bindings", () => {
+test("individual evidence accepts a stable V4 envelope with exact row bindings", () => {
   const dir = writeBundle();
   const { assessment } = assessIndividualEvidence(dir);
   assert.equal(assessment.status, "complete", assessment.reasons.join("; "));
   assert.equal(assessment.generation, "a".repeat(32));
+  assert.equal(assessment.groupGeneration, "c".repeat(32));
   assert.deepEqual(assessment.acceptedRows, []);
   assert.deepEqual(assessment.acceptedSummaries, [{
     cpu: 19,
@@ -69,6 +72,85 @@ test("individual evidence accepts a stable V3 envelope with exact row bindings",
     invalidRuns: [],
     failedRuns: [{ run: 1, rc: 139, signal: "SIGSEGV", elapsedSec: 2 }],
   }]);
+});
+
+test("version 4 individual evidence requires the exact validated groups generation", () => {
+  const missing = writeBundle("19\t1\t139\t2\n", { groupGeneration: undefined, extra: "" });
+  writeFileSync(
+    path.join(missing, "results", "individual.meta"),
+    readFileSync(path.join(missing, "results", "individual.meta"), "utf8")
+      .replace(`GROUP_GENERATION=${"c".repeat(32)}\n`, ""),
+  );
+  const missingResult = assessIndividualEvidence(missing);
+  assert.equal(missingResult.assessment.status, "invalid");
+  assert.match(missingResult.assessment.reasons.join("; "), /group generation is missing or invalid/);
+
+  for (const groupGeneration of ["C".repeat(32), "c".repeat(31), "c".repeat(64), "../outside"]) {
+    const dir = writeBundle("19\t1\t139\t2\n", { groupGeneration });
+    const { assessment } = assessIndividualEvidence(dir);
+    assert.equal(assessment.status, "invalid", groupGeneration);
+    assert.match(assessment.reasons.join("; "), /group generation is missing or invalid/);
+  }
+});
+
+test("legacy V1/V2/V3 individual envelopes reject a smuggled group generation", () => {
+  const version3 = writeBundle("19\t1\t139\t2\n", { version: "3" });
+  const legacy = assessIndividualEvidence(version3);
+  assert.equal(legacy.assessment.status, "complete", legacy.assessment.reasons.join("; "));
+  assert.equal(legacy.assessment.metadataVersion, "3");
+  assert.equal(legacy.assessment.groupGeneration, null);
+
+  const smuggled3 = writeBundle("19\t1\t139\t2\n", {
+    version: "3",
+    extra: `GROUP_GENERATION=${"c".repeat(32)}\n`,
+  });
+  const smuggled3Result = assessIndividualEvidence(smuggled3);
+  assert.equal(smuggled3Result.assessment.status, "invalid");
+  assert.match(smuggled3Result.assessment.reasons.join("; "), /unsupported group generation field/);
+
+  const version2 = tempDir();
+  mkdirSync(path.join(version2, "results"));
+  mkdirSync(path.join(version2, "state"));
+  writeFileSync(path.join(version2, "results", "individual.tsv"), "19\t1\t139\t2\n");
+  writeFileSync(
+    path.join(version2, "results", "individual.meta"),
+    `VERSION=2\nTARGET_CPUS=19\nRUNS_PER_CPU=1\nTARGET_POLICY=failed-groups\n` +
+      `GROUP_PLAN_DIGEST=${"b".repeat(64)}\nGROUP_GENERATION=${"c".repeat(32)}\nSKIPPED=0\nCOMPLETED=0\n`,
+  );
+  const version2Result = assessIndividualEvidence(version2);
+  assert.equal(version2Result.assessment.status, "invalid");
+  assert.match(version2Result.assessment.reasons.join("; "), /unsupported row binding fields/);
+
+  const version1 = tempDir();
+  mkdirSync(path.join(version1, "results"));
+  mkdirSync(path.join(version1, "state"));
+  writeFileSync(path.join(version1, "results", "individual.tsv"), "19\t1\t139\t2\n");
+  writeFileSync(
+    path.join(version1, "results", "individual.meta"),
+    `VERSION=1\nTARGET_CPUS=19\nRUNS_PER_CPU=1\nGROUP_GENERATION=${"c".repeat(32)}\nSKIPPED=0\nCOMPLETED=1\n`,
+  );
+  const version1Result = assessIndividualEvidence(version1);
+  assert.equal(version1Result.assessment.status, "invalid");
+  assert.match(version1Result.assessment.reasons.join("; "), /unsupported provenance fields/);
+});
+
+test("shell-facing meta and bundle outputs carry the group generation", () => {
+  const script = path.join(path.dirname(new URL(import.meta.url).pathname), "..", "individual-evidence.mjs");
+  const dir = writeBundle();
+  const meta = spawnSync(process.execPath, [script, "meta", path.join(dir, "results", "individual.meta")]);
+  assert.equal(meta.status, 0, meta.stderr.toString());
+  assert.match(meta.stdout.toString(), new RegExp(`^GROUP_GENERATION=${"c".repeat(32)}$`, "m"));
+
+  const bundle = spawnSync(process.execPath, [script, "bundle", dir]);
+  assert.equal(bundle.status, 0, bundle.stderr.toString());
+  assert.match(bundle.stdout.toString(), /^STATUS=complete$/m);
+  assert.match(bundle.stdout.toString(), new RegExp(`^GROUP_GENERATION=${"c".repeat(32)}$`, "m"));
+
+  const legacy = writeBundle("19\t1\t139\t2\n", { version: "3" });
+  const legacyMeta = spawnSync(process.execPath, [script, "meta", path.join(legacy, "results", "individual.meta")]);
+  assert.equal(legacyMeta.status, 0, legacyMeta.stderr.toString());
+  assert.match(legacyMeta.stdout.toString(), /^VERSION=3$/m);
+  assert.match(legacyMeta.stdout.toString(), /^GROUP_GENERATION=$/m);
 });
 
 test("individual evidence rejects symlinked and multiply-linked artifacts", () => {
@@ -171,8 +253,9 @@ test("failed-run presentation details have a global bound with explicit omission
   const bytes = Buffer.from(rows);
   writeFileSync(
     path.join(dir, "results", "individual.meta"),
-    `VERSION=3\nGENERATION=${"a".repeat(32)}\nTARGET_CPUS=19\nRUNS_PER_CPU=${count}\n` +
+    `VERSION=4\nGENERATION=${"a".repeat(32)}\nTARGET_CPUS=19\nRUNS_PER_CPU=${count}\n` +
       `TARGET_POLICY=failed-groups\nGROUP_PLAN_DIGEST=${"b".repeat(64)}\n` +
+      `GROUP_GENERATION=${"c".repeat(32)}\n` +
       `SKIPPED=0\nCOMPLETED=1\nROWS_SHA256=${sha256(bytes)}\n` +
       `ROWS_BYTES=${bytes.length}\nROW_COUNT=${count}\n`,
   );

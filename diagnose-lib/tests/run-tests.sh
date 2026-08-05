@@ -148,17 +148,22 @@ COMPLETED=1
 EOF
 }
 
-write_individual_v3_meta() {
+# Shared groups-envelope generation for fixtures whose individual evidence must
+# bind the exact validated groups generation (individual.meta GROUP_GENERATION).
+GROUPS_TEST_GENERATION=00112233445566778899aabbccddeeff
+
+write_individual_v4_meta() {
   local bundle="$1" targets="$2" runs="$3" policy="$4" plan_digest="$5"
-  local skipped="$6" completed="$7" reason="${8:-}"
+  local group_generation="$6" skipped="$7" completed="$8" reason="${9:-}"
   local rows_sha rows_bytes row_count
   rows_sha="$(sha256sum "$bundle/results/individual.tsv" | awk '{print $1}')"
   rows_bytes="$(stat -c %s "$bundle/results/individual.tsv")"
   row_count="$(awk 'END { print NR + 0 }' "$bundle/results/individual.tsv")"
   {
-    printf 'VERSION=3\nGENERATION=%s\n' 0123456789abcdef0123456789abcdef
+    printf 'VERSION=4\nGENERATION=%s\n' 0123456789abcdef0123456789abcdef
     printf 'TARGET_CPUS=%s\nRUNS_PER_CPU=%s\n' "$targets" "$runs"
-    printf 'TARGET_POLICY=%s\nGROUP_PLAN_DIGEST=%s\n' "$policy" "$plan_digest"
+    printf 'TARGET_POLICY=%s\nGROUP_PLAN_DIGEST=%s\nGROUP_GENERATION=%s\n' \
+      "$policy" "$plan_digest" "$group_generation"
     printf 'SKIPPED=%s\nCOMPLETED=%s\n' "$skipped" "$completed"
     [[ -z "$reason" ]] || printf 'SKIP_REASON=%s\n' "$reason"
     if [[ "$completed" == 1 ]]; then
@@ -5101,8 +5106,8 @@ CPU_TARGET=auto
 COMPLETED_PHASES=individual,gdb
 EOF
 printf '%s\t1\t139\t1\n' "$TEST_ONLINE_CPU" > "$CPU_EVIDENCE_RB/results/individual.tsv"
-write_individual_v3_meta "$CPU_EVIDENCE_RB" "$TEST_ONLINE_CPU" 1 \
-  failed-groups "$(printf '0%.0s' {1..64})" 0 1
+write_individual_v4_meta "$CPU_EVIDENCE_RB" "$TEST_ONLINE_CPU" 1 \
+  failed-groups "$(printf '0%.0s' {1..64})" "$GROUPS_TEST_GENERATION" 0 1
 write_gdb_run_fixture "$CPU_EVIDENCE_RB" "$TEST_ONLINE_CPU" 12 3 no-fault
 touch "$CPU_EVIDENCE_RB/state/phase-individual.done"
 (
@@ -5603,6 +5608,7 @@ printf 'COMPLETED_PHASES=\n' > "$INDIVIDUAL_COMPLETE/results/meta.env"
   INDIVIDUAL_TARGET_CPUS=19
   INDIVIDUAL_TARGET_POLICY=failed-groups
   INDIVIDUAL_GROUP_PLAN_DIGEST="$(printf '0%.0s' {1..64})"
+  INDIVIDUAL_GROUP_GENERATION="$GROUPS_TEST_GENERATION"
   INDIVIDUAL_RUNS=2
   phase_individual
 ) > /dev/null 2>&1
@@ -5620,6 +5626,7 @@ printf 'COMPLETED_PHASES=\n' > "$INDIVIDUAL_SKIPPED/results/meta.env"
   META_FILE="$INDIVIDUAL_SKIPPED/results/meta.env"
   INDIVIDUAL_TARGET_POLICY=quick-skip
   INDIVIDUAL_GROUP_PLAN_DIGEST="$(printf '0%.0s' {1..64})"
+  INDIVIDUAL_GROUP_GENERATION="$GROUPS_TEST_GENERATION"
   INDIVIDUAL_RUNS=5
   phase_individual_skipped
 ) > /dev/null 2>&1
@@ -5641,6 +5648,7 @@ printf 'COMPLETED_PHASES=\n' > "$INDIVIDUAL_FRESH_AFTER_REDO/results/meta.env"
   INDIVIDUAL_TARGET_CPUS=19
   INDIVIDUAL_TARGET_POLICY=failed-groups
   INDIVIDUAL_GROUP_PLAN_DIGEST="$(printf '0%.0s' {1..64})"
+  INDIVIDUAL_GROUP_GENERATION="$GROUPS_TEST_GENERATION"
   INDIVIDUAL_RUNS=1
   INDIVIDUAL_META_GENERATION="$STALE_INDIVIDUAL_GENERATION"
   INDIVIDUAL_META_ROWS_SHA256="$(printf 'a%.0s' {1..64})"
@@ -5664,6 +5672,7 @@ printf 'COMPLETED_PHASES=\n' > "$INDIVIDUAL_FRESH_SKIP_AFTER_REDO/results/meta.e
   META_FILE="$INDIVIDUAL_FRESH_SKIP_AFTER_REDO/results/meta.env"
   INDIVIDUAL_TARGET_POLICY=quick-skip
   INDIVIDUAL_GROUP_PLAN_DIGEST="$(printf '0%.0s' {1..64})"
+  INDIVIDUAL_GROUP_GENERATION="$GROUPS_TEST_GENERATION"
   INDIVIDUAL_RUNS=5
   INDIVIDUAL_META_GENERATION="$STALE_INDIVIDUAL_GENERATION"
   INDIVIDUAL_META_ROWS_SHA256="$(printf 'a%.0s' {1..64})"
@@ -5681,8 +5690,8 @@ check_eq "new skipped individual phase never reuses a stale pre-redo generation"
 WORST_CPU_DIR="$TMP/worst-cpu-bundle"
 mkdir -p "$WORST_CPU_DIR"/{results,state}
 printf '3\t1\t1\t2\n3\t2\t1\t2\n4\t1\t139\t2\n4\t2\t0\t2\n' > "$WORST_CPU_DIR/results/individual.tsv"
-write_individual_v3_meta "$WORST_CPU_DIR" 3-4 2 failed-groups \
-  "$(printf '0%.0s' {1..64})" 0 1
+write_individual_v4_meta "$WORST_CPU_DIR" 3-4 2 failed-groups \
+  "$(printf '0%.0s' {1..64})" "$GROUPS_TEST_GENERATION" 0 1
 touch "$WORST_CPU_DIR/state/phase-individual.done"
 worst_cpu_out="$(
   DIAG_SOURCE_ONLY=1
@@ -5692,8 +5701,8 @@ worst_cpu_out="$(
 )"
 check_eq "worst_cpu rejects an invalid completed individual phase" "" "$worst_cpu_out"
 printf '3\t1\t0\t2\n3\t2\t0\t2\n4\t1\t139\t2\n4\t2\t0\t2\n' > "$WORST_CPU_DIR/results/individual.tsv"
-write_individual_v3_meta "$WORST_CPU_DIR" 3-4 2 failed-groups \
-  "$(printf '0%.0s' {1..64})" 0 1
+write_individual_v4_meta "$WORST_CPU_DIR" 3-4 2 failed-groups \
+  "$(printf '0%.0s' {1..64})" "$GROUPS_TEST_GENERATION" 0 1
 worst_cpu_out="$(
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
@@ -5705,8 +5714,8 @@ check_eq "worst_cpu ranks only a fully validated individual phase" "4" "$worst_c
 INDIVIDUAL_FIFO_BASE="$TMP/individual-fifo-base"
 mkdir -p "$INDIVIDUAL_FIFO_BASE"/{results,state}
 printf '19\t1\t139\t1\n' > "$INDIVIDUAL_FIFO_BASE/results/individual.tsv"
-write_individual_v3_meta "$INDIVIDUAL_FIFO_BASE" 19 1 failed-groups \
-  "$(printf '0%.0s' {1..64})" 0 1
+write_individual_v4_meta "$INDIVIDUAL_FIFO_BASE" 19 1 failed-groups \
+  "$(printf '0%.0s' {1..64})" "$GROUPS_TEST_GENERATION" 0 1
 : > "$INDIVIDUAL_FIFO_BASE/state/phase-individual.done"
 individual_fifo_guards=1
 for relative in results/individual.tsv results/individual.meta state/phase-individual.done; do
@@ -6646,7 +6655,7 @@ full_runner_target="$(
   GROUP_NAME=(pcores ecluster-64) GROUP_KIND=(pcore ecluster)
   GROUP_CPUS=(0-3 16-19) GROUP_CLUSTER=(- 64)
   if compute_individual_targets; then
-    result="$INDIVIDUAL_TARGET_CPUS|$INDIVIDUAL_TARGET_POLICY|$INDIVIDUAL_GROUP_PLAN_DIGEST"
+    result="$INDIVIDUAL_TARGET_CPUS|$INDIVIDUAL_TARGET_POLICY|$INDIVIDUAL_GROUP_PLAN_DIGEST|$INDIVIDUAL_GROUP_GENERATION"
   else
     result="unexpected-skip"
   fi
@@ -6654,16 +6663,19 @@ full_runner_target="$(
   printf '%s\n' "$result"
  ) 2> /dev/null
 )"
-IFS='|' read -r full_runner_cpus full_runner_policy full_runner_digest <<< "$full_runner_target"
+IFS='|' read -r full_runner_cpus full_runner_policy full_runner_digest full_runner_generation <<< "$full_runner_target"
 check_eq "full-mode runner targets every validated stored-plan CPU after a group failure" \
-  "0-3,16-19|all-group-cpus|1" \
-  "$full_runner_cpus|$full_runner_policy|$([[ "$full_runner_digest" =~ ^[a-f0-9]{64}$ ]] && echo 1 || echo 0)"
+  "0-3,16-19|all-group-cpus|1|1" \
+  "$full_runner_cpus|$full_runner_policy|$([[ "$full_runner_digest" =~ ^[a-f0-9]{64}$ ]] && echo 1 || echo 0)|$([[ "$full_runner_generation" =~ ^[a-f0-9]{32}$ ]] && echo 1 || echo 0)"
+groups_runner_generation="$(sed -n 's/^GENERATION=//p' "$GROUPS_RUNNER/results/groups.meta")"
+check_eq "validated groups envelope carries its published generation" "1" \
+  "$([[ "$groups_runner_generation" == "$full_runner_generation" ]] && echo 1 || echo 0)"
 
 FULL_TARGET_RESUME="$TMP/full-target-resume"
 mkdir -p "$FULL_TARGET_RESUME"/{results,state}
 for cpu in 16 17 18 19; do printf '%s\t1\t0\t1\n' "$cpu"; done > "$FULL_TARGET_RESUME/results/individual.tsv"
-write_individual_v3_meta "$FULL_TARGET_RESUME" 16-19 1 failed-groups \
-  "$full_runner_digest" 0 1
+write_individual_v4_meta "$FULL_TARGET_RESUME" 16-19 1 failed-groups \
+  "$full_runner_digest" "$full_runner_generation" 0 1
 : > "$FULL_TARGET_RESUME/state/phase-individual.done"
 full_stale_resume="$(
  (
@@ -6672,6 +6684,7 @@ full_stale_resume="$(
   OUT_DIR="$FULL_TARGET_RESUME" INDIVIDUAL_RUNS=1
   INDIVIDUAL_TARGET_CPUS=0-3,16-19 INDIVIDUAL_TARGET_POLICY=all-group-cpus
   INDIVIDUAL_GROUP_PLAN_DIGEST="$full_runner_digest"
+  INDIVIDUAL_GROUP_GENERATION="$full_runner_generation"
   self_consistent=0 compatible=0
   individual_phase_result_is_complete && self_consistent=1
   individual_phase_matches_expected_targets 1 && compatible=1
@@ -6681,8 +6694,8 @@ full_stale_resume="$(
 check_eq "full-mode resume rejects self-consistent failed-group-only evidence" "1|0" "$full_stale_resume"
 
 for cpu in 0 1 2 3 16 17 18 19; do printf '%s\t1\t0\t1\n' "$cpu"; done > "$FULL_TARGET_RESUME/results/individual.tsv"
-write_individual_v3_meta "$FULL_TARGET_RESUME" 0-3,16-19 1 all-group-cpus \
-  "$full_runner_digest" 0 1
+write_individual_v4_meta "$FULL_TARGET_RESUME" 0-3,16-19 1 all-group-cpus \
+  "$full_runner_digest" "$full_runner_generation" 0 1
 full_current_resume="$(
  (
   DIAG_SOURCE_ONLY=1
@@ -6690,6 +6703,7 @@ full_current_resume="$(
   OUT_DIR="$FULL_TARGET_RESUME" INDIVIDUAL_RUNS=1
   INDIVIDUAL_TARGET_CPUS=0-3,16-19 INDIVIDUAL_TARGET_POLICY=all-group-cpus
   INDIVIDUAL_GROUP_PLAN_DIGEST="$full_runner_digest"
+  INDIVIDUAL_GROUP_GENERATION="$full_runner_generation"
   self_consistent=0 compatible=0
   individual_phase_result_is_complete && self_consistent=1
   individual_phase_matches_expected_targets 1 && compatible=1
@@ -6736,6 +6750,192 @@ groups_partial_second_rc=$?
 groups_partial_after="$(sha256sum "$GROUPS_PARTIAL/results/groups.tsv" "$GROUPS_PARTIAL/results/groups.meta" "$GROUPS_PARTIAL/logs/groups/pcores.log")"
 check_eq "interrupted groups evidence is preserved and explicitly requires redo" "1" \
   "$([[ $groups_partial_first_rc -ne 0 && $groups_partial_second_rc -ne 0 && "$groups_partial_before" == "$groups_partial_after" ]] && grep -q -- '--redo groups' "$GROUPS_PARTIAL/second.output" && echo 1 || echo 0)"
+
+echo "== groups redo invalidates stale individual generation bindings =="
+STALE_BIND="$TMP/stale-groups-bind"
+mkdir -p "$STALE_BIND"/{results,logs,state,freq}
+cat > "$STALE_BIND/results/meta.env" << EOF
+MODE=quick
+BASELINE_CHILDREN=8
+BASELINE_WAVES=10
+GROUP_WAVES=5
+INDIVIDUAL_RUNS=1
+GDB_MAX_RUNS=6
+SKIP_GDB=1
+CPU_TARGET=auto
+COMPLETED_PHASES=
+EOF
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$STALE_BIND"
+  STATE_DIR="$STALE_BIND/state"
+  META_FILE="$STALE_BIND/results/meta.env"
+  DIAG_LOG_FILE=""
+  GROUP_WAVES=5
+  GROUP_NAME=(pcores ecluster-64)
+  GROUP_KIND=(pcore ecluster)
+  GROUP_CPUS=(0-3 16-19)
+  GROUP_CLUSTER=(- 64)
+  diag_freq_sampler_start() { :; }
+  diag_freq_sampler_stop() { :; }
+  run_repro_logged() {
+    if [[ "$1" == */pcores.log ]]; then cp "$FIX/repro-clean-4x5.log" "$1"; REPRO_RC=0
+    else cp "$FIX/repro-fail.log" "$1"; REPRO_RC=1
+    fi
+  }
+  phase_groups
+) > /dev/null 2>&1
+stale_bind_groups_rc=$?
+stale_bind_plan_digest="$(cut -f1-8 "$STALE_BIND/results/groups.tsv" | sha256sum | cut -d' ' -f1)"
+stale_bind_generation="$(sed -n 's/^GENERATION=//p' "$STALE_BIND/results/groups.meta")"
+for cpu in 16 17 18 19; do printf '%s\t1\t139\t1\n' "$cpu"; done > "$STALE_BIND/results/individual.tsv"
+write_individual_v4_meta "$STALE_BIND" 16-19 1 failed-groups \
+  "$stale_bind_plan_digest" "$stale_bind_generation" 0 1
+: > "$STALE_BIND/state/phase-individual.done"
+stale_gate_before_rc=0
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$STALE_BIND" STATE_DIR="$STALE_BIND/state" GROUP_WAVES=5 MODE=default INDIVIDUAL_RUNS=1
+  GROUP_NAME=(pcores ecluster-64) GROUP_KIND=(pcore ecluster)
+  GROUP_CPUS=(0-3 16-19) GROUP_CLUSTER=(- 64)
+  compute_individual_targets
+  individual_phase_is_complete_and_matches_expected 1
+  redo_marker_temp_cleanup
+) > /dev/null 2>&1 || stale_gate_before_rc=$?
+check_eq "completed individual evidence bound to the validated groups generation passes the resume gate" "1" \
+  "$([[ $stale_bind_groups_rc -eq 0 && $stale_gate_before_rc -eq 0 && "$stale_bind_generation" =~ ^[a-f0-9]{32}$ ]] && echo 1 || echo 0)"
+
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$STALE_BIND"
+  STATE_DIR="$STALE_BIND/state"
+  META_FILE="$STALE_BIND/results/meta.env"
+  MODE=quick BASELINE_CHILDREN=8 BASELINE_WAVES=10 GROUP_WAVES=5
+  INDIVIDUAL_RUNS=1 GDB_MAX_RUNS=6 SKIP_GDB=1 CPU_TARGET=auto
+  REDO_PHASES=groups
+  build_redo_plan
+  apply_redo_plan
+) > /dev/null 2>&1
+stale_redo_rc=$?
+stale_stash="$(find "$STALE_BIND/state/superseded" -mindepth 1 -maxdepth 1 -type d -name 'redo-*' -print -quit)"
+stale_archived_generation="$(sed -n 's/^GENERATION=//p' "$stale_stash/groups/results/groups.meta")"
+check_eq "redo groups archives the exact previous groups generation" "1" \
+  "$([[ $stale_redo_rc -eq 0 && -n "$stale_stash" && "$stale_archived_generation" == "$stale_bind_generation" && ! -e "$STALE_BIND/results/groups.meta" && ! -e "$STALE_BIND/results/individual.meta" ]] && echo 1 || echo 0)"
+
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$STALE_BIND"
+  STATE_DIR="$STALE_BIND/state"
+  META_FILE="$STALE_BIND/results/meta.env"
+  DIAG_LOG_FILE=""
+  GROUP_WAVES=5
+  GROUP_NAME=(pcores ecluster-64)
+  GROUP_KIND=(pcore ecluster)
+  GROUP_CPUS=(0-3 16-19)
+  GROUP_CLUSTER=(- 64)
+  diag_freq_sampler_start() { :; }
+  diag_freq_sampler_stop() { :; }
+  run_repro_logged() {
+    if [[ "$1" == */pcores.log ]]; then cp "$FIX/repro-clean-4x5.log" "$1"; REPRO_RC=0
+    else cp "$FIX/repro-fail.log" "$1"; REPRO_RC=1
+    fi
+  }
+  phase_groups
+) > /dev/null 2>&1
+stale_regroups_rc=$?
+stale_regroups_generation="$(sed -n 's/^GENERATION=//p' "$STALE_BIND/results/groups.meta")"
+# The redone plan is byte-identical (same topology), so only the fresh random
+# generation distinguishes the new envelope from the archived one.
+check_eq "same-topology redo groups mints a different generation for the same plan digest" "1" \
+  "$([[ $stale_regroups_rc -eq 0 && "$stale_regroups_generation" =~ ^[a-f0-9]{32}$ && "$stale_regroups_generation" != "$stale_archived_generation" && "$(cut -f1-8 "$STALE_BIND/results/groups.tsv" | sha256sum | cut -d' ' -f1)" == "$stale_bind_plan_digest" ]] && echo 1 || echo 0)"
+
+# Adversarial restore: the archived individual envelope reappears beside the
+# redone groups evidence. Its plan digest still matches; its GROUP_GENERATION
+# binds the archived groups generation, so the completed-phase gate must fail.
+cp "$stale_stash/individual/results/individual.tsv" "$STALE_BIND/results/individual.tsv"
+cp "$stale_stash/individual/results/individual.meta" "$STALE_BIND/results/individual.meta"
+: > "$STALE_BIND/state/phase-individual.done"
+stale_gate_output="$(
+ (
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$STALE_BIND" STATE_DIR="$STALE_BIND/state" GROUP_WAVES=5 MODE=default INDIVIDUAL_RUNS=1
+  GROUP_NAME=(pcores ecluster-64) GROUP_KIND=(pcore ecluster)
+  GROUP_CPUS=(0-3 16-19) GROUP_CLUSTER=(- 64)
+  compute_individual_targets
+  individual_phase_is_complete_and_matches_expected 1 ||
+    diag_die "completed individual phase does not match the validated group target policy; preserve it and resume with --redo individual"
+ ) 2>&1
+)"
+stale_gate_rc=$?
+check_eq "individual evidence bound to a redone groups generation requires --redo individual" "1" \
+  "$([[ $stale_gate_rc -ne 0 ]] && grep -q -- '--redo individual' <<< "$stale_gate_output" && echo 1 || echo 0)"
+
+# Forgery: rewrite the stale envelope's GROUP_GENERATION to the current groups
+# generation but leave its row binding untouched, then flip one row's outcome.
+# The version 4 row binding must still fail closed.
+sed -i "s/^GROUP_GENERATION=.*/GROUP_GENERATION=$stale_regroups_generation/" "$STALE_BIND/results/individual.meta"
+sed -i 's/^16\t1\t139\t/16\t1\t0\t/' "$STALE_BIND/results/individual.tsv"
+stale_forged_status="$(node "$LIB/individual-evidence.mjs" bundle "$STALE_BIND" 2> /dev/null | sed -n 's/^STATUS=//p')"
+stale_forged_gate_rc=0
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$STALE_BIND" STATE_DIR="$STALE_BIND/state" GROUP_WAVES=5 MODE=default INDIVIDUAL_RUNS=1
+  GROUP_NAME=(pcores ecluster-64) GROUP_KIND=(pcore ecluster)
+  GROUP_CPUS=(0-3 16-19) GROUP_CLUSTER=(- 64)
+  compute_individual_targets
+  individual_phase_is_complete_and_matches_expected 1
+) > /dev/null 2>&1 || stale_forged_gate_rc=$?
+check_eq "forged v4 group generation with a tampered row binding assesses invalid" "invalid" "$stale_forged_status"
+check_eq "forged v4 group generation with a tampered row binding fails the resume gate" "1" \
+  "$([[ $stale_forged_gate_rc -ne 0 ]] && echo 1 || echo 0)"
+
+# A well-formed legacy v3 envelope (valid plan digest, valid row binding, no
+# GROUP_GENERATION) must fail the shell authority gates too: only v4 is
+# authoritative, even when the groups envelope validates.
+cp "$stale_stash/individual/results/individual.tsv" "$STALE_BIND/results/individual.tsv"
+write_individual_v4_meta "$STALE_BIND" 16-19 1 failed-groups \
+  "$stale_bind_plan_digest" "$stale_regroups_generation" 0 1
+sed -i 's/^VERSION=4/VERSION=3/; /^GROUP_GENERATION=/d' "$STALE_BIND/results/individual.meta"
+: > "$STALE_BIND/state/phase-individual.done"
+stale_v3_gate_output="$(
+  (
+    DIAG_SOURCE_ONLY=1
+    source "$REPO_ROOT/diagnose.sh"
+    OUT_DIR="$STALE_BIND" STATE_DIR="$STALE_BIND/state" GROUP_WAVES=5 MODE=default INDIVIDUAL_RUNS=1
+    GROUP_NAME=(pcores ecluster-64) GROUP_KIND=(pcore ecluster)
+    GROUP_CPUS=(0-3 16-19) GROUP_CLUSTER=(- 64)
+    compute_individual_targets
+    individual_phase_is_complete_and_matches_expected 1 ||
+      diag_die "completed individual phase does not match the validated group target policy; preserve it and resume with --redo individual"
+  ) 2>&1
+)"
+stale_v3_gate_rc=$?
+check_eq "legacy v3 individual evidence fails the shell resume gate" "1" \
+  "$([[ $stale_v3_gate_rc -ne 0 ]] && grep -q -- '--redo individual' <<< "$stale_v3_gate_output" && echo 1 || echo 0)"
+
+# Publishing v4 metadata without a derived groups generation must die before
+# any file is written.
+INDIVIDUAL_WRITE_GUARD="$TMP/individual-write-guard"
+mkdir -p "$INDIVIDUAL_WRITE_GUARD/results"
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$INDIVIDUAL_WRITE_GUARD"
+  INDIVIDUAL_TARGET_POLICY=failed-groups
+  INDIVIDUAL_GROUP_PLAN_DIGEST="$stale_bind_plan_digest"
+  INDIVIDUAL_GROUP_GENERATION=""
+  individual_meta_write 16-19 1 0 0 ""
+) > "$INDIVIDUAL_WRITE_GUARD/output" 2>&1
+individual_write_guard_rc=$?
+check_eq "individual metadata publication requires a valid groups generation" "1" \
+  "$([[ $individual_write_guard_rc -ne 0 ]] && grep -q 'valid groups generation' \
+    "$INDIVIDUAL_WRITE_GUARD/output" && echo 1 || echo 0)"
 
 GROUPS_TARGET_GUARD="$TMP/groups-target-guard"
 mkdir -p "$GROUPS_TARGET_GUARD"/{results,logs,state,freq}
@@ -6857,7 +7057,8 @@ ecluster-64	ecluster	16-19	64	4	5	logs/groups/ecluster-64.log	group-ecluster-64	
 EOF
 groups_plan_digest="$(cut -f1-8 "$B/results/groups.tsv" | sha256sum | cut -d' ' -f1)"
 cat > "$B/results/groups.meta" << EOF
-VERSION=1
+VERSION=2
+GENERATION=$GROUPS_TEST_GENERATION
 EXPECTED_ROWS=2
 GROUP_WAVES=5
 PLAN_DIGEST=$groups_plan_digest
@@ -6879,7 +7080,7 @@ for i in $(seq 1 20); do
     printf '19\t%s\t0\t2\n' "$i" >> "$B/results/individual.tsv"
   fi
 done
-write_individual_v3_meta "$B" 16-19 20 failed-groups "$groups_plan_digest" 0 1
+write_individual_v4_meta "$B" 16-19 20 failed-groups "$groups_plan_digest" "$GROUPS_TEST_GENERATION" 0 1
 
 # Leg B also carries one launch-error row (rc 126): excluded from the valid
 # runs the frequency inference is based on.
