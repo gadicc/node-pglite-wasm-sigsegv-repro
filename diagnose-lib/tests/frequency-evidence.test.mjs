@@ -221,7 +221,10 @@ test("collector resolves automatic frequency and GDB CPUs only from authoritativ
   assert.equal(result.cpuSelectionStatus.status, "resolved");
   assert.equal(result.cpuSelectionStatus.cpu, 19);
   assert.equal(result.frequencyAbStatus.status, "complete");
-  assert.equal(result.gdb.status, "no-fault");
+  // Legacy gdb.meta without a manifest stays descriptive: the CPU binding is
+  // still enforced (mismatch below), but it cannot authorize no-fault.
+  assert.equal(result.gdb.status, "incomplete");
+  assert.match(result.gdb.reason, /no validated manifest/);
 
   writeFileSync(
     path.join(matching, "results", "frequency-ab.meta"),

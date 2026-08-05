@@ -11,19 +11,39 @@
 //   results/individual.meta    target CPUs, runs per CPU, skip/completion state
 //   results/frequency-ab.tsv   leg, run, rc, elapsed
 //   results/frequency-ab.meta  leg configuration + restore status
-//   results/gdb.meta           gdb phase parameters
-//   env/summary.env            sanitized environment headline fields
-//   logs/...                   repro output logs (epoch-prefixed)
-//   gdb/*.txt                  capture transcripts
-//   freq/<tag>.samples         "epoch cpu khz" lines (or raw turbostat)
+//   results/gdb.manifest     authoritative gdb evidence envelope
+//   results/gdb.meta         gdb phase parameters (legacy, descriptive only)
+//   env/summary.env          sanitized environment headline fields
+//   logs/...                 repro output logs (epoch-prefixed)
+//   gdb/*.txt                capture transcripts
+//   freq/<tag>.samples       "epoch cpu khz" lines (or raw turbostat)
 
-import { existsSync, lstatSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  readSync,
+  writeFileSync,
+} from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { parseReproLog } from "./parse-repro-log.mjs";
 import { parseGdbCapture } from "./parse-gdb.mjs";
 import { assessBaselineEvidence } from "./baseline-evidence.mjs";
 import { assessGroupsEvidence, deriveIndividualTargetPolicy } from "./groups-evidence.mjs";
 import { inspectFrequencyEvidence, readBoundFrequencyArtifact } from "./frequency-evidence.mjs";
+import {
+  GDB_META_MAX_BYTES,
+  GDB_RESULTS_ENTRY_LIMIT,
+  GDB_TRANSCRIPT_MAX_BYTES,
+  inspectGdbManifestConfig,
+  validateGdbEvidence,
+} from "./gdb-evidence.mjs";
 import {
   assessIndividual as assessIndividualEnvelopeRows,
   inspectIndividualEvidence,
@@ -175,15 +195,43 @@ function readTsv(file) {
     .map((l) => l.split("\t"));
 }
 
+// results/gdb.meta is legacy descriptive evidence: bounded reads only, and
+// it can never authorize a conclusion without a validated manifest.
 function readGdbMeta(file) {
-  if (!existsSync(file)) return { present: false, values: {}, errors: [] };
+  let stat;
+  try {
+    stat = lstatSync(file);
+  } catch (error) {
+    if (error?.code === "ENOENT") return { present: false, values: {}, errors: [] };
+    return { present: true, values: {}, errors: ["GDB metadata could not be inspected"] };
+  }
+  if (!stat.isFile()) {
+    return {
+      present: true,
+      values: {},
+      errors: ["GDB metadata must be a real non-symlink regular file"],
+    };
+  }
+  if (stat.size > GDB_META_MAX_BYTES) {
+    return { present: true, values: {}, errors: ["GDB metadata exceeds the evidence size limit"] };
+  }
   const values = {};
   const errors = [];
   const allowed = new Set([
     "CPU", "MAX_RUNS", "EXIT_CODE", "ATTEMPTED_RUNS", "CLEAN_RUNS",
     "CAPTURED_RUNS", "ERROR_RUNS", "SKIPPED", "SKIP_REASON",
   ]);
-  const lines = readFileSync(file, "utf8").split("\n");
+  let text;
+  try {
+    const buffer = readFileSync(file);
+    if (buffer.length > GDB_META_MAX_BYTES) {
+      return { present: true, values: {}, errors: ["GDB metadata exceeds the evidence size limit"] };
+    }
+    text = buffer.toString("utf8");
+  } catch {
+    return { present: true, values: {}, errors: ["GDB metadata could not be read"] };
+  }
+  const lines = text.split("\n");
   if (lines.at(-1) === "") lines.pop();
   for (const line of lines) {
     const match = line.match(/^([A-Z_]+)=(.*)$/);
@@ -609,6 +657,291 @@ export function assessGdb(
   return { status: "incomplete", reason: "GDB metadata has no terminal exit code" };
 }
 
+function identicalGdbCaptures(captures) {
+  if (captures.length < 2) return null;
+  return captures.every(
+    (c) =>
+      c.instruction === captures[0].instruction &&
+      c.siAddr === captures[0].siAddr &&
+      c.intendedAddr === captures[0].intendedAddr &&
+      JSON.stringify(c.diffBits) === JSON.stringify(captures[0].diffBits),
+  );
+}
+
+// Inventory the legacy gdb/ directory in bounded form: the listing is capped
+// at the entry limit, and only regular files are transcript candidates
+// (symlinks and other types are skipped, never followed). Any anomaly is an
+// error so the entry degrades to incomplete instead of crashing.
+function listGdbTranscripts(outDir) {
+  const gdbDir = path.join(outDir, "gdb");
+  let stat;
+  try {
+    stat = lstatSync(gdbDir);
+  } catch (error) {
+    if (error?.code === "ENOENT") return { names: [], errors: [] };
+    return { names: [], errors: ["GDB transcript directory could not be inspected"] };
+  }
+  if (!stat.isDirectory()) {
+    return { names: [], errors: ["GDB transcript path is not a real directory"] };
+  }
+  let entries;
+  try {
+    entries = readdirSync(gdbDir);
+  } catch {
+    return { names: [], errors: ["GDB transcript directory could not be listed"] };
+  }
+  if (entries.length > GDB_RESULTS_ENTRY_LIMIT) {
+    return { names: [], errors: ["GDB transcript directory exceeds the entry limit"] };
+  }
+  const names = [];
+  for (const name of entries.sort()) {
+    if (!name.endsWith(".txt")) continue;
+    try {
+      if (!lstatSync(path.join(gdbDir, name)).isFile()) continue;
+    } catch {
+      continue; // vanished mid-listing: the bounded read re-checks the path
+    }
+    names.push(name);
+  }
+  return { names, errors: [] };
+}
+
+// Bounded legacy transcript read: regular files within the evidence size
+// limit only; anything else returns null so the entry degrades to incomplete.
+function readLegacyTranscript(file) {
+  try {
+    const stat = lstatSync(file);
+    if (!stat.isFile() || stat.size > GDB_TRANSCRIPT_MAX_BYTES) return null;
+    const buffer = readFileSync(file);
+    if (buffer.length > GDB_TRANSCRIPT_MAX_BYTES) return null;
+    return buffer;
+  } catch {
+    return null;
+  }
+}
+
+// Re-read a validated capture transcript TOCTOU-safely: open without
+// following links, stream bounded, and require the exact validated size and
+// digest. Any mismatch means the artifact changed after validation.
+function readBoundGdbTranscript(file, binding) {
+  const expectedBytes = Number(binding.bytes);
+  if (!Number.isSafeInteger(expectedBytes) || expectedBytes > GDB_TRANSCRIPT_MAX_BYTES) return null;
+  let fd;
+  try {
+    fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.size !== expectedBytes) return null;
+    const hash = createHash("sha256");
+    const chunks = [];
+    let total = 0;
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    while (true) {
+      const count = readSync(fd, buffer, 0, buffer.length, null);
+      if (count === 0) break;
+      total += count;
+      if (total > GDB_TRANSCRIPT_MAX_BYTES) return null;
+      const chunk = buffer.subarray(0, count);
+      hash.update(chunk);
+      chunks.push(Buffer.from(chunk));
+    }
+    if (total !== expectedBytes || hash.digest("hex") !== binding.sha256) return null;
+    return Buffer.concat(chunks);
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // The read result is already determined.
+      }
+    }
+  }
+}
+
+function parseGdbCaptureFile(rel, buffer) {
+  const parsed = parseGdbCapture(buffer.toString("utf8"));
+  // Full mappings stay in the raw transcript; keep the JSON compact.
+  parsed.mappings = undefined;
+  parsed.file = rel;
+  return parsed;
+}
+
+// Strict path: an authoritative manifest is present, so only a fully
+// validated generation-bound envelope may authorize a conclusion. Every
+// failure is a descriptive incomplete (fail closed).
+function assessGdbStrict(outDir, runMetaState, expectedCpuState) {
+  const incomplete = (reason, generation = null) => ({
+    status: "incomplete",
+    reason,
+    cpu: null,
+    maxRuns: null,
+    exitCode: null,
+    captures: [],
+    capturesIdentical: null,
+    generation,
+  });
+  const inspected = inspectGdbManifestConfig(outDir);
+  if (!inspected.ok) {
+    return incomplete(
+      `GDB manifest configuration could not be inspected: ${inspected.reasons.join("; ")}`,
+    );
+  }
+  // Every authoritative conclusion anchors to complete stored run metadata;
+  // an invalid one cannot supply expectations even for a skip envelope.
+  if (runMetaState.status !== "complete") {
+    return incomplete(
+      "stored run configuration cannot authorize GDB evidence expectations",
+      inspected.generation,
+    );
+  }
+  const expectedMaxRuns = canonicalUint(runMetaState.values.GDB_MAX_RUNS);
+  if (expectedMaxRuns === null || expectedMaxRuns < 1) {
+    return incomplete(
+      "stored run configuration cannot authorize the expected GDB run limit",
+      inspected.generation,
+    );
+  }
+  let expectedCpu = "-";
+  if (inspected.status === "RUN") {
+    if (expectedCpuState.status !== "resolved") {
+      return incomplete(
+        expectedCpuState.reason ?? "no validated CPU target authorizes this GDB evidence",
+        inspected.generation,
+      );
+    }
+    expectedCpu = expectedCpuState.cpu;
+  }
+  const attempts = [];
+  const validated = validateGdbEvidence(outDir, {
+    markerMode: "complete",
+    expectedCpu,
+    expectedMaxRuns,
+    expectedMaxCaptures: inspected.maxCaptures,
+    collectAttempts: attempts,
+  });
+  if (!validated.ok) {
+    return incomplete(
+      `GDB evidence failed validation: ${validated.reasons.join("; ")}`,
+      validated.generation ?? inspected.generation,
+    );
+  }
+  if (validated.outcome === "skipped") {
+    return {
+      status: "skipped",
+      reason: validated.meta.kind,
+      cpu: null,
+      maxRuns: null,
+      exitCode: null,
+      captures: [],
+      capturesIdentical: null,
+      generation: validated.generation,
+    };
+  }
+  const captures = [];
+  for (const binding of attempts) {
+    if (binding.outcome !== "captured") continue; // error transcripts are never parsed
+    const buffer = readBoundGdbTranscript(path.join(outDir, binding.relative), binding);
+    if (buffer === null) {
+      return incomplete(
+        `GDB transcript ${binding.relative} changed after validation`,
+        validated.generation,
+      );
+    }
+    const parsed = parseGdbCaptureFile(binding.relative, buffer);
+    if (!parsed.captured) {
+      return incomplete(
+        `captured GDB transcript ${binding.relative} contains no fault stop`,
+        validated.generation,
+      );
+    }
+    captures.push(parsed);
+  }
+  return {
+    status: validated.outcome,
+    reason: null,
+    attemptedRuns: validated.meta.attempted,
+    cleanRuns: validated.meta.clean,
+    capturedRuns: validated.meta.captured,
+    errorRuns: validated.meta.errors,
+    countsAvailable: true,
+    cpu: validated.meta.cpu,
+    maxRuns: validated.meta.maxRuns,
+    exitCode: validated.meta.exitCode,
+    captures,
+    capturesIdentical: identicalGdbCaptures(captures),
+    generation: validated.generation,
+  };
+}
+
+// Legacy path: without an authoritative manifest the gdb.meta + transcript
+// inventory stays descriptive. Would-be captured/no-fault conclusions are
+// downgraded to incomplete; structural problems keep their own reasons.
+function assessGdbLegacy(outDir, resultsDir, expectedCpuState) {
+  const gdbMetaState = readGdbMeta(path.join(resultsDir, "gdb.meta"));
+  const gdbMeta = gdbMetaState.values;
+  const listing = listGdbTranscripts(outDir);
+  const phaseDone = existsSync(path.join(outDir, "state", "phase-gdb.done"));
+  const captures = [];
+  const transcriptErrors = [...listing.errors];
+  for (const name of listing.names) {
+    const rel = path.join("gdb", name);
+    const buffer = readLegacyTranscript(path.join(outDir, rel));
+    if (buffer === null) {
+      transcriptErrors.push(`GDB transcript ${rel} could not be read within the evidence size limit`);
+      continue;
+    }
+    const parsed = parseGdbCaptureFile(rel, buffer);
+    if (!parsed.captured) continue; // clean-run transcripts carry no signature
+    captures.push(parsed);
+  }
+  const assessed = assessGdb(
+    gdbMeta,
+    phaseDone,
+    captures,
+    listing.names.length,
+    gdbMetaState,
+    expectedCpuState,
+  );
+  if (assessed.status === "not-run" && transcriptErrors.length === 0) return null;
+  let conclusion = assessed;
+  if (transcriptErrors.length > 0) {
+    conclusion = { ...conclusion, status: "incomplete", reason: transcriptErrors.join("; ") };
+  } else if (conclusion.status === "captured" || conclusion.status === "no-fault") {
+    conclusion = {
+      ...conclusion,
+      status: "incomplete",
+      reason: "legacy GDB evidence has no validated manifest and is descriptive only; " +
+        "it cannot authorize captured, no-fault, or signature conclusions",
+    };
+  }
+  return {
+    ...conclusion,
+    cpu: num(gdbMeta.CPU),
+    maxRuns: num(gdbMeta.MAX_RUNS),
+    exitCode: num(gdbMeta.EXIT_CODE),
+    captures,
+    capturesIdentical: identicalGdbCaptures(captures),
+    generation: null,
+  };
+}
+
+// The GDB section fails closed: only the strict generation-bound manifest
+// envelope can authorize captured/no-fault/skipped conclusions. Legacy
+// evidence remains descriptive and never authorizes them.
+function assessGdbPhase(outDir, runMetaState, expectedCpuState) {
+  const resultsDir = path.join(outDir, "results");
+  let manifestPresent = true;
+  try {
+    lstatSync(path.join(resultsDir, "gdb.manifest"));
+  } catch (error) {
+    // An uninspectable manifest path still counts as present (fail closed).
+    manifestPresent = error?.code !== "ENOENT";
+  }
+  if (manifestPresent) return assessGdbStrict(outDir, runMetaState, expectedCpuState);
+  return assessGdbLegacy(outDir, resultsDir, expectedCpuState);
+}
+
 function writeCollectedResults(outputFile, results, exclusiveOutput) {
   writeFileSync(
     outputFile,
@@ -628,7 +961,6 @@ export function collect(outDir, options = {}) {
   const rootChecksAssessment = runMetaState.bundleRootSafe
     ? assessRootChecksEvidence(outDir)
     : { status: "invalid", reasons: ["bundle root cannot authorize root-checks evidence"], generation: null };
-  const resultsDir = path.join(outDir, "results");
 
   const results = {
     schemaVersion: 1,
@@ -797,51 +1129,8 @@ export function collect(outDir, options = {}) {
   }
 
   // --- gdb ---
-  const gdbMetaState = readGdbMeta(path.join(resultsDir, "gdb.meta"));
-  const gdbMeta = gdbMetaState.values;
-  const gdbDir = path.join(outDir, "gdb");
-  const captures = [];
-  let transcriptCount = 0;
-  if (existsSync(gdbDir)) {
-    for (const f of readdirSync(gdbDir).sort()) {
-      if (!f.endsWith(".txt")) continue;
-      transcriptCount += 1;
-      const rel = path.join("gdb", f);
-      const parsed = parseGdbCapture(readFileSync(path.join(outDir, rel), "utf8"));
-      if (!parsed.captured) continue; // clean-run transcripts carry no signature
-      // Full mappings stay in the raw transcript; keep the JSON compact.
-      parsed.mappings = undefined;
-      parsed.file = rel;
-      captures.push(parsed);
-    }
-  }
-  const gdbStatus = assessGdb(
-    gdbMeta,
-    existsSync(path.join(outDir, "state", "phase-gdb.done")),
-    captures,
-    transcriptCount,
-    gdbMetaState,
-    expectedCpuState,
-  );
-  if (gdbStatus.status !== "not-run") {
-    const identical =
-      captures.length > 1 &&
-      captures.every(
-        (c) =>
-          c.instruction === captures[0].instruction &&
-          c.siAddr === captures[0].siAddr &&
-          c.intendedAddr === captures[0].intendedAddr &&
-          JSON.stringify(c.diffBits) === JSON.stringify(captures[0].diffBits),
-      );
-    results.gdb = {
-      ...gdbStatus,
-      cpu: num(gdbMeta.CPU),
-      maxRuns: num(gdbMeta.MAX_RUNS),
-      exitCode: num(gdbMeta.EXIT_CODE),
-      captures,
-      capturesIdentical: captures.length > 1 ? identical : null,
-    };
-  }
+  const gdbAssessment = assessGdbPhase(outDir, runMetaState, expectedCpuState);
+  if (gdbAssessment !== null) results.gdb = gdbAssessment;
 
   writeCollectedResults(outputFile, results, exclusiveOutput);
   return results;

@@ -1,4 +1,5 @@
 import {
+  chmodSync,
   chownSync,
   linkSync,
   mkdirSync,
@@ -23,6 +24,7 @@ import {
   GDB_MAX_RUNS_LIMIT,
   GDB_RESULTS_ENTRY_LIMIT,
   buildGdbManifestCandidate,
+  inspectGdbManifestConfig,
   newGdbGeneration,
   validateGdbEvidence,
 } from "../gdb-evidence.mjs";
@@ -617,4 +619,107 @@ test("missing evidence exposes one fixed-shape non-success probe for Bash", () =
   });
   assert.equal(result.ok, false);
   assert.match(result.probe, /^GDB_EVIDENCE\tVERSION\t1\tSTATUS\tINVALID\tGENERATION\t-\tOUTCOME\t-$/);
+});
+
+test("collectAttempts receives exactly the final-pass attempt bindings", () => {
+  const fixture = writeRun({ outcomes: ["captured", "clean", "error"], maxCaptures: 2 });
+  complete(fixture);
+  const attempts = [{ stale: true }];
+  const result = validate(fixture, { collectAttempts: attempts });
+  assert.equal(result.ok, true, result.reasons.join("; "));
+  assert.equal(attempts.length, 3, "bindings come from one final pass, never duplicated");
+  assert.deepEqual(attempts.map((attempt) => attempt.id), [1, 2, 3]);
+  assert.deepEqual(attempts.map((attempt) => attempt.outcome), ["captured", "clean", "error"]);
+  const [captured, clean, error] = attempts;
+  assert.equal(clean.relative, "-");
+  assert.equal(clean.bytes, "-");
+  assert.equal(clean.sha256, "-");
+  for (const [bound, run] of [[captured, 1], [error, 3]]) {
+    assert.equal(bound.relative, `gdb/cpu7-run${run}.txt`);
+    assert.match(bound.sha256, /^[0-9a-f]{64}$/);
+    assert.equal(bound.bytes, String(statSync(path.join(fixture.root, bound.relative)).size));
+  }
+
+  const skipped = writeSkip();
+  complete(skipped);
+  const skippedAttempts = [];
+  assert.equal(validate(skipped, { collectAttempts: skippedAttempts }).ok, true);
+  assert.deepEqual(skippedAttempts, [], "skip envelopes bind no attempts");
+
+  const tampered = writeRun();
+  complete(tampered);
+  writeFileSync(path.join(tampered.root, "gdb/cpu7-run1.txt"), "tampered\n");
+  const stale = [{ stale: true }];
+  const failed = validate(tampered, { collectAttempts: stale });
+  assert.equal(failed.ok, false);
+  assert.deepEqual(stale, [], "invalid validation leaves the array empty");
+});
+
+test("inspectGdbManifestConfig discovers expectations without validating evidence", () => {
+  const run = writeRun({ outcomes: ["captured", "clean", "error"], maxCaptures: 2 });
+  complete(run);
+  assert.deepEqual(inspectGdbManifestConfig(run.root), {
+    ok: true,
+    generation: GENERATION,
+    status: "RUN",
+    maxRuns: 3,
+    maxCaptures: 2,
+    cpu: 7,
+    skipKind: null,
+    reasons: [],
+  });
+
+  const skipped = writeSkip("no failing CPU identified");
+  complete(skipped);
+  assert.deepEqual(inspectGdbManifestConfig(skipped.root), {
+    ok: true,
+    generation: GENERATION,
+    status: "SKIPPED",
+    maxRuns: 6,
+    maxCaptures: 3,
+    cpu: null,
+    skipKind: "no failing CPU identified",
+    reasons: [],
+  });
+
+  // A semantically retuned prefix is still discovered verbatim: only the full
+  // validator proves the configuration against the bound artifacts.
+  const retuned = writeRun();
+  complete(retuned);
+  replaceLine(retuned.root, "CONFIG\tMAX_RUNS\t3", "CONFIG\tMAX_RUNS\t9");
+  const discovered = inspectGdbManifestConfig(retuned.root);
+  assert.equal(discovered.ok, true, discovered.reasons?.join("; "));
+  assert.equal(discovered.maxRuns, 9);
+  assert.equal(validate(retuned).ok, false);
+});
+
+test("inspectGdbManifestConfig rejects missing, malformed, non-private, and oversized manifests", () => {
+  const missing = tempBundle();
+  assert.equal(inspectGdbManifestConfig(missing).ok, false);
+
+  const malformed = writeRun();
+  complete(malformed);
+  replaceLine(malformed.root, "CONFIG\tMAX_RUNS\t3", "CONFIG\tMAX_RUNS\t03");
+  const bad = inspectGdbManifestConfig(malformed.root);
+  assert.equal(bad.ok, false);
+  assert.ok(bad.reasons.length > 0);
+
+  const truncated = writeRun();
+  complete(truncated);
+  const file = path.join(truncated.root, "results/gdb.manifest");
+  writeFileSync(file, readFileSync(file, "utf8").slice(0, -1));
+  assert.match(inspectGdbManifestConfig(truncated.root).reasons.join("; "), /end with LF/);
+
+  const publicFixture = writeRun();
+  complete(publicFixture);
+  chmodSync(path.join(publicFixture.root, "results/gdb.manifest"), 0o644);
+  assert.match(inspectGdbManifestConfig(publicFixture.root).reasons.join("; "), /mode 600/);
+
+  const oversized = writeRun();
+  complete(oversized);
+  truncateSync(
+    path.join(oversized.root, "results/gdb.manifest"),
+    (GDB_MAX_RUNS_LIMIT + 8) * 513 + 1,
+  );
+  assert.match(inspectGdbManifestConfig(oversized.root).reasons.join("; "), /size limit/);
 });

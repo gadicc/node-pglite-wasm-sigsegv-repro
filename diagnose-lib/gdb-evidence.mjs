@@ -865,6 +865,11 @@ function sameRunnerEvidence(left, right) {
 
 function validateInHierarchy(hierarchy, options) {
   const expected = normalizeExpectations(options);
+  // When the caller passes an array as options.collectAttempts, it is filled
+  // (contents replaced) with the attempt bindings of the FINAL scanRunner
+  // pass once validation succeeds; any invalid result leaves it empty.
+  const collectAttempts = Array.isArray(options.collectAttempts) ? options.collectAttempts : null;
+  let collectedAttempts = null;
   hierarchy.errors.push(...expected.reasons);
   if (hierarchy.errors.length > 0) return invalid(hierarchy.errors);
   const markerMode = options.markerMode;
@@ -936,10 +941,13 @@ function validateInHierarchy(hierarchy, options) {
   options.afterArtifactScan?.();
   if (manifest.status === "RUN" && runner !== null && expected.cpu !== null &&
       GENERATION_RE.test(manifest.generation ?? "")) {
+    // Only this final pass publishes attempt bindings, so entries are never
+    // duplicated across the repeated scans.
+    if (collectAttempts !== null) collectedAttempts = [];
     const repeated = scanRunner(
       hierarchy,
       { ...expected, generation: manifest.generation },
-      null,
+      collectedAttempts === null ? null : (attempt) => collectedAttempts.push(attempt),
       { hold: true },
     );
     checkTerminalRules(hierarchy, meta, repeated, expected);
@@ -953,6 +961,10 @@ function validateInHierarchy(hierarchy, options) {
   checkCandidateNamespace(hierarchy, allowedCandidateName);
   hierarchy.verify();
   if (hierarchy.errors.length > 0) return invalid(hierarchy.errors, manifest.generation);
+  if (collectAttempts !== null) {
+    collectAttempts.length = 0;
+    if (collectedAttempts !== null) collectAttempts.push(...collectedAttempts);
+  }
   const outcome = manifest.status === "SKIPPED"
     ? "SKIPPED"
     : runner.exitCode === 0 ? "CAPTURED" : "NO_FAULT";
@@ -970,10 +982,106 @@ function validateInHierarchy(hierarchy, options) {
 }
 
 export function validateGdbEvidence(outDir, options = {}) {
+  // Attempt bindings are replaced only on success; every invalid result
+  // leaves a caller-provided collectAttempts array empty.
+  if (Array.isArray(options.collectAttempts)) options.collectAttempts.length = 0;
   const hierarchy = new AnchoredHierarchy(outDir);
   try {
     if (hierarchy.errors.length > 0) return invalid(hierarchy.errors);
     return validateInHierarchy(hierarchy, options);
+  } finally {
+    hierarchy.close();
+  }
+}
+
+// Expectation-discovery pre-read: open the authoritative manifest through the
+// same anchored, ownership-checked, no-follow, mode-0600 path as full
+// validation, then parse only the fixed record prefix (VERSION, GENERATION,
+// STATUS, the two CONFIG limits, and the RUN CPU or SKIP kind). Digests,
+// attempt records, metadata, transcripts, and the completion marker are
+// deliberately NOT validated here, so the result is only meaningful when
+// immediately followed by validateGdbEvidence.
+export function inspectGdbManifestConfig(outDir) {
+  const fail = (reasons) => ({
+    ok: false,
+    reasons: reasons.length > 0
+      ? [...new Set(reasons)]
+      : ["GDB manifest configuration could not be inspected"],
+  });
+  const hierarchy = new AnchoredHierarchy(outDir);
+  try {
+    if (hierarchy.errors.length > 0) return fail(hierarchy.errors);
+    const maxBytes = (BigInt(GDB_MAX_RUNS_LIMIT) + 8n) * BigInt(GDB_CONTROL_LINE_MAX_BYTES + 1);
+    const opened = hierarchy.openFile(
+      "results",
+      "gdb.manifest",
+      maxBytes,
+      "results/gdb.manifest",
+      { requiredMode: 0o600 },
+    );
+    if (!opened) return fail(hierarchy.errors);
+    const config = {
+      generation: null,
+      status: null,
+      maxRuns: null,
+      maxCaptures: null,
+      cpu: null,
+      skipKind: null,
+    };
+    try {
+      scanControlLines(opened, maxBytes, {
+        maxLines: GDB_MAX_RUNS_LIMIT + 8,
+        onLine(line, index) {
+          const fields = line.split("\t");
+          if (index === 0) {
+            if (fields.length !== 2 || fields[0] !== "VERSION" || fields[1] !== "1") {
+              throw new Error("GDB manifest has an invalid VERSION record");
+            }
+          } else if (index === 1) {
+            if (fields.length !== 2 || fields[0] !== "GENERATION" || !GENERATION_RE.test(fields[1])) {
+              throw new Error("GDB manifest has an invalid GENERATION record");
+            }
+            config.generation = fields[1];
+          } else if (index === 2) {
+            if (fields.length !== 2 || fields[0] !== "STATUS" || !["RUN", "SKIPPED"].includes(fields[1])) {
+              throw new Error("GDB manifest has an invalid STATUS record");
+            }
+            config.status = fields[1];
+          } else if (index === 3 || index === 4) {
+            const key = index === 3 ? "MAX_RUNS" : "MAX_CAPTURES";
+            const value = canonicalUint(fields[2], { positive: true });
+            if (fields.length !== 3 || fields[0] !== "CONFIG" || fields[1] !== key || value === null) {
+              throw new Error(`GDB manifest has an invalid CONFIG ${key} record`);
+            }
+            if (index === 3) config.maxRuns = value;
+            else config.maxCaptures = value;
+          } else if (index === 5 && config.status === "RUN") {
+            const cpu = canonicalUint(fields[2], { max: 65535 });
+            if (fields.length !== 3 || fields[0] !== "CONFIG" || fields[1] !== "CPU" || cpu === null) {
+              throw new Error("GDB manifest has an invalid CONFIG CPU record");
+            }
+            config.cpu = cpu;
+          } else if (index === 5 && config.status === "SKIPPED") {
+            if (fields.length !== 2 || fields[0] !== "SKIP" || !SKIP_KINDS.has(fields[1])) {
+              throw new Error("GDB manifest has an invalid SKIP record");
+            }
+            config.skipKind = fields[1];
+          }
+          // Records past the fixed prefix are validated only by validateGdbEvidence.
+        },
+      });
+    } catch (error) {
+      hierarchy.errors.push(error.message);
+    }
+    hierarchy.finishFile(opened);
+    if (hierarchy.errors.length > 0) return fail(hierarchy.errors);
+    if (config.generation === null || config.status === null ||
+        config.maxRuns === null || config.maxCaptures === null ||
+        (config.status === "RUN" && config.cpu === null) ||
+        (config.status === "SKIPPED" && config.skipKind === null)) {
+      return fail(["GDB manifest is missing required ordered records"]);
+    }
+    return { ok: true, ...config, reasons: [] };
   } finally {
     hierarchy.close();
   }

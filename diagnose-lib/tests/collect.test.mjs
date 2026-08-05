@@ -1,6 +1,15 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import {
+  appendFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  truncateSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -12,6 +21,12 @@ import {
   selectWorstIndividualCpu,
   summarizeFreqSamples,
 } from "../collect.mjs";
+import {
+  GDB_TRANSCRIPT_MAX_BYTES,
+  buildGdbManifestCandidate,
+  newGdbGeneration,
+  validateGdbEvidence,
+} from "../gdb-evidence.mjs";
 
 // Representative capture from `turbostat --quiet --interval 1` (no --Summary):
 // the header repeats every interval, the "- -" row is the whole-system
@@ -45,6 +60,106 @@ function writeFixedCpuConfig(dir, cpu = 19) {
     `MODE=quick\nBASELINE_CHILDREN=4\nBASELINE_WAVES=5\nGROUP_WAVES=5\n` +
       `INDIVIDUAL_RUNS=1\nGDB_MAX_RUNS=6\nSKIP_GDB=0\nCPU_TARGET=${cpu}\n`,
   );
+}
+
+function writeAutoCpuConfig(dir) {
+  writeFileSync(
+    path.join(dir, "results", "meta.env"),
+    `MODE=quick\nBASELINE_CHILDREN=4\nBASELINE_WAVES=5\nGROUP_WAVES=5\n` +
+      `INDIVIDUAL_RUNS=1\nGDB_MAX_RUNS=6\nSKIP_GDB=0\nCPU_TARGET=auto\n`,
+  );
+}
+
+const GDB_FIXTURE_BODY =
+  "Program received signal SIGSEGV, Segmentation fault.\n0x0000000000401234 in ?? ()\n";
+
+// Node mirror of the shell write_gdb_run_fixture: a complete, valid,
+// marked-done GDB evidence envelope (runner.log, provenance transcripts for
+// retained attempts, the 7-line gdb.meta, and the authoritative manifest
+// built, renamed, marker-created, and re-validated).
+function writeGdbRunFixture(dir, { cpu = 19, maxRuns = 6, maxCaptures = 3, outcomes, capturedBody } = {}) {
+  outcomes ??= Array.from({ length: maxRuns }, (_, index) => (index === 0 ? "captured" : "clean"));
+  const generation = newGdbGeneration();
+  for (const relative of ["results", "state", "gdb", "logs/gdb"]) {
+    mkdirSync(path.join(dir, relative), { recursive: true });
+  }
+  const counts = { clean: 0, captured: 0, error: 0 };
+  const runner = [];
+  outcomes.forEach((outcome, index) => {
+    const run = index + 1;
+    counts[outcome] += 1;
+    runner.push(
+      `ATTEMPT\tGENERATION\t${generation}\tCPU\t${cpu}\tMAX_RUNS\t${maxRuns}` +
+      `\tMAX_CAPTURES\t${maxCaptures}\tRUN\t${run}\tOUTCOME\t${outcome}`,
+    );
+    if (outcome !== "clean") {
+      writeFileSync(
+        path.join(dir, "gdb", `cpu${cpu}-run${run}.txt`),
+        `GDB_TRANSCRIPT\tVERSION\t1\tGENERATION\t${generation}\tCPU\t${cpu}` +
+          `\tMAX_RUNS\t${maxRuns}\tMAX_CAPTURES\t${maxCaptures}\tRUN\t${run}\tOUTCOME\t${outcome}\n` +
+          (outcome === "captured" ? (capturedBody ?? GDB_FIXTURE_BODY) : "synthetic runner error\n") +
+          `GDB_TRANSCRIPT_END\tGENERATION\t${generation}\tCPU\t${cpu}\tRUN\t${run}\tOUTCOME\t${outcome}\n`,
+      );
+    }
+  });
+  const exitCode = counts.captured > 0 ? 0 : 3;
+  runner.push(
+    `COUNTS\tGENERATION\t${generation}\tCPU\t${cpu}\tMAX_RUNS\t${maxRuns}` +
+    `\tMAX_CAPTURES\t${maxCaptures}\tATTEMPTED\t${outcomes.length}` +
+    `\tCLEAN\t${counts.clean}\tCAPTURED\t${counts.captured}\tERRORS\t${counts.error}` +
+    `\tEXIT_CODE\t${exitCode}`,
+  );
+  writeFileSync(path.join(dir, "logs", "gdb", "runner.log"), `${runner.join("\n")}\n`);
+  writeFileSync(
+    path.join(dir, "results", "gdb.meta"),
+    `CPU=${cpu}\nMAX_RUNS=${maxRuns}\nEXIT_CODE=${exitCode}\nATTEMPTED_RUNS=${outcomes.length}\n` +
+      `CLEAN_RUNS=${counts.clean}\nCAPTURED_RUNS=${counts.captured}\nERROR_RUNS=${counts.error}\n`,
+  );
+  const candidate = path.join(dir, "results", `.gdb.manifest.${generation}`);
+  const built = buildGdbManifestCandidate(dir, candidate, {
+    generation,
+    expectedCpu: cpu,
+    expectedMaxRuns: maxRuns,
+    expectedMaxCaptures: maxCaptures,
+  });
+  assert.equal(built.ok, true, built.reasons.join("; "));
+  renameSync(candidate, path.join(dir, "results", "gdb.manifest"));
+  writeFileSync(path.join(dir, "state", "phase-gdb.done"), "");
+  const validated = validateGdbEvidence(dir, {
+    markerMode: "complete",
+    expectedCpu: cpu,
+    expectedMaxRuns: maxRuns,
+    expectedMaxCaptures: maxCaptures,
+  });
+  assert.equal(validated.ok, true, validated.reasons.join("; "));
+  return { generation, cpu, maxRuns, maxCaptures, outcomes, counts, exitCode };
+}
+
+// Skip-envelope variant of writeGdbRunFixture (CPU-independent).
+function writeGdbSkipFixture(dir, kind = "--skip-gdb", { maxRuns = 6, maxCaptures = 3 } = {}) {
+  const generation = newGdbGeneration();
+  for (const relative of ["results", "state", "gdb", "logs/gdb"]) {
+    mkdirSync(path.join(dir, relative), { recursive: true });
+  }
+  writeFileSync(path.join(dir, "results", "gdb.meta"), `SKIPPED=1\nSKIP_REASON=${kind}\n`);
+  const candidate = path.join(dir, "results", `.gdb.manifest.${generation}`);
+  const built = buildGdbManifestCandidate(dir, candidate, {
+    generation,
+    expectedCpu: null,
+    expectedMaxRuns: maxRuns,
+    expectedMaxCaptures: maxCaptures,
+  });
+  assert.equal(built.ok, true, built.reasons.join("; "));
+  renameSync(candidate, path.join(dir, "results", "gdb.manifest"));
+  writeFileSync(path.join(dir, "state", "phase-gdb.done"), "");
+  const validated = validateGdbEvidence(dir, {
+    markerMode: "complete",
+    expectedCpu: null,
+    expectedMaxRuns: maxRuns,
+    expectedMaxCaptures: maxCaptures,
+  });
+  assert.equal(validated.ok, true, validated.reasons.join("; "));
+  return { generation, kind, maxRuns, maxCaptures };
 }
 
 function writeCapture(samples, method = "turbostat") {
@@ -200,7 +315,10 @@ test("collect: terminal GDB metadata distinguishes no-fault from failure", () =>
   writeFileSync(path.join(noFaultDir, "results", "gdb.meta"), "CPU=19\nMAX_RUNS=6\nEXIT_CODE=3\n");
   writeFileSync(path.join(noFaultDir, "state", "phase-gdb.done"), "");
   const noFault = collect(noFaultDir);
-  assert.equal(noFault.gdb.status, "no-fault");
+  // Without a validated manifest the would-be no-fault result is descriptive.
+  assert.equal(noFault.gdb.status, "incomplete");
+  assert.match(noFault.gdb.reason, /no validated manifest/);
+  assert.equal(noFault.gdb.generation, null);
   assert.equal(noFault.gdb.countsAvailable, false);
   assert.equal(noFault.gdb.cleanRuns, null);
 
@@ -211,6 +329,7 @@ test("collect: terminal GDB metadata distinguishes no-fault from failure", () =>
   writeFileSync(path.join(failedDir, "results", "gdb.meta"), "CPU=19\nMAX_RUNS=6\nEXIT_CODE=5\n");
   const failed = collect(failedDir);
   assert.equal(failed.gdb.status, "failed");
+  assert.equal(failed.gdb.generation, null);
 });
 
 test("collect: GDB no-fault accounting excludes runner errors from the denominator", () => {
@@ -229,7 +348,10 @@ test("collect: GDB no-fault accounting excludes runner errors from the denominat
   }
   writeFileSync(path.join(dir, "state", "phase-gdb.done"), "");
   const result = collect(dir);
-  assert.equal(result.gdb.status, "no-fault");
+  // The accounting stays visible descriptively but cannot authorize no-fault.
+  assert.equal(result.gdb.status, "incomplete");
+  assert.match(result.gdb.reason, /descriptive only/);
+  assert.equal(result.gdb.generation, null);
   assert.equal(result.gdb.attemptedRuns, 6);
   assert.equal(result.gdb.cleanRuns, 1);
   assert.equal(result.gdb.capturedRuns, 0);
@@ -326,6 +448,181 @@ test("collector binds non-skipped GDB evidence while strict skips remain policy-
   assert.match(result.gdb.reason, /retained GDB transcripts/);
 });
 
+test("collect: a validated captured GDB envelope authorizes the captured conclusion", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "collect-test-"));
+  tmpDirs.push(dir);
+  mkdirSync(path.join(dir, "results"));
+  writeFixedCpuConfig(dir, 19);
+  const fixture = writeGdbRunFixture(dir, { outcomes: ["captured", "captured", "captured"] });
+  const result = collect(dir);
+  assert.equal(result.gdb.status, "captured");
+  assert.equal(result.gdb.reason, null);
+  assert.equal(result.gdb.generation, fixture.generation);
+  assert.equal(result.gdb.attemptedRuns, 3);
+  assert.equal(result.gdb.cleanRuns, 0);
+  assert.equal(result.gdb.capturedRuns, 3);
+  assert.equal(result.gdb.errorRuns, 0);
+  assert.equal(result.gdb.countsAvailable, true);
+  assert.equal(result.gdb.cpu, 19);
+  assert.equal(result.gdb.maxRuns, 6);
+  assert.equal(result.gdb.exitCode, 0);
+  assert.equal(result.gdb.captures.length, 3);
+  assert.equal(result.gdb.captures[0].captured, true);
+  assert.equal(result.gdb.captures[0].mappings, undefined);
+  assert.equal(result.gdb.captures[0].file, "gdb/cpu19-run1.txt");
+  assert.equal(result.gdb.capturesIdentical, true);
+});
+
+test("collect: a validated no-fault GDB envelope authorizes the no-fault conclusion", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "collect-test-"));
+  tmpDirs.push(dir);
+  mkdirSync(path.join(dir, "results"));
+  writeFixedCpuConfig(dir, 19);
+  const fixture = writeGdbRunFixture(dir, {
+    outcomes: ["clean", "clean", "clean", "clean", "clean", "clean"],
+  });
+  const result = collect(dir);
+  assert.equal(result.gdb.status, "no-fault");
+  assert.equal(result.gdb.generation, fixture.generation);
+  assert.equal(result.gdb.attemptedRuns, 6);
+  assert.equal(result.gdb.cleanRuns, 6);
+  assert.equal(result.gdb.capturedRuns, 0);
+  assert.equal(result.gdb.errorRuns, 0);
+  assert.equal(result.gdb.countsAvailable, true);
+  assert.equal(result.gdb.cpu, 19);
+  assert.equal(result.gdb.exitCode, 3);
+  assert.deepEqual(result.gdb.captures, []);
+  assert.equal(result.gdb.capturesIdentical, null);
+});
+
+test("collect: a validated skip GDB envelope stays skipped and CPU-independent", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "collect-test-"));
+  tmpDirs.push(dir);
+  mkdirSync(path.join(dir, "results"));
+  writeFixedCpuConfig(dir, 19);
+  const fixture = writeGdbSkipFixture(dir, "no failing CPU identified");
+  const result = collect(dir);
+  assert.equal(result.gdb.status, "skipped");
+  assert.equal(result.gdb.reason, "no failing CPU identified");
+  assert.equal(result.gdb.generation, fixture.generation);
+  assert.deepEqual(result.gdb.captures, []);
+});
+
+test("collect: a transcript tampered after publication fails closed", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "collect-test-"));
+  tmpDirs.push(dir);
+  mkdirSync(path.join(dir, "results"));
+  writeFixedCpuConfig(dir, 19);
+  writeGdbRunFixture(dir, { outcomes: ["captured", "captured", "captured"] });
+  appendFileSync(path.join(dir, "gdb", "cpu19-run1.txt"), "tampered\n");
+  const result = collect(dir);
+  assert.equal(result.gdb.status, "incomplete");
+  assert.match(result.gdb.reason, /GDB evidence failed validation/);
+});
+
+test("collect: a tampered GDB manifest fails closed", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "collect-test-"));
+  tmpDirs.push(dir);
+  mkdirSync(path.join(dir, "results"));
+  writeFixedCpuConfig(dir, 19);
+  const fixture = writeGdbRunFixture(dir, { outcomes: ["captured", "captured", "captured"] });
+  const manifest = path.join(dir, "results", "gdb.manifest");
+  const flipped = fixture.generation.startsWith("a") ? "b" : "a";
+  writeFileSync(
+    manifest,
+    readFileSync(manifest, "utf8").replace(
+      `GENERATION\t${fixture.generation}`,
+      `GENERATION\t${flipped}${fixture.generation.slice(1)}`,
+    ),
+  );
+  const result = collect(dir);
+  assert.equal(result.gdb.status, "incomplete");
+  assert.match(result.gdb.reason, /GDB evidence failed validation/);
+});
+
+test("collect: run GDB evidence without a resolvable CPU target is incomplete", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "collect-test-"));
+  tmpDirs.push(dir);
+  mkdirSync(path.join(dir, "results"));
+  // CPU_TARGET=auto with no individual evidence: nothing authorizes CPU 19.
+  writeAutoCpuConfig(dir);
+  writeGdbRunFixture(dir, { outcomes: ["clean", "clean", "clean", "clean", "clean", "clean"] });
+  const result = collect(dir);
+  assert.equal(result.gdb.status, "incomplete");
+  assert.match(result.gdb.reason, /automatic CPU selection requires/);
+});
+
+test("collect: legacy captured GDB evidence without a manifest cannot authorize conclusions", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "collect-test-"));
+  tmpDirs.push(dir);
+  mkdirSync(path.join(dir, "results"));
+  mkdirSync(path.join(dir, "state"));
+  mkdirSync(path.join(dir, "gdb"));
+  writeFixedCpuConfig(dir, 19);
+  writeFileSync(
+    path.join(dir, "results", "gdb.meta"),
+    "CPU=19\nMAX_RUNS=6\nEXIT_CODE=0\nATTEMPTED_RUNS=1\nCLEAN_RUNS=0\nCAPTURED_RUNS=1\nERROR_RUNS=0\n",
+  );
+  writeFileSync(path.join(dir, "gdb", "cpu19-run1.txt"), GDB_FIXTURE_BODY);
+  writeFileSync(path.join(dir, "state", "phase-gdb.done"), "");
+  const result = collect(dir);
+  assert.equal(result.gdb.status, "incomplete");
+  assert.notEqual(result.gdb.status, "captured");
+  assert.match(result.gdb.reason, /no validated manifest/);
+  assert.match(result.gdb.reason, /descriptive only/);
+  assert.match(result.gdb.reason, /cannot authorize/);
+  assert.equal(result.gdb.generation, null);
+  // The parsed capture stays available as descriptive detail only.
+  assert.equal(result.gdb.captures.length, 1);
+  assert.equal(result.gdb.captures[0].captured, true);
+});
+
+test("collect: oversized legacy GDB metadata is bounded and incomplete", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "collect-test-"));
+  tmpDirs.push(dir);
+  mkdirSync(path.join(dir, "results"));
+  writeFileSync(
+    path.join(dir, "results", "gdb.meta"),
+    `CPU=19\nMAX_RUNS=6\nEXIT_CODE=3\n${"x".repeat(8192)}\n`,
+  );
+  const result = collect(dir);
+  assert.equal(result.gdb.status, "incomplete");
+  assert.match(result.gdb.reason, /size limit/);
+});
+
+test("collect: oversized legacy GDB transcripts are bounded and incomplete", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "collect-test-"));
+  tmpDirs.push(dir);
+  mkdirSync(path.join(dir, "results"));
+  mkdirSync(path.join(dir, "state"));
+  mkdirSync(path.join(dir, "gdb"));
+  writeFixedCpuConfig(dir, 19);
+  writeFileSync(
+    path.join(dir, "results", "gdb.meta"),
+    "CPU=19\nMAX_RUNS=6\nEXIT_CODE=0\nATTEMPTED_RUNS=1\nCLEAN_RUNS=0\nCAPTURED_RUNS=1\nERROR_RUNS=0\n",
+  );
+  const transcript = path.join(dir, "gdb", "cpu19-run1.txt");
+  writeFileSync(transcript, "\n");
+  truncateSync(transcript, GDB_TRANSCRIPT_MAX_BYTES + 1);
+  writeFileSync(path.join(dir, "state", "phase-gdb.done"), "");
+  const result = collect(dir);
+  assert.equal(result.gdb.status, "incomplete");
+  assert.match(result.gdb.reason, /size limit/);
+});
+
+test("collect: an over-limit GDB directory listing is bounded and incomplete", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "collect-test-"));
+  tmpDirs.push(dir);
+  mkdirSync(path.join(dir, "results"));
+  mkdirSync(path.join(dir, "gdb"));
+  for (let index = 0; index <= 256; index += 1) {
+    writeFileSync(path.join(dir, "gdb", `run${index}.txt`), "x\n");
+  }
+  const result = collect(dir);
+  assert.equal(result.gdb.status, "incomplete");
+  assert.match(result.gdb.reason, /entry limit/);
+});
+
 test("assessIndividual: exact completion and partial prefixes have explicit status", () => {
   const meta = { VERSION: "1", TARGET_CPUS: "3-4", RUNS_PER_CPU: "2", SKIPPED: "0", COMPLETED: "1" };
   const complete = assessIndividual([
@@ -403,4 +700,36 @@ test("collect: self-consistent individual evidence is non-authoritative without 
   assert.equal(r.individual, undefined);
   assert.equal(r.worstCpu, null);
   assert.match(r.individualStatus.reasons.join("; "), /group evidence is unavailable/);
+});
+
+test("collect: a validated skip envelope still anchors to complete stored run metadata", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "collect-test-"));
+  tmpDirs.push(dir);
+  mkdirSync(path.join(dir, "results"));
+  // Duplicate GDB_MAX_RUNS rows make the stored run configuration invalid.
+  writeFileSync(
+    path.join(dir, "results", "meta.env"),
+    `MODE=quick\nBASELINE_CHILDREN=4\nBASELINE_WAVES=5\nGROUP_WAVES=5\n` +
+      `INDIVIDUAL_RUNS=1\nGDB_MAX_RUNS=6\nGDB_MAX_RUNS=6\nSKIP_GDB=0\nCPU_TARGET=19\n`,
+  );
+  writeGdbSkipFixture(dir, "--skip-gdb");
+  const result = collect(dir);
+  assert.equal(result.gdb.status, "incomplete");
+  assert.match(result.gdb.reason, /stored run configuration cannot authorize/);
+});
+
+test("collect: a captured binding whose transcript has no fault stop fails closed", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "collect-test-"));
+  tmpDirs.push(dir);
+  mkdirSync(path.join(dir, "results"));
+  writeFixedCpuConfig(dir, 19);
+  // The provenance envelope is fully valid, but the captured body never
+  // stopped at SIGSEGV, so no capture conclusion may stand.
+  writeGdbRunFixture(dir, {
+    outcomes: ["captured", "clean", "clean", "clean", "clean", "clean"],
+    capturedBody: "Program exited normally.\n",
+  });
+  const result = collect(dir);
+  assert.equal(result.gdb.status, "incomplete");
+  assert.match(result.gdb.reason, /contains no fault stop/);
 });
