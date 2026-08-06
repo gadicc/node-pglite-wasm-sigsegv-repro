@@ -2331,6 +2331,13 @@ bash "$REPO_ROOT/frequency-ab.sh" > /dev/null 2>&1
 check_eq "frequency-ab.sh usage error (rc=2)" "2" "$?"
 bash "$REPO_ROOT/root-checks.sh" > /dev/null 2>&1
 check_eq "root-checks.sh usage error (rc=2)" "2" "$?"
+root_checks_usage_text="$(bash "$REPO_ROOT/root-checks.sh" --help 2>&1 || true)"
+check_eq "root-checks.sh usage documents --fresh orphan recovery" "1" \
+  "$(grep -q -- '--fresh' <<< "$root_checks_usage_text" && echo 1 || echo 0)"
+check_eq "root-checks.sh staging no longer uses a random mktemp directory" "0" \
+  "$(grep -c 'mktemp -d /tmp/root-checks' "$REPO_ROOT/root-checks.sh")"
+check_eq "root-checks.sh derives the stage from the invoking uid and bundle hash" "1" \
+  "$(grep -qF 'root-checks.${invoking_uid}.$(printf' "$REPO_ROOT/root-checks.sh" && echo 1 || echo 0)"
 
 FREQUENCY_INITIAL="$TMP/frequency-initial-state"
 mkdir -p "$FREQUENCY_INITIAL"
@@ -3787,6 +3794,293 @@ if ((EUID != 0)); then
   root_substitute_rc=$?
   check_eq "unprivileged root-checks publisher rejects output-directory substitution" "1" \
     "$([[ $root_substitute_rc -ne 0 && "$(cat "$ROOT_SUBSTITUTE/substitute/sentinel")" == "safe directory victim" && ! -e "$ROOT_SUBSTITUTE/substitute/cctk.txt" && -f "$ROOT_SUBSTITUTE/stage/cctk.txt" ]] && echo 1 || echo 0)"
+
+  root_stage_classify() {
+    # root_stage_classify <dir> [root]
+    # Classifies <dir> through the sourced root-checks.sh internals. With the
+    # literal second argument "root", the identity seam reports the fixture
+    # as root-owned so non-root tests can exercise the pre-handoff class.
+    local dir="$1" as_root="${2:-}"
+    ROOT_CHECKS_SOURCE_ONLY=1
+    source "$REPO_ROOT/root-checks.sh"
+    ROOT_CHECKS_STAGE_UID="$(id -u)"
+    ROOT_CHECKS_STAGE_GID="$(id -g)"
+    if [[ "$as_root" == root ]]; then
+      root_checks_stage_identity() {
+        local real
+        real="$(stat -Lc '%u:%g:%a:%h' -- "$1" 2> /dev/null)" || return 1
+        printf '0:0:%s\n' "${real#*:*:}"
+      }
+    fi
+    root_checks_classify_existing_stage "$dir"
+  }
+
+  ROOT_STAGE_CLASSIFY="$TMP/root-checks-stage-classify"
+  mkdir -p "$ROOT_STAGE_CLASSIFY"
+  check_eq "root-checks stage classification reports an absent path as absent" "absent" \
+    "$(root_stage_classify "$ROOT_STAGE_CLASSIFY/does-not-exist")"
+
+  root_publish_stage_prepare "$ROOT_STAGE_CLASSIFY/handed-off"
+  check_eq "root-checks stage classification accepts a complete user-owned stage as handed-off" \
+    "handed-off" "$(root_stage_classify "$ROOT_STAGE_CLASSIFY/handed-off")"
+  check_eq "root-checks stage classification reports a root-owned complete stage as pre-handoff" \
+    "pre-handoff" "$(root_stage_classify "$ROOT_STAGE_CLASSIFY/handed-off" root)"
+
+  ln -s "$ROOT_STAGE_CLASSIFY/handed-off" "$ROOT_STAGE_CLASSIFY/stage-link"
+  check_eq "root-checks stage classification rejects a symlinked stage as unsafe" \
+    "unsafe" "$(root_stage_classify "$ROOT_STAGE_CLASSIFY/stage-link")"
+
+  root_publish_stage_prepare "$ROOT_STAGE_CLASSIFY/foreign"
+  printf 'foreign\n' > "$ROOT_STAGE_CLASSIFY/foreign/foreign.txt"
+  chmod 0600 "$ROOT_STAGE_CLASSIFY/foreign/foreign.txt"
+  check_eq "root-checks stage classification rejects an extra foreign entry as unsafe" \
+    "unsafe" "$(root_stage_classify "$ROOT_STAGE_CLASSIFY/foreign")"
+
+  root_publish_stage_prepare "$ROOT_STAGE_CLASSIFY/missing"
+  rm -f "$ROOT_STAGE_CLASSIFY/missing/cctk.txt"
+  check_eq "root-checks stage classification rejects a missing payload as unsafe" \
+    "unsafe" "$(root_stage_classify "$ROOT_STAGE_CLASSIFY/missing")"
+
+  root_publish_stage_prepare "$ROOT_STAGE_CLASSIFY/wrong-mode"
+  chmod 0755 "$ROOT_STAGE_CLASSIFY/wrong-mode"
+  check_eq "root-checks stage classification rejects a wrong-mode stage as unsafe" \
+    "unsafe" "$(root_stage_classify "$ROOT_STAGE_CLASSIFY/wrong-mode")"
+
+  root_publish_stage_prepare "$ROOT_STAGE_CLASSIFY/fifo"
+  rm -f "$ROOT_STAGE_CLASSIFY/fifo/cctk.txt"
+  mkfifo "$ROOT_STAGE_CLASSIFY/fifo/cctk.txt"
+  # Pin the entry-type check specifically: with mode 600 the fifo passes every
+  # ownership/mode/link rule, so only the regular-file requirement rejects it.
+  chmod 0600 "$ROOT_STAGE_CLASSIFY/fifo/cctk.txt"
+  check_eq "root-checks stage classification rejects a fifo payload as unsafe" \
+    "unsafe" "$(root_stage_classify "$ROOT_STAGE_CLASSIFY/fifo")"
+
+  root_publish_stage_prepare "$ROOT_STAGE_CLASSIFY/payload-link"
+  rm -f "$ROOT_STAGE_CLASSIFY/payload-link/cctk.txt"
+  printf 'valid target\n' > "$ROOT_STAGE_CLASSIFY/payload-link-target"
+  chmod 0600 "$ROOT_STAGE_CLASSIFY/payload-link-target"
+  ln -s "$ROOT_STAGE_CLASSIFY/payload-link-target" "$ROOT_STAGE_CLASSIFY/payload-link/cctk.txt"
+  check_eq "root-checks stage classification rejects a symlinked payload as unsafe" \
+    "unsafe" "$(root_stage_classify "$ROOT_STAGE_CLASSIFY/payload-link")"
+
+  root_publish_stage_prepare "$ROOT_STAGE_CLASSIFY/foreign-owner"
+  foreign_owner_class="$(
+    ROOT_CHECKS_SOURCE_ONLY=1
+    source "$REPO_ROOT/root-checks.sh"
+    ROOT_CHECKS_STAGE_UID="$(id -u)"
+    ROOT_CHECKS_STAGE_GID="$(id -g)"
+    root_checks_stage_identity() {
+      local real
+      real="$(stat -Lc '%a:%h' -- "$1" 2> /dev/null)" || return 1
+      printf '4321:4321:%s\n' "$real"
+    }
+    root_checks_classify_existing_stage "$ROOT_STAGE_CLASSIFY/foreign-owner"
+  )"
+  check_eq "root-checks stage classification rejects a foreign-owner stage as unsafe" \
+    "unsafe" "$foreign_owner_class"
+
+  root_publish_stage_prepare "$ROOT_STAGE_CLASSIFY/hardlink"
+  ln "$ROOT_STAGE_CLASSIFY/hardlink/cctk.txt" "$ROOT_STAGE_CLASSIFY/cctk-hardlink"
+  check_eq "root-checks stage classification rejects a hardlinked payload as unsafe" \
+    "unsafe" "$(root_stage_classify "$ROOT_STAGE_CLASSIFY/hardlink")"
+
+  ROOT_PRE_HANDOFF="$TMP/root-checks-pre-handoff-recovery"
+  mkdir -p -m 0700 "$ROOT_PRE_HANDOFF/stage"
+  printf 'partial kernel warnings\n' > "$ROOT_PRE_HANDOFF/stage/kernel-warnings.txt"
+  printf 'partial cctk\n' > "$ROOT_PRE_HANDOFF/stage/cctk.txt"
+  chmod 0600 "$ROOT_PRE_HANDOFF/stage/kernel-warnings.txt" "$ROOT_PRE_HANDOFF/stage/cctk.txt"
+  pre_handoff_recovery="$(
+    ROOT_CHECKS_SOURCE_ONLY=1
+    source "$REPO_ROOT/root-checks.sh"
+    ROOT_CHECKS_STAGE_UID="$(id -u)"
+    ROOT_CHECKS_STAGE_GID="$(id -g)"
+    root_checks_stage_identity() {
+      local real
+      real="$(stat -Lc '%u:%g:%a:%h' -- "$1" 2> /dev/null)" || return 1
+      printf '0:0:%s\n' "${real#*:*:}"
+    }
+    class="$(root_checks_classify_existing_stage "$ROOT_PRE_HANDOFF/stage")"
+    rc=0
+    root_checks_stage_dispatch "$class" "$ROOT_PRE_HANDOFF/stage" \
+      "$ROOT_PRE_HANDOFF/bundle" 0 2> /dev/null || rc=$?
+    leftovers="$(find "$ROOT_PRE_HANDOFF/stage" -mindepth 1 -maxdepth 1 -print | wc -l)"
+    stage_state=lost
+    if [[ -d "$ROOT_PRE_HANDOFF/stage" && ! -L "$ROOT_PRE_HANDOFF/stage" ]]; then
+      stage_state=reused
+    fi
+    printf '%s:%s:%s:%s\n' "$class" "$rc" "$leftovers" "$stage_state"
+  )"
+  check_eq "pre-handoff recovery removes root-owned known payloads and reuses the stage" \
+    "pre-handoff:0:0:reused" "$pre_handoff_recovery"
+
+  # The half-chowned window: root's directory is intact, but the per-file
+  # handoff already ran, so the payloads are user-owned. Root provably owns
+  # the directory, so this is still root's own interrupted stage.
+  ROOT_MIXED_HANDOFF="$TMP/root-checks-pre-handoff-mixed"
+  mkdir -p -m 0700 "$ROOT_MIXED_HANDOFF/stage"
+  printf 'partial kernel warnings\n' > "$ROOT_MIXED_HANDOFF/stage/kernel-warnings.txt"
+  printf 'partial cctk\n' > "$ROOT_MIXED_HANDOFF/stage/cctk.txt"
+  chmod 0600 "$ROOT_MIXED_HANDOFF/stage/kernel-warnings.txt" "$ROOT_MIXED_HANDOFF/stage/cctk.txt"
+  mixed_handoff_recovery="$(
+    ROOT_CHECKS_SOURCE_ONLY=1
+    source "$REPO_ROOT/root-checks.sh"
+    ROOT_CHECKS_STAGE_UID="$(id -u)"
+    ROOT_CHECKS_STAGE_GID="$(id -g)"
+    root_checks_stage_identity() {
+      local real
+      real="$(stat -Lc '%u:%g:%a:%h' -- "$1" 2> /dev/null)" || return 1
+      if [[ "$1" == "$ROOT_MIXED_HANDOFF/stage" ]]; then
+        printf '0:0:%s\n' "${real#*:*:}"
+      else
+        printf '%s\n' "$real"
+      fi
+    }
+    class="$(root_checks_classify_existing_stage "$ROOT_MIXED_HANDOFF/stage")"
+    rc=0
+    root_checks_stage_dispatch "$class" "$ROOT_MIXED_HANDOFF/stage" \
+      "$ROOT_MIXED_HANDOFF/bundle" 0 2> /dev/null || rc=$?
+    leftovers="$(find "$ROOT_MIXED_HANDOFF/stage" -mindepth 1 -maxdepth 1 -print | wc -l)"
+    stage_state=lost
+    if [[ -d "$ROOT_MIXED_HANDOFF/stage" && ! -L "$ROOT_MIXED_HANDOFF/stage" ]]; then
+      stage_state=reused
+    fi
+    printf '%s:%s:%s:%s\n' "$class" "$rc" "$leftovers" "$stage_state"
+  )"
+  check_eq "pre-handoff recovery accepts the half-chowned handoff window" \
+    "pre-handoff:0:0:reused" "$mixed_handoff_recovery"
+
+  ROOT_PRE_FOREIGN="$TMP/root-checks-pre-handoff-foreign"
+  mkdir -p -m 0700 "$ROOT_PRE_FOREIGN/stage"
+  printf 'partial cctk\n' > "$ROOT_PRE_FOREIGN/stage/cctk.txt"
+  printf 'foreign\n' > "$ROOT_PRE_FOREIGN/stage/foreign.txt"
+  chmod 0600 "$ROOT_PRE_FOREIGN/stage/cctk.txt" "$ROOT_PRE_FOREIGN/stage/foreign.txt"
+  pre_foreign_result="$(
+    ROOT_CHECKS_SOURCE_ONLY=1
+    source "$REPO_ROOT/root-checks.sh"
+    ROOT_CHECKS_STAGE_UID="$(id -u)"
+    ROOT_CHECKS_STAGE_GID="$(id -g)"
+    root_checks_stage_identity() {
+      local real
+      real="$(stat -Lc '%u:%g:%a:%h' -- "$1" 2> /dev/null)" || return 1
+      printf '0:0:%s\n' "${real#*:*:}"
+    }
+    class="$(root_checks_classify_existing_stage "$ROOT_PRE_FOREIGN/stage")"
+    rc=0
+    root_checks_stage_dispatch "$class" "$ROOT_PRE_FOREIGN/stage" \
+      "$ROOT_PRE_FOREIGN/bundle" 0 2> /dev/null || rc=$?
+    refused=0
+    if ((rc != 0)); then refused=1; fi
+    kept=0
+    if [[ -f "$ROOT_PRE_FOREIGN/stage/cctk.txt" && -f "$ROOT_PRE_FOREIGN/stage/foreign.txt" ]]; then
+      kept=1
+    fi
+    printf '%s:%s:%s\n' "$class" "$refused" "$kept"
+  )"
+  check_eq "pre-handoff recovery refuses a foreign entry without deleting anything" \
+    "unsafe:1:1" "$pre_foreign_result"
+
+  ROOT_ORPHAN="$TMP/root-checks-handed-off-orphan"
+  root_publish_stage_prepare "$ROOT_ORPHAN/stage" 33333333333333333333333333333333
+  mkdir -p "$ROOT_ORPHAN/bundle"
+  (
+    ROOT_CHECKS_SOURCE_ONLY=1
+    source "$REPO_ROOT/root-checks.sh"
+    SUDO_USER="$(id -un)"
+    ROOT_CHECKS_STAGE_UID="$(id -u)"
+    ROOT_CHECKS_STAGE_GID="$(id -g)"
+    runuser() {
+      [[ "$1" == -u && "$3" == -- ]] || return 1
+      shift 3
+      "$@"
+    }
+    class="$(root_checks_classify_existing_stage "$ROOT_ORPHAN/stage")"
+    [[ "$class" == handed-off ]] || exit 3
+    rc=0
+    root_checks_stage_dispatch "$class" "$ROOT_ORPHAN/stage" "$ROOT_ORPHAN/bundle" 0 \
+      > /dev/null 2> "$ROOT_ORPHAN/notice" || rc=$?
+    [[ "$rc" == 100 ]]
+  )
+  check_eq "handed-off orphan recovery dispatch republishes instead of re-collecting" "0" "$?"
+  check_eq "handed-off orphan recovery publishes one validated generation and removes the stage" "1" \
+    "$([[ ! -e "$ROOT_ORPHAN/stage" && ! -L "$ROOT_ORPHAN/stage" ]] &&
+      node "$LIB/root-checks-evidence.mjs" --validate-complete "$ROOT_ORPHAN/bundle" > /dev/null 2>&1 &&
+      echo 1 || echo 0)"
+  check_eq "handed-off orphan recovery notice names the stage and collection time" "1" \
+    "$(grep -qF "$ROOT_ORPHAN/stage" "$ROOT_ORPHAN/notice" &&
+      grep -qF '2026-08-02T20:00:00' "$ROOT_ORPHAN/notice" && echo 1 || echo 0)"
+
+  ROOT_FRESH="$TMP/root-checks-fresh-discard"
+  root_publish_stage_prepare "$ROOT_FRESH/stage"
+  mkdir -p "$ROOT_FRESH/bundle"
+  fresh_discard_result="$(
+    ROOT_CHECKS_SOURCE_ONLY=1
+    source "$REPO_ROOT/root-checks.sh"
+    SUDO_USER="$(id -un)"
+    ROOT_CHECKS_STAGE_UID="$(id -u)"
+    ROOT_CHECKS_STAGE_GID="$(id -g)"
+    runuser() { return 99; }
+    rc=0
+    root_checks_stage_discard_handed_off "$ROOT_FRESH/stage" 2> /dev/null || rc=$?
+    stage_state=gone
+    if [[ -e "$ROOT_FRESH/stage" || -L "$ROOT_FRESH/stage" ]]; then stage_state=present; fi
+    published=no
+    if [[ -e "$ROOT_FRESH/bundle/env/root" ]]; then published=yes; fi
+    printf '%s:%s:%s\n' "$rc" "$stage_state" "$published"
+  )"
+  check_eq "--fresh discards a proven handed-off orphan without publishing" \
+    "0:gone:no" "$fresh_discard_result"
+
+  ROOT_FRESH_FOREIGN="$TMP/root-checks-fresh-foreign"
+  root_publish_stage_prepare "$ROOT_FRESH_FOREIGN/stage"
+  printf 'foreign\n' > "$ROOT_FRESH_FOREIGN/stage/foreign.txt"
+  chmod 0600 "$ROOT_FRESH_FOREIGN/stage/foreign.txt"
+  fresh_foreign_result="$(
+    ROOT_CHECKS_SOURCE_ONLY=1
+    source "$REPO_ROOT/root-checks.sh"
+    SUDO_USER="$(id -un)"
+    ROOT_CHECKS_STAGE_UID="$(id -u)"
+    ROOT_CHECKS_STAGE_GID="$(id -g)"
+    class="$(root_checks_classify_existing_stage "$ROOT_FRESH_FOREIGN/stage")"
+    rc=0
+    root_checks_stage_dispatch "$class" "$ROOT_FRESH_FOREIGN/stage" \
+      "$ROOT_FRESH_FOREIGN/bundle" 1 2> /dev/null || rc=$?
+    refused=0
+    if ((rc != 0)); then refused=1; fi
+    kept=0
+    if [[ -f "$ROOT_FRESH_FOREIGN/stage/foreign.txt" &&
+      -f "$ROOT_FRESH_FOREIGN/stage/root-checks.meta" &&
+      -d "$ROOT_FRESH_FOREIGN/stage" ]]; then
+      kept=1
+    fi
+    printf '%s:%s:%s\n' "$class" "$refused" "$kept"
+  )"
+  check_eq "--fresh on a foreign-entry stage refuses and deletes nothing" \
+    "unsafe:1:1" "$fresh_foreign_result"
+
+  ROOT_FRESH_INCOMPLETE="$TMP/root-checks-fresh-incomplete"
+  root_publish_stage_prepare "$ROOT_FRESH_INCOMPLETE/stage"
+  rm -f "$ROOT_FRESH_INCOMPLETE/stage/cctk.txt"
+  fresh_incomplete_result="$(
+    ROOT_CHECKS_SOURCE_ONLY=1
+    source "$REPO_ROOT/root-checks.sh"
+    SUDO_USER="$(id -un)"
+    ROOT_CHECKS_STAGE_UID="$(id -u)"
+    ROOT_CHECKS_STAGE_GID="$(id -g)"
+    rc=0
+    root_checks_stage_discard_handed_off "$ROOT_FRESH_INCOMPLETE/stage" \
+      > /dev/null 2>&1 || rc=$?
+    refused=0
+    if ((rc != 0)); then refused=1; fi
+    kept=0
+    if [[ -f "$ROOT_FRESH_INCOMPLETE/stage/kernel-warnings.txt" &&
+      -f "$ROOT_FRESH_INCOMPLETE/stage/root-checks.meta" &&
+      -d "$ROOT_FRESH_INCOMPLETE/stage" ]]; then
+      kept=1
+    fi
+    printf '%s:%s\n' "$refused" "$kept"
+  )"
+  check_eq "--fresh discard refuses an incomplete stage and deletes nothing" \
+    "1:1" "$fresh_incomplete_result"
 else
   ok "busy root-checks publisher returns 75 without mutating stage or bundle [skipped while tests run as root]"
   ok "root-check publication retries after the bundle lock is released [skipped while tests run as root]"
@@ -3799,6 +4093,26 @@ else
   ok "unsearchable env parent fails before derived or evidence mutation [skipped while tests run as root]"
   ok "unknown root-check destination fails before derived invalidation [skipped while tests run as root]"
   ok "unprivileged root-checks publisher rejects output-directory substitution [skipped while tests run as root]"
+  ok "root-checks stage classification reports an absent path as absent [skipped while tests run as root]"
+  ok "root-checks stage classification accepts a complete user-owned stage as handed-off [skipped while tests run as root]"
+  ok "root-checks stage classification reports a root-owned complete stage as pre-handoff [skipped while tests run as root]"
+  ok "root-checks stage classification rejects a symlinked stage as unsafe [skipped while tests run as root]"
+  ok "root-checks stage classification rejects an extra foreign entry as unsafe [skipped while tests run as root]"
+  ok "root-checks stage classification rejects a missing payload as unsafe [skipped while tests run as root]"
+  ok "root-checks stage classification rejects a wrong-mode stage as unsafe [skipped while tests run as root]"
+  ok "root-checks stage classification rejects a fifo payload as unsafe [skipped while tests run as root]"
+  ok "root-checks stage classification rejects a symlinked payload as unsafe [skipped while tests run as root]"
+  ok "root-checks stage classification rejects a foreign-owner stage as unsafe [skipped while tests run as root]"
+  ok "root-checks stage classification rejects a hardlinked payload as unsafe [skipped while tests run as root]"
+  ok "pre-handoff recovery removes root-owned known payloads and reuses the stage [skipped while tests run as root]"
+  ok "pre-handoff recovery accepts the half-chowned handoff window [skipped while tests run as root]"
+  ok "pre-handoff recovery refuses a foreign entry without deleting anything [skipped while tests run as root]"
+  ok "handed-off orphan recovery dispatch republishes instead of re-collecting [skipped while tests run as root]"
+  ok "handed-off orphan recovery publishes one validated generation and removes the stage [skipped while tests run as root]"
+  ok "handed-off orphan recovery notice names the stage and collection time [skipped while tests run as root]"
+  ok "--fresh discards a proven handed-off orphan without publishing [skipped while tests run as root]"
+  ok "--fresh on a foreign-entry stage refuses and deletes nothing [skipped while tests run as root]"
+  ok "--fresh discard refuses an incomplete stage and deletes nothing [skipped while tests run as root]"
 fi
 
 echo "== --redo phase handling =="
