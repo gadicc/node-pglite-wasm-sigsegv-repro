@@ -175,6 +175,12 @@ pre_pass() {
         usage
         exit 0
         ;;
+      --dry-run)
+        # A dry run must stay read-only everywhere, including the early resume
+        # branch (interrupted-initialization recovery) before parse_args runs.
+        DRY_RUN=1
+        shift
+        ;;
       --resume)
         RESUME_DIR="${2:?--resume needs a directory}"
         shift 2
@@ -493,6 +499,137 @@ bundle_mutable_graph_validate() {
     phase_marker_is_valid "$name" ||
       diag_die "completion marker '${path#"$OUT_DIR"/}' is unsafe"
   done
+}
+
+# A crash during fresh bundle initialization can strand a narrow set of
+# artifacts: the empty preparation directories, the operational logs, the
+# initial metadata (possibly only partially written), atomic metadata rewrite
+# temps, and the legacy initializer sentinel. Such a tree holds no evidence
+# and no resumable state, so a resume may discard exactly that validated set
+# and continue as a fresh run on the same directory. Anything beyond the set
+# means the bundle saw real work; recovery then refuses and the caller falls
+# through to the ordinary resume validation, which fails closed as before.
+fresh_init_meta_key() {
+  case "$1" in
+    MODE | START_EPOCH | START_ISO | BASELINE_CHILDREN | BASELINE_WAVES | \
+      GROUP_WAVES | INDIVIDUAL_RUNS | GDB_MAX_RUNS | SKIP_GDB | CPU_TARGET | \
+      INTERRUPTED)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+fresh_init_meta_is_partial_config() {
+  # Every line must be KEY=VALUE with an initialization key. The writer could
+  # have died anywhere inside the initial block, so an empty file, missing
+  # keys, duplicates, and a truncated trailing value are all acceptable;
+  # unknown keys and malformed lines are not. The genuine block is a handful
+  # of lines, so the read stays size-bounded.
+  local path="$1" size line key
+  size="$(stat -c '%s' -- "$path" 2> /dev/null)" || return 1
+  [[ "$size" =~ ^[0-9]+$ ]] || return 1
+  ((size <= 4096)) || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" == *=* ]] || return 1
+    key="${line%%=*}"
+    fresh_init_meta_key "$key" || return 1
+  done < "$path"
+}
+
+fresh_init_interrupted_recover() {
+  [[ -n "$DIAG_BUNDLE_LOCK_ID" ]] ||
+    diag_die "fresh initialization recovery requires the writer lock"
+  local current_id
+  current_id="$(stat -Lc '%d:%i' -- "$OUT_DIR" 2> /dev/null)" ||
+    diag_die "cannot inspect the locked diagnostics bundle"
+  [[ "$current_id" == "$DIAG_BUNDLE_LOCK_ID" ]] ||
+    diag_die "diagnostics bundle changed after its writer lock was acquired"
+  bundle_owned_real_dir "$OUT_DIR" || return 1
+
+  # Survey the locked bundle first. Deletion starts only once every present
+  # entry is proven to be an initialization artifact.
+  local -a init_files=() init_dirs=()
+  local entry name sub subname
+  for entry in "$OUT_DIR"/* "$OUT_DIR"/.[!.]* "$OUT_DIR"/..?*; do
+    [[ -e "$entry" || -L "$entry" ]] || continue
+    name="${entry##*/}"
+    case "$name" in
+      results)
+        bundle_owned_real_dir "$entry" || return 1
+        for sub in "$entry"/* "$entry"/.[!.]* "$entry"/..?*; do
+          [[ -e "$sub" || -L "$sub" ]] || continue
+          subname="${sub##*/}"
+          case "$subname" in
+            meta.env)
+              bundle_owned_single_regular "$sub" || return 1
+              fresh_init_meta_is_partial_config "$sub" || return 1
+              init_files+=("results/meta.env")
+              ;;
+            .meta.env.initializing)
+              bundle_owned_single_regular "$sub" || return 1
+              init_files+=("results/.meta.env.initializing")
+              ;;
+            *)
+              [[ "$subname" =~ ^\.meta\.env\.[A-Za-z0-9]{6}$ ]] || return 1
+              bundle_owned_single_regular "$sub" || return 1
+              init_files+=("results/$subname")
+              ;;
+          esac
+        done
+        init_dirs+=("results")
+        ;;
+      logs)
+        bundle_owned_real_dir "$entry" || return 1
+        for sub in "$entry"/* "$entry"/.[!.]* "$entry"/..?*; do
+          [[ -e "$sub" || -L "$sub" ]] || continue
+          [[ "${sub##*/}" == individual ]] || return 1
+          bundle_owned_real_dir "$sub" || return 1
+          if find "$sub" -mindepth 1 -print -quit | grep -q .; then return 1; fi
+          init_dirs+=("logs/individual")
+        done
+        init_dirs+=("logs")
+        ;;
+      state | env | freq | gdb)
+        bundle_owned_real_dir "$entry" || return 1
+        if find "$entry" -mindepth 1 -print -quit | grep -q .; then return 1; fi
+        init_dirs+=("$name")
+        ;;
+      run.log | commands.log | .meta.env.initializing)
+        bundle_owned_single_regular "$entry" || return 1
+        init_files+=("$name")
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  done
+
+  # Every present entry is an initialization artifact. A dry run must not
+  # mutate the bundle: report the recovery the real run would perform.
+  if ((DRY_RUN == 1)); then
+    diag_warn "would recover an interrupted fresh bundle initialization: would discard partial initialization artifacts and continue as a fresh run in '$OUT_DIR'"
+    return 0
+  fi
+
+  # Every present entry is an initialization artifact. Re-validate each one
+  # immediately before its deletion; if anything changed since the survey,
+  # abandon recovery and let the ordinary resume validation fail closed on
+  # what remains.
+  local victim
+  for victim in "${init_files[@]}"; do
+    bundle_owned_single_regular "$OUT_DIR/$victim" || return 1
+    rm -f -- "$OUT_DIR/$victim" || return 1
+    [[ ! -e "$OUT_DIR/$victim" && ! -L "$OUT_DIR/$victim" ]] || return 1
+  done
+  for victim in "${init_dirs[@]}"; do
+    bundle_owned_real_dir "$OUT_DIR/$victim" || return 1
+    if find "$OUT_DIR/$victim" -mindepth 1 -print -quit | grep -q .; then return 1; fi
+    rmdir -- "$OUT_DIR/$victim" || return 1
+  done
+  sync -f "$OUT_DIR" > /dev/null 2>&1 || return 1
+  diag_warn "recovered an interrupted fresh bundle initialization: discarded partial initialization artifacts; continuing as a fresh run in '$OUT_DIR'"
+  return 0
 }
 
 meta_set() {
@@ -4191,6 +4328,7 @@ main() {
   fi
 
   local resume_abs=""
+  local fresh_init_recovered=0
   if [[ -n "$RESUME_DIR" ]]; then
     [[ -d "$RESUME_DIR" ]] || diag_die "resume directory '$RESUME_DIR' does not exist"
     resume_abs="$(cd "$RESUME_DIR" && pwd -P)"
@@ -4214,9 +4352,20 @@ main() {
       diag_die "a frequency publication transaction is pending; retry frequency-ab.sh before resuming diagnostics"
     META_FILE="$OUT_DIR/results/meta.env"
     STATE_DIR="$OUT_DIR/state"
-    bundle_mutable_graph_validate
-    load_stored_config "$OUT_DIR"
-    # Stored values are already concrete; do not re-apply the mode preset.
+    if fresh_init_interrupted_recover; then
+      # The bundle only ever reached initialization: it holds no evidence and
+      # no resumable state, so continue as a fresh run on the same (now
+      # emptied) directory. The fresh path below re-acquires the writer lock
+      # and re-verifies emptiness under it before mutating anything.
+      fresh_init_recovered=1
+      RESUME_DIR=""
+      diag_bundle_lock_release ||
+        diag_die "cannot release the diagnostics bundle writer lock"
+    else
+      bundle_mutable_graph_validate
+      load_stored_config "$OUT_DIR"
+      # Stored values are already concrete; do not re-apply the mode preset.
+    fi
   fi
 
   parse_args "$@"
@@ -4229,6 +4378,9 @@ main() {
     RESUME_DIR="$resume_abs"
     OUT_DIR="$resume_abs"
   fi
+  # parse_args re-applied --resume from the original argv; a recovered
+  # interrupted fresh initialization instead runs fresh on the same directory.
+  ((fresh_init_recovered == 0)) || RESUME_DIR=""
   validate_config
 
   # A pending redo is authoritative for its embedded persisted configuration.
@@ -4262,7 +4414,7 @@ main() {
   if [[ -z "$OUT_DIR" ]]; then
     OUT_DIR="diagnostics/$(date -u +%Y-%m-%dT%H%M%SZ)"
   fi
-  if [[ -z "$RESUME_DIR" && -e "$OUT_DIR" ]]; then
+  if [[ -z "$RESUME_DIR" && "$fresh_init_recovered" == 0 && -e "$OUT_DIR" ]]; then
     [[ -d "$OUT_DIR" ]] || diag_die "output path '$OUT_DIR' exists and is not a directory"
     if find "$OUT_DIR" -mindepth 1 -print -quit | grep -q .; then
       diag_die "output directory '$OUT_DIR' is not empty; use --resume to continue that bundle"

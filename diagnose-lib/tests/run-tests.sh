@@ -1987,6 +1987,420 @@ initializing_meta_rc=$?
 check_eq "normal resume rejects a stranded fresh metadata initializer" "1" \
   "$([[ $initializing_meta_rc -eq 1 && "$(cat "$INITIALIZING_META_BUNDLE/manifest.txt")" == authoritative-before-resume && -f "$INITIALIZING_META_BUNDLE/.meta.env.initializing" ]] && echo 1 || echo 0)"
 
+echo "== fresh-init interrupted recovery =="
+# A crash during fresh bundle initialization can strand only the narrow
+# artifact set main() creates before the first phase mutation. --resume must
+# recover exactly that tree and continue as a fresh run on the same
+# directory; anything beyond the set keeps the old resume behavior (ordinary
+# validation, tree untouched). The fake node keeps every workload invocation
+# synthetic, so a recovered run proceeds through the fresh path and dies
+# deterministically in phase 1 evidence generation -- well past the old
+# "not a safe diagnostic bundle" rejection.
+INIT_FAKE_BIN="$TMP/fresh-init-fake-bin"
+mkdir -p "$INIT_FAKE_BIN"
+cat > "$INIT_FAKE_BIN/node" << 'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  */diagnose-lib/gdb-attempt-io.mjs | */diagnose-lib/gdb-evidence.mjs) exec "$REAL_NODE_BIN" "$@" ;;
+esac
+printf 'synthetic workload output\n'
+exit 0
+EOF
+cat > "$INIT_FAKE_BIN/taskset" << 'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  -c) shift 2; exec "$@" ;;
+  -pc) printf 'pid %s affinity: synthetic\n' "$2"; exit 0 ;;
+  *) exit 2 ;;
+esac
+EOF
+cat > "$INIT_FAKE_BIN/gdb" << 'EOF'
+#!/usr/bin/env bash
+printf 'Inferior 1 exited normally\n'
+EOF
+cat > "$INIT_FAKE_BIN/timeout" << 'EOF'
+#!/usr/bin/env bash
+[[ "$1" == "--foreground" && "$2" == "--signal=KILL" ]] || exit 91
+shift 3
+exec "$@"
+EOF
+chmod +x "$INIT_FAKE_BIN/node" "$INIT_FAKE_BIN/taskset" \
+  "$INIT_FAKE_BIN/gdb" "$INIT_FAKE_BIN/timeout"
+
+write_init_dirs_fixture() {
+  # The seven directories bundle_prepare_dir creates, and nothing else.
+  mkdir -p "$1/results" "$1/logs/individual" "$1/state" "$1/env" "$1/freq" "$1/gdb"
+}
+
+write_init_meta_fixture() {
+  # A complete initial config block with stale values, distinct from the CLI
+  # overrides below so the fresh rewrite is observable.
+  cat > "$1/results/meta.env" << 'EOF'
+MODE=default
+START_EPOCH=1
+START_ISO=2026-01-01T00:00:00+00:00
+BASELINE_CHILDREN=16
+BASELINE_WAVES=50
+GROUP_WAVES=50
+INDIVIDUAL_RUNS=50
+GDB_MAX_RUNS=12
+SKIP_GDB=0
+CPU_TARGET=auto
+INTERRUPTED=0
+EOF
+}
+
+write_partial_init_meta_fixture() {
+  # Only initialization keys, but missing the baseline/group rows that
+  # load_stored_config requires. Alone this is still init-era; paired with
+  # any non-init artifact it proves recovery refused by falling through to
+  # the old stored-config failure.
+  cat > "$1/results/meta.env" << 'EOF'
+MODE=default
+INDIVIDUAL_RUNS=50
+GDB_MAX_RUNS=12
+SKIP_GDB=0
+CPU_TARGET=auto
+INTERRUPTED=0
+EOF
+}
+
+run_fresh_init_resume() {
+  # run_fresh_init_resume <bundle> <output-file> <timeout-seconds>
+  local bundle="$1" output="$2" seconds="$3"
+  timeout --signal=TERM --kill-after=2 "$seconds" \
+    env PATH="$INIT_FAKE_BIN:$PATH" REAL_NODE_BIN="$REAL_NODE_BIN" \
+    "$REPO_ROOT/diagnose.sh" --resume "$bundle" --yes \
+    --quick --individual-runs 1 --group-waves 1 --gdb-max-runs 1 --skip-gdb \
+    > "$output" 2>&1
+}
+
+fresh_init_recovery_observed() {
+  # fresh_init_recovery_observed <bundle> <output-file> <rc>: the run
+  # recovered, continued as a fresh run past the old rejection point, and
+  # wrote fresh current-configuration metadata.
+  local bundle="$1" output="$2" rc="$3"
+  [[ $rc -eq 1 ]] &&
+    grep -q 'recovered an interrupted fresh bundle initialization' "$output" &&
+    ! grep -q 'not a safe diagnostic bundle' "$output" &&
+    ! grep -q 'is not empty' "$output" &&
+    grep -q 'phase 1/7: preflight' "$output" &&
+    grep -qF "out dir            $bundle" "$output" &&
+    ! grep -q '(resume)' "$output" &&
+    [[ -f "$bundle/results/meta.env" && ! -L "$bundle/results/meta.env" ]] &&
+    grep -q '^MODE=quick$' "$bundle/results/meta.env" &&
+    grep -q '^GROUP_WAVES=1$' "$bundle/results/meta.env" &&
+    grep -q '^INDIVIDUAL_RUNS=1$' "$bundle/results/meta.env" &&
+    grep -q '^GDB_MAX_RUNS=1$' "$bundle/results/meta.env" &&
+    grep -q '^SKIP_GDB=1$' "$bundle/results/meta.env"
+}
+
+fresh_init_recovery_refused() {
+  # fresh_init_recovery_refused <bundle> <output> <rc> <message> <tree-before>:
+  # recovery did not fire, the run died with the old message, and the tree is
+  # byte-for-byte untouched.
+  local bundle="$1" output="$2" rc="$3" message="$4" tree_before="$5"
+  [[ $rc -eq 1 ]] &&
+    grep -qF "$message" "$output" &&
+    ! grep -q 'recovered an interrupted fresh bundle initialization' "$output" &&
+    [[ "$(find "$bundle" -printf '%P\t%y\t%s\n' | sort)" == "$tree_before" ]]
+}
+
+INIT_P1="$TMP/fresh-init-empty-dirs"
+write_init_dirs_fixture "$INIT_P1"
+run_fresh_init_resume "$INIT_P1" "$INIT_P1.output" 90
+init_p1_rc=$?
+check_eq "fresh-init recovery accepts the seven empty preparation directories" "1" \
+  "$(fresh_init_recovery_observed "$INIT_P1" "$INIT_P1.output" "$init_p1_rc" && echo 1 || echo 0)"
+
+INIT_P2="$TMP/fresh-init-empty-bundle"
+mkdir -p "$INIT_P2"
+run_fresh_init_resume "$INIT_P2" "$INIT_P2.output" 90
+init_p2_rc=$?
+check_eq "fresh-init recovery accepts a completely empty bundle directory" "1" \
+  "$(fresh_init_recovery_observed "$INIT_P2" "$INIT_P2.output" "$init_p2_rc" && echo 1 || echo 0)"
+
+# A dry run must stay read-only: the recovery is reported, the plan is the
+# fresh plan, and the tree is byte-for-byte untouched.
+INIT_DRY="$TMP/fresh-init-dry-run"
+write_init_dirs_fixture "$INIT_DRY"
+write_init_meta_fixture "$INIT_DRY"
+init_dry_before="$(find "$INIT_DRY" -printf '%P\t%y\t%s\n' | sort)"
+timeout --signal=TERM --kill-after=2 30 \
+  "$REPO_ROOT/diagnose.sh" --resume "$INIT_DRY" --dry-run --yes \
+  > "$INIT_DRY.output" 2>&1
+init_dry_rc=$?
+check_eq "fresh-init recovery dry run reports without mutating" "1" \
+  "$([[ $init_dry_rc -eq 0 ]] &&
+    grep -q 'would recover an interrupted fresh bundle initialization' "$INIT_DRY.output" &&
+    ! grep -q '(resume)' "$INIT_DRY.output" &&
+    [[ "$(find "$INIT_DRY" -printf '%P\t%y\t%s\n' | sort)" == "$init_dry_before" ]] && echo 1 || echo 0)"
+
+INIT_P3="$TMP/fresh-init-full-meta"
+write_init_dirs_fixture "$INIT_P3"
+write_init_meta_fixture "$INIT_P3"
+run_fresh_init_resume "$INIT_P3" "$INIT_P3.output" 90
+init_p3_rc=$?
+check_eq "fresh-init recovery rewrites a complete stale initial config block" "1" \
+  "$(fresh_init_recovery_observed "$INIT_P3" "$INIT_P3.output" "$init_p3_rc" &&
+    ! grep -q '^INDIVIDUAL_RUNS=50$' "$INIT_P3/results/meta.env" && echo 1 || echo 0)"
+
+INIT_P4="$TMP/fresh-init-truncated-meta"
+write_init_dirs_fixture "$INIT_P4"
+# SIGKILL mid-write shape: missing keys, a truncated trailing value, and no
+# trailing newline.
+printf 'MODE=default\nSTART_EPOCH=1\nBASELINE_CHILDREN=16\nCPU_TARGET=au' > "$INIT_P4/results/meta.env"
+run_fresh_init_resume "$INIT_P4" "$INIT_P4.output" 90
+init_p4_rc=$?
+check_eq "fresh-init recovery tolerates a truncated initial config block" "1" \
+  "$(fresh_init_recovery_observed "$INIT_P4" "$INIT_P4.output" "$init_p4_rc" && echo 1 || echo 0)"
+
+INIT_P5="$TMP/fresh-init-zero-meta"
+write_init_dirs_fixture "$INIT_P5"
+: > "$INIT_P5/results/meta.env"
+run_fresh_init_resume "$INIT_P5" "$INIT_P5.output" 90
+init_p5_rc=$?
+check_eq "fresh-init recovery accepts a zero-byte initial metadata file" "1" \
+  "$(fresh_init_recovery_observed "$INIT_P5" "$INIT_P5.output" "$init_p5_rc" && echo 1 || echo 0)"
+
+INIT_P6="$TMP/fresh-init-operational-logs"
+write_init_dirs_fixture "$INIT_P6"
+write_init_meta_fixture "$INIT_P6"
+printf 'sentinel run log from the interrupted init\n' > "$INIT_P6/run.log"
+printf 'sentinel command log from the interrupted init\n' > "$INIT_P6/commands.log"
+run_fresh_init_resume "$INIT_P6" "$INIT_P6.output" 90
+init_p6_rc=$?
+check_eq "fresh-init recovery discards interrupted operational logs" "1" \
+  "$(fresh_init_recovery_observed "$INIT_P6" "$INIT_P6.output" "$init_p6_rc" &&
+    ! grep -q sentinel "$INIT_P6/run.log" &&
+    ! grep -q sentinel "$INIT_P6/commands.log" && echo 1 || echo 0)"
+
+INIT_P7="$TMP/fresh-init-stranded-meta-temp"
+write_init_dirs_fixture "$INIT_P7"
+write_init_meta_fixture "$INIT_P7"
+printf 'partial atomic rewrite\n' > "$INIT_P7/results/.meta.env.a1B2c3"
+run_fresh_init_resume "$INIT_P7" "$INIT_P7.output" 90
+init_p7_rc=$?
+check_eq "fresh-init recovery discards a stranded atomic metadata temp" "1" \
+  "$(fresh_init_recovery_observed "$INIT_P7" "$INIT_P7.output" "$init_p7_rc" &&
+    [[ -z "$(find "$INIT_P7/results" -mindepth 1 -name '.meta.env.*' -print -quit)" ]] && echo 1 || echo 0)"
+
+INIT_P8="$TMP/fresh-init-legacy-root-initializer"
+write_init_dirs_fixture "$INIT_P8"
+write_init_meta_fixture "$INIT_P8"
+printf 'partial metadata\n' > "$INIT_P8/.meta.env.initializing"
+run_fresh_init_resume "$INIT_P8" "$INIT_P8.output" 90
+init_p8_rc=$?
+check_eq "fresh-init recovery discards a legacy root metadata initializer" "1" \
+  "$(fresh_init_recovery_observed "$INIT_P8" "$INIT_P8.output" "$init_p8_rc" &&
+    [[ ! -e "$INIT_P8/.meta.env.initializing" && ! -L "$INIT_P8/.meta.env.initializing" ]] && echo 1 || echo 0)"
+
+INIT_P9="$TMP/fresh-init-legacy-results-initializer"
+write_init_dirs_fixture "$INIT_P9"
+write_init_meta_fixture "$INIT_P9"
+printf 'partial metadata\n' > "$INIT_P9/results/.meta.env.initializing"
+run_fresh_init_resume "$INIT_P9" "$INIT_P9.output" 90
+init_p9_rc=$?
+check_eq "fresh-init recovery discards a legacy results metadata initializer" "1" \
+  "$(fresh_init_recovery_observed "$INIT_P9" "$INIT_P9.output" "$init_p9_rc" &&
+    [[ ! -e "$INIT_P9/results/.meta.env.initializing" && ! -L "$INIT_P9/results/.meta.env.initializing" ]] && echo 1 || echo 0)"
+
+INIT_N1="$TMP/fresh-init-reject-completed-phases"
+write_init_dirs_fixture "$INIT_N1"
+write_partial_init_meta_fixture "$INIT_N1"
+printf 'COMPLETED_PHASES=\n' >> "$INIT_N1/results/meta.env"
+init_n1_before="$(find "$INIT_N1" -printf '%P\t%y\t%s\n' | sort)"
+run_fresh_init_resume "$INIT_N1" "$INIT_N1.output" 15
+init_n1_rc=$?
+check_eq "fresh-init recovery refuses metadata carrying completion keys" "1" \
+  "$(fresh_init_recovery_refused "$INIT_N1" "$INIT_N1.output" "$init_n1_rc" \
+    'stored metadata is missing its exact baseline/group configuration' "$init_n1_before" && echo 1 || echo 0)"
+
+INIT_N2="$TMP/fresh-init-reject-unknown-key"
+write_init_dirs_fixture "$INIT_N2"
+write_partial_init_meta_fixture "$INIT_N2"
+printf 'BOGUS_KEY=1\n' >> "$INIT_N2/results/meta.env"
+init_n2_before="$(find "$INIT_N2" -printf '%P\t%y\t%s\n' | sort)"
+run_fresh_init_resume "$INIT_N2" "$INIT_N2.output" 15
+init_n2_rc=$?
+check_eq "fresh-init recovery refuses metadata carrying unknown keys" "1" \
+  "$(fresh_init_recovery_refused "$INIT_N2" "$INIT_N2.output" "$init_n2_rc" \
+    'stored metadata is missing its exact baseline/group configuration' "$init_n2_before" && echo 1 || echo 0)"
+
+INIT_N3="$TMP/fresh-init-reject-state-marker"
+write_init_dirs_fixture "$INIT_N3"
+write_partial_init_meta_fixture "$INIT_N3"
+: > "$INIT_N3/state/phase-baseline.done"
+init_n3_before="$(find "$INIT_N3" -printf '%P\t%y\t%s\n' | sort)"
+run_fresh_init_resume "$INIT_N3" "$INIT_N3.output" 15
+init_n3_rc=$?
+check_eq "fresh-init recovery refuses a bundle with a completion marker" "1" \
+  "$(fresh_init_recovery_refused "$INIT_N3" "$INIT_N3.output" "$init_n3_rc" \
+    'stored metadata is missing its exact baseline/group configuration' "$init_n3_before" && echo 1 || echo 0)"
+
+INIT_N4="$TMP/fresh-init-reject-redo-pending"
+write_init_dirs_fixture "$INIT_N4"
+write_partial_init_meta_fixture "$INIT_N4"
+printf 'garbage pending redo\n' > "$INIT_N4/state/redo.pending"
+init_n4_before="$(find "$INIT_N4" -printf '%P\t%y\t%s\n' | sort)"
+run_fresh_init_resume "$INIT_N4" "$INIT_N4.output" 15
+init_n4_rc=$?
+check_eq "fresh-init recovery refuses a bundle with a pending redo record" "1" \
+  "$(fresh_init_recovery_refused "$INIT_N4" "$INIT_N4.output" "$init_n4_rc" \
+    'stored metadata is missing its exact baseline/group configuration' "$init_n4_before" && echo 1 || echo 0)"
+
+INIT_N5="$TMP/fresh-init-reject-long-temp-suffix"
+write_init_dirs_fixture "$INIT_N5"
+write_partial_init_meta_fixture "$INIT_N5"
+printf 'stale temp\n' > "$INIT_N5/results/.meta.env.toolong7"
+init_n5_before="$(find "$INIT_N5" -printf '%P\t%y\t%s\n' | sort)"
+run_fresh_init_resume "$INIT_N5" "$INIT_N5.output" 15
+init_n5_rc=$?
+check_eq "fresh-init recovery refuses a non-mktemp metadata temp name" "1" \
+  "$(fresh_init_recovery_refused "$INIT_N5" "$INIT_N5.output" "$init_n5_rc" \
+    'stored metadata is missing its exact baseline/group configuration' "$init_n5_before" && echo 1 || echo 0)"
+
+INIT_N6="$TMP/fresh-init-reject-malformed-meta-line"
+write_init_dirs_fixture "$INIT_N6"
+write_partial_init_meta_fixture "$INIT_N6"
+printf 'garbage-without-equals\n' >> "$INIT_N6/results/meta.env"
+init_n6_before="$(find "$INIT_N6" -printf '%P\t%y\t%s\n' | sort)"
+run_fresh_init_resume "$INIT_N6" "$INIT_N6.output" 15
+init_n6_rc=$?
+check_eq "fresh-init recovery refuses a malformed metadata line" "1" \
+  "$(fresh_init_recovery_refused "$INIT_N6" "$INIT_N6.output" "$init_n6_rc" \
+    'stored metadata is missing its exact baseline/group configuration' "$init_n6_before" && echo 1 || echo 0)"
+
+INIT_N7="$TMP/fresh-init-reject-oversized-meta"
+write_init_dirs_fixture "$INIT_N7"
+write_partial_init_meta_fixture "$INIT_N7"
+for _ in $(seq 1 800); do printf 'START_EPOCH=1\n'; done >> "$INIT_N7/results/meta.env"
+init_n7_before="$(find "$INIT_N7" -printf '%P\t%y\t%s\n' | sort)"
+run_fresh_init_resume "$INIT_N7" "$INIT_N7.output" 15
+init_n7_rc=$?
+check_eq "fresh-init recovery refuses an oversized metadata file" "1" \
+  "$(fresh_init_recovery_refused "$INIT_N7" "$INIT_N7.output" "$init_n7_rc" \
+    'stored metadata is missing its exact baseline/group configuration' "$init_n7_before" && echo 1 || echo 0)"
+
+# Recovery must fire before the --redo validation: a recoverable tree is
+# emptied, then the run dies because --redo requires a real resumable bundle.
+INIT_REDO="$TMP/fresh-init-redo-after-recovery"
+write_init_dirs_fixture "$INIT_REDO"
+write_init_meta_fixture "$INIT_REDO"
+timeout --signal=TERM --kill-after=2 30 \
+  env PATH="$INIT_FAKE_BIN:$PATH" REAL_NODE_BIN="$REAL_NODE_BIN" \
+  "$REPO_ROOT/diagnose.sh" --resume "$INIT_REDO" --redo preflight --yes \
+  > "$INIT_REDO.output" 2>&1
+init_redo_rc=$?
+check_eq "fresh-init recovery precedes the --redo resume requirement" "1" \
+  "$([[ $init_redo_rc -eq 1 ]] &&
+    grep -q 'recovered an interrupted fresh bundle initialization' "$INIT_REDO.output" &&
+    grep -qF -- '--redo requires --resume DIR' "$INIT_REDO.output" &&
+    [[ ! -e "$INIT_REDO/results" && ! -L "$INIT_REDO/results" ]] && echo 1 || echo 0)"
+
+init_evidence_refused=0
+for init_evidence_dir in env freq gdb logs logs/individual; do
+  init_evidence_slug="${init_evidence_dir//\//-}"
+  INIT_NEV="$TMP/fresh-init-reject-evidence-$init_evidence_slug"
+  write_init_dirs_fixture "$INIT_NEV"
+  write_partial_init_meta_fixture "$INIT_NEV"
+  printf 'evidence\n' > "$INIT_NEV/$init_evidence_dir/foo.txt"
+  init_nev_before="$(find "$INIT_NEV" -printf '%P\t%y\t%s\n' | sort)"
+  run_fresh_init_resume "$INIT_NEV" "$INIT_NEV.output" 15
+  init_nev_rc=$?
+  if fresh_init_recovery_refused "$INIT_NEV" "$INIT_NEV.output" "$init_nev_rc" \
+    'stored metadata is missing its exact baseline/group configuration' "$init_nev_before"; then
+    init_evidence_refused=$((init_evidence_refused + 1))
+  fi
+done
+check_eq "fresh-init recovery refuses any evidence-directory entry" "5" \
+  "$init_evidence_refused"
+
+INIT_N10="$TMP/fresh-init-reject-derived-output"
+write_init_dirs_fixture "$INIT_N10"
+write_partial_init_meta_fixture "$INIT_N10"
+printf '{}\n' > "$INIT_N10/results.json"
+init_n10_before="$(find "$INIT_N10" -printf '%P\t%y\t%s\n' | sort)"
+run_fresh_init_resume "$INIT_N10" "$INIT_N10.output" 15
+init_n10_rc=$?
+check_eq "fresh-init recovery refuses a bundle with derived outputs" "1" \
+  "$(fresh_init_recovery_refused "$INIT_N10" "$INIT_N10.output" "$init_n10_rc" \
+    'stored metadata is missing its exact baseline/group configuration' "$init_n10_before" && echo 1 || echo 0)"
+
+INIT_N11_ROOT="$TMP/fresh-init-reject-run-symlink"
+INIT_N11="$INIT_N11_ROOT/bundle"
+write_init_dirs_fixture "$INIT_N11"
+write_partial_init_meta_fixture "$INIT_N11"
+printf 'victim before resume\n' > "$INIT_N11_ROOT/victim"
+ln -s "$INIT_N11_ROOT/victim" "$INIT_N11/run.log"
+init_n11_before="$(find "$INIT_N11" -printf '%P\t%y\t%s\n' | sort)"
+run_fresh_init_resume "$INIT_N11" "$INIT_N11_ROOT/output" 15
+init_n11_rc=$?
+check_eq "fresh-init recovery refuses a symlinked run log" "1" \
+  "$(fresh_init_recovery_refused "$INIT_N11" "$INIT_N11_ROOT/output" "$init_n11_rc" \
+    "mutable bundle file 'run.log' is unsafe" "$init_n11_before" &&
+    [[ "$(cat "$INIT_N11_ROOT/victim")" == 'victim before resume' ]] && echo 1 || echo 0)"
+
+INIT_N12_ROOT="$TMP/fresh-init-reject-meta-symlink"
+INIT_N12="$INIT_N12_ROOT/bundle"
+write_init_dirs_fixture "$INIT_N12"
+printf 'stored metadata\n' > "$INIT_N12_ROOT/victim"
+ln -s "$INIT_N12_ROOT/victim" "$INIT_N12/results/meta.env"
+init_n12_before="$(find "$INIT_N12" -printf '%P\t%y\t%s\n' | sort)"
+run_fresh_init_resume "$INIT_N12" "$INIT_N12_ROOT/output" 15
+init_n12_rc=$?
+check_eq "fresh-init recovery refuses a symlinked metadata file" "1" \
+  "$(fresh_init_recovery_refused "$INIT_N12" "$INIT_N12_ROOT/output" "$init_n12_rc" \
+    'is not a safe diagnostic bundle' "$init_n12_before" &&
+    [[ "$(cat "$INIT_N12_ROOT/victim")" == 'stored metadata' ]] && echo 1 || echo 0)"
+
+INIT_N13_ROOT="$TMP/fresh-init-reject-meta-hardlink"
+INIT_N13="$INIT_N13_ROOT/bundle"
+write_init_dirs_fixture "$INIT_N13"
+write_partial_init_meta_fixture "$INIT_N13"
+mv "$INIT_N13/results/meta.env" "$INIT_N13_ROOT/meta.env"
+ln "$INIT_N13_ROOT/meta.env" "$INIT_N13/results/meta.env"
+init_n13_before="$(find "$INIT_N13" -printf '%P\t%y\t%s\n' | sort)"
+run_fresh_init_resume "$INIT_N13" "$INIT_N13_ROOT/output" 15
+init_n13_rc=$?
+check_eq "fresh-init recovery refuses a hardlinked metadata file" "1" \
+  "$(fresh_init_recovery_refused "$INIT_N13" "$INIT_N13_ROOT/output" "$init_n13_rc" \
+    'is not a safe diagnostic bundle' "$init_n13_before" &&
+    [[ "$(cat "$INIT_N13_ROOT/meta.env")" == "$(cat "$INIT_N13/results/meta.env")" ]] && echo 1 || echo 0)"
+
+INIT_N14="$TMP/fresh-init-reject-run-dir"
+write_init_dirs_fixture "$INIT_N14"
+write_partial_init_meta_fixture "$INIT_N14"
+mkdir "$INIT_N14/run.log"
+init_n14_before="$(find "$INIT_N14" -printf '%P\t%y\t%s\n' | sort)"
+run_fresh_init_resume "$INIT_N14" "$INIT_N14.output" 15
+init_n14_rc=$?
+check_eq "fresh-init recovery refuses a directory named run.log" "1" \
+  "$(fresh_init_recovery_refused "$INIT_N14" "$INIT_N14.output" "$init_n14_rc" \
+    "mutable bundle file 'run.log' is unsafe" "$init_n14_before" && echo 1 || echo 0)"
+
+INIT_N15="$TMP/fresh-init-reject-unknown-root-file"
+write_init_dirs_fixture "$INIT_N15"
+write_partial_init_meta_fixture "$INIT_N15"
+printf 'unrelated\n' > "$INIT_N15/foo.txt"
+init_n15_before="$(find "$INIT_N15" -printf '%P\t%y\t%s\n' | sort)"
+run_fresh_init_resume "$INIT_N15" "$INIT_N15.output" 15
+init_n15_rc=$?
+check_eq "fresh-init recovery refuses an unknown file at the bundle root" "1" \
+  "$(fresh_init_recovery_refused "$INIT_N15" "$INIT_N15.output" "$init_n15_rc" \
+    'stored metadata is missing its exact baseline/group configuration' "$init_n15_before" && echo 1 || echo 0)"
+
+INIT_N16="$TMP/fresh-init-reject-unknown-results-file"
+write_init_dirs_fixture "$INIT_N16"
+write_partial_init_meta_fixture "$INIT_N16"
+printf 'groups\n' > "$INIT_N16/results/groups.tsv"
+init_n16_before="$(find "$INIT_N16" -printf '%P\t%y\t%s\n' | sort)"
+run_fresh_init_resume "$INIT_N16" "$INIT_N16.output" 15
+init_n16_rc=$?
+check_eq "fresh-init recovery refuses unknown result evidence" "1" \
+  "$(fresh_init_recovery_refused "$INIT_N16" "$INIT_N16.output" "$init_n16_rc" \
+    'stored metadata is missing its exact baseline/group configuration' "$init_n16_before" && echo 1 || echo 0)"
+
 UNKNOWN_MARKER_BUNDLE="$TMP/mutable-unknown-marker/bundle"
 write_mutable_graph_fixture "$UNKNOWN_MARKER_BUNDLE"
 mkdir -p "$UNKNOWN_MARKER_BUNDLE/state"
@@ -6247,7 +6661,11 @@ mkdir -p "$TMP/different-bundle"
 (cd "$TMP" && "$REPO_ROOT/diagnose.sh" --resume redo-bundle --out-dir different-bundle --dry-run --yes) > /dev/null 2>&1
 resume_conflict_rc=$?
 check_eq "resume rejects a different --out-dir" "1" "$([[ $resume_conflict_rc -ne 0 ]] && echo 1 || echo 0)"
+# A completely empty directory is recovered as an interrupted fresh
+# initialization (see the fresh-init recovery tests); this fixture keeps an
+# entry so the directory stays a non-bundle.
 mkdir -p "$TMP/not-a-bundle"
+printf 'unrelated content\n' > "$TMP/not-a-bundle/notes.txt"
 "$REPO_ROOT/diagnose.sh" --resume "$TMP/not-a-bundle" --dry-run --yes > /dev/null 2>&1
 not_bundle_rc=$?
 check_eq "resume requires diagnostic bundle metadata" "1" "$([[ $not_bundle_rc -ne 0 ]] && echo 1 || echo 0)"
