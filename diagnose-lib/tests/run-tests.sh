@@ -6702,6 +6702,20 @@ check_eq "oversized individual runs are rejected before execution" "1" \
 oversized_gdb_rc=$?
 check_eq "oversized gdb attempts are rejected before execution" "1" \
   "$([[ $oversized_gdb_rc -ne 0 ]] && echo 1 || echo 0)"
+"$REPO_ROOT/diagnose.sh" --gdb-max-runs 4097 --dry-run --yes > /dev/null 2>&1
+overlimit_gdb_rc=$?
+check_eq "gdb attempts above the evidence envelope limit are rejected before execution" "1" \
+  "$([[ $overlimit_gdb_rc -ne 0 ]] && echo 1 || echo 0)"
+"$REPO_ROOT/diagnose.sh" --gdb-max-runs 4096 --dry-run --yes > /dev/null 2>&1
+check_eq "gdb attempts at the evidence envelope limit are accepted" "0" "$?"
+GDB_LIMIT_BUNDLE="$TMP/gdb-overlimit-stored"
+mkdir -p "$GDB_LIMIT_BUNDLE/results"
+cp "$RB/results/meta.env" "$GDB_LIMIT_BUNDLE/results/meta.env"
+sed -i 's/^GDB_MAX_RUNS=.*/GDB_MAX_RUNS=4097/' "$GDB_LIMIT_BUNDLE/results/meta.env"
+"$REPO_ROOT/diagnose.sh" --resume "$GDB_LIMIT_BUNDLE" --dry-run --yes > /dev/null 2>&1
+overlimit_stored_rc=$?
+check_eq "stored gdb attempts above the envelope limit are rejected before resume mutation" "1" \
+  "$([[ $overlimit_stored_rc -ne 0 && ! -e "$GDB_LIMIT_BUNDLE/commands.log" ]] && echo 1 || echo 0)"
 "$REPO_ROOT/diagnose.sh" --group-waves 010 --dry-run --yes > /dev/null 2>&1
 noncanonical_group_waves_rc=$?
 check_eq "non-canonical group waves are rejected before execution" "1" \

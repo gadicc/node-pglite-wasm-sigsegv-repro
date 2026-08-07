@@ -45,6 +45,10 @@ GROUP_WAVES=50
 INDIVIDUAL_RUNS=50
 GDB_MAX_RUNS=12
 GDB_MAX_CAPTURES=3
+# The GDB evidence envelope's structural ceiling (GDB_MAX_RUNS_LIMIT in
+# diagnose-lib/gdb-evidence.mjs); enforced up front so an out-of-range run
+# limit fails at configuration time instead of after the workload.
+GDB_MAX_RUNS_LIMIT=4096
 OUT_DIR=""
 OUT_DIR_EXPLICIT=0
 RESUME_DIR=""
@@ -271,6 +275,8 @@ load_stored_config() {
       GDB_MAX_RUNS)
         diag_is_safe_positive_uint "$v" ||
           diag_die "stored GDB_MAX_RUNS must be a canonical safe positive integer, got '$v'"
+        ((v <= GDB_MAX_RUNS_LIMIT)) ||
+          diag_die "stored GDB_MAX_RUNS must be at most $GDB_MAX_RUNS_LIMIT, got '$v'"
         GDB_MAX_RUNS="$v"
         ;;
       SKIP_GDB) SKIP_GDB="$v" ;;
@@ -375,6 +381,8 @@ validate_config() {
     "--gdb-max-runs" "$GDB_MAX_RUNS" \
     "baseline children" "$BASELINE_CHILDREN" \
     "baseline waves" "$BASELINE_WAVES"
+  ((GDB_MAX_RUNS <= GDB_MAX_RUNS_LIMIT)) ||
+    diag_die "--gdb-max-runs must be at most $GDB_MAX_RUNS_LIMIT, got '$GDB_MAX_RUNS'"
   [[ "$SKIP_GDB" == "0" || "$SKIP_GDB" == "1" ]] ||
     diag_die "stored SKIP_GDB must be 0 or 1, got '$SKIP_GDB'"
   [[ "$CPU_TARGET" == auto || "$CPU_TARGET" =~ ^(0|[1-9][0-9]*)$ ]] ||
