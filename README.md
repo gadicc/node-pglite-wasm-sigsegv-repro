@@ -106,6 +106,12 @@ sudo ./frequency-ab.sh 19 20 diagnostics/<bundle> # the A/B/A experiment
   four allowlisted payloads plus strict digest metadata into the user-owned
   bundle. A zero-byte completion marker is published last; incomplete, mixed,
   oversized, or changed generations are excluded by the collector.
+  The staging directory is deterministic (derived from the invoking user and
+  the bundle), so an interrupted attempt is found on the next run: a fully
+  handed-off orphan is republished as-is after revalidation (discard it with
+  `--fresh` to re-collect instead), root's own half-staged leftovers are
+  cleared and restaged, and anything unrecognized is refused for manual
+  inspection rather than silently deleted.
 - `frequency-ab.sh` is the only script that changes anything; see below.
 
 Both companion publishers validate their complete staging and destination
@@ -160,8 +166,8 @@ npm ci
 
 `--yes` accepts the safety warning (required when not interactive).
 Useful overrides: `--individual-runs N`, `--group-waves N`,
-`--gdb-max-runs N`, `--skip-gdb`, `--run-gdb`, `--out-dir DIR`, and
-`--cpu N|auto`. The CPU selection policy is persisted in the bundle:
+`--gdb-max-runs N` (bounded by the evidence envelope at 4096), `--skip-gdb`,
+`--run-gdb`, `--out-dir DIR`, and `--cpu N|auto`. The CPU selection policy is persisted in the bundle:
 `auto` (the default) uses the worst failing CPU from validated individual
 results, while a number pins the manual frequency hint and GDB capture to that
 CPU. Use `--cpu auto` on resume to clear a previously fixed choice; completed
@@ -186,7 +192,9 @@ Everything lands in a timestamped bundle, `diagnostics/<UTC timestamp>/`
   `root-checks.sh` was run)
 - `logs/` — raw stdout/stderr per phase
 - `freq/` — frequency samples per phase
-- `gdb/` — capture transcripts
+- `gdb/` — capture transcripts, bound by the authoritative generation-stamped
+  `results/gdb.manifest` envelope (exact runner log, metadata, and transcript
+  digests); `results/gdb.meta` is the legacy descriptive summary only
 - `privacy-review.txt` — category/file-only sentinel scan for paths, UUIDs,
   and MAC-shaped values; a flag means review the raw file, not that it is unsafe
 - `manifest.txt` — file names and SHA-256 checksums
@@ -203,7 +211,10 @@ validated finalization candidates and regenerates the complete set.
 Phases mark completion under `state/`; an interrupted run (SIGINT/SIGTERM
 writes a partial report first) can be resumed without discarding finished
 work — including partially completed per-CPU tables, which are topped up
-by running only the missing runs:
+by running only the missing runs. A run that died during fresh bundle
+initialization (before any phase produced evidence) is likewise resumable:
+`--resume` proves the directory holds only initialization-era artifacts,
+discards them, and starts fresh instead of refusing a non-empty directory:
 
 ```sh
 ./diagnose.sh --resume diagnostics/2026-08-01T084335Z --yes
@@ -219,6 +230,14 @@ Before a completed baseline is skipped, its fixed metadata/log envelope is
 validated against the stored child/wave configuration and completion marker.
 Missing, malformed, mismatched, or unsafe file types are preserved and require
 `--redo baseline`; they are never silently overwritten or used for conclusions.
+
+Group and individual evidence are bound by exact generations, not just by a
+reproducible plan: `results/groups.meta` carries a fresh random generation per
+attempt, and `results/individual.meta` records the exact groups generation
+that authorized its CPU targets. Redoing groups mints a new generation even
+when the rediscovered topology plan is identical, so stale individual evidence
+fails closed and requires `--redo individual`. Legacy envelopes without these
+generation bindings stay descriptive and cannot authorize conclusions.
 
 To instead *repeat* a phase from scratch in one contiguous session (for
 example the per-CPU tests, so all runs share one turbo/load regime), use
@@ -237,10 +256,14 @@ privileged reads from an older preflight generation cannot survive as current
 evidence.
 
 GDB capture attempts are not combined across resumes. Before phase 6 runs or
-writes any terminal skip result, a prior incomplete attempt (metadata, capture,
-or runner log) and its stale derived reports are preserved together under one
-`state/superseded/` transaction. Empty setup directories are ignored, and an
-interrupted archive is recovered before phase execution on the next resume.
+writes any terminal skip result, a prior incomplete attempt (metadata, capture
+transcripts, runner log, and any published or hidden manifest) and its stale
+derived reports are preserved together under one `state/superseded/`
+transaction. Empty setup directories are ignored, and an interrupted archive
+is recovered before phase execution on the next resume. A completed phase is
+accepted on resume only after the full generation-bound manifest envelope
+revalidates; bundles from before the manifest existed (marker plus legacy
+`gdb.meta` alone) are preserved and require `--redo gdb`.
 
 ### Interpreting the report
 
@@ -280,8 +303,10 @@ cleared of per-run rates above ~5.8%, and observed rates can drift between
 batches, so treat "clean" verdicts as exclusions of high rates, not proof
 of correct hardware. For GDB capture, `n` includes only attempts that actually
 ran the workload cleanly: debugger/runner errors are reported separately and
-never inflate the no-fault denominator. Legacy bundles without exact attempt
-accounting retain their no-fault observation but receive no numerical bound.
+never inflate the no-fault denominator. Every captured or no-fault conclusion
+requires the validated generation-bound manifest envelope; legacy bundles
+without one keep their evidence descriptive only — it is displayed but
+authorizes no conclusion and no numerical bound.
 
 ### Testing the tooling
 
