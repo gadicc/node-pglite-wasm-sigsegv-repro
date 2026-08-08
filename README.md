@@ -151,6 +151,12 @@ the user-owned diagnostics bundle. A live per-UID lock refuses overlapping
 experiments, while a dead owner's lock is reclaimed so its validated ledger
 can be recovered before new work begins.
 
+The ordinary baseline/group sampler also fails closed: it must produce a
+valid frequency row and remain live through the workload. An empty or dead
+sampler aborts before evidence is published instead of becoming an apparent
+`avg —, max —` measurement. Older bundles with empty samples are reported as
+frequency unavailable.
+
 ### Quick and full examples
 
 ```sh
@@ -178,6 +184,47 @@ explicit.
 On resume, the stored GDB choice remains the default. Use `--run-gdb` to
 reverse an earlier `--skip-gdb`; if that skipped phase is already complete,
 also pass `--redo gdb` so its old terminal evidence is preserved first.
+
+### Targeted CPU follow-ups
+
+The main group phase answers whether a *shared CPU affinity mask* reproduces
+the problem. It does not identify a CPU: the controller and its children can
+migrate anywhere inside that mask. The ordinary individual phase uses one
+direct, pinned child at a time, so it is attributable but does not reproduce
+the simultaneous group load. `targeted-cpu-test.mjs` supplies the two missing
+controlled comparisons while leaving all frequency settings untouched.
+
+First preserve the concurrent cluster load but pin one child to each CPU:
+
+```sh
+node targeted-cpu-test.mjs --mode one-to-one --cpus 8-11 --rounds 50 --dry-run
+node targeted-cpu-test.mjs --mode one-to-one --cpus 16-19 --rounds 50 --dry-run
+node targeted-cpu-test.mjs --mode one-to-one --cpus 20-23 --rounds 50 --dry-run
+```
+
+Then compare the previously observed candidates 11, 19, and 21 with matched
+clean controls using a balanced randomized order and exactly the same child
+launcher:
+
+```sh
+node targeted-cpu-test.mjs --mode interleaved \
+  --cpus 10,11,18,19,20,21 --rounds 50 --seed 20260808 --dry-run
+```
+
+Review each plan, replace `--dry-run` with `--yes` to execute it, and use
+`--out-dir DIR` when a specific destination is wanted. The controller is
+automatically pinned to an allowed CPU outside the target set. Each output
+directory records the `intel_pstate/no_turbo` value at both ends, a JSONL row
+for every child, and a short report with the measured per-CPU percentages.
+The script never changes turbo or any other system setting.
+
+GDB confirmation on a candidate remains a separate live workload. Do not
+overwrite a completed diagnostic bundle's CPU 19 capture merely to add CPU 11
+or 21; use separate capture directories, or make a new diagnostic bundle.
+The controlled frequency A/B/A script deliberately refuses to start when
+`intel_pstate/no_turbo` is already `1`: restore turbo manually only when ready
+to test, then let `frequency-ab.sh` perform and verify its own A/B/A
+restoration.
 
 ### Output layout and resumability
 
@@ -268,8 +315,15 @@ revalidates; bundles from before the manifest existed (marker plus legacy
 ### Interpreting the report
 
 Per-CPU rates and baseline/group **wave** rates are reported with Wilson 95%
-confidence intervals. CPU localization is descriptive because its sequential
-batches are not exchangeable. For the prespecified frequency A/B/A reversal,
+confidence intervals. A group result such as `50/50` means 50 of 50 waves had
+at least one confirmed SIGSEGV; it does **not** mean every child failed. The
+separate child column gives the measured child failure count and percentage,
+without a child-level interval because children within a wave are correlated.
+A group row names an affinity mask, not the faulting CPU. CPU localization is
+descriptive because its sequential batches are not exchangeable and uses a
+different, single-process protocol from the group phase. A zero there means
+only that this run did not reproduce under that protocol; it does not erase a
+failure captured in an older diagnostic session. For the prespecified frequency A/B/A reversal,
 each turbo-on leg is compared separately with the turbo-off leg using a
 one-sided Fisher exact test on confirmed SIGSEGV counts over valid runs. A
 replicated reduction is claimed only when both comparisons are in the

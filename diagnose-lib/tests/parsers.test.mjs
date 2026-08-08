@@ -510,7 +510,7 @@ test("renderReport: partial baseline and group data are marked as truncated", ()
   };
   const md = renderReport(results);
   assert.ok(md.includes("| Waves | 2/5 processed, 1 failed (log truncated; partial data) |"));
-  assert.ok(md.includes("| pcores | 0-7 | 2 | 2/5 processed (1 failed) (log truncated; partial data) |"));
+  assert.ok(md.includes("| pcores | 0-7 | 2 | 2/5 (1 any-failure) (log truncated; partial data) |"));
 
   // The same counts from a completed run carry no truncation marker.
   const complete = renderReport({
@@ -651,10 +651,10 @@ test("renderReport: impossible failure counts never throw or get an interval", (
       failedRuns: [],
     }],
   });
-  assert.match(md, /SIGSEGV \| 3/);
-  assert.match(md, /Child failures \(descriptive only\) \| invalid\/missing/);
-  assert.match(md, /bad-counts.*invalid\/2.*interval unavailable/);
-  assert.match(md, /zero-denominator.*invalid\/0.*interval unavailable/);
+  assert.match(md, /Confirmed child SIGSEGVs \/ measured rate \(descriptive\) \| invalid\/missing/);
+  assert.match(md, /All child failures \/ measured rate \(descriptive\) \| invalid\/missing/);
+  assert.match(md, /bad-counts.*interval unavailable.*invalid/);
+  assert.match(md, /zero-denominator.*interval unavailable.*invalid/);
   assert.match(md, /invalid\/inconsistent counts; no interval/);
   assert.match(md, /inconsistent failure counts; excluded from conclusions/);
   assert.match(md, /impossible failure-count evidence was excluded/);
@@ -678,8 +678,8 @@ test("renderReport: impossible failure counts never throw or get an interval", (
       log: "logs/baseline/run1.log",
     },
   });
-  assert.match(missingPrimary, /SIGSEGV \| invalid\/missing/);
-  assert.match(missingPrimary, /Child failures \(descriptive only\) \| invalid\/missing/);
+  assert.match(missingPrimary, /Confirmed child SIGSEGVs \/ measured rate \(descriptive\) \| invalid\/missing/);
+  assert.match(missingPrimary, /All child failures \/ measured rate \(descriptive\) \| invalid\/missing/);
   assert.match(missingPrimary, /impossible failure-count evidence was excluded/);
   assert.doesNotMatch(missingPrimary, /NaN\/1/);
   assert.doesNotMatch(missingPrimary, /\*\*No failure reproduced\*\*/);
@@ -902,6 +902,8 @@ test("renderReport: identical child SIGSEGV counts have different clustered wave
   });
   assert.match(md, /SIGSEGV wave rate \/ 95% CI \| 1\/10 = 10\.0% \[1\.8%, 40\.4%\]/);
   assert.match(md, /spread.*4\/10 = 40\.0% \[16\.8%, 68\.7%\]/);
+  assert.match(md, /spread.*4\/40 = 10\.0%/);
+  assert.match(md, /Waves with ≥1 SIGSEGV/);
   assert.match(md, /Concurrent children within a wave are correlated/);
   assert.match(md, /different children-per-wave are not\s+directly comparable/);
 });
@@ -1034,7 +1036,7 @@ test("renderReport: incomplete individual prefixes are descriptive but cannot lo
   assert.match(md, /Only unambiguous/);
   assert.match(md, /excluded\s+from worst-CPU selection and CPU-localization conclusions/);
   assert.match(md, /\| 4 \| 1 \| 1 \|/);
-  assert.doesNotMatch(md, /\*\*CPU localization\*\*: failures observed/);
+  assert.doesNotMatch(md, /\*\*Single-process per-CPU screen \(this run only\)\*\*: failures observed/);
   assert.doesNotMatch(md, /highest observed rate/);
 });
 

@@ -223,6 +223,16 @@ test("summarizeFreqSamples: legacy summary remains available without a CPU filte
   assert.match(legacy.note, /including idle time/);
 });
 
+test("summarizeFreqSamples: an existing empty capture is unavailable", () => {
+  const dir = writeCapture("", "scaling_cur_freq");
+  const empty = summarizeFreqSamples(dir, "exp");
+  assert.equal(empty.available, false);
+  assert.equal(empty.samples, 0);
+  assert.equal(empty.avgMHz, undefined);
+  assert.equal(empty.maxMHz, undefined);
+  assert.match(empty.note, /no valid frequency samples/);
+});
+
 test("summarizeFreqSamples: missing samples file is reported unavailable", () => {
   const dir = mkdtempSync(path.join(tmpdir(), "collect-test-"));
   tmpDirs.push(dir);

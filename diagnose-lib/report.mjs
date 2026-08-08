@@ -31,6 +31,20 @@ function fmtMHz(x) {
   return x >= 1000 ? `${(x / 1000).toFixed(2)} GHz` : `${Math.round(x)} MHz`;
 }
 
+function descriptiveRateCell(failures, n) {
+  if (!validBinomialCounts(failures, n)) return `${failures}/${n} (invalid count)`;
+  return `${failures}/${n} = ${pct(failures / n)}`;
+}
+
+function frequencyCell(frequency, separator = ", ") {
+  if (!frequency || frequency.available === false || frequency.samples === 0) {
+    const reason = frequency?.note ??
+      (frequency?.samples === 0 ? "0 valid samples; sampler output unavailable" : "not collected");
+    return `unavailable (${reason})`;
+  }
+  return `avg ${fmtMHz(frequency.avgMHz)}${separator}max ${fmtMHz(frequency.maxMHz)}`;
+}
+
 function validBinomialCounts(failures, n) {
   return Number.isSafeInteger(failures) && Number.isSafeInteger(n) &&
     n > 0 && failures >= 0 && failures <= n;
@@ -251,6 +265,8 @@ export function renderReport(results) {
   L.push("");
   L.push("All conclusions below are derived from the measurements in");
   L.push("`results.json` produced by *this* run, not from prior reports.");
+  L.push("A zero in this report means no failure was observed in this batch; it");
+  L.push("does not supersede a failure captured in an earlier diagnostic session.");
   L.push("");
 
   // ------------------------------------------------------------------
@@ -373,16 +389,16 @@ export function renderReport(results) {
       : completionStatus === "inconsistent" ? " (structurally inconsistent; descriptive only)" : "";
     L.push(`| Waves | ${b.processedWaves ?? b.completedWaves}/${b.requestedWaves} processed, ${b.failedWaves} failed${statusNote} |`);
     L.push(`| Child invocations | ${b.totalChildInvocations} |`);
-    L.push(`| SIGSEGV | ${b.sigsegvCount ?? "invalid/missing"} |`);
+    L.push(`| Confirmed child SIGSEGVs / measured rate (descriptive) | ${validReproCounts(b) ? descriptiveRateCell(b.sigsegvCount, b.totalChildInvocations) : "invalid/missing"} |`);
     L.push(`| Other failures | ${b.otherFailureCount} |`);
     if ((b.unclassifiedFailureCount ?? 0) > 0) L.push(`| Unclassified failures (summary only) | ${b.unclassifiedFailureCount} |`);
-    L.push(`| Child failures (descriptive only) | ${failureCount === null ? "invalid/missing" : `${failureCount}/${b.totalChildInvocations}`} |`);
+    L.push(`| All child failures / measured rate (descriptive) | ${failureCount === null ? "invalid/missing" : descriptiveRateCell(failureCount, b.totalChildInvocations)} |`);
     L.push(`| SIGSEGV-positive waves | ${validReproWaveCounts(b) ? b.sigsegvWaveCount : "invalid/missing"} |`);
     L.push(`| Unresolved SIGSEGV endpoint waves | ${validReproWaveCounts(b) ? b.sigsegvUnresolvedWaveCount : "invalid/missing"} |`);
     L.push(`| SIGSEGV wave rate / 95% CI | ${reproWaveStatsCell(b)} |`);
     L.push(`| Time to first failure | ${fmtSec(b.firstFailureAfterSec)} |`);
     L.push(`| Duration | ${fmtSec(b.durationSec)} |`);
-    L.push(`| Frequency (${b.frequency?.method ?? "n/a"}) | avg ${fmtMHz(b.frequency?.avgMHz)}, max ${fmtMHz(b.frequency?.maxMHz)} |`);
+    L.push(`| Frequency (${b.frequency?.method ?? "n/a"}) | ${frequencyCell(b.frequency)} |`);
     L.push("");
     L.push(`Raw log: \`${b.log}\`. Concurrent children within a wave are correlated,`);
     L.push("so child-process counts are descriptive and the interval treats resolved");
@@ -412,11 +428,13 @@ export function renderReport(results) {
   }
   if (groupsStatus === "complete" && r.groups?.length) {
     L.push("Groups were discovered from sysfs topology, not hardcoded.");
+    L.push("Each row uses one shared CPU affinity mask for the controller and all");
+    L.push("children. Children may migrate anywhere inside that mask; child index");
+    L.push("is not CPU identity, and a group failure cannot identify which CPU faulted.");
     L.push("");
-    L.push("| Group | CPUs | Children | Waves | Child failures (descriptive) | SIGSEGV waves / resolved-wave rate (95% CI) | Unresolved waves | Eff. freq (avg/max) |");
-    L.push("| --- | --- | --- | --- | --- | --- | --- | --- |");
+    L.push("| Group | CPU affinity mask | Children/wave | Processed waves (any-failure waves) | Waves with ≥1 SIGSEGV / rate (95% CI) | Child SIGSEGVs / measured rate (descriptive) | Other child failures | Unresolved waves | Eff. freq |");
+    L.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
     for (const g of r.groups) {
-      const f = reproFailureCount(g);
       const n = g.totalChildInvocations ?? 0;
       const completionStatus = reproCompletionStatus(g);
       const statusNote = completionStatus === "partial"
@@ -424,7 +442,7 @@ export function renderReport(results) {
         : completionStatus === "inconsistent" ? " (structurally inconsistent; descriptive only)" : "";
       const waveCountsValid = validReproWaveCounts(g);
       L.push(
-        `| ${g.name} | ${g.cpus} | ${g.children} | ${g.processedWaves ?? g.completedWaves ?? "?"}/${g.wavesRequested} processed (${g.failedWaves ?? "?"} failed)${statusNote} | ${f ?? "invalid"}/${n}${(g.unclassifiedFailureCount ?? 0) > 0 ? ` (${g.unclassifiedFailureCount} unclassified)` : ""} | ${reproWaveStatsCell(g)} | ${waveCountsValid ? g.sigsegvUnresolvedWaveCount : "invalid/missing"} | ${fmtMHz(g.frequency?.avgMHz)} / ${fmtMHz(g.frequency?.maxMHz)} |`,
+        `| ${g.name} | ${g.cpus} | ${g.children} | ${g.processedWaves ?? g.completedWaves ?? "?"}/${g.wavesRequested} (${g.failedWaves ?? "?"} any-failure)${statusNote} | ${reproWaveStatsCell(g)} | ${validReproCounts(g) ? descriptiveRateCell(g.sigsegvCount, n) : "invalid"} | ${validReproCounts(g) ? (g.otherFailureCount ?? 0) : "invalid"}${(g.unclassifiedFailureCount ?? 0) > 0 ? ` (+${g.unclassifiedFailureCount} unclassified)` : ""} | ${waveCountsValid ? g.sigsegvUnresolvedWaveCount : "invalid/missing"} | ${frequencyCell(g.frequency, " / ")} |`,
       );
     }
     L.push("");
@@ -432,6 +450,9 @@ export function renderReport(results) {
     L.push("stationary. Rates from groups with different children-per-wave are not");
     L.push("directly comparable because the chance of at least one SIGSEGV changes");
     L.push("with the number of concurrent children.");
+    L.push("The child percentage is the observed fraction of child processes that");
+    L.push("SIGSEGVed. It is descriptive only: children in one wave share load and");
+    L.push("an affinity mask, so they are correlated and receive no child-level CI.");
     L.push("Excluding unresolved waves can also bias a resolved-wave interval; their");
     L.push("count is shown rather than silently treating them as negative trials.");
     L.push("");
@@ -455,11 +476,15 @@ export function renderReport(results) {
       for (const reason of r.individualStatus?.reasons ?? []) L.push(`- ${reason}`);
       L.push("");
     }
-    L.push("One child process pinned to one logical CPU per run. CPU batches");
-    L.push("run sequentially, so localization is descriptive/exploratory and");
-    L.push("may be confounded by time or thermal drift.");
+    L.push("This is a **different workload protocol** from the group phase: one direct");
+    L.push("`node child.mjs` process is pinned to exactly one logical CPU per run,");
+    L.push("with no concurrent PGlite siblings. It does not retest the shared-mask");
+    L.push("cluster condition above. CPU batches run sequentially, so localization");
+    L.push("is descriptive/exploratory and may be confounded by time or thermal drift.");
     L.push("A CPU with zero failures is **not** proven good; the 95% upper");
-    L.push("bound shows which per-run failure rates its sample excludes.");
+    L.push("bound shows which per-run failure rates its sample excludes. It means only");
+    L.push("that this protocol did not reproduce on that CPU in this run; it does not");
+    L.push("erase failures observed in prior sessions.");
     L.push("");
     L.push("| CPU | Runs | Failures | Rate / bound | Notes |");
     L.push("| --- | --- | --- | --- | --- |");
@@ -509,7 +534,7 @@ export function renderReport(results) {
     for (const leg of fa.legs) {
       const inv = leg.invalidRuns?.length ?? 0;
       L.push(
-        `| ${leg.leg} | ${leg.noTurbo ?? "—"} | ${leg.scalingMaxKhz ? `${Math.round(leg.scalingMaxKhz / 1000)} MHz` : "—"} | ${leg.runs} | ${leg.failures}${inv > 0 ? ` (+${inv} invalid excluded)` : ""} | ${statsCell(leg.failures, leg.runs)} | ${fmtMHz(leg.frequency?.avgMHz)} / ${fmtMHz(leg.frequency?.maxMHz)} |`,
+        `| ${leg.leg} | ${leg.noTurbo ?? "—"} | ${leg.scalingMaxKhz ? `${Math.round(leg.scalingMaxKhz / 1000)} MHz` : "—"} | ${leg.runs} | ${leg.failures}${inv > 0 ? ` (+${inv} invalid excluded)` : ""} | ${statsCell(leg.failures, leg.runs)} | ${frequencyCell(leg.frequency, " / ")} |`,
       );
     }
     L.push("");
@@ -553,7 +578,7 @@ export function renderReport(results) {
     L.push(`${fc.note}.`);
     L.push("");
     for (const leg of fc.legs ?? []) {
-      L.push(`- ${leg.leg}: ${statsCell(leg.failures, leg.runs)}, measured avg ${fmtMHz(leg.frequency?.avgMHz)}, max ${fmtMHz(leg.frequency?.maxMHz)}`);
+      L.push(`- ${leg.leg}: ${statsCell(leg.failures, leg.runs)}, frequency ${frequencyCell(leg.frequency)}`);
     }
     L.push("");
   } else if (r.frequencyCapStatus?.status === "incomplete") {
@@ -748,7 +773,7 @@ function renderConclusions(r) {
   const failingCpus = testedCpus.filter((c) => c.sigsegv > 0);
   const cleanCpus = testedCpus.filter((c) => c.sigsegv === 0);
   if (failingCpus.length > 0) {
-    let line = `- **CPU localization**: failures observed on CPU(s) ${failingCpus.map((c) => `${c.cpu} at ${c.sigsegv}/${c.runs}`).join(", ")}`;
+    let line = `- **Single-process per-CPU screen (this run only)**: failures observed on CPU(s) ${failingCpus.map((c) => `${c.cpu} at ${c.sigsegv}/${c.runs}`).join(", ")}`;
     if (cleanCpus.length > 0) {
       let cleanN = 0;
       let cleanNSafe = true;
@@ -766,11 +791,11 @@ function renderConclusions(r) {
       line += "; every other tested CPU also observed at least one failure";
     }
     line += testedCpus.length > 1
-      ? ". This is exploratory localization only because CPU batches were sequential, not randomized or interleaved"
+      ? ". These zeros do not supersede prior sessions or explain shared-mask group failures. This is exploratory localization only because CPU batches were sequential, not randomized or interleaved"
       : ". Only one CPU was tested, so no cross-CPU comparison is possible";
     C.push(`${line}.`);
   } else if (testedCpus.length > 0) {
-    C.push("- CPU localization: no failures observed on any tested CPU; sequential per-CPU results remain descriptive only.");
+    C.push("- Single-process per-CPU screen (this run only): no failures observed on any tested CPU. These zeros do not supersede prior sessions or explain shared-mask group results; sequential per-CPU results remain descriptive only.");
   }
   const conclusionGroups = groupsEvidenceStatus === "complete" ? (r.groups ?? []) : [];
   const failingGroups = conclusionGroups.filter(
@@ -791,7 +816,7 @@ function renderConclusions(r) {
         (g.otherFailureCount ?? 0) > 0 || (g.unclassifiedFailureCount ?? 0) > 0),
   );
   if (failingGroups.length > 0) {
-    C.push(`- **Group isolation**: SIGSEGV in group(s) ${failingGroups.map((g) => `${g.name} (${g.cpus})`).join(", ")}; clean group(s): ${cleanGroups.length > 0 ? cleanGroups.map((g) => `${g.name} (${g.cpus})`).join(", ") : "none"}${unresolvedGroups.length > 0 ? `; no clean group conclusion for: ${unresolvedGroups.map((g) => `${g.name} (${g.cpus})`).join(", ")}` : ""}.`);
+    C.push(`- **Shared-affinity group exposure**: SIGSEGV in group(s) ${failingGroups.map((g) => `${g.name} (${g.cpus})`).join(", ")}; clean group(s): ${cleanGroups.length > 0 ? cleanGroups.map((g) => `${g.name} (${g.cpus})`).join(", ") : "none"}${unresolvedGroups.length > 0 ? `; no clean group conclusion for: ${unresolvedGroups.map((g) => `${g.name} (${g.cpus})`).join(", ")}` : ""}. Group rows do not identify the faulting CPU because children may migrate within each mask.`);
   }
 
   // 3. Frequency effect: each turbo-on leg must independently pass the

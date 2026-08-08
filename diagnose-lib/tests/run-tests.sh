@@ -48,6 +48,16 @@ check_eq "safe positive integer validation uses JavaScript boundaries" \
   $'accept:1\naccept:9\naccept:9007199254740991\nreject:\nreject:0\nreject:00\nreject:01\nreject:+1\nreject:-1\nreject: 1\nreject:1 \nreject:9007199254740992\nreject:10000000000000000' \
   "$safe_uint_boundaries"
 
+SAMPLER_SYSFS="$TMP/sampler-sysfs"
+mkdir -p "$SAMPLER_SYSFS/cpu7/cpufreq"
+printf '4700000\n' > "$SAMPLER_SYSFS/cpu7/cpufreq/scaling_cur_freq"
+sampler_one_shot="$(/bin/bash "$LIB/frequency-sampler.sh" --once "$SAMPLER_SYSFS")"
+check_eq "scaling frequency sampler emits a valid one-shot row" "1" \
+  "$([[ "$sampler_one_shot" =~ ^[0-9]{9,}[[:space:]]7[[:space:]]4700000$ ]] && echo 1 || echo 0)"
+printf '%s\n' "$sampler_one_shot" > "$TMP/sampler-valid.samples"
+check_eq "frequency sample validator accepts sampler output" "1" \
+  "$(diag_frequency_samples_have_valid_row "$TMP/sampler-valid.samples" scaling_cur_freq && echo 1 || echo 0)"
+
 write_preflight_fixture() {
   local bundle="$1" generation="${2:-0123456789abcdef0123456789abcdef}"
   local -a files=(
@@ -7903,7 +7913,7 @@ else
   fail=$((fail + 1))
 fi
 
-grep -q "CPU localization" "$B/report.md"
+grep -q "Single-process per-CPU screen (this run only)" "$B/report.md"
 check_eq "report contains localization conclusion" "0" "$?"
 grep -q "Permutation test" "$B/report.md"
 check_eq "report omits invalid permutation localization test" "1" "$?"

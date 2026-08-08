@@ -374,6 +374,12 @@ export function summarizeFreqSamples(outDir, tag, cpuFilter = null, binding = nu
       }
     }
   }
+  if (summary.samples === 0) {
+    summary.available = false;
+    summary.note = summary.note
+      ? `${summary.note}; no valid frequency samples were captured`
+      : "no valid frequency samples were captured";
+  }
   return summary;
 }
 

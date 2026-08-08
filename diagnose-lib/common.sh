@@ -22,6 +22,9 @@
 DIAG_SUPERVISE_PROCESS_GROUP="$({
   cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P
 })/supervise-process-group.sh"
+DIAG_FREQUENCY_SAMPLER="$({
+  cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P
+})/frequency-sampler.sh"
 
 diag_redact_log_text() {
   local text="$1"
@@ -648,6 +651,8 @@ diag_register_restore_trap() {
 : "${DIAG_FREQ_DIR:=.}"
 DIAG_SAMPLER_PID=""
 DIAG_WORKLOAD_PID=""
+DIAG_SAMPLER_SAMPLE_FILE=""
+DIAG_SAMPLER_METHOD=""
 : "${DIAG_OPERATIONAL_ERROR_RC:=125}"
 declare -gA DIAG_SUPERVISED_GROUP_START_TICKS=()
 
@@ -825,33 +830,86 @@ diag_turbostat_usable() {
   ((EUID == 0))
 }
 
+diag_frequency_samples_have_valid_row() {
+  local samples="$1" method="$2"
+  [[ -f "$samples" && ! -L "$samples" ]] || return 1
+  case "$method" in
+    scaling_cur_freq) grep -Eq '^[0-9]{9,} [0-9]+ [0-9]+$' "$samples" ;;
+    turbostat) grep -Eq '(^|[[:space:]])CPU([[:space:]]|$).*Bzy_MHz' "$samples" ;;
+    *) return 1 ;;
+  esac
+}
+
+diag_freq_sampler_state_clear() {
+  DIAG_SAMPLER_SAMPLE_FILE=""
+  DIAG_SAMPLER_METHOD=""
+}
+
 diag_freq_sampler_start() {
   local tag="$1"
   local samples="$DIAG_FREQ_DIR/${tag}.samples"
+  local method i pid expected_start
   : > "$samples"
   if diag_turbostat_usable; then
-    printf 'turbostat\n' > "$DIAG_FREQ_DIR/${tag}.method"
+    method=turbostat
+    printf '%s\n' "$method" > "$DIAG_FREQ_DIR/${tag}.method"
     diag_supervised_group_start DIAG_SAMPLER_PID "frequency sampler" \
-      turbostat --quiet --interval 1 >> "$samples" 2> /dev/null
+      turbostat --quiet --interval 1 >> "$samples" 2> /dev/null || return "$DIAG_OPERATIONAL_ERROR_RC"
   else
-    printf 'scaling_cur_freq\n' > "$DIAG_FREQ_DIR/${tag}.method"
-    diag_supervised_group_start DIAG_SAMPLER_PID "frequency sampler" bash -c '
-      while :; do
-        now="$(date +%s)"
-        for f in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq; do
-          [[ -r "$f" ]] || continue
-          cpu="${f%/cpufreq/scaling_cur_freq}"
-          cpu="${cpu##*/cpu}"
-          printf '%s %s %s\n' "$now" "$cpu" "$(cat "$f")"
-        done
-        sleep 1
-      done
-    ' diag-frequency-sampler >> "$samples" 2> /dev/null
+    method=scaling_cur_freq
+    printf '%s\n' "$method" > "$DIAG_FREQ_DIR/${tag}.method"
+    [[ -f "$DIAG_FREQUENCY_SAMPLER" && ! -L "$DIAG_FREQUENCY_SAMPLER" ]] || {
+      diag_warn "frequency sampler helper is missing or unsafe"
+      return "$DIAG_OPERATIONAL_ERROR_RC"
+    }
+    diag_supervised_group_start DIAG_SAMPLER_PID "frequency sampler" \
+      /bin/bash "$DIAG_FREQUENCY_SAMPLER" /sys/devices/system/cpu \
+      >> "$samples" 2> /dev/null || return "$DIAG_OPERATIONAL_ERROR_RC"
   fi
+  DIAG_SAMPLER_SAMPLE_FILE="$samples"
+  DIAG_SAMPLER_METHOD="$method"
+  pid="$DIAG_SAMPLER_PID"
+  expected_start="${DIAG_SUPERVISED_GROUP_START_TICKS[DIAG_SAMPLER_PID]:-}"
+  for ((i = 0; i < 60; i++)); do
+    diag_frequency_samples_have_valid_row "$samples" "$method" && return 0
+    diag_is_uint "$expected_start" &&
+      diag_process_identity_is_live "$pid" "$expected_start" || break
+    sleep 0.05
+  done
+  diag_warn "frequency sampler failed to produce a valid $method sample"
+  diag_supervised_group_stop DIAG_SAMPLER_PID "frequency sampler" 20 || true
+  diag_freq_sampler_state_clear
+  return "$DIAG_OPERATIONAL_ERROR_RC"
 }
 
 diag_freq_sampler_stop() {
-  diag_supervised_group_stop DIAG_SAMPLER_PID "frequency sampler" 20
+  [[ -n "$DIAG_SAMPLER_PID" ]] || {
+    diag_freq_sampler_state_clear
+    return 0
+  }
+  local pid="$DIAG_SAMPLER_PID"
+  local expected_start="${DIAG_SUPERVISED_GROUP_START_TICKS[DIAG_SAMPLER_PID]:-}"
+  local samples="$DIAG_SAMPLER_SAMPLE_FILE" method="$DIAG_SAMPLER_METHOD"
+  local premature=0 stop_rc=0 valid=0
+  if [[ -z "$samples" || -z "$method" ]]; then
+    diag_supervised_group_stop DIAG_SAMPLER_PID "frequency sampler" 20 || stop_rc=$?
+    diag_freq_sampler_state_clear
+    return "$stop_rc"
+  fi
+  diag_is_uint "$expected_start" &&
+    diag_process_identity_is_live "$pid" "$expected_start" || premature=1
+  diag_supervised_group_stop DIAG_SAMPLER_PID "frequency sampler" 20 || stop_rc=$?
+  diag_frequency_samples_have_valid_row "$samples" "$method" && valid=1
+  diag_freq_sampler_state_clear
+  ((stop_rc == 0)) || return "$stop_rc"
+  if ((premature == 1)); then
+    diag_warn "frequency sampler exited before the workload completed"
+    return "$DIAG_OPERATIONAL_ERROR_RC"
+  fi
+  if ((valid == 0)); then
+    diag_warn "frequency sampler captured no valid samples"
+    return "$DIAG_OPERATIONAL_ERROR_RC"
+  fi
 }
 
 # Run single-child workload legs on one pinned CPU, appending

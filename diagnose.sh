@@ -2575,7 +2575,8 @@ phase_baseline() {
   local logf="logs/baseline/run1.log"
   baseline_prepare_fresh_targets
   diag_log "baseline: $BASELINE_CHILDREN children x $BASELINE_WAVES waves, STOP_ON_FAILURE=0"
-  diag_freq_sampler_start baseline
+  diag_freq_sampler_start baseline ||
+    diag_die "baseline frequency sampler failed before workload launch"
   run_repro_logged "$OUT_DIR/$logf" "-" "$BASELINE_CHILDREN" "$BASELINE_WAVES"
   diag_freq_sampler_stop ||
     diag_die "baseline sampler could not be confirmed stopped; refusing evidence publication"
@@ -2611,7 +2612,8 @@ phase_groups() {
     freq_tag="group-${name}"
     groups_require_fresh_row_targets "$name" "$freq_tag"
     diag_log "group $((i + 1))/$total: $name cpus=$cpus children=$children waves=$GROUP_WAVES"
-    diag_freq_sampler_start "$freq_tag"
+    diag_freq_sampler_start "$freq_tag" ||
+      diag_die "group $name frequency sampler failed before workload launch"
     run_repro_logged "$OUT_DIR/$logf" "$cpus" "$children" "$GROUP_WAVES"
     diag_freq_sampler_stop ||
       diag_die "group $name sampler could not be confirmed stopped; refusing evidence publication"
