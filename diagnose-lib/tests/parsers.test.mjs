@@ -1257,6 +1257,30 @@ test("parseGdbCapture: known +2^42 signature (real transcript)", () => {
   assert.ok(r.mappings.length > 100);
 });
 
+test("parseGdbCapture: recognizes the CPU 19 mov-to-r13 +2^42 signature", () => {
+  const text = readFixture("gdb-known.txt")
+    .replace(
+      /=> (0x[0-9a-f]+):\s*addl\s+\$0x1,0x1c0\(%r13\)/,
+      "=> $1:\tmov    %r10,0xa8(%r13)",
+    )
+    .replace("SI_ADDR=0x40006720240", "SI_ADDR=0x40006720128");
+  const r = parseGdbCapture(text);
+  assert.equal(r.instruction, "mov %r10,0xa8(%r13)");
+  assert.equal(r.knownInstruction, true);
+  assert.equal(r.registers.r13, "0x6720080");
+  assert.equal(r.intendedAddr, "0x6720128");
+  assert.equal(r.intendedMapped, true);
+  assert.equal(r.intendedWritable, true);
+  assert.equal(r.intendedMappingFile, "[heap]");
+  assert.equal(r.siAddr, "0x40006720128");
+  assert.equal(r.siAddrMapped, false);
+  assert.equal(r.addrDiffHex, "0x40000000000");
+  assert.deepEqual(r.diffBits, [42]);
+  assert.equal(r.matchesKnownArithmetic, true);
+  assert.equal(r.matchesKnownSignature, true);
+  assert.equal(r.classification, "known-signature");
+});
+
 test("parseGdbCapture: accepts GDB's lowercase objfile mapping header", () => {
   const text = readFixture("gdb-known.txt").replace("Perms File ", "Perms objfile ");
   const r = parseGdbCapture(text);

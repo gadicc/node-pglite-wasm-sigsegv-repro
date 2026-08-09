@@ -29,6 +29,12 @@ const KNOWN_INSTRUCTIONS = [
     displacement: 0xb0n,
     canonical: "mov %rbp, 0xb0(%r13)",
   },
+  {
+    pattern: /^mov %r10,0xa8\(%r13\)$/,
+    base: "r13",
+    displacement: 0xa8n,
+    canonical: "mov %r10, 0xa8(%r13)",
+  },
 ];
 
 const BIT42 = 1n << 42n;
