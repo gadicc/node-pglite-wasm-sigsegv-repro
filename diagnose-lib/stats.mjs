@@ -47,6 +47,9 @@ export function wilson(failures, n, z = Z95) {
   if (failures < 0 || failures > n) {
     throw new Error(`wilson: failures ${failures} out of range for n=${n}`);
   }
+  if (!Number.isFinite(z) || z <= 0) {
+    throw new Error(`wilson: invalid z=${z}`);
+  }
   const p = failures / n;
   const z2 = z * z;
   const denom = 1 + z2 / n;
@@ -68,7 +71,10 @@ export function zeroFailureUpperBound(n, confidence = DEFAULT_CONFIDENCE) {
   if (!Number.isInteger(n) || n <= 0) {
     throw new Error(`zeroFailureUpperBound: invalid n=${n}`);
   }
-  return 1 - Math.pow(1 - confidence, 1 / n);
+  if (!Number.isFinite(confidence) || confidence <= 0 || confidence >= 1) {
+    throw new Error(`zeroFailureUpperBound: invalid confidence=${confidence}`);
+  }
+  return -Math.expm1(Math.log1p(-confidence) / n);
 }
 
 // Hypergeometric probability of a 2x2 table with fixed margins:
@@ -84,7 +90,7 @@ function hypergeomProb(a, r1, r2, col1, n) {
 // observed table). a/b = failures/non-failures in group 1, c/d in group 2.
 export function fisherExact2x2(a, b, c, d) {
   for (const v of [a, b, c, d]) {
-    if (!Number.isInteger(v) || v < 0) {
+    if (!Number.isSafeInteger(v) || v < 0) {
       throw new Error(`fisherExact2x2: invalid cell value ${v}`);
     }
   }
@@ -92,6 +98,10 @@ export function fisherExact2x2(a, b, c, d) {
   const r2 = c + d;
   const col1 = a + c;
   const n = r1 + r2;
+  if (!Number.isSafeInteger(r1) || !Number.isSafeInteger(r2) ||
+      !Number.isSafeInteger(col1) || !Number.isSafeInteger(n)) {
+    throw new Error("fisherExact2x2: table totals exceed the safe integer range");
+  }
   if (n === 0) return 1;
 
   const lo = Math.max(0, col1 - r2);

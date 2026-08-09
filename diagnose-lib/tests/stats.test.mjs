@@ -38,6 +38,8 @@ test("wilson: rejects invalid input", () => {
   assert.throws(() => wilson(11, 10));
   assert.throws(() => wilson(1, 0));
   assert.throws(() => wilson(0.5, 10));
+  assert.throws(() => wilson(1, 10, 0));
+  assert.throws(() => wilson(1, 10, Number.NaN));
 });
 
 test("zeroFailureUpperBound: exact 95% bound, rule-of-three consistent", () => {
@@ -46,6 +48,9 @@ test("zeroFailureUpperBound: exact 95% bound, rule-of-three consistent", () => {
   assert.ok(Math.abs(zeroFailureUpperBound(20) - 3 / 20) < 0.012);
   closeTo(zeroFailureUpperBound(50), 1 - Math.pow(0.05, 1 / 50), 1e-12);
   assert.throws(() => zeroFailureUpperBound(0));
+  assert.throws(() => zeroFailureUpperBound(20, 0));
+  assert.throws(() => zeroFailureUpperBound(20, 1));
+  assert.throws(() => zeroFailureUpperBound(20, Number.NaN));
 });
 
 test("fisherExact2x2: lady tasting tea reference value", () => {
@@ -64,6 +69,11 @@ test("fisherExact2x2: identical rates give p = 1", () => {
 
 test("fisherExact2x2: symmetric in group order", () => {
   closeTo(fisherExact2x2(1, 9, 5, 5), fisherExact2x2(5, 5, 1, 9), 1e-12);
+});
+
+test("fisherExact2x2: rejects unsafe cells and margins", () => {
+  assert.throws(() => fisherExact2x2(Number.MAX_SAFE_INTEGER + 1, 0, 0, 0));
+  assert.throws(() => fisherExact2x2(Number.MAX_SAFE_INTEGER, 1, 0, 0));
 });
 
 test("fisherExactGreater: validated one-sided upper-tail reference values", () => {

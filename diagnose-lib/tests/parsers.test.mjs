@@ -1038,6 +1038,7 @@ test("renderReport: incomplete individual prefixes are descriptive but cannot lo
   assert.match(md, /\| 4 \| 1 \| 1 \|/);
   assert.doesNotMatch(md, /\*\*Single-process per-CPU screen \(this run only\)\*\*: failures observed/);
   assert.doesNotMatch(md, /highest observed rate/);
+  assert.doesNotMatch(md, /\*\*The problem reproduced\*\*/);
 });
 
 test("renderReport: bounded failed-run details disclose exact omissions", () => {

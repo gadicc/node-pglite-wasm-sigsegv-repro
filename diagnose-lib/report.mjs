@@ -7,7 +7,7 @@
 // assumed: if a run does not reproduce, localize, or match the known
 // signature, the report says so.
 
-import { existsSync, readFileSync, writeFileSync, readdirSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, writeFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import {
   wilson,
@@ -730,7 +730,7 @@ function renderConclusions(r) {
       hasInvalidCountEvidence = true;
     }
   }
-  for (const c of r.individual ?? []) {
+  for (const c of r.individualStatus?.status === "complete" ? (r.individual ?? []) : []) {
     if (validIndividualCounts(c)) {
       if (!addAggregate(c.sigsegv, 0, 0, c.runs)) hasInvalidCountEvidence = true;
     } else {
@@ -906,6 +906,21 @@ export function writeReport(outDir, options = {}) {
   const resultsFile = options.resultsFile ?? path.join(outDir, "results.json");
   const outputFile = options.outputFile ?? path.join(outDir, "report.md");
   const exclusiveOutput = options.exclusiveOutput === true;
+  let readinessPathPresent = false;
+  if (options.outputFile === undefined) {
+    try {
+      lstatSync(path.join(outDir, "manifest.txt"));
+      readinessPathPresent = true;
+    } catch (error) {
+      readinessPathPresent = error?.code !== "ENOENT";
+    }
+  }
+  if (readinessPathPresent) {
+    throw new Error(
+      "refusing to overwrite report.md in a manifested bundle; " +
+      "resume with diagnose.sh so readiness is revoked and republished, or use explicit input/output paths",
+    );
+  }
   if (!existsSync(resultsFile)) {
     throw new Error(`${resultsFile} not found; run collect.mjs first`);
   }

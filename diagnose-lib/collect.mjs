@@ -968,9 +968,27 @@ function writeCollectedResults(outputFile, results, exclusiveOutput) {
   );
 }
 
+function bundleReadinessTokenExists(outDir) {
+  try {
+    lstatSync(path.join(path.resolve(outDir), "manifest.txt"));
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    // An uninspectable readiness path is still authority that this standalone
+    // writer must not risk invalidating.
+    return true;
+  }
+}
+
 export function collect(outDir, options = {}) {
   const outputFile = options.outputFile ?? path.join(outDir, "results.json");
   const exclusiveOutput = options.exclusiveOutput === true;
+  if (options.outputFile === undefined && bundleReadinessTokenExists(outDir)) {
+    throw new Error(
+      "refusing to overwrite results.json in a manifested bundle; " +
+      "resume with diagnose.sh so readiness is revoked and republished, or use an explicit output path",
+    );
+  }
   const runMetaState = readStoredRunMetadata(outDir);
   const meta = runMetaState.values;
   const preflightAssessment = runMetaState.bundleRootSafe
