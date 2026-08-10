@@ -6,10 +6,11 @@
 #   1 preflight   read-only environment collection (sanitized)
 #   2 baseline    concurrent reproduction, STOP_ON_FAILURE=0
 #   3 groups      CPU-group isolation (topology discovered from sysfs)
-#   4 individual  per-CPU single-child runs
-#   5 frequency   manual step only (see frequency-ab.sh; never automatic)
-#   6 gdb         pristine fault-signature capture on the worst CPU
-#   7 report      statistics, conclusions, manifest
+#   4 individual  interleaved per-CPU single-child runs
+#   5 pinned-concurrent exact-CPU topology-context waves
+#   6 frequency   manual step only (see frequency-ab.sh; never automatic)
+#   7 gdb         pristine fault-signature capture on the worst CPU
+#   8 report      statistics, conclusions, manifest
 #
 # This script never requires root and never elevates privileges.
 # Privileged reads live in root-checks.sh and the setting-changing
@@ -42,7 +43,13 @@ MODE="default"
 BASELINE_CHILDREN=16
 BASELINE_WAVES=50
 GROUP_WAVES=50
-INDIVIDUAL_RUNS=50
+INDIVIDUAL_RUNS=200
+PINNED_CONCURRENT_ROUNDS=200
+PROTOCOL_SEED="auto"
+PROTOCOL_SEED_MAX=4294967295
+SKIP_PINNED_CONCURRENT=0
+TELEMETRY_INTERVAL_MS=250
+RUN_SCHEMA_VERSION=2
 GDB_MAX_RUNS=12
 GDB_MAX_CAPTURES=3
 # The GDB evidence envelope's structural ceiling (GDB_MAX_RUNS_LIMIT in
@@ -62,6 +69,7 @@ REDO_NEW_TXN_ID=""
 REDO_TXN_ID=""
 REDO_TXN_VERSION=""
 REDO_TXN_HAS_CPU_TARGET=0
+REDO_TXN_HAS_SCHEMA2=0
 declare -a REDO_TXN_PHASES=()
 declare -a REDO_TXN_OWNERS=()
 declare -a REDO_TXN_PATHS=()
@@ -70,6 +78,7 @@ REDO_REQUEST_SATISFIED_BY_PENDING=0
 REDO_RECOVERED_PENDING=0
 META_UPDATE_TEMP=""
 GROUP_PLAN_TEMP=""
+PINNED_CONTEXTS_TEMP=""
 GROUP_META_TEMP=""
 GROUPS_META_GENERATION=""
 PREFLIGHT_MANIFEST_TEMP=""
@@ -91,12 +100,27 @@ DERIVED_MANIFEST_DEST_STATE=""
 DERIVED_FINALIZATION_ERROR=""
 DERIVED_FINALIZATION_COMPLETE=0
 GROUP_PLAN_DIGEST=""
+TELEMETRY_ACTIVE_PHASE=""
+TELEMETRY_ACTIVE_TAG=""
+TELEMETRY_ACTIVE_GENERATION=""
+TELEMETRY_ACTIVE_SEGMENT=""
+TELEMETRY_ACTIVE_LOG=""
+TELEMETRY_ACTIVE_BOUNDARY=""
+TELEMETRY_ACTIVE_STATE=""
+TELEMETRY_BOUNDARY_STARTED=0
+TELEMETRY_DEGRADED=0
 CPU_TARGET="auto"
 WORST_CPU_OVERRIDE=""
 SESSION_DID_WORK=0
 MODE_EXPLICIT=0
 GROUP_WAVES_EXPLICIT=0
 INDIVIDUAL_RUNS_EXPLICIT=0
+PINNED_CONCURRENT_ROUNDS_EXPLICIT=0
+PROTOCOL_SEED_EXPLICIT=0
+SKIP_PINNED_CONCURRENT_EXPLICIT=0
+SKIP_PINNED_CONCURRENT_FLAG_SEEN=0
+RUN_PINNED_CONCURRENT_FLAG_SEEN=0
+TELEMETRY_INTERVAL_MS_EXPLICIT=0
 GDB_MAX_RUNS_EXPLICIT=0
 SKIP_GDB_EXPLICIT=0
 SKIP_GDB_FLAG_SEEN=0
@@ -106,7 +130,7 @@ CPU_FLAG_SEEN=0
 PENDING_CPU_TARGET_UNAVAILABLE=0
 REQUIRED_COMMANDS=(
   awk basename bash cat chmod cmp cut date dirname find flock grep head mkdir mktemp mv node
-  nproc paste readlink rm sed setsid sha256sum sleep sort stat sync tail taskset tee timeout
+  nproc paste readlink rm rmdir sed setsid sha256sum sleep sort stat sync tail taskset tee timeout
   touch tr uniq wc xargs
 )
 PREFLIGHT_ARTIFACTS=(
@@ -121,12 +145,14 @@ Usage: ./diagnose.sh [options]
 
 Modes (pick at most one):
   --quick               short run: 8x10 baseline, 10 group waves,
-                        5 individual runs, 6 gdb runs
+                        5 isolated rounds/CPU, 5 pinned-concurrent rounds,
+                        6 gdb runs
   --full                long run: 16x100 baseline, 100 group waves,
-                        100 individual runs on every online CPU, 24 gdb runs
-  (default)             16x50 baseline, 50 group waves, 50 individual runs,
-                        12 gdb runs
-                        (50 clean runs exclude per-run rates above ~5.8%)
+                        400 isolated rounds/CPU, 400 pinned-concurrent rounds,
+                        24 gdb runs
+  (default)             16x50 baseline, 50 group waves, 200 isolated
+                        rounds/CPU, 200 pinned-concurrent rounds, 12 gdb runs
+                        (0/200 gives a one-sided 95% upper bound of 1.49%)
 
 Options:
   --resume DIR          resume an interrupted run, skipping completed phases
@@ -134,13 +160,24 @@ Options:
                         root-checks.sh or frequency-ab.sh manually)
   --redo PHASES         with --resume: re-run phase(s) from scratch
                         (comma-separated: preflight,baseline,groups,individual,
-                        gdb,frequency). Redoing preflight also redoes every
-                        later phase. Old data is preserved under
-                        state/superseded/, never deleted.
+                        pinned-concurrent,gdb,frequency). Redoing preflight
+                        also redoes every later phase. Old data is preserved
+                        under state/superseded/, never deleted.
   --out-dir DIR         output directory (default: diagnostics/<UTC timestamp>)
   --skip-gdb            skip the GDB capture phase
   --run-gdb             run GDB even when a resumed bundle stored --skip-gdb
-  --individual-runs N   runs per CPU (overrides mode default)
+  --individual-runs N   seeded, interleaved isolated rounds per usable CPU
+                        (overrides mode default)
+  --pinned-concurrent-rounds N
+                        pinned-concurrent macro-rounds per topology context
+  --protocol-seed auto|N
+                        persisted uint32 schedule seed (auto for a fresh run)
+  --skip-pinned-concurrent
+                        omit the exact-CPU concurrent protocol explicitly
+  --run-pinned-concurrent
+                        run it even when a resumed bundle stored an explicit skip
+  --telemetry-interval-ms N
+                        read-only telemetry interval, 50..60000 (default 250)
   --group-waves N       waves per CPU group (overrides mode default)
   --gdb-max-runs N      max gdb attempts (overrides mode default)
   --cpu N|auto          use a fixed CPU for GDB/frequency evidence, or select
@@ -206,13 +243,15 @@ apply_mode_preset() {
       BASELINE_WAVES=10
       GROUP_WAVES=10
       INDIVIDUAL_RUNS=5
+      [[ "$RUN_SCHEMA_VERSION" == 2 ]] && PINNED_CONCURRENT_ROUNDS=5
       GDB_MAX_RUNS=6
       ;;
     full)
       BASELINE_CHILDREN=16
       BASELINE_WAVES=100
       GROUP_WAVES=100
-      INDIVIDUAL_RUNS=100
+      INDIVIDUAL_RUNS=400
+      [[ "$RUN_SCHEMA_VERSION" == 2 ]] && PINNED_CONCURRENT_ROUNDS=400
       GDB_MAX_RUNS=24
       ;;
     default) : ;;
@@ -241,17 +280,32 @@ load_stored_config() {
   else
     return 0
   fi
+  # Bundles created before schema 2 remain on their original CPU-major
+  # protocol. They must never silently acquire a newly introduced stress
+  # phase merely because a newer diagnose.sh resumes them.
+  RUN_SCHEMA_VERSION=1
+  PINNED_CONCURRENT_ROUNDS=0
+  SKIP_PINNED_CONCURRENT=1
+  PROTOCOL_SEED="legacy"
+  TELEMETRY_INTERVAL_MS=250
   local k v
   local -A config_seen=()
   while IFS='=' read -r k v || [[ -n "$k" || -n "$v" ]]; do
     case "$k" in
-      MODE | BASELINE_CHILDREN | BASELINE_WAVES | GROUP_WAVES | INDIVIDUAL_RUNS | GDB_MAX_RUNS | SKIP_GDB | CPU_TARGET)
+      MODE | RUN_SCHEMA_VERSION | BASELINE_CHILDREN | BASELINE_WAVES | GROUP_WAVES | \
+        INDIVIDUAL_RUNS | PINNED_CONCURRENT_ROUNDS | PROTOCOL_SEED | \
+        SKIP_PINNED_CONCURRENT | TELEMETRY_INTERVAL_MS | GDB_MAX_RUNS | SKIP_GDB | CPU_TARGET)
         [[ -z "${config_seen[$k]:-}" ]] || diag_die "stored metadata contains duplicate $k rows"
         config_seen[$k]=1
         ;;
     esac
     case "$k" in
       MODE) MODE="$v" ;;
+      RUN_SCHEMA_VERSION)
+        [[ "$v" == 1 || "$v" == 2 ]] ||
+          diag_die "stored RUN_SCHEMA_VERSION must be 1 or 2, got '$v'"
+        RUN_SCHEMA_VERSION="$v"
+        ;;
       BASELINE_CHILDREN)
         diag_is_safe_positive_uint "$v" ||
           diag_die "stored BASELINE_CHILDREN must be a canonical safe positive integer, got '$v'"
@@ -272,6 +326,22 @@ load_stored_config() {
           diag_die "stored INDIVIDUAL_RUNS must be a canonical safe positive integer, got '$v'"
         INDIVIDUAL_RUNS="$v"
         ;;
+      PINNED_CONCURRENT_ROUNDS)
+        diag_is_safe_positive_uint "$v" ||
+          diag_die "stored PINNED_CONCURRENT_ROUNDS must be a canonical safe positive integer, got '$v'"
+        PINNED_CONCURRENT_ROUNDS="$v"
+        ;;
+      PROTOCOL_SEED)
+        [[ "$v" =~ ^(0|[1-9][0-9]*)$ ]] && ((${#v} < 10 || (${#v} == 10 && v <= PROTOCOL_SEED_MAX))) ||
+          diag_die "stored PROTOCOL_SEED must be a canonical uint32, got '$v'"
+        PROTOCOL_SEED="$v"
+        ;;
+      SKIP_PINNED_CONCURRENT) SKIP_PINNED_CONCURRENT="$v" ;;
+      TELEMETRY_INTERVAL_MS)
+        diag_is_safe_positive_uint "$v" && ((v >= 50 && v <= 60000)) ||
+          diag_die "stored TELEMETRY_INTERVAL_MS must be 50..60000, got '$v'"
+        TELEMETRY_INTERVAL_MS="$v"
+        ;;
       GDB_MAX_RUNS)
         diag_is_safe_positive_uint "$v" ||
           diag_die "stored GDB_MAX_RUNS must be a canonical safe positive integer, got '$v'"
@@ -290,6 +360,21 @@ load_stored_config() {
   [[ -n "${config_seen[BASELINE_CHILDREN]:-}" && -n "${config_seen[BASELINE_WAVES]:-}" &&
     -n "${config_seen[GROUP_WAVES]:-}" ]] ||
     diag_die "stored metadata is missing its exact baseline/group configuration"
+  if [[ "$RUN_SCHEMA_VERSION" == 2 ]]; then
+    local required_new_key
+    for required_new_key in RUN_SCHEMA_VERSION PINNED_CONCURRENT_ROUNDS PROTOCOL_SEED \
+      SKIP_PINNED_CONCURRENT TELEMETRY_INTERVAL_MS; do
+      [[ -n "${config_seen[$required_new_key]:-}" ]] ||
+        diag_die "schema 2 stored metadata is missing $required_new_key"
+    done
+  else
+    local unexpected_new_key
+    for unexpected_new_key in PINNED_CONCURRENT_ROUNDS PROTOCOL_SEED \
+      SKIP_PINNED_CONCURRENT TELEMETRY_INTERVAL_MS; do
+      [[ -z "${config_seen[$unexpected_new_key]:-}" ]] ||
+        diag_die "legacy stored metadata unexpectedly contains $unexpected_new_key"
+    done
+  fi
   apply_cpu_target_runtime
 }
 
@@ -320,7 +405,8 @@ parse_args() {
         mode_count=$((mode_count + 1))
         shift
         ;;
-      --resume | --out-dir | --redo | --individual-runs | --group-waves | --gdb-max-runs | --cpu)
+      --resume | --out-dir | --redo | --individual-runs | --pinned-concurrent-rounds | \
+        --protocol-seed | --telemetry-interval-ms | --group-waves | --gdb-max-runs | --cpu)
         (($# >= 2)) || diag_die "$1 needs a value"
         shift 2
         ;;
@@ -350,6 +436,33 @@ parse_args() {
         ;;
       --redo) REDO_PHASES="${2:?--redo needs a phase list}"; shift 2 ;;
       --individual-runs) INDIVIDUAL_RUNS="${2:?}"; INDIVIDUAL_RUNS_EXPLICIT=1; shift 2 ;;
+      --pinned-concurrent-rounds)
+        PINNED_CONCURRENT_ROUNDS="${2:?}"
+        PINNED_CONCURRENT_ROUNDS_EXPLICIT=1
+        shift 2
+        ;;
+      --protocol-seed)
+        PROTOCOL_SEED="${2:?}"
+        PROTOCOL_SEED_EXPLICIT=1
+        shift 2
+        ;;
+      --skip-pinned-concurrent)
+        SKIP_PINNED_CONCURRENT=1
+        SKIP_PINNED_CONCURRENT_EXPLICIT=1
+        SKIP_PINNED_CONCURRENT_FLAG_SEEN=1
+        shift
+        ;;
+      --run-pinned-concurrent)
+        SKIP_PINNED_CONCURRENT=0
+        SKIP_PINNED_CONCURRENT_EXPLICIT=1
+        RUN_PINNED_CONCURRENT_FLAG_SEEN=1
+        shift
+        ;;
+      --telemetry-interval-ms)
+        TELEMETRY_INTERVAL_MS="${2:?}"
+        TELEMETRY_INTERVAL_MS_EXPLICIT=1
+        shift 2
+        ;;
       --group-waves) GROUP_WAVES="${2:?}"; GROUP_WAVES_EXPLICIT=1; shift 2 ;;
       --gdb-max-runs) GDB_MAX_RUNS="${2:?}"; GDB_MAX_RUNS_EXPLICIT=1; shift 2 ;;
       --cpu)
@@ -368,6 +481,8 @@ parse_args() {
   done
   ((SKIP_GDB_FLAG_SEEN == 0 || RUN_GDB_FLAG_SEEN == 0)) ||
     diag_die "--skip-gdb and --run-gdb conflict; pick one"
+  ((SKIP_PINNED_CONCURRENT_FLAG_SEEN == 0 || RUN_PINNED_CONCURRENT_FLAG_SEEN == 0)) ||
+    diag_die "--skip-pinned-concurrent and --run-pinned-concurrent conflict; pick one"
 }
 
 validate_config() {
@@ -381,6 +496,28 @@ validate_config() {
     "--gdb-max-runs" "$GDB_MAX_RUNS" \
     "baseline children" "$BASELINE_CHILDREN" \
     "baseline waves" "$BASELINE_WAVES"
+  [[ "$RUN_SCHEMA_VERSION" == 1 || "$RUN_SCHEMA_VERSION" == 2 ]] ||
+    diag_die "RUN_SCHEMA_VERSION must be 1 or 2"
+  if [[ "$RUN_SCHEMA_VERSION" == 2 ]]; then
+    validate_count_config "--pinned-concurrent-rounds" "$PINNED_CONCURRENT_ROUNDS"
+    [[ "$PROTOCOL_SEED" == auto || "$PROTOCOL_SEED" =~ ^(0|[1-9][0-9]*)$ ]] ||
+      diag_die "--protocol-seed must be auto or a canonical uint32"
+    if [[ "$PROTOCOL_SEED" != auto ]]; then
+      ((${#PROTOCOL_SEED} < 10 || (${#PROTOCOL_SEED} == 10 && PROTOCOL_SEED <= PROTOCOL_SEED_MAX))) ||
+        diag_die "--protocol-seed must be at most $PROTOCOL_SEED_MAX"
+    fi
+    [[ "$SKIP_PINNED_CONCURRENT" == 0 || "$SKIP_PINNED_CONCURRENT" == 1 ]] ||
+      diag_die "stored SKIP_PINNED_CONCURRENT must be 0 or 1"
+    diag_is_safe_positive_uint "$TELEMETRY_INTERVAL_MS" &&
+      ((TELEMETRY_INTERVAL_MS >= 50 && TELEMETRY_INTERVAL_MS <= 60000)) ||
+      diag_die "--telemetry-interval-ms must be an integer from 50 through 60000"
+    if [[ -n "$RESUME_DIR" && "$PROTOCOL_SEED_EXPLICIT" == 1 && "$PROTOCOL_SEED" == auto ]]; then
+      diag_die "--protocol-seed auto is only valid for a fresh bundle; resume uses its persisted concrete seed"
+    fi
+  elif ((PINNED_CONCURRENT_ROUNDS_EXPLICIT == 1 || PROTOCOL_SEED_EXPLICIT == 1 ||
+    SKIP_PINNED_CONCURRENT_EXPLICIT == 1 || TELEMETRY_INTERVAL_MS_EXPLICIT == 1)); then
+    diag_die "this legacy bundle cannot be upgraded to the schema 2 pinned protocol in place; start a fresh bundle"
+  fi
   ((GDB_MAX_RUNS <= GDB_MAX_RUNS_LIMIT)) ||
     diag_die "--gdb-max-runs must be at most $GDB_MAX_RUNS_LIMIT, got '$GDB_MAX_RUNS'"
   [[ "$SKIP_GDB" == "0" || "$SKIP_GDB" == "1" ]] ||
@@ -392,6 +529,17 @@ validate_config() {
     diag_die "--redo requires --resume DIR (it re-runs phases of an existing bundle)"
   fi
   build_redo_plan
+}
+
+resolve_protocol_seed() {
+  [[ "$RUN_SCHEMA_VERSION" == 2 ]] || return 0
+  [[ "$PROTOCOL_SEED" == auto ]] || return 0
+  PROTOCOL_SEED="$($DIAG_INDIVIDUAL_NODE_BIN -e \
+    'process.stdout.write(String(require("node:crypto").randomBytes(4).readUInt32LE(0)))')" ||
+    diag_die "cannot generate the persisted protocol seed"
+  [[ "$PROTOCOL_SEED" =~ ^(0|[1-9][0-9]*)$ ]] &&
+    ((${#PROTOCOL_SEED} < 10 || (${#PROTOCOL_SEED} == 10 && PROTOCOL_SEED <= PROTOCOL_SEED_MAX))) ||
+    diag_die "generated protocol seed is malformed"
 }
 
 require_dependencies() {
@@ -452,8 +600,23 @@ bundle_prepare_dir() {
 }
 
 phase_name_supported() {
-  case "$1" in preflight | baseline | groups | individual | frequency | gdb) return 0 ;; esac
+  case "$1" in
+    preflight | baseline | groups | individual | pinned-concurrent | \
+      pinned-concurrent-unavailable | frequency | gdb) return 0 ;;
+  esac
   return 1
+}
+
+# Legacy bundles have no pinned-concurrent phase. Accepting a marker or any
+# evidence for it would let a newer runner silently relabel schema-1 history.
+validate_loaded_schema_artifacts() {
+  [[ "$RUN_SCHEMA_VERSION" == 1 ]] || return 0
+  local marker="$STATE_DIR/phase-pinned-concurrent.done"
+  [[ ! -e "$marker" && ! -L "$marker" ]] ||
+    diag_die "legacy bundle contains a schema-2 pinned-concurrent completion marker"
+  phase_attempt_is_meaningful pinned-concurrent &&
+    diag_die "legacy bundle contains schema-2 pinned-concurrent artifacts"
+  return 0
 }
 
 phase_marker_is_valid() {
@@ -476,7 +639,14 @@ bundle_mutable_graph_validate() {
   bundle_owned_real_dir "$OUT_DIR" ||
     diag_die "diagnostics bundle must be an owned, writable real directory"
 
-  for relative in results logs state env freq gdb logs/individual logs/gdb; do
+  for relative in results logs state env freq gdb telemetry \
+    logs/individual logs/gdb logs/pinned-concurrent \
+    state/individual-attempts state/individual-finalize \
+    state/pinned-concurrent-waves state/pinned-concurrent-finalize \
+    state/telemetry-baseline state/telemetry-groups state/telemetry-individual \
+    state/telemetry-pinned-concurrent state/telemetry-gdb \
+    telemetry/baseline telemetry/groups telemetry/individual \
+    telemetry/pinned-concurrent telemetry/gdb; do
     path="$OUT_DIR/$relative"
     [[ ! -e "$path" && ! -L "$path" ]] && continue
     bundle_owned_real_dir "$path" ||
@@ -519,8 +689,9 @@ bundle_mutable_graph_validate() {
 # through to the ordinary resume validation, which fails closed as before.
 fresh_init_meta_key() {
   case "$1" in
-    MODE | START_EPOCH | START_ISO | BASELINE_CHILDREN | BASELINE_WAVES | \
-      GROUP_WAVES | INDIVIDUAL_RUNS | GDB_MAX_RUNS | SKIP_GDB | CPU_TARGET | \
+    MODE | RUN_SCHEMA_VERSION | START_EPOCH | START_ISO | BASELINE_CHILDREN | BASELINE_WAVES | \
+      GROUP_WAVES | INDIVIDUAL_RUNS | PINNED_CONCURRENT_ROUNDS | PROTOCOL_SEED | \
+      SKIP_PINNED_CONCURRENT | TELEMETRY_INTERVAL_MS | GDB_MAX_RUNS | SKIP_GDB | CPU_TARGET | \
       INTERRUPTED)
       return 0
       ;;
@@ -848,7 +1019,10 @@ phase_is_done() {
 
 sync_meta_completed() {
   local list="" phase
-  for phase in preflight baseline groups individual frequency gdb; do
+  local -a phases=(preflight baseline groups individual)
+  [[ "$RUN_SCHEMA_VERSION" == 2 ]] && phases+=(pinned-concurrent)
+  phases+=(frequency gdb)
+  for phase in "${phases[@]}"; do
     if phase_is_done "$phase"; then
       list="${list:+$list,}$phase"
     fi
@@ -897,7 +1071,10 @@ persist_effective_config() {
 
 completed_phases_value() {
   local list="" phase
-  for phase in preflight baseline groups individual frequency gdb; do
+  local -a phases=(preflight baseline groups individual)
+  [[ "$RUN_SCHEMA_VERSION" == 2 ]] && phases+=(pinned-concurrent)
+  phases+=(frequency gdb)
+  for phase in "${phases[@]}"; do
     if phase_is_done "$phase"; then
       list="${list:+$list,}$phase"
     fi
@@ -924,7 +1101,9 @@ rewrite_meta_atomic() {
   while IFS= read -r line || [[ -n "$line" ]]; do
     key="${line%%=*}"
     case "$key" in
-      MODE | BASELINE_CHILDREN | BASELINE_WAVES | GROUP_WAVES | INDIVIDUAL_RUNS | GDB_MAX_RUNS | SKIP_GDB | CPU_TARGET)
+      MODE | RUN_SCHEMA_VERSION | BASELINE_CHILDREN | BASELINE_WAVES | GROUP_WAVES | \
+        INDIVIDUAL_RUNS | PINNED_CONCURRENT_ROUNDS | PROTOCOL_SEED | \
+        SKIP_PINNED_CONCURRENT | TELEMETRY_INTERVAL_MS | GDB_MAX_RUNS | SKIP_GDB | CPU_TARGET)
         if ((include_config == 1)); then continue; fi
         ;;
       COMPLETED_PHASES)
@@ -940,10 +1119,17 @@ rewrite_meta_atomic() {
   {
     if ((include_config == 1)); then
       printf 'MODE=%s\n' "$MODE"
+      printf 'RUN_SCHEMA_VERSION=%s\n' "$RUN_SCHEMA_VERSION"
       printf 'BASELINE_CHILDREN=%s\n' "$BASELINE_CHILDREN"
       printf 'BASELINE_WAVES=%s\n' "$BASELINE_WAVES"
       printf 'GROUP_WAVES=%s\n' "$GROUP_WAVES"
       printf 'INDIVIDUAL_RUNS=%s\n' "$INDIVIDUAL_RUNS"
+      if [[ "$RUN_SCHEMA_VERSION" == 2 ]]; then
+        printf 'PINNED_CONCURRENT_ROUNDS=%s\n' "$PINNED_CONCURRENT_ROUNDS"
+        printf 'PROTOCOL_SEED=%s\n' "$PROTOCOL_SEED"
+        printf 'SKIP_PINNED_CONCURRENT=%s\n' "$SKIP_PINNED_CONCURRENT"
+        printf 'TELEMETRY_INTERVAL_MS=%s\n' "$TELEMETRY_INTERVAL_MS"
+      fi
       printf 'GDB_MAX_RUNS=%s\n' "$GDB_MAX_RUNS"
       printf 'SKIP_GDB=%s\n' "$SKIP_GDB"
       printf 'CPU_TARGET=%s\n' "$CPU_TARGET"
@@ -978,6 +1164,84 @@ redo_plan_contains() {
   for phase in "${REDO_PLAN[@]}"; do
     [[ "$phase" == "$wanted" ]] && return 0
   done
+  return 1
+}
+
+phase_redo_is_authorized() {
+  local phase="$1"
+  redo_plan_contains "$phase" && return 0
+  [[ -n "$REDO_TXN_ID" ]] && redo_transaction_has_phase "$phase"
+}
+
+bundle_path_is_meaningful() {
+  local path="$1"
+  [[ -e "$path" || -L "$path" ]] || return 1
+  if [[ -d "$path" && ! -L "$path" ]]; then
+    [[ -n "$(find "$path" -mindepth 1 -maxdepth 1 -print -quit 2> /dev/null)" ]]
+  else
+    return 0
+  fi
+}
+
+phase_attempt_is_meaningful() {
+  local phase="$1" path
+  local -a paths=()
+  case "$phase" in
+    baseline)
+      paths=(results/baseline.meta logs/baseline freq/baseline.samples
+        freq/baseline.method results/telemetry-baseline.tsv
+        results/telemetry-baseline.meta telemetry/baseline state/telemetry-baseline)
+      ;;
+    groups)
+      paths=(results/groups.tsv results/groups.meta logs/groups
+        results/telemetry-groups.tsv results/telemetry-groups.meta
+        telemetry/groups state/telemetry-groups)
+      ;;
+    individual)
+      paths=(results/individual.tsv results/individual.meta
+        results/individual.plan.tsv results/individual.boundaries.ndjson
+        logs/individual state/individual-attempts state/individual-finalize
+        results/telemetry-individual.tsv results/telemetry-individual.meta
+        telemetry/individual state/telemetry-individual)
+      ;;
+    pinned-concurrent)
+      paths=(results/pinned-concurrent.tsv results/pinned-concurrent.meta
+        results/pinned-concurrent.groups.tsv results/pinned-concurrent.plan.tsv
+        results/pinned-concurrent.boundaries.ndjson logs/pinned-concurrent
+        state/pinned-concurrent-waves state/pinned-concurrent-finalize
+        results/pinned-concurrent.unavailable.meta
+        state/phase-pinned-concurrent-unavailable.done
+        results/telemetry-pinned-concurrent.tsv
+        results/telemetry-pinned-concurrent.meta telemetry/pinned-concurrent
+        state/telemetry-pinned-concurrent)
+      ;;
+    frequency)
+      paths=(results/frequency-ab.tsv results/frequency-ab.meta
+        results/frequency-cap.tsv results/frequency-cap.meta)
+      ;;
+    gdb)
+      paths=(results/gdb.meta results/gdb.manifest gdb logs/gdb
+        results/telemetry-gdb.tsv results/telemetry-gdb.meta
+        telemetry/gdb state/telemetry-gdb)
+      ;;
+    *) return 1 ;;
+  esac
+  for path in "${paths[@]}"; do
+    bundle_path_is_meaningful "$OUT_DIR/$path" && return 0
+  done
+  if [[ "$phase" == groups ]]; then
+    for path in "$OUT_DIR"/freq/group-*; do
+      [[ -e "$path" || -L "$path" ]] && return 0
+    done
+  elif [[ "$phase" == frequency ]]; then
+    for path in "$OUT_DIR"/freq/freq-ab-*; do
+      [[ -e "$path" || -L "$path" ]] && return 0
+    done
+  elif [[ "$phase" == gdb ]]; then
+    for path in "$OUT_DIR"/results/.gdb.manifest.* "$OUT_DIR"/results/.gdb.meta.*; do
+      [[ -e "$path" || -L "$path" ]] && return 0
+    done
+  fi
   return 1
 }
 
@@ -1051,14 +1315,17 @@ validate_cpu_target_for_completed_phases() {
 }
 
 require_redo_for_completed_change() {
-  local phase="$1" description="$2"
-  phase_is_done "$phase" || return 0
+  local phase="$1" description="$2" evidence_state=completed
+  if ! phase_is_done "$phase"; then
+    phase_attempt_is_meaningful "$phase" || return 0
+    evidence_state=incomplete
+  fi
   redo_plan_contains "$phase" && return 0
   if [[ -n "$STATE_DIR" ]] && [[ -e "$STATE_DIR/redo.pending" || -L "$STATE_DIR/redo.pending" ]] &&
     redo_transaction_has_phase "$phase"; then
     return 0
   fi
-  diag_die "$description changes completed $phase evidence; resume with --redo $phase"
+  diag_die "$description changes $evidence_state $phase evidence; resume with --redo $phase"
 }
 
 validate_completed_phase_overrides() {
@@ -1069,7 +1336,7 @@ validate_completed_phase_overrides() {
     stored="$(metadata_value "$meta" MODE)"
     if [[ "$stored" != "$MODE" ]]; then
       local phase
-      for phase in baseline groups individual gdb; do
+      for phase in baseline groups individual pinned-concurrent gdb; do
         require_redo_for_completed_change "$phase" "changing mode from $stored to $MODE"
       done
     fi
@@ -1084,6 +1351,41 @@ validate_completed_phase_overrides() {
     [[ "$stored" == "$INDIVIDUAL_RUNS" ]] ||
       require_redo_for_completed_change individual "changing --individual-runs from $stored to $INDIVIDUAL_RUNS"
   fi
+  if ((PINNED_CONCURRENT_ROUNDS_EXPLICIT == 1)); then
+    stored="$(metadata_value "$meta" PINNED_CONCURRENT_ROUNDS)"
+    [[ "$stored" == "$PINNED_CONCURRENT_ROUNDS" ]] ||
+      require_redo_for_completed_change pinned-concurrent \
+        "changing --pinned-concurrent-rounds from $stored to $PINNED_CONCURRENT_ROUNDS"
+  fi
+  if ((PROTOCOL_SEED_EXPLICIT == 1)); then
+    stored="$(metadata_value "$meta" PROTOCOL_SEED)"
+    if [[ "$stored" != "$PROTOCOL_SEED" ]]; then
+      require_redo_for_completed_change individual \
+        "changing --protocol-seed from $stored to $PROTOCOL_SEED"
+      require_redo_for_completed_change pinned-concurrent \
+        "changing --protocol-seed from $stored to $PROTOCOL_SEED"
+    fi
+  fi
+  if ((SKIP_PINNED_CONCURRENT_EXPLICIT == 1)); then
+    stored="$(metadata_value "$meta" SKIP_PINNED_CONCURRENT)"
+    if [[ "$stored" != "$SKIP_PINNED_CONCURRENT" ]] &&
+      ! phase_redo_is_authorized pinned-concurrent; then
+      diag_die "changing the pinned-concurrent skip choice on resume requires --redo pinned-concurrent"
+    fi
+    [[ "$stored" == "$SKIP_PINNED_CONCURRENT" ]] ||
+      require_redo_for_completed_change pinned-concurrent \
+        "changing the pinned-concurrent skip choice from $stored to $SKIP_PINNED_CONCURRENT"
+  fi
+  if ((TELEMETRY_INTERVAL_MS_EXPLICIT == 1)); then
+    stored="$(metadata_value "$meta" TELEMETRY_INTERVAL_MS)"
+    if [[ "$stored" != "$TELEMETRY_INTERVAL_MS" ]]; then
+      local telemetry_phase
+      for telemetry_phase in baseline groups individual pinned-concurrent gdb; do
+        require_redo_for_completed_change "$telemetry_phase" \
+          "changing --telemetry-interval-ms from $stored to $TELEMETRY_INTERVAL_MS"
+      done
+    fi
+  fi
   if ((GDB_MAX_RUNS_EXPLICIT == 1)); then
     stored="$(metadata_value "$meta" GDB_MAX_RUNS)"
     [[ "$stored" == "$GDB_MAX_RUNS" ]] ||
@@ -1096,6 +1398,12 @@ validate_completed_phase_overrides() {
   fi
   stored="$(stored_cpu_target_value "$meta")" ||
     diag_die "stored CPU_TARGET metadata is malformed"
+  if ((CPU_EXPLICIT == 1)) && [[ "$stored" != "$CPU_TARGET" ]]; then
+    require_redo_for_completed_change frequency \
+      "changing CPU selection policy from $stored to $CPU_TARGET"
+    require_redo_for_completed_change gdb \
+      "changing CPU selection policy from $stored to $CPU_TARGET"
+  fi
   validate_cpu_target_for_completed_phases "$CPU_TARGET"
 }
 
@@ -1240,15 +1548,18 @@ build_redo_plan() {
   IFS=',' read -ra requested <<< "$REDO_PHASES"
   for phase in "${requested[@]}"; do
     case "$phase" in
-      preflight | baseline | groups | individual | gdb | frequency) ;;
+      preflight | baseline | groups | individual | pinned-concurrent | gdb | frequency) ;;
       *)
-        diag_die "--redo: unknown or unsupported phase '$phase' (supported: preflight,baseline,groups,individual,gdb,frequency)"
+        diag_die "--redo: unknown or unsupported phase '$phase' (supported: preflight,baseline,groups,individual,pinned-concurrent,gdb,frequency)"
         ;;
     esac
     [[ -z "${seen[$phase]:-}" ]] || diag_die "--redo phase '$phase' was listed more than once"
     seen[$phase]=1
     wanted[$phase]=1
   done
+  if [[ "$RUN_SCHEMA_VERSION" == 1 && -n "${wanted[pinned-concurrent]:-}" ]]; then
+    diag_die "--redo pinned-concurrent is unavailable for a legacy bundle; start a fresh schema 2 bundle"
+  fi
 
   # A fresh environment snapshot cannot remain attached to retained workload
   # evidence. Redoing preflight therefore invalidates every later phase.
@@ -1256,6 +1567,7 @@ build_redo_plan() {
     wanted[baseline]=1
     wanted[groups]=1
     wanted[individual]=1
+    [[ "$RUN_SCHEMA_VERSION" == 2 ]] && wanted[pinned-concurrent]=1
     wanted[frequency]=1
     wanted[gdb]=1
   fi
@@ -1265,6 +1577,7 @@ build_redo_plan() {
   # an upstream phase therefore invalidates every completed dependent phase.
   if [[ -n "${wanted[groups]:-}" ]]; then
     wanted[individual]=1
+    [[ "$RUN_SCHEMA_VERSION" == 2 ]] && wanted[pinned-concurrent]=1
   fi
   if [[ -n "${wanted[individual]:-}" ]]; then
     wanted[frequency]=1
@@ -1273,13 +1586,13 @@ build_redo_plan() {
 
   # Always execute the closure in dependency order, independent of the order
   # used on the command line.
-  for phase in preflight baseline groups individual frequency gdb; do
+  for phase in preflight baseline groups individual pinned-concurrent frequency gdb; do
     [[ -n "${wanted[$phase]:-}" ]] && REDO_PLAN+=("$phase")
   done
 }
 
 redo_phase_supported() {
-  case "$1" in preflight | baseline | groups | individual | frequency | gdb) return 0 ;; esac
+  case "$1" in preflight | baseline | groups | individual | pinned-concurrent | frequency | gdb) return 0 ;; esac
   return 1
 }
 
@@ -1295,7 +1608,7 @@ redo_path_is_allowed() {
   local phase="$1" path="$2" suffix
   redo_relative_path_is_safe "$path" || return 1
   case "$phase:$path" in
-    preflight:results/preflight.meta|preflight:env/preflight.manifest|preflight:env/cmdline.txt|preflight:env/cpuinfo-extra.txt|preflight:env/cpufreq.txt|preflight:env/cctk.txt|preflight:env/date.txt|preflight:env/dependencies.txt|preflight:env/dmi.txt|preflight:env/kernel-warnings.txt|preflight:env/lscpu.txt|preflight:env/node.txt|preflight:env/online.txt|preflight:env/os-release.txt|preflight:env/power.txt|preflight:env/summary.env|preflight:env/topology.tsv|preflight:env/uname.txt|preflight:env/undervolt.txt|preflight:env/root|baseline:results/baseline.meta|baseline:logs/baseline|baseline:freq/baseline.samples|baseline:freq/baseline.method|groups:results/groups.tsv|groups:results/groups.meta|groups:logs/groups|individual:results/individual.tsv|individual:results/individual.meta|individual:logs/individual|gdb:results/gdb.meta|gdb:results/gdb.manifest|gdb:gdb|gdb:logs/gdb|frequency:results/frequency-ab.tsv|frequency:results/frequency-ab.meta|frequency:results/frequency-cap.tsv|frequency:results/frequency-cap.meta) return 0 ;;
+    preflight:results/preflight.meta|preflight:env/preflight.manifest|preflight:env/cmdline.txt|preflight:env/cpuinfo-extra.txt|preflight:env/cpufreq.txt|preflight:env/cctk.txt|preflight:env/date.txt|preflight:env/dependencies.txt|preflight:env/dmi.txt|preflight:env/kernel-warnings.txt|preflight:env/lscpu.txt|preflight:env/node.txt|preflight:env/online.txt|preflight:env/os-release.txt|preflight:env/power.txt|preflight:env/summary.env|preflight:env/topology.tsv|preflight:env/uname.txt|preflight:env/undervolt.txt|preflight:env/root|baseline:results/baseline.meta|baseline:logs/baseline|baseline:freq/baseline.samples|baseline:freq/baseline.method|baseline:results/telemetry-baseline.tsv|baseline:results/telemetry-baseline.meta|baseline:telemetry/baseline|baseline:state/telemetry-baseline|groups:results/groups.tsv|groups:results/groups.meta|groups:logs/groups|groups:results/telemetry-groups.tsv|groups:results/telemetry-groups.meta|groups:telemetry/groups|groups:state/telemetry-groups|individual:results/individual.tsv|individual:results/individual.meta|individual:results/individual.plan.tsv|individual:results/individual.boundaries.ndjson|individual:logs/individual|individual:state/individual-attempts|individual:state/individual-finalize|individual:results/telemetry-individual.tsv|individual:results/telemetry-individual.meta|individual:telemetry/individual|individual:state/telemetry-individual|pinned-concurrent:results/pinned-concurrent.tsv|pinned-concurrent:results/pinned-concurrent.meta|pinned-concurrent:results/pinned-concurrent.groups.tsv|pinned-concurrent:results/pinned-concurrent.plan.tsv|pinned-concurrent:results/pinned-concurrent.boundaries.ndjson|pinned-concurrent:results/pinned-concurrent.unavailable.meta|pinned-concurrent:state/phase-pinned-concurrent-unavailable.done|pinned-concurrent:logs/pinned-concurrent|pinned-concurrent:state/pinned-concurrent-waves|pinned-concurrent:state/pinned-concurrent-finalize|pinned-concurrent:results/telemetry-pinned-concurrent.tsv|pinned-concurrent:results/telemetry-pinned-concurrent.meta|pinned-concurrent:telemetry/pinned-concurrent|pinned-concurrent:state/telemetry-pinned-concurrent|gdb:results/gdb.meta|gdb:results/gdb.manifest|gdb:gdb|gdb:logs/gdb|gdb:results/telemetry-gdb.tsv|gdb:results/telemetry-gdb.meta|gdb:telemetry/gdb|gdb:state/telemetry-gdb|frequency:results/frequency-ab.tsv|frequency:results/frequency-ab.meta|frequency:results/frequency-cap.tsv|frequency:results/frequency-cap.meta) return 0 ;;
   esac
   if [[ "$phase" == gdb && "$path" == results/.gdb.manifest.* ]]; then
     suffix="${path#results/.gdb.manifest.}"
@@ -1340,13 +1653,21 @@ redo_config_value_is_valid() {
   local key="$1" value="$2"
   case "$key" in
     MODE) [[ "$value" == default || "$value" == quick || "$value" == full ]] ;;
-    BASELINE_CHILDREN | BASELINE_WAVES | INDIVIDUAL_RUNS | GDB_MAX_RUNS)
+    RUN_SCHEMA_VERSION) [[ "$value" == 2 ]] ;;
+    BASELINE_CHILDREN | BASELINE_WAVES | INDIVIDUAL_RUNS | PINNED_CONCURRENT_ROUNDS | GDB_MAX_RUNS)
       diag_is_safe_positive_uint "$value"
       ;;
     GROUP_WAVES)
       diag_is_safe_positive_uint "$value"
       ;;
-    SKIP_GDB) [[ "$value" == 0 || "$value" == 1 ]] ;;
+    PROTOCOL_SEED)
+      [[ "$value" =~ ^(0|[1-9][0-9]*)$ ]] &&
+        ((${#value} < 10 || (${#value} == 10 && value <= PROTOCOL_SEED_MAX)))
+      ;;
+    SKIP_PINNED_CONCURRENT | SKIP_GDB) [[ "$value" == 0 || "$value" == 1 ]] ;;
+    TELEMETRY_INTERVAL_MS)
+      diag_is_safe_positive_uint "$value" && ((value >= 50 && value <= 60000))
+      ;;
     CPU_TARGET) [[ "$value" == auto || "$value" =~ ^(0|[1-9][0-9]*)$ ]] ;;
     *) return 1 ;;
   esac
@@ -1354,10 +1675,19 @@ redo_config_value_is_valid() {
 
 redo_write_config_records() {
   printf 'CONFIG\tMODE\t%s\n' "$MODE"
+  if [[ "$RUN_SCHEMA_VERSION" == 2 ]]; then
+    printf 'CONFIG\tRUN_SCHEMA_VERSION\t%s\n' "$RUN_SCHEMA_VERSION"
+  fi
   printf 'CONFIG\tBASELINE_CHILDREN\t%s\n' "$BASELINE_CHILDREN"
   printf 'CONFIG\tBASELINE_WAVES\t%s\n' "$BASELINE_WAVES"
   printf 'CONFIG\tGROUP_WAVES\t%s\n' "$GROUP_WAVES"
   printf 'CONFIG\tINDIVIDUAL_RUNS\t%s\n' "$INDIVIDUAL_RUNS"
+  if [[ "$RUN_SCHEMA_VERSION" == 2 ]]; then
+    printf 'CONFIG\tPINNED_CONCURRENT_ROUNDS\t%s\n' "$PINNED_CONCURRENT_ROUNDS"
+    printf 'CONFIG\tPROTOCOL_SEED\t%s\n' "$PROTOCOL_SEED"
+    printf 'CONFIG\tSKIP_PINNED_CONCURRENT\t%s\n' "$SKIP_PINNED_CONCURRENT"
+    printf 'CONFIG\tTELEMETRY_INTERVAL_MS\t%s\n' "$TELEMETRY_INTERVAL_MS"
+  fi
   printf 'CONFIG\tGDB_MAX_RUNS\t%s\n' "$GDB_MAX_RUNS"
   printf 'CONFIG\tSKIP_GDB\t%s\n' "$SKIP_GDB"
   printf 'CONFIG\tCPU_TARGET\t%s\n' "$CPU_TARGET"
@@ -1366,11 +1696,14 @@ redo_write_config_records() {
 redo_transaction_validate() {
   local marker="$1" line kind owner path version="" txn="" last_rank=0 rank section=version
   local config_index=0 expected_key
-  local -a config_keys=(MODE BASELINE_CHILDREN BASELINE_WAVES GROUP_WAVES INDIVIDUAL_RUNS GDB_MAX_RUNS SKIP_GDB CPU_TARGET)
+  local -a config_keys_v2=(MODE BASELINE_CHILDREN BASELINE_WAVES GROUP_WAVES INDIVIDUAL_RUNS GDB_MAX_RUNS SKIP_GDB CPU_TARGET)
+  local -a config_keys_v3=(MODE RUN_SCHEMA_VERSION BASELINE_CHILDREN BASELINE_WAVES GROUP_WAVES INDIVIDUAL_RUNS PINNED_CONCURRENT_ROUNDS PROTOCOL_SEED SKIP_PINNED_CONCURRENT TELEMETRY_INTERVAL_MS GDB_MAX_RUNS SKIP_GDB CPU_TARGET)
+  local -a config_keys=()
   local -A phases=() records=()
   REDO_TXN_ID=""
   REDO_TXN_VERSION=""
   REDO_TXN_HAS_CPU_TARGET=0
+  REDO_TXN_HAS_SCHEMA2=0
   REDO_TXN_PHASES=()
   REDO_TXN_OWNERS=()
   REDO_TXN_PATHS=()
@@ -1381,18 +1714,24 @@ redo_transaction_validate() {
     case "$kind" in
       VERSION)
         [[ "$section" == version && "$line" == "VERSION"$'\t'"$owner" &&
-          ("$owner" == 1 || "$owner" == 2) ]] || return 1
+          ("$owner" == 1 || "$owner" == 2 || "$owner" == 3) ]] || return 1
         version="$owner"
+        if [[ "$version" == 2 ]]; then
+          config_keys=("${config_keys_v2[@]}")
+        elif [[ "$version" == 3 ]]; then
+          config_keys=("${config_keys_v3[@]}")
+        fi
         section=txn
         ;;
       TXN)
         [[ "$section" == txn && "$line" == "TXN"$'\t'"$owner" &&
           "$owner" =~ ^redo-[0-9]{8}T[0-9]{6}-[A-Za-z0-9]+$ ]] || return 1
         txn="$owner"
-        if [[ "$version" == 2 ]]; then section=config; else section=phases; fi
+        if [[ "$version" == 2 || "$version" == 3 ]]; then section=config; else section=phases; fi
         ;;
       CONFIG)
-        [[ "$version" == 2 && "$section" == config && $config_index -lt ${#config_keys[@]} ]] || return 1
+        [[ ("$version" == 2 || "$version" == 3) && "$section" == config &&
+          $config_index -lt ${#config_keys[@]} ]] || return 1
         expected_key="${config_keys[$config_index]}"
         [[ "$owner" == "$expected_key" && "$line" == "CONFIG"$'\t'"$owner"$'\t'"$path" ]] || return 1
         redo_config_value_is_valid "$owner" "$path" || return 1
@@ -1404,12 +1743,16 @@ redo_transaction_validate() {
         if [[ "$version" == 2 ]]; then
           [[ ("$section" == config || "$section" == phases) &&
             ($config_index -eq 7 || $config_index -eq ${#config_keys[@]}) ]] || return 1
+        elif [[ "$version" == 3 ]]; then
+          [[ ("$section" == config || "$section" == phases) &&
+            $config_index -eq ${#config_keys[@]} ]] || return 1
         else
           [[ "$section" == phases ]] || return 1
         fi
         [[ "$line" == "PHASE"$'\t'"$owner" ]] || return 1
         redo_phase_supported "$owner" && [[ -z "${phases[$owner]:-}" ]] || return 1
-        case "$owner" in preflight) rank=1 ;; baseline) rank=2 ;; groups) rank=3 ;; individual) rank=4 ;; frequency) rank=5 ;; gdb) rank=6 ;; esac
+        [[ "$owner" != pinned-concurrent || "$version" == 3 ]] || return 1
+        case "$owner" in preflight) rank=1 ;; baseline) rank=2 ;; groups) rank=3 ;; individual) rank=4 ;; pinned-concurrent) rank=5 ;; frequency) rank=6 ;; gdb) rank=7 ;; esac
         ((rank > last_rank)) || return 1
         last_rank=$rank
         phases[$owner]=1
@@ -1436,8 +1779,11 @@ redo_transaction_validate() {
       *) return 1 ;;
     esac
   done < "$marker"
-  [[ ("$version" == 1 || "$version" == 2) && -n "$txn" && ${#REDO_TXN_PHASES[@]} -gt 0 ]] || return 1
-  [[ "$version" == 1 || $config_index -eq 7 || $config_index -eq ${#config_keys[@]} ]] || return 1
+  [[ ("$version" == 1 || "$version" == 2 || "$version" == 3) && -n "$txn" &&
+    ${#REDO_TXN_PHASES[@]} -gt 0 ]] || return 1
+  [[ "$version" == 1 || ("$version" == 2 && ($config_index -eq 7 ||
+    $config_index -eq ${#config_keys[@]})) || ("$version" == 3 &&
+    $config_index -eq ${#config_keys[@]}) ]] || return 1
   if [[ "$version" == 2 ]]; then
     ((config_index == 8)) && REDO_TXN_HAS_CPU_TARGET=1
     case "${REDO_TXN_CONFIG[MODE]}" in
@@ -1451,6 +1797,24 @@ redo_transaction_validate() {
         [[ "${REDO_TXN_CONFIG[BASELINE_CHILDREN]}" == 16 && "${REDO_TXN_CONFIG[BASELINE_WAVES]}" == 100 ]] || return 1
         ;;
     esac
+  elif [[ "$version" == 3 ]]; then
+    REDO_TXN_HAS_CPU_TARGET=1
+    REDO_TXN_HAS_SCHEMA2=1
+    [[ "${REDO_TXN_CONFIG[RUN_SCHEMA_VERSION]}" == 2 ]] || return 1
+    case "${REDO_TXN_CONFIG[MODE]}" in
+      quick)
+        [[ "${REDO_TXN_CONFIG[BASELINE_CHILDREN]}" == 8 &&
+          "${REDO_TXN_CONFIG[BASELINE_WAVES]}" == 10 ]] || return 1
+        ;;
+      default)
+        [[ "${REDO_TXN_CONFIG[BASELINE_CHILDREN]}" == 16 &&
+          "${REDO_TXN_CONFIG[BASELINE_WAVES]}" == 50 ]] || return 1
+        ;;
+      full)
+        [[ "${REDO_TXN_CONFIG[BASELINE_CHILDREN]}" == 16 &&
+          "${REDO_TXN_CONFIG[BASELINE_WAVES]}" == 100 ]] || return 1
+        ;;
+    esac
   fi
   local phase
   for phase in "${REDO_TXN_OWNERS[@]}"; do
@@ -1458,6 +1822,7 @@ redo_transaction_validate() {
   done
   if [[ -n "${phases[groups]:-}" ]]; then
     [[ -n "${phases[individual]:-}" && -n "${phases[frequency]:-}" && -n "${phases[gdb]:-}" ]] || return 1
+    [[ "$version" != 3 || -n "${phases[pinned-concurrent]:-}" ]] || return 1
   fi
   if [[ -n "${phases[individual]:-}" ]]; then
     [[ -n "${phases[frequency]:-}" && -n "${phases[gdb]:-}" ]] || return 1
@@ -1466,18 +1831,28 @@ redo_transaction_validate() {
     [[ -n "${phases[baseline]:-}" && -n "${phases[groups]:-}" &&
       -n "${phases[individual]:-}" && -n "${phases[frequency]:-}" &&
       -n "${phases[gdb]:-}" ]] || return 1
+    [[ "$version" != 3 || -n "${phases[pinned-concurrent]:-}" ]] || return 1
   fi
   REDO_TXN_VERSION="$version"
   REDO_TXN_ID="$txn"
 }
 
 redo_adopt_pending_config() {
-  [[ "$REDO_TXN_VERSION" == 2 ]] || return 0
+  [[ "$REDO_TXN_VERSION" == 2 || "$REDO_TXN_VERSION" == 3 ]] || return 0
   MODE="${REDO_TXN_CONFIG[MODE]}"
+  if [[ "$REDO_TXN_VERSION" == 3 ]]; then
+    RUN_SCHEMA_VERSION="${REDO_TXN_CONFIG[RUN_SCHEMA_VERSION]}"
+  fi
   BASELINE_CHILDREN="${REDO_TXN_CONFIG[BASELINE_CHILDREN]}"
   BASELINE_WAVES="${REDO_TXN_CONFIG[BASELINE_WAVES]}"
   GROUP_WAVES="${REDO_TXN_CONFIG[GROUP_WAVES]}"
   INDIVIDUAL_RUNS="${REDO_TXN_CONFIG[INDIVIDUAL_RUNS]}"
+  if [[ "$REDO_TXN_VERSION" == 3 ]]; then
+    PINNED_CONCURRENT_ROUNDS="${REDO_TXN_CONFIG[PINNED_CONCURRENT_ROUNDS]}"
+    PROTOCOL_SEED="${REDO_TXN_CONFIG[PROTOCOL_SEED]}"
+    SKIP_PINNED_CONCURRENT="${REDO_TXN_CONFIG[SKIP_PINNED_CONCURRENT]}"
+    TELEMETRY_INTERVAL_MS="${REDO_TXN_CONFIG[TELEMETRY_INTERVAL_MS]}"
+  fi
   GDB_MAX_RUNS="${REDO_TXN_CONFIG[GDB_MAX_RUNS]}"
   SKIP_GDB="${REDO_TXN_CONFIG[SKIP_GDB]}"
   if ((REDO_TXN_HAS_CPU_TARGET == 1)); then
@@ -1496,7 +1871,7 @@ redo_transaction_has_phase() {
 
 redo_changed_config_authorized_for_phase() {
   local phase="$1"
-  if phase_is_done "$phase"; then
+  if phase_is_done "$phase" || phase_attempt_is_meaningful "$phase"; then
     redo_transaction_has_phase "$phase"
   else
     return 0
@@ -1507,17 +1882,24 @@ redo_changed_config_authorized_for_phase() {
 # leaves in place. Only a transaction containing the affected phase may alter
 # the config key that describes that phase's evidence.
 redo_transaction_target_is_authorized() {
-  [[ "$REDO_TXN_VERSION" == 2 ]] || return 0
+  [[ "$REDO_TXN_VERSION" == 2 || "$REDO_TXN_VERSION" == 3 ]] || return 0
   local key stored target phase target_cpu_policy
-  for key in MODE BASELINE_CHILDREN BASELINE_WAVES GROUP_WAVES INDIVIDUAL_RUNS GDB_MAX_RUNS SKIP_GDB; do
+  local -a keys=(MODE BASELINE_CHILDREN BASELINE_WAVES GROUP_WAVES INDIVIDUAL_RUNS GDB_MAX_RUNS SKIP_GDB)
+  if [[ "$REDO_TXN_VERSION" == 3 ]]; then
+    keys+=(RUN_SCHEMA_VERSION PINNED_CONCURRENT_ROUNDS PROTOCOL_SEED SKIP_PINNED_CONCURRENT TELEMETRY_INTERVAL_MS)
+  fi
+  for key in "${keys[@]}"; do
     stored="$(metadata_value "$META_FILE" "$key")"
     target="${REDO_TXN_CONFIG[$key]}"
     [[ "$stored" == "$target" ]] && continue
     case "$key" in
       MODE)
-        for phase in baseline groups individual gdb; do
+        for phase in baseline groups individual pinned-concurrent gdb; do
           redo_changed_config_authorized_for_phase "$phase" || return 1
         done
+        ;;
+      RUN_SCHEMA_VERSION)
+        return 1
         ;;
       BASELINE_CHILDREN | BASELINE_WAVES)
         redo_changed_config_authorized_for_phase baseline || return 1
@@ -1527,6 +1909,18 @@ redo_transaction_target_is_authorized() {
         ;;
       INDIVIDUAL_RUNS)
         redo_changed_config_authorized_for_phase individual || return 1
+        ;;
+      PINNED_CONCURRENT_ROUNDS | SKIP_PINNED_CONCURRENT)
+        redo_changed_config_authorized_for_phase pinned-concurrent || return 1
+        ;;
+      PROTOCOL_SEED)
+        redo_changed_config_authorized_for_phase individual || return 1
+        redo_changed_config_authorized_for_phase pinned-concurrent || return 1
+        ;;
+      TELEMETRY_INTERVAL_MS)
+        for phase in baseline groups individual pinned-concurrent gdb; do
+          redo_changed_config_authorized_for_phase "$phase" || return 1
+        done
         ;;
       GDB_MAX_RUNS | SKIP_GDB)
         redo_changed_config_authorized_for_phase gdb || return 1
@@ -1561,10 +1955,28 @@ redo_pending_explicit_config_matches_v2() {
       "$GROUP_WAVES" == "${REDO_TXN_CONFIG[GROUP_WAVES]}" &&
       "$INDIVIDUAL_RUNS" == "${REDO_TXN_CONFIG[INDIVIDUAL_RUNS]}" &&
       "$GDB_MAX_RUNS" == "${REDO_TXN_CONFIG[GDB_MAX_RUNS]}" ]] || return 1
+    if [[ "$REDO_TXN_VERSION" == 3 ]]; then
+      [[ "$RUN_SCHEMA_VERSION" == "${REDO_TXN_CONFIG[RUN_SCHEMA_VERSION]}" &&
+        "$PINNED_CONCURRENT_ROUNDS" == "${REDO_TXN_CONFIG[PINNED_CONCURRENT_ROUNDS]}" &&
+        "$PROTOCOL_SEED" == "${REDO_TXN_CONFIG[PROTOCOL_SEED]}" &&
+        "$TELEMETRY_INTERVAL_MS" == "${REDO_TXN_CONFIG[TELEMETRY_INTERVAL_MS]}" ]] || return 1
+    fi
   else
     ((GROUP_WAVES_EXPLICIT == 0)) || [[ "$GROUP_WAVES" == "${REDO_TXN_CONFIG[GROUP_WAVES]}" ]] || return 1
     ((INDIVIDUAL_RUNS_EXPLICIT == 0)) || [[ "$INDIVIDUAL_RUNS" == "${REDO_TXN_CONFIG[INDIVIDUAL_RUNS]}" ]] || return 1
     ((GDB_MAX_RUNS_EXPLICIT == 0)) || [[ "$GDB_MAX_RUNS" == "${REDO_TXN_CONFIG[GDB_MAX_RUNS]}" ]] || return 1
+    if [[ "$REDO_TXN_VERSION" == 3 ]]; then
+      ((PINNED_CONCURRENT_ROUNDS_EXPLICIT == 0)) ||
+        [[ "$PINNED_CONCURRENT_ROUNDS" == "${REDO_TXN_CONFIG[PINNED_CONCURRENT_ROUNDS]}" ]] || return 1
+      ((PROTOCOL_SEED_EXPLICIT == 0)) ||
+        [[ "$PROTOCOL_SEED" == "${REDO_TXN_CONFIG[PROTOCOL_SEED]}" ]] || return 1
+      ((TELEMETRY_INTERVAL_MS_EXPLICIT == 0)) ||
+        [[ "$TELEMETRY_INTERVAL_MS" == "${REDO_TXN_CONFIG[TELEMETRY_INTERVAL_MS]}" ]] || return 1
+    fi
+  fi
+  if [[ "$REDO_TXN_VERSION" == 3 ]]; then
+    ((SKIP_PINNED_CONCURRENT_EXPLICIT == 0)) ||
+      [[ "$SKIP_PINNED_CONCURRENT" == "${REDO_TXN_CONFIG[SKIP_PINNED_CONCURRENT]}" ]] || return 1
   fi
   ((SKIP_GDB_EXPLICIT == 0)) || [[ "$SKIP_GDB" == "${REDO_TXN_CONFIG[SKIP_GDB]}" ]] || return 1
   if ((CPU_EXPLICIT == 1)); then
@@ -1605,7 +2017,7 @@ reconcile_pending_redo_request() {
     diag_die "pending redo has an unsafe or conflicting source/archive state"
   redo_pending_phase_request_matches ||
     diag_die "requested --redo phases conflict with the pending redo transaction"
-  if [[ "$REDO_TXN_VERSION" == 2 ]]; then
+  if [[ "$REDO_TXN_VERSION" == 2 || "$REDO_TXN_VERSION" == 3 ]]; then
     redo_pending_explicit_config_matches_v2 ||
       diag_die "explicit configuration conflicts with the pending redo target"
     redo_adopt_pending_config
@@ -1769,7 +2181,7 @@ redo_transaction_execute() {
     fi
   done
 
-  if [[ "$REDO_TXN_VERSION" == 2 ]]; then
+  if [[ "$REDO_TXN_VERSION" == 2 || "$REDO_TXN_VERSION" == 3 ]]; then
     rewrite_meta_atomic 1 1
   else
     # V1 markers predate embedded config and were only published after their
@@ -1830,9 +2242,10 @@ apply_redo_plan() {
   ((${#REDO_PLAN[@]} > 0)) || return 0
   ((REDO_REQUEST_SATISFIED_BY_PENDING == 0)) || return 0
   redo_transaction_prepare
-  local phase path artifact
+  local phase path artifact redo_format=2
+  [[ "$RUN_SCHEMA_VERSION" == 2 ]] && redo_format=3
   {
-    printf 'VERSION\t2\nTXN\t%s\n' "$REDO_NEW_TXN_ID"
+    printf 'VERSION\t%s\nTXN\t%s\n' "$redo_format" "$REDO_NEW_TXN_ID"
     redo_write_config_records
     for phase in "${REDO_PLAN[@]}"; do printf 'PHASE\t%s\n' "$phase"; done
     for path in results.json report.md privacy-review.txt manifest.txt; do
@@ -1849,11 +2262,12 @@ apply_redo_plan() {
           done
           paths+=(env/root)
           ;;
-        baseline) paths=(results/baseline.meta logs/baseline freq/baseline.samples freq/baseline.method) ;;
-        groups) paths=(results/groups.tsv results/groups.meta logs/groups) ;;
-        individual) paths=(results/individual.tsv results/individual.meta logs/individual) ;;
+        baseline) paths=(results/baseline.meta logs/baseline freq/baseline.samples freq/baseline.method results/telemetry-baseline.tsv results/telemetry-baseline.meta telemetry/baseline state/telemetry-baseline) ;;
+        groups) paths=(results/groups.tsv results/groups.meta logs/groups results/telemetry-groups.tsv results/telemetry-groups.meta telemetry/groups state/telemetry-groups) ;;
+        individual) paths=(results/individual.tsv results/individual.meta results/individual.plan.tsv results/individual.boundaries.ndjson logs/individual state/individual-attempts state/individual-finalize results/telemetry-individual.tsv results/telemetry-individual.meta telemetry/individual state/telemetry-individual) ;;
+        pinned-concurrent) paths=(results/pinned-concurrent.tsv results/pinned-concurrent.meta results/pinned-concurrent.groups.tsv results/pinned-concurrent.plan.tsv results/pinned-concurrent.boundaries.ndjson results/pinned-concurrent.unavailable.meta state/phase-pinned-concurrent-unavailable.done logs/pinned-concurrent state/pinned-concurrent-waves state/pinned-concurrent-finalize results/telemetry-pinned-concurrent.tsv results/telemetry-pinned-concurrent.meta telemetry/pinned-concurrent state/telemetry-pinned-concurrent) ;;
         frequency) paths=(results/frequency-ab.tsv results/frequency-ab.meta results/frequency-cap.tsv results/frequency-cap.meta) ;;
-        gdb) paths=(results/gdb.meta results/gdb.manifest gdb logs/gdb) ;;
+        gdb) paths=(results/gdb.meta results/gdb.manifest gdb logs/gdb results/telemetry-gdb.tsv results/telemetry-gdb.meta telemetry/gdb state/telemetry-gdb) ;;
         *) diag_die "--redo: unsupported phase '$phase'" ;;
       esac
       if [[ "$phase" == groups ]]; then
@@ -1902,6 +2316,10 @@ redo_marker_temp_cleanup() {
     GROUP_PLAN_TEMP=""
     GROUP_PLAN_DIGEST=""
   fi
+  if [[ -n "$PINNED_CONTEXTS_TEMP" ]]; then
+    case "$PINNED_CONTEXTS_TEMP" in /tmp/.pinned-contexts.*) rm -f -- "$PINNED_CONTEXTS_TEMP" ;; esac
+    PINNED_CONTEXTS_TEMP=""
+  fi
   if [[ -n "$GROUP_META_TEMP" ]]; then
     case "$GROUP_META_TEMP" in "${OUT_DIR:-}/results"/.groups.meta.*) rm -f -- "$GROUP_META_TEMP" ;; esac
     GROUP_META_TEMP=""
@@ -1934,6 +2352,12 @@ declare -a GROUP_NAME=()
 declare -a GROUP_KIND=()
 declare -a GROUP_CPUS=()
 declare -a GROUP_CLUSTER=()
+declare -a CONCURRENT_NAME=()
+declare -a CONCURRENT_KIND=()
+declare -a CONCURRENT_CPUS=()
+declare -a CONCURRENT_CLUSTER=()
+declare -a CONCURRENT_CONTROLLER=()
+PINNED_CONCURRENT_UNAVAILABLE_REASON=""
 
 add_group() {
   GROUP_NAME+=("$1")
@@ -1942,9 +2366,123 @@ add_group() {
   GROUP_CLUSTER+=("$4")
 }
 
+add_concurrent_context() {
+  CONCURRENT_NAME+=("$1")
+  CONCURRENT_KIND+=("$2")
+  CONCURRENT_CPUS+=("$3")
+  CONCURRENT_CLUSTER+=("$4")
+  CONCURRENT_CONTROLLER+=("$5")
+}
+
 # unique sorted cpu list from stdin expansion of $1
 cpu_list_sorted() {
   diag_cpulist_expand "$1" | sort -n | uniq
+}
+
+cpulist_first_outside() {
+  local active="$1" candidate
+  while read -r candidate; do
+    diag_cpulist_contains "$active" "$candidate" || {
+      printf '%s\n' "$candidate"
+      return 0
+    }
+  done < <(cpu_list_sorted "$ONLINE_CPUS")
+  return 1
+}
+
+add_partitioned_concurrent_contexts() {
+  local base_name="$1" kind="$2" cpulist="$3"
+  local -a cpus=() unit_keys=()
+  mapfile -t cpus < <(cpu_list_sorted "$cpulist")
+  ((${#cpus[@]} >= 2)) || return 1
+  declare -A units=()
+  local cpu package_id core_id key
+  for cpu in "${cpus[@]}"; do
+    package_id="$(cat "/sys/devices/system/cpu/cpu${cpu}/topology/physical_package_id" 2> /dev/null || true)"
+    core_id="$(cat "/sys/devices/system/cpu/cpu${cpu}/topology/core_id" 2> /dev/null || true)"
+    [[ "$package_id" =~ ^(0|[1-9][0-9]*)$ ]] || package_id=unknown
+    [[ "$core_id" =~ ^(0|[1-9][0-9]*)$ ]] || core_id="cpu${cpu}"
+    key="$package_id:$core_id"
+    units[$key]="${units[$key]:+${units[$key]},}$cpu"
+  done
+  mapfile -t unit_keys < <(printf '%s\n' "${!units[@]}" | LC_ALL=C sort)
+  local -a left=() right=() members=()
+  local index=0 member
+  if ((${#unit_keys[@]} >= 2)); then
+    for key in "${unit_keys[@]}"; do
+      IFS=',' read -ra members <<< "${units[$key]}"
+      if ((index % 2 == 0)); then left+=("${members[@]}"); else right+=("${members[@]}"); fi
+      index=$((index + 1))
+    done
+  else
+    for member in "${cpus[@]}"; do
+      if ((index % 2 == 0)); then left+=("$member"); else right+=("$member"); fi
+      index=$((index + 1))
+    done
+  fi
+  ((${#left[@]} > 0 && ${#right[@]} > 0)) || return 1
+  local left_list right_list left_controller right_controller
+  left_list="$(printf '%s\n' "${left[@]}" | sort -n -u | diag_cpulist_compress)"
+  right_list="$(printf '%s\n' "${right[@]}" | sort -n -u | diag_cpulist_compress)"
+  left_controller="$(cpulist_first_outside "$left_list")" || return 1
+  right_controller="$(cpulist_first_outside "$right_list")" || return 1
+  add_concurrent_context "${base_name}-a" "$kind" "$left_list" "-" "$left_controller"
+  add_concurrent_context "${base_name}-b" "$kind" "$right_list" "-" "$right_controller"
+}
+
+build_concurrent_contexts() {
+  CONCURRENT_NAME=()
+  CONCURRENT_KIND=()
+  CONCURRENT_CPUS=()
+  CONCURRENT_CLUSTER=()
+  CONCURRENT_CONTROLLER=()
+  PINNED_CONCURRENT_UNAVAILABLE_REASON=""
+  local i controller
+  for ((i = 0; i < ${#GROUP_NAME[@]}; i++)); do
+    if controller="$(cpulist_first_outside "${GROUP_CPUS[$i]}")"; then
+      add_concurrent_context "${GROUP_NAME[$i]}" "${GROUP_KIND[$i]}" \
+        "${GROUP_CPUS[$i]}" "${GROUP_CLUSTER[$i]}" "$controller"
+    elif ! add_partitioned_concurrent_contexts "${GROUP_NAME[$i]}" \
+      "${GROUP_KIND[$i]}-partition" "${GROUP_CPUS[$i]}"; then
+      PINNED_CONCURRENT_UNAVAILABLE_REASON="no topology partition leaves a controller CPU outside the active set"
+      break
+    fi
+  done
+  if [[ -n "$PINNED_CONCURRENT_UNAVAILABLE_REASON" ]]; then
+    CONCURRENT_NAME=()
+    CONCURRENT_KIND=()
+    CONCURRENT_CPUS=()
+    CONCURRENT_CLUSTER=()
+    CONCURRENT_CONTROLLER=()
+  fi
+  if ((${#CONCURRENT_NAME[@]} == 0)) && [[ -z "$PINNED_CONCURRENT_UNAVAILABLE_REASON" ]]; then
+    PINNED_CONCURRENT_UNAVAILABLE_REASON="no valid pinned-concurrent topology context was discovered"
+  fi
+}
+
+pinned_contexts_prepare() {
+  if [[ -n "$PINNED_CONTEXTS_TEMP" && -f "$PINNED_CONTEXTS_TEMP" &&
+    ! -L "$PINNED_CONTEXTS_TEMP" ]]; then
+    return 0
+  fi
+  ((${#CONCURRENT_NAME[@]} > 0)) || return 1
+  PINNED_CONTEXTS_TEMP="$(mktemp /tmp/.pinned-contexts.XXXXXX)" || return 1
+  chmod 0600 "$PINNED_CONTEXTS_TEMP" || return 1
+  local i comma="" cpus_json
+  printf '[' > "$PINNED_CONTEXTS_TEMP" || return 1
+  for ((i = 0; i < ${#CONCURRENT_NAME[@]}; i++)); do
+    [[ "${CONCURRENT_NAME[$i]}" =~ ^[a-z][a-z0-9_-]{0,63}$ &&
+      "${CONCURRENT_KIND[$i]}" =~ ^[a-z][a-z0-9-]{0,31}$ &&
+      "${CONCURRENT_CONTROLLER[$i]}" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+    cpus_json="$(cpu_list_sorted "${CONCURRENT_CPUS[$i]}" | paste -sd, -)" || return 1
+    [[ -n "$cpus_json" ]] || return 1
+    printf '%s{"group":"%s","kind":"%s","cpus":[%s],"cluster":"%s","controllerCpu":%s}' \
+      "$comma" "${CONCURRENT_NAME[$i]}" "${CONCURRENT_KIND[$i]}" "$cpus_json" \
+      "${CONCURRENT_CLUSTER[$i]}" "${CONCURRENT_CONTROLLER[$i]}" \
+      >> "$PINNED_CONTEXTS_TEMP" || return 1
+    comma=,
+  done
+  printf ']\n' >> "$PINNED_CONTEXTS_TEMP" || return 1
 }
 
 discover_topology() {
@@ -1963,6 +2501,17 @@ discover_topology() {
     E_CORES="$(diag_cpulist_intersect "$(cat /sys/devices/cpu_atom/cpus)" "$ONLINE_CPUS")"
   fi
 
+  if [[ -n "$P_CORES" || -n "$E_CORES" ]]; then
+    local overlap classified
+    overlap="$(diag_cpulist_intersect "$P_CORES" "$E_CORES")"
+    [[ -z "$overlap" ]] ||
+      diag_die "sysfs P/E CPU class masks overlap ($overlap); refusing an ambiguous topology plan"
+    classified="$({ cpu_list_sorted "$P_CORES"; cpu_list_sorted "$E_CORES"; } |
+      sort -n -u | diag_cpulist_compress)"
+    [[ "$classified" == "$ONLINE_CPUS" ]] ||
+      diag_die "sysfs P/E CPU class masks do not exactly cover the usable CPU set ($ONLINE_CPUS); discovered $classified"
+  fi
+
   if [[ -n "$P_CORES" ]]; then
     add_group "pcores" "pcore" "$P_CORES" "-"
   fi
@@ -1970,7 +2519,7 @@ discover_topology() {
     add_group "ecores" "ecore" "$E_CORES" "-"
     # Individual E-core clusters by topology/cluster_id (fallback: shared L2).
     declare -A cluster_map=()
-    local cpu cid
+    local cpu cid package_id cluster_key
     while read -r cpu; do
       cid="unknown"
       if [[ -r "/sys/devices/system/cpu/cpu${cpu}/topology/cluster_id" ]]; then
@@ -1987,24 +2536,33 @@ discover_topology() {
         shared_l2="$(diag_cpulist_intersect "$shared_l2" "$ONLINE_CPUS")"
         [[ -n "$shared_l2" ]] && cid="l2:$shared_l2"
       fi
-      cluster_map[$cid]="${cluster_map[$cid]:+${cluster_map[$cid]},}$cpu"
+      package_id="$(cat "/sys/devices/system/cpu/cpu${cpu}/topology/physical_package_id" 2> /dev/null || true)"
+      [[ "$package_id" =~ ^(0|[1-9][0-9]*)$ ]] || package_id=unknown
+      cluster_key="$package_id|$cid"
+      cluster_map[$cluster_key]="${cluster_map[$cluster_key]:+${cluster_map[$cluster_key]},}$cpu"
     done < <(cpu_list_sorted "$E_CORES")
-    local cid_key cpus group_name cluster_hash
+    local cid_key cpus group_name cluster_hash stored_cluster stored_package raw_cluster
     while read -r cid_key; do
       [[ -n "$cid_key" ]] || continue
       cpus="$(cpu_list_sorted "${cluster_map[$cid_key]}" | diag_cpulist_compress)"
-      if [[ "$cid_key" == l2:* ]]; then
-        cluster_hash="$(printf '%s' "$cid_key" | sha256sum | cut -c1-12)"
+      stored_package="${cid_key%%|*}"
+      raw_cluster="${cid_key#*|}"
+      if [[ "$raw_cluster" == l2:* ]]; then
+        stored_cluster="$raw_cluster"
+        cluster_hash="$(printf '%s' "$stored_cluster" | sha256sum | cut -c1-12)"
         group_name="ecluster-l2-$cluster_hash"
       else
-        group_name="ecluster-${cid_key}"
+        stored_cluster="topo:${stored_package}:${raw_cluster}"
+        cluster_hash="$(printf '%s' "$stored_cluster" | sha256sum | cut -c1-12)"
+        group_name="ecluster-topo-$cluster_hash"
       fi
-      add_group "$group_name" "ecluster" "$cpus" "$cid_key"
+      add_group "$group_name" "ecluster" "$cpus" "$stored_cluster"
     done < <(printf '%s\n' "${!cluster_map[@]}" | LC_ALL=C sort)
   fi
   if [[ -z "$P_CORES" && -z "$E_CORES" ]]; then
     add_group "all-cpus" "uniform" "$ONLINE_CPUS" "-"
   fi
+  build_concurrent_contexts
 }
 
 group_children() {
@@ -2049,6 +2607,415 @@ safety_gate() {
 # ---------------------------------------------------------------------------
 # Phase runners
 # ---------------------------------------------------------------------------
+
+telemetry_active_clear() {
+  TELEMETRY_ACTIVE_PHASE=""
+  TELEMETRY_ACTIVE_TAG=""
+  TELEMETRY_ACTIVE_GENERATION=""
+  TELEMETRY_ACTIVE_SEGMENT=""
+  TELEMETRY_ACTIVE_LOG=""
+  TELEMETRY_ACTIVE_BOUNDARY=""
+  TELEMETRY_ACTIVE_STATE=""
+  TELEMETRY_BOUNDARY_STARTED=0
+}
+
+telemetry_unstarted_artifacts_discard() {
+  [[ "$TELEMETRY_BOUNDARY_STARTED" == 0 && -z "${DIAG_TELEMETRY_PID:-}" &&
+    -n "$TELEMETRY_ACTIVE_LOG" && -n "$TELEMETRY_ACTIVE_STATE" &&
+    -n "$TELEMETRY_ACTIVE_BOUNDARY" ]] || return 1
+  local path
+  for path in "$TELEMETRY_ACTIVE_LOG" "$TELEMETRY_ACTIVE_STATE" \
+    "$TELEMETRY_ACTIVE_BOUNDARY"; do
+    [[ ! -e "$path" && ! -L "$path" ]] || bundle_owned_single_regular "$path" || return 1
+  done
+  bundle_owned_real_dir "${TELEMETRY_ACTIVE_LOG%/*}" &&
+    bundle_owned_real_dir "${TELEMETRY_ACTIVE_STATE%/*}" || return 1
+  for path in "$TELEMETRY_ACTIVE_LOG" "$TELEMETRY_ACTIVE_STATE" \
+    "$TELEMETRY_ACTIVE_BOUNDARY"; do
+    [[ ! -e "$path" && ! -L "$path" ]] || rm -f -- "$path" || return 1
+  done
+  sync -f "${TELEMETRY_ACTIVE_LOG%/*}" &&
+    sync -f "${TELEMETRY_ACTIVE_STATE%/*}"
+}
+
+telemetry_phase_generation_read() {
+  local phase="$1" directory="$STATE_DIR/telemetry-$phase"
+  local file="$directory/generation" generation size lines
+  bundle_prepare_dir telemetry || return 1
+  bundle_prepare_dir "telemetry/$phase" || return 1
+  bundle_prepare_dir "state/telemetry-$phase" || return 1
+  if [[ ! -e "$file" && ! -L "$file" ]]; then
+    bundle_create_empty_exclusive "$file" 0600 || return 1
+    generation="$(node "$LIB/telemetry-session.mjs" mint-generation)" || return 1
+    [[ "$generation" =~ ^[a-f0-9]{32}$ ]] || return 1
+    printf '%s\n' "$generation" > "$file" || return 1
+    sync -f "$file" && sync -f "$directory" || return 1
+  fi
+  bundle_owned_single_regular "$file" || return 1
+  size="$(stat -c %s -- "$file" 2> /dev/null)" || return 1
+  lines="$(wc -l < "$file")" || return 1
+  IFS= read -r generation < "$file" || return 1
+  [[ "$size" == 33 && "$lines" == 1 && "$generation" =~ ^[a-f0-9]{32}$ ]] || return 1
+  printf '%s\n' "$generation"
+}
+
+telemetry_sampler_start() {
+  local phase="$1" tag="$2" segment="$3" generation i pid expected_start
+  [[ -z "${DIAG_TELEMETRY_PID:-}" && -z "$TELEMETRY_ACTIVE_PHASE" ]] || return 1
+  [[ "$phase" =~ ^(baseline|groups|individual|pinned-concurrent|gdb)$ &&
+    "$tag" =~ ^[a-z0-9][a-z0-9_.-]{0,127}$ &&
+    "$segment" =~ ^[1-9][0-9]*$ ]] || return 1
+  generation="$(telemetry_phase_generation_read "$phase")" || return 1
+  TELEMETRY_ACTIVE_PHASE="$phase"
+  TELEMETRY_ACTIVE_TAG="$tag"
+  TELEMETRY_ACTIVE_GENERATION="$generation"
+  TELEMETRY_ACTIVE_SEGMENT="$segment"
+  TELEMETRY_ACTIVE_LOG="$OUT_DIR/telemetry/$phase/$generation-$segment.ndjson"
+  TELEMETRY_ACTIVE_BOUNDARY="$OUT_DIR/telemetry/$phase/$generation-$segment.boundary.json"
+  TELEMETRY_ACTIVE_STATE="$STATE_DIR/telemetry-$phase/$generation-$segment.start.json"
+  [[ ! -e "$TELEMETRY_ACTIVE_LOG" && ! -L "$TELEMETRY_ACTIVE_LOG" &&
+    ! -e "$TELEMETRY_ACTIVE_BOUNDARY" && ! -L "$TELEMETRY_ACTIVE_BOUNDARY" &&
+    ! -e "$TELEMETRY_ACTIVE_STATE" && ! -L "$TELEMETRY_ACTIVE_STATE" ]] || {
+    telemetry_active_clear
+    return 1
+  }
+  diag_supervised_group_start DIAG_TELEMETRY_PID "telemetry sampler" \
+    node "$LIB/telemetry-sampler.mjs" --output "$TELEMETRY_ACTIVE_LOG" \
+    --cpus "$ONLINE_CPUS" --interval-ms "$TELEMETRY_INTERVAL_MS" \
+    --no-turbo-path /sys/devices/system/cpu/intel_pstate/no_turbo || {
+    if [[ -n "${DIAG_TELEMETRY_PID:-}" ]]; then
+      telemetry_segment_stop || return "$DIAG_OPERATIONAL_ERROR_RC"
+    else
+      telemetry_unstarted_artifacts_discard || true
+    fi
+    telemetry_active_clear
+    return "$DIAG_OPERATIONAL_ERROR_RC"
+  }
+  pid="$DIAG_TELEMETRY_PID"
+  expected_start="${DIAG_SUPERVISED_GROUP_START_TICKS[DIAG_TELEMETRY_PID]:-}"
+  for ((i = 0; i < 100; i++)); do
+    grep -q '"type":"telemetry_sample"' "$TELEMETRY_ACTIVE_LOG" 2> /dev/null && return 0
+    diag_is_uint "$expected_start" &&
+      diag_process_identity_is_live "$pid" "$expected_start" || break
+    sleep 0.05
+  done
+  diag_warn "$phase telemetry sampler did not produce its initial sample"
+  telemetry_segment_stop || return "$DIAG_OPERATIONAL_ERROR_RC"
+  return "$DIAG_OPERATIONAL_ERROR_RC"
+}
+
+telemetry_boundary_start() {
+  [[ -n "$TELEMETRY_ACTIVE_PHASE" && -n "${DIAG_TELEMETRY_PID:-}" &&
+    "$TELEMETRY_BOUNDARY_STARTED" == 0 ]] || return 1
+  node "$LIB/telemetry-session.mjs" start \
+    --state-file "$TELEMETRY_ACTIVE_STATE" --phase "$TELEMETRY_ACTIVE_PHASE" \
+    --tag "$TELEMETRY_ACTIVE_TAG" --generation "$TELEMETRY_ACTIVE_GENERATION" \
+    --segment "$TELEMETRY_ACTIVE_SEGMENT" \
+    --no-turbo-path /sys/devices/system/cpu/intel_pstate/no_turbo > /dev/null || return 1
+  TELEMETRY_BOUNDARY_STARTED=1
+}
+
+telemetry_segment_stop() {
+  [[ -n "$TELEMETRY_ACTIVE_PHASE" || -n "${DIAG_TELEMETRY_PID:-}" ]] || {
+    telemetry_active_clear
+    return 0
+  }
+  local stop_rc=0 premature=0 pid="${DIAG_TELEMETRY_PID:-}"
+  local expected_start="${DIAG_SUPERVISED_GROUP_START_TICKS[DIAG_TELEMETRY_PID]:-}"
+  if [[ -n "$pid" ]]; then
+    diag_is_uint "$expected_start" &&
+      diag_process_identity_is_live "$pid" "$expected_start" || premature=1
+  fi
+  if [[ "$TELEMETRY_BOUNDARY_STARTED" == 1 ]]; then
+    if node "$LIB/telemetry-session.mjs" finish \
+      --state-file "$TELEMETRY_ACTIVE_STATE" \
+      --boundary-output "$TELEMETRY_ACTIVE_BOUNDARY" \
+      --no-turbo-path /sys/devices/system/cpu/intel_pstate/no_turbo \
+      > /dev/null 2>&1; then
+      TELEMETRY_BOUNDARY_STARTED=2
+    else
+      TELEMETRY_DEGRADED=1
+      diag_warn "$TELEMETRY_ACTIVE_PHASE telemetry boundary could not be finalized; workload evidence is retained"
+    fi
+  fi
+  diag_supervised_group_stop DIAG_TELEMETRY_PID "telemetry sampler" 40 || stop_rc=$?
+  if ((stop_rc != 0)); then
+    return "$stop_rc"
+  fi
+  if [[ "$TELEMETRY_BOUNDARY_STARTED" == 0 ]]; then
+    telemetry_unstarted_artifacts_discard || {
+      TELEMETRY_DEGRADED=1
+      diag_warn "$TELEMETRY_ACTIVE_PHASE telemetry left an unstarted segment that could not be safely discarded"
+    }
+  fi
+  if ((premature == 1)); then
+    TELEMETRY_DEGRADED=1
+    diag_warn "$TELEMETRY_ACTIVE_PHASE telemetry sampler ended before its workload boundary; workload evidence is retained"
+  fi
+  telemetry_active_clear
+  return 0
+}
+
+TELEMETRY_WORKLOAD_GENERATION=""
+TELEMETRY_WORKLOAD_BINDING_SHA256=""
+TELEMETRY_WORKLOAD_BOUNDARIES_SHA256=""
+TELEMETRY_WORKLOAD_BOUNDARY_ROW_COUNT=""
+telemetry_workload_binding_read() {
+  local phase="$1" output line key value count=0
+  local version="" format="" bound_phase="" generation="" digest="" boundaries="" boundary_rows=""
+  local -A seen=()
+  output="$(node "$LIB/telemetry-workload-binding.mjs" "$phase" "$OUT_DIR" 2> /dev/null)" || return 1
+  ((${#output} > 0 && ${#output} <= 1024)) || return 1
+  [[ "$output" != *$'\r'* ]] || return 1
+  while IFS= read -r line; do
+    [[ "$line" =~ ^([A-Z][A-Z0-9_]*)=([^[:space:]]+)$ ]] || return 1
+    key="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[2]}"
+    [[ -z "${seen[$key]+x}" ]] || return 1
+    seen["$key"]=1
+    ((count += 1))
+    case "$key" in
+      VERSION) version="$value" ;;
+      FORMAT) format="$value" ;;
+      PHASE) bound_phase="$value" ;;
+      WORKLOAD_GENERATION) generation="$value" ;;
+      WORKLOAD_BINDING_SHA256) digest="$value" ;;
+      WORKLOAD_BOUNDARIES_SHA256) boundaries="$value" ;;
+      WORKLOAD_BOUNDARY_ROW_COUNT) boundary_rows="$value" ;;
+      *) return 1 ;;
+    esac
+  done <<< "$output"
+  [[ "$count" == 7 && "$version" == 1 &&
+    "$format" == node-pglite-diagnostics/telemetry-workload-binding/v1 &&
+    "$bound_phase" == "$phase" && "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+  if [[ "$phase" == baseline ]]; then
+    [[ "$generation" == - ]] || return 1
+  else
+    [[ "$generation" =~ ^[0-9a-f]{32}$ ]] || return 1
+  fi
+  if [[ "$phase" == individual || "$phase" == pinned-concurrent ]]; then
+    [[ "$boundaries" =~ ^[0-9a-f]{64}$ ]] || return 1
+    [[ "$boundary_rows" =~ ^[1-9][0-9]*$ && ${#boundary_rows} -le 8 ]] || return 1
+    ((boundary_rows <= 20000000)) || return 1
+  else
+    [[ "$boundaries" == - && "$boundary_rows" == - ]] || return 1
+  fi
+  TELEMETRY_WORKLOAD_GENERATION="$generation"
+  TELEMETRY_WORKLOAD_BINDING_SHA256="$digest"
+  TELEMETRY_WORKLOAD_BOUNDARIES_SHA256="$boundaries"
+  TELEMETRY_WORKLOAD_BOUNDARY_ROW_COUNT="$boundary_rows"
+}
+
+telemetry_phase_publish() {
+  local phase="$1" segments_json="$2" generation index meta output
+  generation="$(telemetry_phase_generation_read "$phase")" || {
+    TELEMETRY_DEGRADED=1
+    diag_warn "$phase telemetry generation is unavailable; workload evidence is retained"
+    return 0
+  }
+  index="$OUT_DIR/results/telemetry-$phase.tsv"
+  meta="$OUT_DIR/results/telemetry-$phase.meta"
+  if [[ -e "$index" || -L "$index" || -e "$meta" || -L "$meta" ]]; then
+    TELEMETRY_DEGRADED=1
+    diag_warn "$phase telemetry envelope already exists or is unsafe; workload evidence is retained"
+    return 0
+  fi
+  telemetry_workload_binding_read "$phase" || {
+    TELEMETRY_DEGRADED=1
+    diag_warn "$phase telemetry could not bind the exact owning workload evidence; workload evidence is retained"
+    return 0
+  }
+  output="$(node "$LIB/telemetry-session.mjs" envelope --bundle-dir "$OUT_DIR" \
+    --phase "$phase" --generation "$generation" --interval-ms "$TELEMETRY_INTERVAL_MS" \
+    --workload-generation "$TELEMETRY_WORKLOAD_GENERATION" \
+    --workload-binding-sha256 "$TELEMETRY_WORKLOAD_BINDING_SHA256" \
+    --workload-boundaries-sha256 "$TELEMETRY_WORKLOAD_BOUNDARIES_SHA256" \
+    --workload-boundary-row-count "$TELEMETRY_WORKLOAD_BOUNDARY_ROW_COUNT" \
+    --segments-json "$segments_json" --index-output "$index" --meta-output "$meta" \
+    2> /dev/null)" || {
+    TELEMETRY_DEGRADED=1
+    diag_warn "$phase telemetry envelope could not be validated; workload evidence is retained"
+    return 0
+  }
+  [[ "$output" =~ \"status\":\"(complete|incomplete)\" ]] || {
+    TELEMETRY_DEGRADED=1
+    diag_warn "$phase telemetry envelope returned an unknown status; workload evidence is retained"
+    return 0
+  }
+  if [[ "${BASH_REMATCH[1]}" != complete ]]; then
+    TELEMETRY_DEGRADED=1
+    diag_warn "$phase telemetry is incomplete; workload evidence remains independently valid"
+  fi
+}
+
+TELEMETRY_RESUME_NEXT_SEGMENT=""
+TELEMETRY_RESUME_SEGMENTS_JSON=""
+TELEMETRY_RESUME_AVAILABLE=0
+telemetry_resumable_prepare() {
+  local phase="$1" tag_prefix="$2" generation phase_dir state_dir name kind segment
+  local -a segments=() state_segments=()
+  local expected=1 json="[" comma="" entry_count=0 state_entry_count=0 state_index
+  generation="$(telemetry_phase_generation_read "$phase")" || return 1
+  phase_dir="$OUT_DIR/telemetry/$phase"
+  state_dir="$STATE_DIR/telemetry-$phase"
+  while IFS=$'\t' read -r name kind; do
+    [[ -n "$name" ]] || continue
+    ((entry_count += 1))
+    [[ "$kind" == f ]] || return 1
+    if [[ "$name" =~ ^${generation}-([1-9][0-9]*)\.ndjson$ ]]; then
+      segments+=("${BASH_REMATCH[1]}")
+    elif [[ "$name" =~ ^${generation}-([1-9][0-9]*)\.boundary\.json$ ]]; then
+      :
+    else
+      return 1
+    fi
+  done < <(find "$phase_dir" -mindepth 1 -maxdepth 1 -printf '%f\t%y\n' | LC_ALL=C sort)
+  if ((${#segments[@]} > 0)); then
+    mapfile -t segments < <(printf '%s\n' "${segments[@]}" | sort -n)
+  fi
+  while IFS=$'\t' read -r name kind; do
+    [[ -n "$name" ]] || continue
+    ((state_entry_count += 1))
+    [[ "$kind" == f ]] || return 1
+    if [[ "$name" == generation ]]; then
+      :
+    elif [[ "$name" =~ ^${generation}-([1-9][0-9]*)\.start\.json$ ]]; then
+      state_segments+=("${BASH_REMATCH[1]}")
+    else
+      return 1
+    fi
+  done < <(find "$state_dir" -mindepth 1 -maxdepth 1 -printf '%f\t%y\n' | LC_ALL=C sort)
+  if ((${#state_segments[@]} > 0)); then
+    mapfile -t state_segments < <(printf '%s\n' "${state_segments[@]}" | sort -n)
+  fi
+  ((${#state_segments[@]} == ${#segments[@]} &&
+    state_entry_count == ${#segments[@]} + 1)) || return 1
+  for ((state_index = 0; state_index < ${#segments[@]}; state_index++)); do
+    [[ "${state_segments[$state_index]}" == "${segments[$state_index]}" ]] || return 1
+  done
+  for segment in "${segments[@]}"; do
+    [[ "$segment" == "$expected" ]] || return 1
+    bundle_owned_single_regular "$phase_dir/$generation-$segment.ndjson" || return 1
+    bundle_owned_single_regular "$state_dir/$generation-$segment.start.json" || return 1
+    if [[ ! -e "$phase_dir/$generation-$segment.boundary.json" &&
+      ! -L "$phase_dir/$generation-$segment.boundary.json" ]]; then
+      node "$LIB/telemetry-session.mjs" finish --recover \
+        --state-file "$state_dir/$generation-$segment.start.json" \
+        --boundary-output "$phase_dir/$generation-$segment.boundary.json" \
+        --no-turbo-path /sys/devices/system/cpu/intel_pstate/no_turbo \
+        > /dev/null || return 1
+      ((entry_count += 1))
+      TELEMETRY_DEGRADED=1
+      diag_warn "$phase telemetry session $segment was recovered after interruption and remains descriptive"
+    fi
+    bundle_owned_single_regular "$phase_dir/$generation-$segment.boundary.json" || return 1
+    printf -v json '%s%s{"segment":%s,"tag":"%s%s"}' \
+      "$json" "$comma" "$segment" "$tag_prefix" "$segment"
+    comma=,
+    expected=$((expected + 1))
+  done
+  ((entry_count == ${#segments[@]} * 2)) || return 1
+  TELEMETRY_RESUME_NEXT_SEGMENT="$expected"
+  TELEMETRY_RESUME_SEGMENTS_JSON="$json]"
+}
+
+# Telemetry is deliberately descriptive and cannot own workload authority.
+# Once a resumable workload has committed state, a damaged or cross-boot
+# telemetry session is preserved for the collector to describe, but it must
+# not erase or prevent completion of the generation-bound workload evidence.
+telemetry_resumable_prepare_descriptive() {
+  local phase="$1" tag_prefix="$2"
+  TELEMETRY_RESUME_AVAILABLE=0
+  TELEMETRY_RESUME_NEXT_SEGMENT=""
+  TELEMETRY_RESUME_SEGMENTS_JSON="[]"
+  if telemetry_resumable_prepare "$phase" "$tag_prefix"; then
+    TELEMETRY_RESUME_AVAILABLE=1
+    return 0
+  fi
+  TELEMETRY_DEGRADED=1
+  diag_warn "$phase telemetry resume state is invalid or unavailable; preserving it and continuing the independently bound workload protocol without further telemetry"
+  return 0
+}
+
+telemetry_resumable_append_active() {
+  local tag_prefix="$1" segment="$2" json="$TELEMETRY_RESUME_SEGMENTS_JSON"
+  [[ "$segment" == "$TELEMETRY_RESUME_NEXT_SEGMENT" && "$json" == \[*\] ]] || return 1
+  if [[ "$json" == "[]" ]]; then
+    TELEMETRY_RESUME_SEGMENTS_JSON="[{\"segment\":$segment,\"tag\":\"$tag_prefix$segment\"}]"
+  else
+    TELEMETRY_RESUME_SEGMENTS_JSON="${json%]},{\"segment\":$segment,\"tag\":\"$tag_prefix$segment\"}]"
+  fi
+  TELEMETRY_RESUME_NEXT_SEGMENT=$((segment + 1))
+}
+
+# Final protocol outputs are deterministic projections of generation-bound,
+# immutable state. Keep their staging directories at fixed, redo-owned paths
+# so SIGKILL cannot strand untracked wildcard directories. A retry discards
+# only a fully validated set of known derived files, then regenerates them.
+protocol_finalize_stage_prepare() {
+  local stage="$1"
+  shift
+  case "$stage" in
+    "$STATE_DIR/individual-finalize" | "$STATE_DIR/pinned-concurrent-finalize") ;;
+    *) return 1 ;;
+  esac
+  bundle_owned_real_dir "$STATE_DIR" || return 1
+  local -A allowed=()
+  local name entry
+  for name in "$@"; do
+    [[ "$name" =~ ^[a-z0-9][a-z0-9.-]{0,127}$ ]] || return 1
+    allowed[$name]=1
+  done
+  if [[ -e "$stage" || -L "$stage" ]]; then
+    bundle_owned_real_dir "$stage" || return 1
+    while IFS= read -r name; do
+      [[ -n "$name" && -n "${allowed[$name]:-}" ]] || return 1
+      entry="$stage/$name"
+      bundle_owned_single_regular "$entry" || return 1
+    done < <(find "$stage" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
+    while IFS= read -r name; do
+      [[ -n "$name" ]] || continue
+      rm -f -- "$stage/$name" || return 1
+    done < <(find "$stage" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
+    rmdir -- "$stage" || return 1
+    sync -f "$STATE_DIR" || return 1
+  fi
+  mkdir -- "$stage" || return 1
+  chmod 0700 -- "$stage" || return 1
+  sync -f "$STATE_DIR" || return 1
+  bundle_owned_real_dir "$stage"
+}
+
+protocol_finalize_stage_close() {
+  local stage="$1"
+  case "$stage" in
+    "$STATE_DIR/individual-finalize" | "$STATE_DIR/pinned-concurrent-finalize") ;;
+    *) return 1 ;;
+  esac
+  bundle_owned_real_dir "$stage" || return 1
+  [[ -z "$(find "$stage" -mindepth 1 -maxdepth 1 -print -quit 2> /dev/null)" ]] || return 1
+  rmdir -- "$stage" || return 1
+  sync -f "$STATE_DIR"
+}
+
+protocol_file_is_exact_prefix() {
+  local prefix="$1" complete="$2" prefix_size complete_size
+  bundle_owned_single_regular "$prefix" && bundle_owned_single_regular "$complete" || return 1
+  prefix_size="$(stat -c %s -- "$prefix" 2> /dev/null)" || return 1
+  complete_size="$(stat -c %s -- "$complete" 2> /dev/null)" || return 1
+  [[ "$prefix_size" =~ ^[0-9]+$ && "$complete_size" =~ ^[0-9]+$ ]] || return 1
+  ((prefix_size <= complete_size)) || return 1
+  cmp -n "$prefix_size" -- "$prefix" "$complete" > /dev/null 2>&1
+}
+
+protocol_destination_is_recoverable_prefix() {
+  local destination="$1" complete="$2" allow_absent="$3"
+  if [[ ! -e "$destination" && ! -L "$destination" ]]; then
+    [[ "$allow_absent" == 1 ]]
+    return
+  fi
+  protocol_file_is_exact_prefix "$destination" "$complete"
+}
 
 # Run repro.mjs with epoch-prefixed output. Always returns 0; REPRO_RC holds
 # the repro exit code (1 = failed waves, an expected outcome).
@@ -2097,6 +3064,30 @@ run_individual_logged() {
   ' diag-individual "$SCRIPT_DIR" "$cpu" "$runs" "$tsv" "$first_run" "$logf" \
     "$DIAG_OPERATIONAL_ERROR_RC" || return "$DIAG_OPERATIONAL_ERROR_RC"
   diag_process_group_wait
+}
+
+# Run one pinned-protocol execution unit under the same supervised outer
+# process-group contract as the legacy runners. The Node executor owns its
+# pinned child process groups and responds to TERM/INT by aborting and reaping
+# them before it exits. Canonical stdout stays separate from human diagnostics.
+run_pinned_protocol_logged() {
+  local output="$1" logf="$2" log_fd="" log_fd_path="" create=0 rc=0
+  shift 2
+  : > "$output" || return "$DIAG_OPERATIONAL_ERROR_RC"
+  if [[ -e "$logf" || -L "$logf" ]]; then
+    bundle_owned_single_regular "$logf" || return "$DIAG_OPERATIONAL_ERROR_RC"
+  else
+    create=1
+  fi
+  bundle_append_fd_open protocol "$logf" log_fd log_fd_path "$create" ||
+    return "$DIAG_OPERATIONAL_ERROR_RC"
+  if ! diag_process_group_start "$@" > "$output" 2>> "$log_fd_path"; then
+    rc="$DIAG_OPERATIONAL_ERROR_RC"
+  else
+    diag_process_group_wait || rc=$?
+  fi
+  exec {log_fd}>&- || return "$DIAG_OPERATIONAL_ERROR_RC"
+  return "$rc"
 }
 
 # The runner log is authoritative evidence: capture-fault.sh writes only its
@@ -2575,9 +3566,21 @@ phase_baseline() {
   local logf="logs/baseline/run1.log"
   baseline_prepare_fresh_targets
   diag_log "baseline: $BASELINE_CHILDREN children x $BASELINE_WAVES waves, STOP_ON_FAILURE=0"
+  if [[ "$RUN_SCHEMA_VERSION" == 2 ]]; then
+    telemetry_sampler_start baseline baseline 1 ||
+      diag_die "baseline telemetry failed before workload launch"
+  fi
   diag_freq_sampler_start baseline ||
     diag_die "baseline frequency sampler failed before workload launch"
+  if [[ "$RUN_SCHEMA_VERSION" == 2 ]]; then
+    telemetry_boundary_start ||
+      diag_die "baseline telemetry boundary failed before workload launch"
+  fi
   run_repro_logged "$OUT_DIR/$logf" "-" "$BASELINE_CHILDREN" "$BASELINE_WAVES"
+  if [[ "$RUN_SCHEMA_VERSION" == 2 ]]; then
+    telemetry_segment_stop ||
+      diag_die "baseline telemetry writer could not be confirmed stopped"
+  fi
   diag_freq_sampler_stop ||
     diag_die "baseline sampler could not be confirmed stopped; refusing evidence publication"
   [[ -z "$DIAG_WORKLOAD_PID" ]] ||
@@ -2588,6 +3591,9 @@ phase_baseline() {
     printf 'LOG=%s\n' "$logf"
     printf 'EXIT_CODE=%s\n' "$REPRO_RC"
   } > "$OUT_DIR/results/baseline.meta"
+  if [[ "$RUN_SCHEMA_VERSION" == 2 ]]; then
+    telemetry_phase_publish baseline '[{"segment":1,"tag":"baseline"}]'
+  fi
   baseline_evidence_is_complete --validate-before-mark ||
     diag_die "baseline did not produce a valid complete evidence envelope (rc=$REPRO_RC); preserve it and resume with --redo baseline"
   mark_done baseline
@@ -2600,7 +3606,8 @@ phase_groups() {
     diag_die "cannot safely create groups results; preserve the bundle and resume with --redo groups"
   fi
   groups_meta_publish 0
-  local i name kind cpus cluster children logf freq_tag
+  local i name kind cpus cluster children logf freq_tag telemetry_tag
+  local segments_json="[" segments_comma=""
   local total=${#GROUP_NAME[@]}
   for ((i = 0; i < total; i++)); do
     name="${GROUP_NAME[$i]}"
@@ -2610,11 +3617,24 @@ phase_groups() {
     children="$(group_children "$cpus")"
     logf="logs/groups/${name}.log"
     freq_tag="group-${name}"
+    telemetry_tag="group-${name}"
     groups_require_fresh_row_targets "$name" "$freq_tag"
     diag_log "group $((i + 1))/$total: $name cpus=$cpus children=$children waves=$GROUP_WAVES"
+    if [[ "$RUN_SCHEMA_VERSION" == 2 ]]; then
+      telemetry_sampler_start groups "$telemetry_tag" "$((i + 1))" ||
+        diag_die "group $name telemetry failed before workload launch"
+    fi
     diag_freq_sampler_start "$freq_tag" ||
       diag_die "group $name frequency sampler failed before workload launch"
+    if [[ "$RUN_SCHEMA_VERSION" == 2 ]]; then
+      telemetry_boundary_start ||
+        diag_die "group $name telemetry boundary failed before workload launch"
+    fi
     run_repro_logged "$OUT_DIR/$logf" "$cpus" "$children" "$GROUP_WAVES"
+    if [[ "$RUN_SCHEMA_VERSION" == 2 ]]; then
+      telemetry_segment_stop ||
+        diag_die "group $name telemetry writer could not be confirmed stopped"
+    fi
     diag_freq_sampler_stop ||
       diag_die "group $name sampler could not be confirmed stopped; refusing evidence publication"
     [[ -z "$DIAG_WORKLOAD_PID" ]] ||
@@ -2626,31 +3646,40 @@ phase_groups() {
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$name" "$kind" "$cpus" "$cluster" "$children" "$GROUP_WAVES" \
       "$logf" "$freq_tag" "$REPRO_RC" >> "$OUT_DIR/results/groups.tsv"
+    if [[ "$RUN_SCHEMA_VERSION" == 2 ]]; then
+      printf -v segments_json '%s%s{"segment":%s,"tag":"%s"}' \
+        "$segments_json" "$segments_comma" "$((i + 1))" "$telemetry_tag"
+      segments_comma=,
+    fi
   done
+  segments_json+="]"
   groups_meta_publish 1
+  if [[ "$RUN_SCHEMA_VERSION" == 2 ]]; then
+    telemetry_phase_publish groups "$segments_json"
+  fi
   groups_evidence_is_complete --validate-before-mark ||
     diag_die "groups did not produce a valid complete evidence envelope; preserve it and resume with --redo groups"
   mark_done groups
 }
 
 # ------------------------------------------------------------------
-# Full mode tests the validated stored group-plan CPU union. Default tests CPUs
-# from failed groups, with the full stored union as its no-failure fallback;
-# quick tests failed-group CPUs or records an explicit no-failure skip.
+# Schema 2 tests every usable CPU in a seeded, interleaved schedule. Legacy
+# bundles retain their original mode-dependent target policy exactly.
 INDIVIDUAL_TARGET_CPUS=""
 INDIVIDUAL_TARGET_POLICY=""
 INDIVIDUAL_GROUP_PLAN_DIGEST=""
 INDIVIDUAL_GROUP_GENERATION=""
 compute_individual_targets() {
-  local output line key value
+  local output line key value target_mode="$MODE"
   local seen_policy=0 seen_targets=0 seen_digest=0 seen_group_generation=0
   INDIVIDUAL_TARGET_CPUS=""
   INDIVIDUAL_TARGET_POLICY=""
   INDIVIDUAL_GROUP_PLAN_DIGEST=""
   INDIVIDUAL_GROUP_GENERATION=""
   groups_plan_prepare
+  [[ "$RUN_SCHEMA_VERSION" == 2 ]] && target_mode=schema2
   output="$(node "$LIB/groups-evidence.mjs" --individual-targets \
-    "$OUT_DIR" "$GROUP_PLAN_TEMP" "$GROUP_WAVES" "$MODE")" ||
+    "$OUT_DIR" "$GROUP_PLAN_TEMP" "$GROUP_WAVES" "$target_mode")" ||
     diag_die "cannot derive individual CPU targets from the validated groups evidence; preserve it and resume with --redo groups"
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ "$line" =~ ^([A-Z_]+)=(.*)$ ]] ||
@@ -2659,7 +3688,8 @@ compute_individual_targets() {
     case "$key" in
       TARGET_POLICY)
         ((seen_policy == 0)) || diag_die "groups target derivation duplicated its policy"
-        [[ "$value" == failed-groups || "$value" == all-group-cpus || "$value" == quick-skip ]] ||
+        [[ "$value" == failed-groups || "$value" == all-group-cpus ||
+          "$value" == all-usable-cpus || "$value" == quick-skip ]] ||
           diag_die "groups target derivation produced an invalid policy"
         INDIVIDUAL_TARGET_POLICY="$value"; seen_policy=1
         ;;
@@ -2689,7 +3719,220 @@ compute_individual_targets() {
   fi
   individual_cpulist_is_canonical "$INDIVIDUAL_TARGET_CPUS" ||
     diag_die "groups target derivation produced an invalid CPU list"
+  if [[ "$RUN_SCHEMA_VERSION" == 2 && ( "$INDIVIDUAL_TARGET_POLICY" != all-usable-cpus ||
+    "$INDIVIDUAL_TARGET_CPUS" != "$ONLINE_CPUS" ) ]]; then
+    diag_die "schema 2 individual targets do not exactly cover the usable CPU set ($ONLINE_CPUS)"
+  fi
   return 0
+}
+
+phase_individual_v5() {
+  local tsv="$OUT_DIR/results/individual.tsv"
+  local meta="$OUT_DIR/results/individual.meta"
+  local plan="$OUT_DIR/results/individual.plan.tsv"
+  local boundaries="$OUT_DIR/results/individual.boundaries.ndjson"
+  local attempt_state="$STATE_DIR/individual-attempts"
+  local protocol_log="$OUT_DIR/logs/individual/protocol.log"
+  local no_turbo_path=/sys/devices/system/cpu/intel_pstate/no_turbo
+  local expected_plan_sha expected_plan_bytes expected_plan_rows
+  local expected_generation expected_rows_sha expected_rows_bytes expected_row_count
+  local expected_boundaries_sha expected_boundaries_bytes expected_boundary_rows
+  local progress committed complete total output result stage staged_tsv staged_boundaries
+  local protocol_rc=0 telemetry_segment="" telemetry_started=0
+
+  [[ "$RUN_SCHEMA_VERSION" == 2 && "$INDIVIDUAL_TARGET_POLICY" == all-usable-cpus &&
+    "$INDIVIDUAL_TARGET_CPUS" == "$ONLINE_CPUS" ]] ||
+    diag_die "schema-2 isolated protocol requires the exact usable CPU set"
+  mkdir -p "$OUT_DIR/logs/individual"
+
+  if [[ -e "$meta" || -L "$meta" ]]; then
+    individual_meta_read "$meta" ||
+      diag_die "existing schema-2 individual metadata is invalid; preserve it and use --redo individual"
+    [[ "$INDIVIDUAL_META_VERSION" == 5 && "$INDIVIDUAL_META_SKIPPED" == 0 &&
+      "$INDIVIDUAL_META_TARGET_CPUS" == "$INDIVIDUAL_TARGET_CPUS" &&
+      "$INDIVIDUAL_META_RUNS" == "$INDIVIDUAL_RUNS" &&
+      "$INDIVIDUAL_META_TARGET_POLICY" == all-usable-cpus &&
+      "$INDIVIDUAL_META_GROUP_PLAN_DIGEST" == "$INDIVIDUAL_GROUP_PLAN_DIGEST" &&
+      "$INDIVIDUAL_META_GROUP_GENERATION" == "$INDIVIDUAL_GROUP_GENERATION" &&
+      "$INDIVIDUAL_META_PROTOCOL" == isolated-interleaved-v1 &&
+      "$INDIVIDUAL_META_SCHEDULE_SEED" == "$PROTOCOL_SEED" &&
+      "$INDIVIDUAL_META_SCHEDULE_ALGORITHM" == balanced-cyclic-v1 ]] ||
+      diag_die "existing schema-2 individual metadata does not match this resumable protocol"
+    expected_generation="$INDIVIDUAL_META_GENERATION"
+    expected_plan_sha="$INDIVIDUAL_META_PLAN_SHA256"
+    expected_plan_bytes="$INDIVIDUAL_META_PLAN_BYTES"
+    expected_plan_rows="$INDIVIDUAL_META_PLAN_ROW_COUNT"
+    expected_rows_sha="$INDIVIDUAL_META_ROWS_SHA256"
+    expected_rows_bytes="$INDIVIDUAL_META_ROWS_BYTES"
+    expected_row_count="$INDIVIDUAL_META_ROW_COUNT"
+    expected_boundaries_sha="$INDIVIDUAL_META_BOUNDARIES_SHA256"
+    expected_boundaries_bytes="$INDIVIDUAL_META_BOUNDARIES_BYTES"
+    expected_boundary_rows="$INDIVIDUAL_META_BOUNDARY_ROW_COUNT"
+    bundle_owned_real_dir "$attempt_state" && bundle_owned_single_regular "$plan" &&
+      bundle_owned_single_regular "$tsv" && bundle_owned_single_regular "$boundaries" ||
+      diag_die "schema-2 individual resume artifacts are missing or unsafe"
+    individual_v5_binding_read "$plan" "$tsv" "$boundaries" \
+      "$INDIVIDUAL_TARGET_CPUS" "$INDIVIDUAL_RUNS" \
+      "$([[ "$INDIVIDUAL_META_COMPLETED" == 1 ]] && printf 1 || printf 0)" ||
+      diag_die "schema-2 individual artifacts are not an exact plan-bound prefix"
+    [[ "$INDIVIDUAL_META_PLAN_SHA256" == "$expected_plan_sha" &&
+      "$INDIVIDUAL_META_PLAN_BYTES" == "$expected_plan_bytes" &&
+      "$INDIVIDUAL_META_PLAN_ROW_COUNT" == "$expected_plan_rows" ]] ||
+      diag_die "schema-2 individual plan does not match its metadata binding"
+    INDIVIDUAL_META_GENERATION="$expected_generation"
+    if [[ "$INDIVIDUAL_META_COMPLETED" == 1 ]]; then
+      [[ "$INDIVIDUAL_META_ROWS_SHA256" == "$expected_rows_sha" &&
+        "$INDIVIDUAL_META_ROWS_BYTES" == "$expected_rows_bytes" &&
+        "$INDIVIDUAL_META_ROW_COUNT" == "$expected_row_count" &&
+        "$INDIVIDUAL_META_BOUNDARIES_SHA256" == "$expected_boundaries_sha" &&
+        "$INDIVIDUAL_META_BOUNDARIES_BYTES" == "$expected_boundaries_bytes" &&
+        "$INDIVIDUAL_META_BOUNDARY_ROW_COUNT" == "$expected_boundary_rows" ]] ||
+        diag_die "completed schema-2 individual artifacts do not match their terminal bindings"
+      if [[ -e "$STATE_DIR/individual-finalize" ||
+        -L "$STATE_DIR/individual-finalize" ]]; then
+        protocol_finalize_stage_prepare "$STATE_DIR/individual-finalize" \
+          individual.tsv individual.boundaries.ndjson &&
+          protocol_finalize_stage_close "$STATE_DIR/individual-finalize" ||
+          diag_die "completed isolated evidence has an unsafe stranded finalization stage"
+      fi
+      telemetry_resumable_prepare_descriptive individual individual-session-
+      if ((TELEMETRY_RESUME_AVAILABLE == 1)) &&
+        [[ ! -e "$OUT_DIR/results/telemetry-individual.tsv" &&
+        ! -L "$OUT_DIR/results/telemetry-individual.tsv" &&
+        ! -e "$OUT_DIR/results/telemetry-individual.meta" &&
+        ! -L "$OUT_DIR/results/telemetry-individual.meta" &&
+        "$TELEMETRY_RESUME_SEGMENTS_JSON" != "[]" ]]; then
+        telemetry_phase_publish individual "$TELEMETRY_RESUME_SEGMENTS_JSON"
+      fi
+      mark_done individual
+      individual_evidence_read && [[ "$INDIVIDUAL_EVIDENCE_STATUS" == complete ]] ||
+        diag_die "completed schema-2 individual evidence failed post-marker validation"
+      return 0
+    fi
+  else
+    [[ ! -e "$plan" && ! -L "$plan" && ! -e "$tsv" && ! -L "$tsv" &&
+      ! -e "$boundaries" && ! -L "$boundaries" &&
+      ! -e "$attempt_state" && ! -L "$attempt_state" ]] ||
+      diag_die "existing schema-2 individual artifacts lack resumable metadata; preserve them and use --redo individual"
+    bundle_prepare_dir state/individual-attempts ||
+      diag_die "cannot create a safe isolated protocol state directory"
+    bundle_create_empty_exclusive "$tsv" 0600 &&
+      bundle_create_empty_exclusive "$boundaries" 0600 ||
+      diag_die "cannot create isolated result sidecars exclusively"
+    diag_log_cmd node diagnose-lib/pinned-protocol.mjs plan-isolated \
+      --cpus "$INDIVIDUAL_TARGET_CPUS" --rounds "$INDIVIDUAL_RUNS" \
+      --seed "$PROTOCOL_SEED" --plan-output "$plan"
+    node "$LIB/pinned-protocol.mjs" plan-isolated \
+      --cpus "$INDIVIDUAL_TARGET_CPUS" --rounds "$INDIVIDUAL_RUNS" \
+      --seed "$PROTOCOL_SEED" --plan-output "$plan" > /dev/null ||
+      diag_die "cannot publish the immutable isolated protocol plan"
+    individual_meta_reset_generation
+    INDIVIDUAL_META_GENERATION="$("$DIAG_INDIVIDUAL_NODE_BIN" -e \
+      'process.stdout.write(require("node:crypto").randomBytes(16).toString("hex"))')" ||
+      diag_die "cannot generate isolated evidence generation"
+    INDIVIDUAL_META_PROTOCOL=isolated-interleaved-v1
+    INDIVIDUAL_META_SCHEDULE_SEED="$PROTOCOL_SEED"
+    INDIVIDUAL_META_SCHEDULE_ALGORITHM=balanced-cyclic-v1
+    individual_v5_binding_read "$plan" "$tsv" "$boundaries" \
+      "$INDIVIDUAL_TARGET_CPUS" "$INDIVIDUAL_RUNS" 0 ||
+      diag_die "cannot validate the fresh isolated protocol plan"
+    individual_meta_write "$INDIVIDUAL_TARGET_CPUS" "$INDIVIDUAL_RUNS" 0 0 ""
+  fi
+
+  total=$(( $(diag_cpulist_count "$INDIVIDUAL_TARGET_CPUS") * INDIVIDUAL_RUNS ))
+  progress="$(node "$LIB/pinned-protocol.mjs" next-isolated \
+    --cpus "$INDIVIDUAL_TARGET_CPUS" --rounds "$INDIVIDUAL_RUNS" \
+    --seed "$PROTOCOL_SEED" --generation "$INDIVIDUAL_META_GENERATION" \
+    --state-dir "$attempt_state")" ||
+    diag_die "isolated resume state is not an exact contiguous plan prefix"
+  [[ "$progress" =~ \"committedRecords\":([0-9]+) ]] ||
+    diag_die "isolated executor returned malformed progress"
+  committed="${BASH_REMATCH[1]}"
+  [[ "$progress" =~ \"complete\":(true|false) ]] ||
+    diag_die "isolated executor omitted its completion state"
+  complete="${BASH_REMATCH[1]}"
+  ((committed <= total)) || diag_die "isolated executor state exceeds its immutable plan"
+  telemetry_resumable_prepare_descriptive individual individual-session-
+  if [[ "$complete" == false && "$TELEMETRY_RESUME_AVAILABLE" == 1 ]]; then
+    telemetry_segment="$TELEMETRY_RESUME_NEXT_SEGMENT"
+    telemetry_sampler_start individual "individual-session-$telemetry_segment" \
+      "$telemetry_segment" ||
+      diag_die "isolated telemetry failed before workload launch"
+    telemetry_boundary_start ||
+      diag_die "isolated telemetry boundary failed before workload launch"
+    telemetry_started=1
+  fi
+  output="$(mktemp /tmp/.diagnose-isolated.XXXXXX)" ||
+    diag_die "cannot prepare isolated executor output"
+  while [[ "$complete" == false ]]; do
+    protocol_rc=0
+    run_pinned_protocol_logged "$output" "$protocol_log" \
+      "$DIAG_INDIVIDUAL_NODE_BIN" "$LIB/pinned-protocol.mjs" attempt-isolated \
+      --cpus "$INDIVIDUAL_TARGET_CPUS" --rounds "$INDIVIDUAL_RUNS" \
+      --seed "$PROTOCOL_SEED" --generation "$INDIVIDUAL_META_GENERATION" \
+      --state-dir "$attempt_state" --command "$DIAG_INDIVIDUAL_NODE_BIN" \
+      --arg "$SCRIPT_DIR/child.mjs" --cwd "$SCRIPT_DIR" \
+      --no-turbo-path "$no_turbo_path" || protocol_rc=$?
+    result="$(<"$output")"
+    [[ "$protocol_rc" == 0 && "$result" =~ \"committed\":true ]] ||
+      diag_die "isolated attempt was not a valid clean/SIGSEGV observation (executor rc=$protocol_rc); phase remains resumable"
+    committed=$((committed + 1))
+    ((committed <= total)) || diag_die "isolated executor committed beyond its immutable plan"
+    if ((committed == total || committed % 25 == 0)); then
+      diag_log "isolated protocol: committed $committed/$total observations"
+    fi
+    ((committed < total)) || complete=true
+  done
+  rm -f -- "$output"
+  if ((telemetry_started == 1)); then
+    telemetry_segment_stop ||
+      diag_die "isolated telemetry writer could not be confirmed stopped"
+    telemetry_resumable_append_active individual-session- "$telemetry_segment" ||
+      diag_die "cannot append the completed isolated telemetry session"
+  fi
+
+  stage="$STATE_DIR/individual-finalize"
+  protocol_finalize_stage_prepare "$stage" \
+    individual.tsv individual.boundaries.ndjson ||
+    diag_die "cannot prepare isolated finalization staging directory"
+  staged_tsv="$stage/individual.tsv"
+  staged_boundaries="$stage/individual.boundaries.ndjson"
+  node "$LIB/pinned-protocol.mjs" finalize-isolated \
+    --cpus "$INDIVIDUAL_TARGET_CPUS" --rounds "$INDIVIDUAL_RUNS" \
+    --seed "$PROTOCOL_SEED" --generation "$INDIVIDUAL_META_GENERATION" \
+    --state-dir "$attempt_state" --results-output "$staged_tsv" \
+    --boundaries-output "$staged_boundaries" > /dev/null ||
+    diag_die "isolated state is not complete enough to finalize"
+  individual_v5_binding_read "$plan" "$staged_tsv" "$staged_boundaries" \
+    "$INDIVIDUAL_TARGET_CPUS" "$INDIVIDUAL_RUNS" 1 ||
+    diag_die "isolated finalization did not reproduce the exact immutable plan"
+  bundle_owned_single_regular "$tsv" && bundle_owned_single_regular "$boundaries" ||
+    diag_die "isolated result destinations became unsafe before publication"
+  mv -T -- "$staged_tsv" "$tsv" && mv -T -- "$staged_boundaries" "$boundaries" ||
+    diag_die "cannot publish finalized isolated evidence"
+  protocol_finalize_stage_close "$stage" ||
+    diag_die "cannot close isolated finalization staging directory"
+  sync -f "$tsv" && sync -f "$boundaries" && sync -f "$OUT_DIR/results" ||
+    diag_die "cannot synchronize finalized isolated evidence"
+  individual_v5_binding_read "$plan" "$tsv" "$boundaries" \
+    "$INDIVIDUAL_TARGET_CPUS" "$INDIVIDUAL_RUNS" 1 ||
+    diag_die "published isolated evidence failed its terminal binding"
+  INDIVIDUAL_META_PROTOCOL=isolated-interleaved-v1
+  INDIVIDUAL_META_SCHEDULE_SEED="$PROTOCOL_SEED"
+  INDIVIDUAL_META_SCHEDULE_ALGORITHM=balanced-cyclic-v1
+  individual_meta_write "$INDIVIDUAL_TARGET_CPUS" "$INDIVIDUAL_RUNS" 0 1 ""
+  if [[ "$TELEMETRY_RESUME_AVAILABLE" == 1 &&
+    "$TELEMETRY_RESUME_SEGMENTS_JSON" != "[]" ]]; then
+    telemetry_phase_publish individual "$TELEMETRY_RESUME_SEGMENTS_JSON"
+  elif [[ "$TELEMETRY_RESUME_AVAILABLE" == 1 ]]; then
+    TELEMETRY_DEGRADED=1
+    diag_warn "isolated telemetry has no complete session envelope; workload evidence is retained"
+  fi
+  individual_evidence_read && [[ "$INDIVIDUAL_EVIDENCE_STATUS" == incomplete ]] ||
+    diag_die "isolated evidence is not publication-ready before its marker"
+  mark_done individual
+  individual_evidence_read && [[ "$INDIVIDUAL_EVIDENCE_STATUS" == complete ]] ||
+    diag_die "completed isolated evidence failed post-marker validation"
 }
 
 phase_individual() {
@@ -2817,12 +4060,30 @@ INDIVIDUAL_META_GENERATION=""
 INDIVIDUAL_META_ROWS_SHA256=""
 INDIVIDUAL_META_ROWS_BYTES=""
 INDIVIDUAL_META_ROW_COUNT=""
+INDIVIDUAL_META_PROTOCOL=""
+INDIVIDUAL_META_SCHEDULE_SEED=""
+INDIVIDUAL_META_SCHEDULE_ALGORITHM=""
+INDIVIDUAL_META_PLAN_SHA256=""
+INDIVIDUAL_META_PLAN_BYTES=""
+INDIVIDUAL_META_PLAN_ROW_COUNT=""
+INDIVIDUAL_META_BOUNDARIES_SHA256=""
+INDIVIDUAL_META_BOUNDARIES_BYTES=""
+INDIVIDUAL_META_BOUNDARY_ROW_COUNT=""
 
 individual_meta_reset_generation() {
   INDIVIDUAL_META_GENERATION=""
   INDIVIDUAL_META_ROWS_SHA256=""
   INDIVIDUAL_META_ROWS_BYTES=""
   INDIVIDUAL_META_ROW_COUNT=""
+  INDIVIDUAL_META_PROTOCOL=""
+  INDIVIDUAL_META_SCHEDULE_SEED=""
+  INDIVIDUAL_META_SCHEDULE_ALGORITHM=""
+  INDIVIDUAL_META_PLAN_SHA256=""
+  INDIVIDUAL_META_PLAN_BYTES=""
+  INDIVIDUAL_META_PLAN_ROW_COUNT=""
+  INDIVIDUAL_META_BOUNDARIES_SHA256=""
+  INDIVIDUAL_META_BOUNDARIES_BYTES=""
+  INDIVIDUAL_META_BOUNDARY_ROW_COUNT=""
 }
 
 individual_meta_read() {
@@ -2841,6 +4102,15 @@ individual_meta_read() {
   INDIVIDUAL_META_ROWS_SHA256=""
   INDIVIDUAL_META_ROWS_BYTES=""
   INDIVIDUAL_META_ROW_COUNT=""
+  INDIVIDUAL_META_PROTOCOL=""
+  INDIVIDUAL_META_SCHEDULE_SEED=""
+  INDIVIDUAL_META_SCHEDULE_ALGORITHM=""
+  INDIVIDUAL_META_PLAN_SHA256=""
+  INDIVIDUAL_META_PLAN_BYTES=""
+  INDIVIDUAL_META_PLAN_ROW_COUNT=""
+  INDIVIDUAL_META_BOUNDARIES_SHA256=""
+  INDIVIDUAL_META_BOUNDARIES_BYTES=""
+  INDIVIDUAL_META_BOUNDARY_ROW_COUNT=""
   [[ -n "$DIAG_INDIVIDUAL_NODE_BIN" ]] || return 1
   output="$("$DIAG_INDIVIDUAL_NODE_BIN" "$LIB/individual-evidence.mjs" meta "$file")" || return 1
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -2862,6 +4132,15 @@ individual_meta_read() {
       ROWS_SHA256) INDIVIDUAL_META_ROWS_SHA256="$value" ;;
       ROWS_BYTES) INDIVIDUAL_META_ROWS_BYTES="$value" ;;
       ROW_COUNT) INDIVIDUAL_META_ROW_COUNT="$value" ;;
+      PROTOCOL) INDIVIDUAL_META_PROTOCOL="$value" ;;
+      SCHEDULE_SEED) INDIVIDUAL_META_SCHEDULE_SEED="$value" ;;
+      SCHEDULE_ALGORITHM) INDIVIDUAL_META_SCHEDULE_ALGORITHM="$value" ;;
+      PLAN_SHA256) INDIVIDUAL_META_PLAN_SHA256="$value" ;;
+      PLAN_BYTES) INDIVIDUAL_META_PLAN_BYTES="$value" ;;
+      PLAN_ROW_COUNT) INDIVIDUAL_META_PLAN_ROW_COUNT="$value" ;;
+      BOUNDARIES_SHA256) INDIVIDUAL_META_BOUNDARIES_SHA256="$value" ;;
+      BOUNDARIES_BYTES) INDIVIDUAL_META_BOUNDARIES_BYTES="$value" ;;
+      BOUNDARY_ROW_COUNT) INDIVIDUAL_META_BOUNDARY_ROW_COUNT="$value" ;;
       SKIP_REASON_PRESENT)
         [[ "$value" =~ ^[01]$ ]] || return 1
         [[ "$value" == 0 ]] || INDIVIDUAL_META_SKIP_REASON=present
@@ -2869,15 +4148,25 @@ individual_meta_read() {
       *) return 1 ;;
     esac
   done <<< "$output"
-  [[ ${#seen[@]} == 13 && -n "${seen[VERSION]:-}" && -n "${seen[TARGET_CPUS]:-}" &&
+  [[ ( ${#seen[@]} == 13 || ${#seen[@]} == 22 ) &&
+    -n "${seen[VERSION]:-}" && -n "${seen[TARGET_CPUS]:-}" &&
     -n "${seen[RUNS_PER_CPU]:-}" && -n "${seen[SKIPPED]:-}" &&
     -n "${seen[COMPLETED]:-}" && -n "${seen[SKIP_REASON_PRESENT]:-}" ]] || return 1
+  if [[ "$INDIVIDUAL_META_VERSION" == 5 ]]; then
+    [[ ${#seen[@]} == 22 && -n "${seen[PROTOCOL]:-}" &&
+      -n "${seen[SCHEDULE_SEED]:-}" && -n "${seen[SCHEDULE_ALGORITHM]:-}" &&
+      -n "${seen[PLAN_SHA256]:-}" && -n "${seen[PLAN_BYTES]:-}" &&
+      -n "${seen[PLAN_ROW_COUNT]:-}" ]] || return 1
+  else
+    [[ ${#seen[@]} == 13 ]] || return 1
+  fi
 }
 
 individual_meta_write() {
   local targets="$1" runs="$2" skipped="$3" completed="$4" reason="${5:-}" tmp
   [[ "$INDIVIDUAL_TARGET_POLICY" == failed-groups ||
     "$INDIVIDUAL_TARGET_POLICY" == all-group-cpus ||
+    "$INDIVIDUAL_TARGET_POLICY" == all-usable-cpus ||
     "$INDIVIDUAL_TARGET_POLICY" == quick-skip ]] ||
     diag_die "cannot publish individual metadata without a valid target policy"
   [[ "$INDIVIDUAL_GROUP_PLAN_DIGEST" =~ ^[a-f0-9]{64}$ ]] ||
@@ -2896,21 +4185,54 @@ individual_meta_write() {
       { [[ "$INDIVIDUAL_META_ROW_COUNT" == 0 ]] || diag_is_safe_positive_uint "$INDIVIDUAL_META_ROW_COUNT"; } ||
       diag_die "cannot publish completed individual metadata without a valid row binding"
   fi
+  if [[ "$RUN_SCHEMA_VERSION" == 2 ]]; then
+    [[ "$skipped" == 0 && "$INDIVIDUAL_TARGET_POLICY" == all-usable-cpus &&
+      "$INDIVIDUAL_META_PROTOCOL" == isolated-interleaved-v1 &&
+      "$INDIVIDUAL_META_SCHEDULE_SEED" == "$PROTOCOL_SEED" &&
+      "$INDIVIDUAL_META_SCHEDULE_ALGORITHM" == balanced-cyclic-v1 &&
+      "$INDIVIDUAL_META_PLAN_SHA256" =~ ^[a-f0-9]{64}$ ]] &&
+      diag_is_safe_positive_uint "$INDIVIDUAL_META_PLAN_BYTES" &&
+      diag_is_safe_positive_uint "$INDIVIDUAL_META_PLAN_ROW_COUNT" ||
+      diag_die "cannot publish schema-2 individual metadata without a valid immutable plan binding"
+    if [[ "$completed" == 1 ]]; then
+      [[ "$INDIVIDUAL_META_BOUNDARIES_SHA256" =~ ^[a-f0-9]{64}$ ]] &&
+        diag_is_safe_positive_uint "$INDIVIDUAL_META_BOUNDARIES_BYTES" &&
+        diag_is_safe_positive_uint "$INDIVIDUAL_META_BOUNDARY_ROW_COUNT" ||
+        diag_die "cannot publish completed schema-2 individual metadata without a valid boundary binding"
+    fi
+  fi
   tmp="$(mktemp "$OUT_DIR/results/.individual.meta.XXXXXX")" || diag_die "cannot create individual metadata"
   {
-    printf 'VERSION=4\nGENERATION=%s\nTARGET_CPUS=%s\nRUNS_PER_CPU=%s\n' \
+    printf 'VERSION=%s\nGENERATION=%s\nTARGET_CPUS=%s\nRUNS_PER_CPU=%s\n' \
+      "$([[ "$RUN_SCHEMA_VERSION" == 2 ]] && printf 5 || printf 4)" \
       "$INDIVIDUAL_META_GENERATION" "$targets" "$runs"
     printf 'TARGET_POLICY=%s\nGROUP_PLAN_DIGEST=%s\nGROUP_GENERATION=%s\n' \
       "$INDIVIDUAL_TARGET_POLICY" "$INDIVIDUAL_GROUP_PLAN_DIGEST" "$INDIVIDUAL_GROUP_GENERATION"
+    if [[ "$RUN_SCHEMA_VERSION" == 2 ]]; then
+      printf 'PROTOCOL=%s\nSCHEDULE_SEED=%s\nSCHEDULE_ALGORITHM=%s\n' \
+        "$INDIVIDUAL_META_PROTOCOL" "$INDIVIDUAL_META_SCHEDULE_SEED" \
+        "$INDIVIDUAL_META_SCHEDULE_ALGORITHM"
+      printf 'PLAN_SHA256=%s\nPLAN_BYTES=%s\nPLAN_ROW_COUNT=%s\n' \
+        "$INDIVIDUAL_META_PLAN_SHA256" "$INDIVIDUAL_META_PLAN_BYTES" \
+        "$INDIVIDUAL_META_PLAN_ROW_COUNT"
+    fi
     printf 'SKIPPED=%s\nCOMPLETED=%s\n' "$skipped" "$completed"
     [[ -z "$reason" ]] || printf 'SKIP_REASON=%s\n' "$reason"
     if [[ "$completed" == 1 ]]; then
       printf 'ROWS_SHA256=%s\nROWS_BYTES=%s\nROW_COUNT=%s\n' \
         "$INDIVIDUAL_META_ROWS_SHA256" "$INDIVIDUAL_META_ROWS_BYTES" \
         "$INDIVIDUAL_META_ROW_COUNT"
+      if [[ "$RUN_SCHEMA_VERSION" == 2 ]]; then
+        printf 'BOUNDARIES_SHA256=%s\nBOUNDARIES_BYTES=%s\nBOUNDARY_ROW_COUNT=%s\n' \
+          "$INDIVIDUAL_META_BOUNDARIES_SHA256" "$INDIVIDUAL_META_BOUNDARIES_BYTES" \
+          "$INDIVIDUAL_META_BOUNDARY_ROW_COUNT"
+      fi
     fi
   } > "$tmp" || diag_die "cannot write individual metadata"
+  chmod 0600 "$tmp" || diag_die "cannot protect individual metadata"
+  sync -f "$tmp" || diag_die "cannot synchronize individual metadata"
   mv -T -- "$tmp" "$OUT_DIR/results/individual.meta" || diag_die "cannot publish individual metadata"
+  sync -f "$OUT_DIR/results" || diag_die "cannot synchronize individual metadata directory"
 }
 
 individual_rows_binding_read() {
@@ -2938,6 +4260,59 @@ individual_rows_binding_read() {
     { [[ "$INDIVIDUAL_META_ROW_COUNT" == 0 ]] || diag_is_safe_positive_uint "$INDIVIDUAL_META_ROW_COUNT"; }
 }
 
+individual_v5_binding_read() {
+  local plan="$1" tsv="$2" boundaries="$3" targets="$4" runs="$5" require_complete="$6"
+  local output line key value expected_fields=6
+  local -A seen=()
+  [[ "$require_complete" =~ ^[01]$ ]] || return 1
+  output="$("$DIAG_INDIVIDUAL_NODE_BIN" "$LIB/individual-evidence.mjs" v5-binding \
+    "$plan" "$tsv" "$boundaries" "$targets" "$runs" "$PROTOCOL_SEED" \
+    "$require_complete")" || return 1
+  INDIVIDUAL_META_PLAN_SHA256=""
+  INDIVIDUAL_META_PLAN_BYTES=""
+  INDIVIDUAL_META_PLAN_ROW_COUNT=""
+  INDIVIDUAL_META_ROWS_SHA256=""
+  INDIVIDUAL_META_ROWS_BYTES=""
+  INDIVIDUAL_META_ROW_COUNT=""
+  INDIVIDUAL_META_BOUNDARIES_SHA256=""
+  INDIVIDUAL_META_BOUNDARIES_BYTES=""
+  INDIVIDUAL_META_BOUNDARY_ROW_COUNT=""
+  [[ "$require_complete" == 0 ]] || expected_fields=12
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]] || return 1
+    key="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"
+    [[ -z "${seen[$key]:-}" ]] || return 1
+    seen[$key]=1
+    case "$key" in
+      PLAN_SHA256) INDIVIDUAL_META_PLAN_SHA256="$value" ;;
+      PLAN_BYTES) INDIVIDUAL_META_PLAN_BYTES="$value" ;;
+      PLAN_ROW_COUNT) INDIVIDUAL_META_PLAN_ROW_COUNT="$value" ;;
+      RESULT_PREFIX_ROW_COUNT | BOUNDARY_PREFIX_ROW_COUNT | COMMON_PREFIX_ROW_COUNT)
+        [[ "$value" == 0 ]] || diag_is_safe_positive_uint "$value" || return 1
+        ;;
+      ROWS_SHA256) INDIVIDUAL_META_ROWS_SHA256="$value" ;;
+      ROWS_BYTES) INDIVIDUAL_META_ROWS_BYTES="$value" ;;
+      ROW_COUNT) INDIVIDUAL_META_ROW_COUNT="$value" ;;
+      BOUNDARIES_SHA256) INDIVIDUAL_META_BOUNDARIES_SHA256="$value" ;;
+      BOUNDARIES_BYTES) INDIVIDUAL_META_BOUNDARIES_BYTES="$value" ;;
+      BOUNDARY_ROW_COUNT) INDIVIDUAL_META_BOUNDARY_ROW_COUNT="$value" ;;
+      *) return 1 ;;
+    esac
+  done <<< "$output"
+  [[ ${#seen[@]} -eq "$expected_fields" &&
+    "$INDIVIDUAL_META_PLAN_SHA256" =~ ^[a-f0-9]{64}$ ]] &&
+    diag_is_safe_positive_uint "$INDIVIDUAL_META_PLAN_BYTES" &&
+    diag_is_safe_positive_uint "$INDIVIDUAL_META_PLAN_ROW_COUNT" || return 1
+  if [[ "$require_complete" == 1 ]]; then
+    [[ "$INDIVIDUAL_META_ROWS_SHA256" =~ ^[a-f0-9]{64}$ &&
+      "$INDIVIDUAL_META_BOUNDARIES_SHA256" =~ ^[a-f0-9]{64}$ ]] &&
+      diag_is_safe_positive_uint "$INDIVIDUAL_META_ROWS_BYTES" &&
+      diag_is_safe_positive_uint "$INDIVIDUAL_META_ROW_COUNT" &&
+      diag_is_safe_positive_uint "$INDIVIDUAL_META_BOUNDARIES_BYTES" &&
+      diag_is_safe_positive_uint "$INDIVIDUAL_META_BOUNDARY_ROW_COUNT"
+  fi
+}
+
 individual_empty_rows_binding_read() {
   local tsv="$1" output line key value
   local -A seen=()
@@ -2963,13 +4338,20 @@ individual_empty_rows_binding_read() {
 
 individual_phase_matches_expected_targets() {
   local should_run="$1"
+  local expected_version=4
+  [[ "$RUN_SCHEMA_VERSION" == 2 ]] && expected_version=5
   [[ "$should_run" =~ ^[01]$ ]] || return 1
   individual_evidence_read || return 1
-  [[ "$INDIVIDUAL_META_VERSION" == 4 &&
+  [[ "$INDIVIDUAL_META_VERSION" == "$expected_version" &&
     "$INDIVIDUAL_META_RUNS" == "$INDIVIDUAL_RUNS" &&
     "$INDIVIDUAL_META_TARGET_POLICY" == "$INDIVIDUAL_TARGET_POLICY" &&
     "$INDIVIDUAL_META_GROUP_PLAN_DIGEST" == "$INDIVIDUAL_GROUP_PLAN_DIGEST" &&
     "$INDIVIDUAL_META_GROUP_GENERATION" == "$INDIVIDUAL_GROUP_GENERATION" ]] || return 1
+  if [[ "$expected_version" == 5 ]]; then
+    [[ "$INDIVIDUAL_META_PROTOCOL" == isolated-interleaved-v1 &&
+      "$INDIVIDUAL_META_SCHEDULE_SEED" == "$PROTOCOL_SEED" &&
+      "$INDIVIDUAL_META_SCHEDULE_ALGORITHM" == balanced-cyclic-v1 ]] || return 1
+  fi
   if [[ "$should_run" == 1 ]]; then
     [[ "$INDIVIDUAL_META_SKIPPED" == 0 &&
       "$INDIVIDUAL_META_TARGET_CPUS" == "$INDIVIDUAL_TARGET_CPUS" ]]
@@ -2988,6 +4370,15 @@ individual_evidence_read() {
   INDIVIDUAL_EVIDENCE_WORST_CPU=""
   INDIVIDUAL_META_SKIP_REASON=""
   INDIVIDUAL_META_GROUP_GENERATION=""
+  INDIVIDUAL_META_PROTOCOL=""
+  INDIVIDUAL_META_SCHEDULE_SEED=""
+  INDIVIDUAL_META_SCHEDULE_ALGORITHM=""
+  INDIVIDUAL_META_PLAN_SHA256=""
+  INDIVIDUAL_META_PLAN_BYTES=""
+  INDIVIDUAL_META_PLAN_ROW_COUNT=""
+  INDIVIDUAL_META_BOUNDARIES_SHA256=""
+  INDIVIDUAL_META_BOUNDARIES_BYTES=""
+  INDIVIDUAL_META_BOUNDARY_ROW_COUNT=""
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ "$line" =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]] || return 1
     key="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"
@@ -3007,6 +4398,15 @@ individual_evidence_read() {
       ROWS_SHA256) INDIVIDUAL_META_ROWS_SHA256="$value" ;;
       ROWS_BYTES) INDIVIDUAL_META_ROWS_BYTES="$value" ;;
       ROW_COUNT) INDIVIDUAL_META_ROW_COUNT="$value" ;;
+      PROTOCOL) INDIVIDUAL_META_PROTOCOL="$value" ;;
+      SCHEDULE_SEED) INDIVIDUAL_META_SCHEDULE_SEED="$value" ;;
+      SCHEDULE_ALGORITHM) INDIVIDUAL_META_SCHEDULE_ALGORITHM="$value" ;;
+      PLAN_SHA256) INDIVIDUAL_META_PLAN_SHA256="$value" ;;
+      PLAN_BYTES) INDIVIDUAL_META_PLAN_BYTES="$value" ;;
+      PLAN_ROW_COUNT) INDIVIDUAL_META_PLAN_ROW_COUNT="$value" ;;
+      BOUNDARIES_SHA256) INDIVIDUAL_META_BOUNDARIES_SHA256="$value" ;;
+      BOUNDARIES_BYTES) INDIVIDUAL_META_BOUNDARIES_BYTES="$value" ;;
+      BOUNDARY_ROW_COUNT) INDIVIDUAL_META_BOUNDARY_ROW_COUNT="$value" ;;
       SKIP_REASON_PRESENT)
         [[ "$value" =~ ^[01]$ ]] || return 1
         [[ "$value" == 0 ]] || INDIVIDUAL_META_SKIP_REASON=present
@@ -3015,25 +4415,41 @@ individual_evidence_read() {
       *) return 1 ;;
     esac
   done <<< "$output"
-  [[ ${#seen[@]} == 15 && "$INDIVIDUAL_EVIDENCE_STATUS" =~ ^(not-run|incomplete|invalid|skipped|complete)$ ]]
+  [[ ( ${#seen[@]} == 15 || ${#seen[@]} == 24 ) &&
+    "$INDIVIDUAL_EVIDENCE_STATUS" =~ ^(not-run|incomplete|invalid|skipped|complete)$ ]] || return 1
+  if [[ "$INDIVIDUAL_META_VERSION" == 5 ]]; then
+    [[ ${#seen[@]} == 24 && "$INDIVIDUAL_META_PROTOCOL" == isolated-interleaved-v1 &&
+      "$INDIVIDUAL_META_SCHEDULE_ALGORITHM" == balanced-cyclic-v1 ]]
+  else
+    [[ ${#seen[@]} == 15 ]]
+  fi
 }
 
 individual_phase_result_is_complete() {
+  local expected_version=4
+  [[ "$RUN_SCHEMA_VERSION" == 2 ]] && expected_version=5
   individual_evidence_read &&
-    [[ "$INDIVIDUAL_META_VERSION" == 4 && "$INDIVIDUAL_META_COMPLETED" == 1 &&
+    [[ "$INDIVIDUAL_META_VERSION" == "$expected_version" && "$INDIVIDUAL_META_COMPLETED" == 1 &&
       ("$INDIVIDUAL_EVIDENCE_STATUS" == complete || "$INDIVIDUAL_EVIDENCE_STATUS" == skipped) ]]
 }
 
 individual_phase_is_complete_and_matches_expected() {
   local should_run="$1"
+  local expected_version=4
+  [[ "$RUN_SCHEMA_VERSION" == 2 ]] && expected_version=5
   [[ "$should_run" =~ ^[01]$ ]] || return 1
   individual_evidence_read || return 1
-  [[ "$INDIVIDUAL_META_VERSION" == 4 && "$INDIVIDUAL_META_COMPLETED" == 1 &&
+  [[ "$INDIVIDUAL_META_VERSION" == "$expected_version" && "$INDIVIDUAL_META_COMPLETED" == 1 &&
     ("$INDIVIDUAL_EVIDENCE_STATUS" == complete || "$INDIVIDUAL_EVIDENCE_STATUS" == skipped) &&
     "$INDIVIDUAL_META_RUNS" == "$INDIVIDUAL_RUNS" &&
     "$INDIVIDUAL_META_TARGET_POLICY" == "$INDIVIDUAL_TARGET_POLICY" &&
     "$INDIVIDUAL_META_GROUP_PLAN_DIGEST" == "$INDIVIDUAL_GROUP_PLAN_DIGEST" &&
     "$INDIVIDUAL_META_GROUP_GENERATION" == "$INDIVIDUAL_GROUP_GENERATION" ]] || return 1
+  if [[ "$expected_version" == 5 ]]; then
+    [[ "$INDIVIDUAL_META_PROTOCOL" == isolated-interleaved-v1 &&
+      "$INDIVIDUAL_META_SCHEDULE_SEED" == "$PROTOCOL_SEED" &&
+      "$INDIVIDUAL_META_SCHEDULE_ALGORITHM" == balanced-cyclic-v1 ]] || return 1
+  fi
   if [[ "$should_run" == 1 ]]; then
     [[ "$INDIVIDUAL_EVIDENCE_STATUS" == complete && "$INDIVIDUAL_META_SKIPPED" == 0 &&
       "$INDIVIDUAL_META_TARGET_CPUS" == "$INDIVIDUAL_TARGET_CPUS" ]]
@@ -3062,6 +4478,389 @@ phase_individual_skipped() {
   mark_done individual
 }
 
+pinned_concurrent_plan_matches_topology() {
+  local plan="$OUT_DIR/results/pinned-concurrent.plan.tsv"
+  local groups="$OUT_DIR/results/pinned-concurrent.groups.tsv"
+  local stage staged_plan staged_groups rc=0
+  pinned_contexts_prepare || return 1
+  stage="$(mktemp -d /tmp/.pinned-plan-check.XXXXXX)" || return 1
+  staged_plan="$stage/plan.tsv"
+  staged_groups="$stage/groups.tsv"
+  node "$LIB/pinned-protocol.mjs" plan-concurrent \
+    --contexts-file "$PINNED_CONTEXTS_TEMP" --rounds "$PINNED_CONCURRENT_ROUNDS" \
+    --seed "$PROTOCOL_SEED" --plan-output "$staged_plan" \
+    --groups-output "$staged_groups" > /dev/null || rc=1
+  ((rc != 0)) || cmp -s -- "$staged_plan" "$plan" || rc=1
+  ((rc != 0)) || cmp -s -- "$staged_groups" "$groups" || rc=1
+  rm -f -- "$staged_plan" "$staged_groups"
+  rmdir -- "$stage" || rc=1
+  return "$rc"
+}
+
+pinned_concurrent_evidence_is_complete() {
+  local meta="$OUT_DIR/results/pinned-concurrent.meta" generation
+  bundle_owned_single_regular "$meta" || return 1
+  generation="$(metadata_exact_value "$meta" GENERATION 2> /dev/null)" || return 1
+  [[ "$generation" =~ ^[a-f0-9]{32}$ ]] || return 1
+  node "$LIB/pinned-concurrent-evidence.mjs" validate-complete "$OUT_DIR" \
+    "$generation" "$INDIVIDUAL_GROUP_GENERATION" "$INDIVIDUAL_GROUP_PLAN_DIGEST" \
+    "$PINNED_CONCURRENT_ROUNDS" "$PROTOCOL_SEED" > /dev/null 2>&1 &&
+    pinned_concurrent_plan_matches_topology
+}
+
+pinned_concurrent_attempt_is_meaningful() {
+  phase_attempt_is_meaningful pinned-concurrent
+}
+
+pinned_concurrent_workload_attempt_is_meaningful() {
+  local relative
+  local -a paths=(
+    results/pinned-concurrent.tsv results/pinned-concurrent.meta
+    results/pinned-concurrent.groups.tsv results/pinned-concurrent.plan.tsv
+    results/pinned-concurrent.boundaries.ndjson logs/pinned-concurrent
+    state/pinned-concurrent-waves state/pinned-concurrent-finalize
+    results/telemetry-pinned-concurrent.tsv
+    results/telemetry-pinned-concurrent.meta telemetry/pinned-concurrent
+    state/telemetry-pinned-concurrent
+  )
+  for relative in "${paths[@]}"; do
+    bundle_path_is_meaningful "$OUT_DIR/$relative" && return 0
+  done
+  return 1
+}
+
+PINNED_CONCURRENT_UNAVAILABLE_STATE=absent
+
+pinned_concurrent_unavailable_meta_render() {
+  [[ "$INDIVIDUAL_GROUP_GENERATION" =~ ^[a-f0-9]{32}$ &&
+    "$INDIVIDUAL_GROUP_PLAN_DIGEST" =~ ^[a-f0-9]{64}$ ]] || return 1
+  printf 'VERSION=1\n'
+  printf 'SOURCE_GROUP_GENERATION=%s\n' "$INDIVIDUAL_GROUP_GENERATION"
+  printf 'SOURCE_GROUP_PLAN_DIGEST=%s\n' "$INDIVIDUAL_GROUP_PLAN_DIGEST"
+  printf 'REASON=no-safe-topology-context\n'
+}
+
+pinned_concurrent_unavailable_decision_present() {
+  [[ -n "$OUT_DIR" && -n "$STATE_DIR" ]] || return 1
+  local meta="$OUT_DIR/results/pinned-concurrent.unavailable.meta"
+  local marker="$STATE_DIR/phase-pinned-concurrent-unavailable.done"
+  [[ -e "$meta" || -L "$meta" || -e "$marker" || -L "$marker" ]]
+}
+
+pinned_concurrent_unavailable_state_read() {
+  local meta="$OUT_DIR/results/pinned-concurrent.unavailable.meta"
+  local marker="$STATE_DIR/phase-pinned-concurrent-unavailable.done"
+  local size
+  PINNED_CONCURRENT_UNAVAILABLE_STATE=absent
+  if [[ ! -e "$meta" && ! -L "$meta" && ! -e "$marker" && ! -L "$marker" ]]; then
+    return 0
+  fi
+  PINNED_CONCURRENT_UNAVAILABLE_STATE=invalid
+  [[ -e "$meta" || -L "$meta" ]] || return 1
+  bundle_owned_single_regular "$meta" || return 1
+  size="$(stat -c %s -- "$meta" 2> /dev/null)" || return 1
+  [[ "$size" =~ ^[0-9]+$ ]] && ((size <= 512)) || return 1
+  cmp -s -- "$meta" <(pinned_concurrent_unavailable_meta_render) || return 1
+  if [[ ! -e "$marker" && ! -L "$marker" ]]; then
+    PINNED_CONCURRENT_UNAVAILABLE_STATE=recoverable
+    return 0
+  fi
+  phase_marker_is_valid pinned-concurrent-unavailable || return 1
+  PINNED_CONCURRENT_UNAVAILABLE_STATE=complete
+}
+
+pinned_concurrent_unavailable_publish() {
+  local meta="$OUT_DIR/results/pinned-concurrent.unavailable.meta"
+  local unavailable_fd="" unavailable_fd_path=""
+  pinned_concurrent_unavailable_state_read || return 1
+  if [[ "$PINNED_CONCURRENT_UNAVAILABLE_STATE" == complete ]]; then
+    return 0
+  fi
+  if [[ "$PINNED_CONCURRENT_UNAVAILABLE_STATE" == absent ]]; then
+    pinned_concurrent_workload_attempt_is_meaningful && return 1
+    bundle_owned_real_dir "$OUT_DIR/results" && bundle_owned_real_dir "$STATE_DIR" || return 1
+    bundle_create_empty_exclusive "$meta" 0600 || return 1
+    bundle_append_fd_open pinned-concurrent-unavailable "$meta" \
+      unavailable_fd unavailable_fd_path 0 || return 1
+    if ! pinned_concurrent_unavailable_meta_render >&"$unavailable_fd" ||
+      ! sync -f "$unavailable_fd_path" ||
+      [[ ! "$meta" -ef "$unavailable_fd_path" ]] ||
+      ! bundle_owned_single_regular "$meta"; then
+      exec {unavailable_fd}>&- || true
+      return 1
+    fi
+    exec {unavailable_fd}>&- || return 1
+    sync -f "$meta" && sync -f "$OUT_DIR/results" || return 1
+  elif [[ "$PINNED_CONCURRENT_UNAVAILABLE_STATE" != recoverable ]]; then
+    return 1
+  fi
+  mark_done pinned-concurrent-unavailable
+  pinned_concurrent_unavailable_state_read &&
+    [[ "$PINNED_CONCURRENT_UNAVAILABLE_STATE" == complete ]]
+}
+
+pinned_concurrent_should_run() {
+  [[ "$RUN_SCHEMA_VERSION" == 2 && "$SKIP_PINNED_CONCURRENT" == 0 &&
+    ${#CONCURRENT_NAME[@]} -gt 0 ]] || return 1
+  phase_redo_is_authorized pinned-concurrent && return 0
+  if [[ -n "$STATE_DIR" ]] && phase_is_done pinned-concurrent; then
+    return 1
+  fi
+  pinned_concurrent_unavailable_decision_present && return 1
+  return 0
+}
+
+pinned_concurrent_final_stage_prepare() {
+  local stage="$1" generation="$2" wave_state="$3"
+  local groups="$4" plan="$5" tsv="$6" boundaries="$7" meta="$8"
+  local staged_tsv="$stage/pinned-concurrent.tsv"
+  local staged_boundaries="$stage/pinned-concurrent.boundaries.ndjson"
+  local staged_meta="$stage/pinned-concurrent.meta"
+  local staged_incomplete_meta="$stage/pinned-concurrent.incomplete.meta"
+  protocol_finalize_stage_prepare "$stage" \
+    pinned-concurrent.tsv pinned-concurrent.boundaries.ndjson \
+    pinned-concurrent.meta pinned-concurrent.incomplete.meta || return 1
+  node "$LIB/pinned-protocol.mjs" finalize-concurrent \
+    --contexts-file "$PINNED_CONTEXTS_TEMP" --rounds "$PINNED_CONCURRENT_ROUNDS" \
+    --seed "$PROTOCOL_SEED" --generation "$generation" --state-dir "$wave_state" \
+    --results-output "$staged_tsv" --boundaries-output "$staged_boundaries" \
+    > /dev/null || return 1
+  node "$LIB/pinned-concurrent-evidence.mjs" build-meta \
+    --generation "$generation" --source-group-generation "$INDIVIDUAL_GROUP_GENERATION" \
+    --source-group-plan-digest "$INDIVIDUAL_GROUP_PLAN_DIGEST" \
+    --rounds "$PINNED_CONCURRENT_ROUNDS" --seed "$PROTOCOL_SEED" \
+    --groups "$groups" --plan "$plan" --results "$staged_tsv" \
+    --boundaries "$staged_boundaries" --completed 1 --output "$staged_meta" || return 1
+  node "$LIB/pinned-concurrent-evidence.mjs" build-meta \
+    --generation "$generation" --source-group-generation "$INDIVIDUAL_GROUP_GENERATION" \
+    --source-group-plan-digest "$INDIVIDUAL_GROUP_PLAN_DIGEST" \
+    --rounds "$PINNED_CONCURRENT_ROUNDS" --seed "$PROTOCOL_SEED" \
+    --groups "$groups" --plan "$plan" --completed 0 \
+    --output "$staged_incomplete_meta" || return 1
+  bundle_owned_single_regular "$meta" &&
+    cmp -s -- "$meta" "$staged_incomplete_meta" || return 1
+  protocol_destination_is_recoverable_prefix "$tsv" "$staged_tsv" 0 || return 1
+  protocol_destination_is_recoverable_prefix \
+    "$boundaries" "$staged_boundaries" 1 || return 1
+  rm -f -- "$staged_incomplete_meta" || return 1
+  sync -f "$stage" || return 1
+}
+
+pinned_concurrent_final_publish() {
+  local stage="$1" staged_tsv="$2" tsv="$3"
+  local staged_boundaries="$4" boundaries="$5" staged_meta="$6" meta="$7"
+  # The completed metadata is the terminal authority boundary. Make both
+  # deterministic sidecars and their directory entries durable before that
+  # metadata can become visible; a crash before its rename then remains an
+  # exact, recoverable incomplete-meta prefix.
+  mv -T -- "$staged_tsv" "$tsv" && mv -T -- "$staged_boundaries" "$boundaries" ||
+    return 1
+  sync -f "$tsv" && sync -f "$boundaries" && sync -f "$OUT_DIR/results" ||
+    return 1
+  mv -T -- "$staged_meta" "$meta" || return 1
+  sync -f "$meta" && sync -f "$OUT_DIR/results" || return 1
+  protocol_finalize_stage_close "$stage"
+}
+
+phase_pinned_concurrent() {
+  local groups="$OUT_DIR/results/pinned-concurrent.groups.tsv"
+  local plan="$OUT_DIR/results/pinned-concurrent.plan.tsv"
+  local tsv="$OUT_DIR/results/pinned-concurrent.tsv"
+  local boundaries="$OUT_DIR/results/pinned-concurrent.boundaries.ndjson"
+  local meta="$OUT_DIR/results/pinned-concurrent.meta"
+  local wave_state="$STATE_DIR/pinned-concurrent-waves"
+  local protocol_log="$OUT_DIR/logs/pinned-concurrent/protocol.log"
+  local generation progress result output controller complete committed_waves
+  local total_waves stage staged_tsv staged_boundaries staged_meta protocol_rc=0
+  local terminal_recovery=0 stage_ready=0
+  local telemetry_segment="" telemetry_started=0
+
+  pinned_contexts_prepare ||
+    diag_die "cannot serialize the discovered pinned-concurrent topology contexts"
+  total_waves=$(( ${#CONCURRENT_NAME[@]} * PINNED_CONCURRENT_ROUNDS ))
+  ((total_waves > 0)) || diag_die "pinned-concurrent protocol has no topology waves"
+  bundle_prepare_dir logs/pinned-concurrent ||
+    diag_die "cannot prepare a safe pinned-concurrent log directory"
+
+  if [[ -e "$meta" || -L "$meta" ]]; then
+    bundle_owned_single_regular "$meta" ||
+      diag_die "pinned-concurrent metadata is unsafe"
+    generation="$(metadata_exact_value "$meta" GENERATION 2> /dev/null)" ||
+      diag_die "pinned-concurrent metadata has no unique generation"
+    [[ "$generation" =~ ^[a-f0-9]{32}$ ]] ||
+      diag_die "pinned-concurrent generation is malformed"
+    if node "$LIB/pinned-concurrent-evidence.mjs" validate-complete "$OUT_DIR" \
+      "$generation" "$INDIVIDUAL_GROUP_GENERATION" "$INDIVIDUAL_GROUP_PLAN_DIGEST" \
+      "$PINNED_CONCURRENT_ROUNDS" "$PROTOCOL_SEED" > /dev/null 2>&1; then
+      pinned_concurrent_plan_matches_topology ||
+        diag_die "completed pinned-concurrent plan disagrees with rediscovered topology"
+      if [[ -e "$STATE_DIR/pinned-concurrent-finalize" ||
+        -L "$STATE_DIR/pinned-concurrent-finalize" ]]; then
+        protocol_finalize_stage_prepare "$STATE_DIR/pinned-concurrent-finalize" \
+          pinned-concurrent.tsv pinned-concurrent.boundaries.ndjson \
+          pinned-concurrent.meta pinned-concurrent.incomplete.meta &&
+          protocol_finalize_stage_close "$STATE_DIR/pinned-concurrent-finalize" ||
+          diag_die "completed pinned-concurrent evidence has an unsafe stranded finalization stage"
+      fi
+      telemetry_resumable_prepare_descriptive pinned-concurrent pinned-concurrent-session-
+      if ((TELEMETRY_RESUME_AVAILABLE == 1)) &&
+        [[ ! -e "$OUT_DIR/results/telemetry-pinned-concurrent.tsv" &&
+        ! -L "$OUT_DIR/results/telemetry-pinned-concurrent.tsv" &&
+        ! -e "$OUT_DIR/results/telemetry-pinned-concurrent.meta" &&
+        ! -L "$OUT_DIR/results/telemetry-pinned-concurrent.meta" &&
+        "$TELEMETRY_RESUME_SEGMENTS_JSON" != "[]" ]]; then
+        telemetry_phase_publish pinned-concurrent "$TELEMETRY_RESUME_SEGMENTS_JSON"
+      fi
+      mark_done pinned-concurrent
+      pinned_concurrent_evidence_is_complete ||
+        diag_die "completed pinned-concurrent evidence failed post-marker validation"
+      return 0
+    fi
+    bundle_owned_real_dir "$wave_state" && pinned_concurrent_plan_matches_topology ||
+      diag_die "pinned-concurrent resume state or immutable plan is unsafe"
+    if ! node "$LIB/pinned-concurrent-evidence.mjs" validate-before "$OUT_DIR" \
+      "$generation" "$INDIVIDUAL_GROUP_GENERATION" "$INDIVIDUAL_GROUP_PLAN_DIGEST" \
+      "$PINNED_CONCURRENT_ROUNDS" "$PROTOCOL_SEED" > /dev/null 2>&1; then
+      # A killed terminal publication may already have atomically installed
+      # one complete sidecar while the metadata still describes a resumable
+      # prefix. Defer that one case until generation-bound state proves the
+      # full plan complete and its deterministic projection matches exactly.
+      terminal_recovery=1
+    fi
+  else
+    [[ ! -e "$groups" && ! -L "$groups" && ! -e "$plan" && ! -L "$plan" &&
+      ! -e "$tsv" && ! -L "$tsv" && ! -e "$boundaries" && ! -L "$boundaries" &&
+      ! -e "$wave_state" && ! -L "$wave_state" ]] ||
+      diag_die "existing pinned-concurrent artifacts lack resumable metadata; preserve them and use --redo pinned-concurrent"
+    bundle_prepare_dir state/pinned-concurrent-waves ||
+      diag_die "cannot create a safe pinned-concurrent wave state directory"
+    generation="$("$DIAG_INDIVIDUAL_NODE_BIN" -e \
+      'process.stdout.write(require("node:crypto").randomBytes(16).toString("hex"))')" ||
+      diag_die "cannot generate pinned-concurrent evidence generation"
+    diag_log_cmd node diagnose-lib/pinned-protocol.mjs plan-concurrent \
+      --contexts-file topology-contexts --rounds "$PINNED_CONCURRENT_ROUNDS" \
+      --seed "$PROTOCOL_SEED"
+    node "$LIB/pinned-protocol.mjs" plan-concurrent \
+      --contexts-file "$PINNED_CONTEXTS_TEMP" --rounds "$PINNED_CONCURRENT_ROUNDS" \
+      --seed "$PROTOCOL_SEED" --plan-output "$plan" --groups-output "$groups" \
+      > /dev/null || diag_die "cannot publish the immutable pinned-concurrent plan"
+    bundle_create_empty_exclusive "$tsv" 0600 ||
+      diag_die "cannot create pinned-concurrent result prefix exclusively"
+    printf 'round\tgroup\tcpu\tlaunch_position\trc\telapsed_ms\n' > "$tsv" ||
+      diag_die "cannot initialize pinned-concurrent result prefix"
+    sync -f "$tsv" || diag_die "cannot synchronize pinned-concurrent result prefix"
+    node "$LIB/pinned-concurrent-evidence.mjs" build-meta \
+      --generation "$generation" --source-group-generation "$INDIVIDUAL_GROUP_GENERATION" \
+      --source-group-plan-digest "$INDIVIDUAL_GROUP_PLAN_DIGEST" \
+      --rounds "$PINNED_CONCURRENT_ROUNDS" --seed "$PROTOCOL_SEED" \
+      --groups "$groups" --plan "$plan" --completed 0 --output "$meta" ||
+      diag_die "cannot publish pinned-concurrent resumable metadata"
+    sync -f "$meta" && sync -f "$OUT_DIR/results" ||
+      diag_die "cannot synchronize pinned-concurrent resumable metadata"
+    node "$LIB/pinned-concurrent-evidence.mjs" validate-before "$OUT_DIR" \
+      "$generation" "$INDIVIDUAL_GROUP_GENERATION" "$INDIVIDUAL_GROUP_PLAN_DIGEST" \
+      "$PINNED_CONCURRENT_ROUNDS" "$PROTOCOL_SEED" > /dev/null ||
+      diag_die "fresh pinned-concurrent evidence failed its resumable validation"
+  fi
+
+  progress="$(node "$LIB/pinned-protocol.mjs" next-concurrent \
+    --contexts-file "$PINNED_CONTEXTS_TEMP" --rounds "$PINNED_CONCURRENT_ROUNDS" \
+    --seed "$PROTOCOL_SEED" --generation "$generation" --state-dir "$wave_state")" ||
+    diag_die "pinned-concurrent state is not an exact whole-wave plan prefix"
+  [[ "$progress" =~ \"committedWaves\":([0-9]+) ]] ||
+    diag_die "pinned-concurrent executor returned malformed progress"
+  committed_waves="${BASH_REMATCH[1]}"
+  [[ "$progress" =~ \"complete\":(true|false) ]] ||
+    diag_die "pinned-concurrent executor omitted its completion state"
+  complete="${BASH_REMATCH[1]}"
+  ((committed_waves <= total_waves)) ||
+    diag_die "pinned-concurrent state exceeds its immutable plan"
+  if ((terminal_recovery == 1)); then
+    [[ "$complete" == true ]] ||
+      diag_die "pinned-concurrent evidence is not a valid resumable prefix; preserve it and use --redo pinned-concurrent"
+    stage="$STATE_DIR/pinned-concurrent-finalize"
+    pinned_concurrent_final_stage_prepare "$stage" "$generation" "$wave_state" \
+      "$groups" "$plan" "$tsv" "$boundaries" "$meta" ||
+      diag_die "interrupted pinned-concurrent finalization does not match its immutable state; preserve it and use --redo pinned-concurrent"
+    stage_ready=1
+  fi
+  telemetry_resumable_prepare_descriptive pinned-concurrent pinned-concurrent-session-
+  if [[ "$complete" == false && "$TELEMETRY_RESUME_AVAILABLE" == 1 ]]; then
+    telemetry_segment="$TELEMETRY_RESUME_NEXT_SEGMENT"
+    telemetry_sampler_start pinned-concurrent \
+      "pinned-concurrent-session-$telemetry_segment" "$telemetry_segment" ||
+      diag_die "pinned-concurrent telemetry failed before workload launch"
+    telemetry_boundary_start ||
+      diag_die "pinned-concurrent telemetry boundary failed before workload launch"
+    telemetry_started=1
+  fi
+  output="$(mktemp /tmp/.diagnose-pinned-concurrent.XXXXXX)" ||
+    diag_die "cannot prepare pinned-concurrent executor output"
+  while [[ "$complete" == false ]]; do
+    [[ "$progress" =~ \"controllerCpu\":([0-9]+) ]] ||
+      diag_die "pinned-concurrent progress omitted its controller CPU"
+    controller="${BASH_REMATCH[1]}"
+    diag_cpulist_contains "$ONLINE_CPUS" "$controller" ||
+      diag_die "pinned-concurrent controller CPU $controller is not usable"
+    protocol_rc=0
+    run_pinned_protocol_logged "$output" "$protocol_log" taskset -c "$controller" \
+      "$DIAG_INDIVIDUAL_NODE_BIN" "$LIB/pinned-protocol.mjs" wave-concurrent \
+      --contexts-file "$PINNED_CONTEXTS_TEMP" --rounds "$PINNED_CONCURRENT_ROUNDS" \
+      --seed "$PROTOCOL_SEED" --generation "$generation" --state-dir "$wave_state" \
+      --command "$DIAG_INDIVIDUAL_NODE_BIN" --arg "$SCRIPT_DIR/child.mjs" \
+      --cwd "$SCRIPT_DIR" --no-turbo-path /sys/devices/system/cpu/intel_pstate/no_turbo \
+      || protocol_rc=$?
+    result="$(<"$output")"
+    [[ "$protocol_rc" == 0 && "$result" =~ \"committed\":true ]] ||
+      diag_die "pinned-concurrent wave was not a complete clean/SIGSEGV observation set (executor rc=$protocol_rc); phase remains resumable"
+    committed_waves=$((committed_waves + 1))
+    if ((committed_waves == total_waves || committed_waves % 10 == 0)); then
+      diag_log "pinned-concurrent protocol: committed $committed_waves/$total_waves waves"
+    fi
+    progress="$(node "$LIB/pinned-protocol.mjs" next-concurrent \
+      --contexts-file "$PINNED_CONTEXTS_TEMP" --rounds "$PINNED_CONCURRENT_ROUNDS" \
+      --seed "$PROTOCOL_SEED" --generation "$generation" --state-dir "$wave_state")" ||
+      diag_die "pinned-concurrent state became invalid after a wave commit"
+    [[ "$progress" =~ \"complete\":(true|false) ]] ||
+      diag_die "pinned-concurrent executor omitted its completion state"
+    complete="${BASH_REMATCH[1]}"
+  done
+  rm -f -- "$output"
+  if ((telemetry_started == 1)); then
+    telemetry_segment_stop ||
+      diag_die "pinned-concurrent telemetry writer could not be confirmed stopped"
+    telemetry_resumable_append_active pinned-concurrent-session- "$telemetry_segment" ||
+      diag_die "cannot append the completed pinned-concurrent telemetry session"
+  fi
+
+  stage="$STATE_DIR/pinned-concurrent-finalize"
+  staged_tsv="$stage/pinned-concurrent.tsv"
+  staged_boundaries="$stage/pinned-concurrent.boundaries.ndjson"
+  staged_meta="$stage/pinned-concurrent.meta"
+  if ((stage_ready == 0)); then
+    pinned_concurrent_final_stage_prepare "$stage" "$generation" "$wave_state" \
+      "$groups" "$plan" "$tsv" "$boundaries" "$meta" ||
+      diag_die "pinned-concurrent finalization failed its strict state/evidence reconciliation"
+  fi
+  pinned_concurrent_final_publish "$stage" "$staged_tsv" "$tsv" \
+    "$staged_boundaries" "$boundaries" "$staged_meta" "$meta" ||
+    diag_die "cannot durably publish finalized pinned-concurrent evidence"
+  node "$LIB/pinned-concurrent-evidence.mjs" validate-complete "$OUT_DIR" \
+    "$generation" "$INDIVIDUAL_GROUP_GENERATION" "$INDIVIDUAL_GROUP_PLAN_DIGEST" \
+    "$PINNED_CONCURRENT_ROUNDS" "$PROTOCOL_SEED" > /dev/null ||
+    diag_die "pinned-concurrent evidence is not publication-ready before its marker"
+  if [[ "$TELEMETRY_RESUME_AVAILABLE" == 1 &&
+    "$TELEMETRY_RESUME_SEGMENTS_JSON" != "[]" ]]; then
+    telemetry_phase_publish pinned-concurrent "$TELEMETRY_RESUME_SEGMENTS_JSON"
+  elif [[ "$TELEMETRY_RESUME_AVAILABLE" == 1 ]]; then
+    TELEMETRY_DEGRADED=1
+    diag_warn "pinned-concurrent telemetry has no complete session envelope; workload evidence is retained"
+  fi
+  mark_done pinned-concurrent
+  pinned_concurrent_evidence_is_complete ||
+    diag_die "completed pinned-concurrent evidence failed post-marker validation"
+}
+
 # ------------------------------------------------------------------
 # Worst CPU from a fully validated individual phase (highest SIGSEGV rate,
 # ties: more SIGSEGVs, then lower CPU id). When this shell already derived the
@@ -3069,8 +4868,11 @@ phase_individual_skipped() {
 # the startup CPU-policy path runs before any derivation and is caught later
 # by the phase-4 gate, so it intentionally skips that comparison.
 worst_cpu() {
+  local expected_version=4
+  [[ "$RUN_SCHEMA_VERSION" == 2 ]] && expected_version=5
   individual_evidence_read || return 0
-  [[ "$INDIVIDUAL_META_VERSION" == 4 && "$INDIVIDUAL_EVIDENCE_STATUS" == complete ]] || return 0
+  [[ "$INDIVIDUAL_META_VERSION" == "$expected_version" &&
+    "$INDIVIDUAL_EVIDENCE_STATUS" == complete ]] || return 0
   [[ -n "$INDIVIDUAL_GROUP_GENERATION" &&
     "$INDIVIDUAL_META_GROUP_GENERATION" != "$INDIVIDUAL_GROUP_GENERATION" ]] && return 0
   printf '%s\n' "$INDIVIDUAL_EVIDENCE_WORST_CPU"
@@ -3084,14 +4886,14 @@ worst_cpu() {
 phase_frequency() {
   local cpu="$1"
   if frequency_result_is_complete "$cpu"; then
-    diag_log "phase 5/7: frequency-ab.tsv present (manual frequency-ab.sh run); incorporating"
+    diag_log "frequency: frequency-ab.tsv present (manual frequency-ab.sh run); incorporating"
     mark_done frequency
     return 0
   fi
   if [[ -e "$OUT_DIR/results/frequency-ab.tsv" || -e "$OUT_DIR/results/frequency-ab.meta" ]]; then
-    diag_warn "phase 5/7: incomplete manual frequency results found; phase remains resumable"
+    diag_warn "frequency: incomplete manual frequency results found; phase remains resumable"
   fi
-  diag_warn "phase 5/7: frequency A/B/A not run by this script (it changes a runtime setting)."
+  diag_warn "frequency: A/B/A not run by this script (it changes a runtime setting)."
   if [[ -n "$cpu" ]]; then
     diag_warn "  to run it manually:  sudo ./frequency-ab.sh $cpu $INDIVIDUAL_RUNS \"$OUT_DIR\""
     diag_warn "  then regenerate:     ./diagnose.sh --resume \"$OUT_DIR\" --yes"
@@ -3306,6 +5108,7 @@ gdb_completed_resume_gate() {
 phase_gdb() {
   local cpu="$1"
   local runner_log="$OUT_DIR/logs/gdb/runner.log"
+  local telemetry_started=0
   gdb_prepare_fresh_dirs
   local generation
   generation="$(node "$LIB/gdb-evidence.mjs" new-generation)" ||
@@ -3313,9 +5116,20 @@ phase_gdb() {
   [[ "$generation" =~ ^[0-9a-f]{32}$ ]] ||
     diag_die "generated gdb evidence generation is malformed"
   diag_log_cmd bash capture-fault.sh "$cpu" "$GDB_MAX_RUNS" "$GDB_MAX_CAPTURES" "$OUT_DIR/gdb" "$generation"
+  if [[ "$RUN_SCHEMA_VERSION" == 2 ]]; then
+    telemetry_sampler_start gdb gdb 1 ||
+      diag_die "gdb telemetry failed before workload launch"
+    telemetry_boundary_start ||
+      diag_die "gdb telemetry boundary failed before workload launch"
+    telemetry_started=1
+  fi
   local rc=0
   run_gdb_logged "$cpu" "$GDB_MAX_RUNS" "$GDB_MAX_CAPTURES" "$OUT_DIR/gdb" \
     "$runner_log" "$generation" || rc=$?
+  if ((telemetry_started == 1)); then
+    telemetry_segment_stop ||
+      diag_die "gdb telemetry writer could not be confirmed stopped"
+  fi
   case "$rc" in
     0 | 3) ;;
     4) diag_die "gdb capture lost a required dependency; phase remains resumable" ;;
@@ -3331,6 +5145,9 @@ phase_gdb() {
     diag_die "gdb terminal accounting violates its run-count policy; phase remains resumable"
   gdb_meta_publish RUN "$cpu" "$rc"
   gdb_evidence_publish "$generation" "$cpu"
+  if [[ "$RUN_SCHEMA_VERSION" == 2 ]]; then
+    telemetry_phase_publish gdb '[{"segment":1,"tag":"gdb"}]'
+  fi
   case "$rc" in
     0) diag_log "gdb: fault captured" ;;
     3) diag_log "gdb: no fault within $GDB_MAX_RUNS runs" ;;
@@ -3385,26 +5202,35 @@ gdb_incomplete_attempt_is_meaningful() {
   local candidate
   [[ -e "$OUT_DIR/results/gdb.meta" || -L "$OUT_DIR/results/gdb.meta" ]] && return 0
   [[ -e "$OUT_DIR/results/gdb.manifest" || -L "$OUT_DIR/results/gdb.manifest" ]] && return 0
+  [[ -e "$OUT_DIR/results/telemetry-gdb.tsv" ||
+    -L "$OUT_DIR/results/telemetry-gdb.tsv" ]] && return 0
+  [[ -e "$OUT_DIR/results/telemetry-gdb.meta" ||
+    -L "$OUT_DIR/results/telemetry-gdb.meta" ]] && return 0
   for candidate in "$OUT_DIR"/results/.gdb.manifest.*; do
     [[ -e "$candidate" || -L "$candidate" ]] && return 0
   done
   gdb_attempt_path_is_meaningful "$OUT_DIR/gdb" && return 0
   gdb_attempt_path_is_meaningful "$OUT_DIR/logs/gdb" && return 0
+  gdb_attempt_path_is_meaningful "$OUT_DIR/telemetry/gdb" && return 0
+  gdb_attempt_path_is_meaningful "$OUT_DIR/state/telemetry-gdb" && return 0
   return 1
 }
 
 archive_incomplete_gdb_attempt() {
   gdb_incomplete_attempt_is_meaningful || return 0
   redo_transaction_prepare
-  local path candidate
+  local path candidate redo_format=2
+  [[ "$RUN_SCHEMA_VERSION" == 2 ]] && redo_format=3
   {
-    printf 'VERSION\t2\nTXN\t%s\n' "$REDO_NEW_TXN_ID"
+    printf 'VERSION\t%s\nTXN\t%s\n' "$redo_format" "$REDO_NEW_TXN_ID"
     redo_write_config_records
     printf 'PHASE\tgdb\n'
     for path in results.json report.md privacy-review.txt manifest.txt; do
       redo_record_if_present DERIVED - "$path"
     done
-    for path in results/gdb.meta results/gdb.manifest gdb logs/gdb; do
+    for path in results/gdb.meta results/gdb.manifest gdb logs/gdb \
+      results/telemetry-gdb.tsv results/telemetry-gdb.meta telemetry/gdb \
+      state/telemetry-gdb; do
       redo_record_if_present ARTIFACT gdb "$path"
     done
     for candidate in "$OUT_DIR"/results/.gdb.manifest.* "$OUT_DIR"/results/.gdb.meta.*; do
@@ -3422,16 +5248,16 @@ phase_gdb_dispatch() {
   # not constitute an attempt.
   archive_incomplete_gdb_attempt
   if [[ "$SKIP_GDB" == "1" ]]; then
-    diag_log "phase 6/7: skipped (--skip-gdb)"
+    diag_log "gdb: skipped (--skip-gdb)"
     phase_gdb_skipped "--skip-gdb"
   elif ! command -v gdb > /dev/null 2>&1; then
-    diag_warn "phase 6/7: gdb not installed; skipping"
+    diag_warn "gdb: gdb not installed; skipping"
     phase_gdb_skipped "gdb not installed"
   elif [[ -z "$target_cpu" ]]; then
-    diag_warn "phase 6/7: no failing CPU identified; skipping"
+    diag_warn "gdb: no failing CPU identified; skipping"
     phase_gdb_skipped "no failing CPU identified"
   else
-    diag_log "phase 6/7: gdb signature capture on cpu $target_cpu (max $GDB_MAX_RUNS runs)"
+    diag_log "gdb: signature capture on cpu $target_cpu (max $GDB_MAX_RUNS runs)"
     phase_gdb "$target_cpu"
   fi
 }
@@ -4108,6 +5934,12 @@ diagnose_stop_tracked_groups() {
     current_rc=$?
     ((stop_rc == 0)) && stop_rc=$current_rc
   }
+  # Close the workload boundary immediately after the workload group stops;
+  # the legacy frequency sampler has no boundary clock and can drain second.
+  telemetry_segment_stop || {
+    current_rc=$?
+    ((stop_rc == 0)) && stop_rc=$current_rc
+  }
   diag_freq_sampler_stop || {
     current_rc=$?
     ((stop_rc == 0)) && stop_rc=$current_rc
@@ -4116,7 +5948,8 @@ diagnose_stop_tracked_groups() {
 }
 
 finalize_report() {
-  if [[ -n "${DIAG_WORKLOAD_PID:-}" || -n "${DIAG_SAMPLER_PID:-}" ]]; then
+  if [[ -n "${DIAG_WORKLOAD_PID:-}" || -n "${DIAG_SAMPLER_PID:-}" ||
+    -n "${DIAG_TELEMETRY_PID:-}" ]]; then
     DERIVED_FINALIZATION_ERROR="tracked writer groups are not confirmed stopped"
     return 1
   fi
@@ -4281,41 +6114,78 @@ on_interrupt() {
 # Plan printing (also used by --dry-run)
 # ---------------------------------------------------------------------------
 print_plan() {
-  local ncpus_online cpu_policy
+  local ncpus_online cpu_policy i context_cpus
+  local concurrent_waves=0 concurrent_child_runs=0 concurrent_peak=0
   ncpus_online="$(diag_cpulist_count "$ONLINE_CPUS")"
   if [[ "$CPU_TARGET" == auto ]]; then
     cpu_policy="auto (worst failing CPU from individual results)"
   else
     cpu_policy="fixed CPU $CPU_TARGET"
   fi
+  for ((i = 0; i < ${#CONCURRENT_NAME[@]}; i++)); do
+    context_cpus="$(diag_cpulist_count "${CONCURRENT_CPUS[$i]}")"
+    concurrent_child_runs=$((concurrent_child_runs + context_cpus * PINNED_CONCURRENT_ROUNDS))
+    ((context_cpus <= concurrent_peak)) || concurrent_peak="$context_cpus"
+  done
+  concurrent_waves=$(( ${#CONCURRENT_NAME[@]} * PINNED_CONCURRENT_ROUNDS ))
   cat << EOF
 Resolved configuration:
   mode               $MODE
   out dir            ${OUT_DIR:-diagnostics/<timestamp>}$( [[ -n "$RESUME_DIR" ]] && printf ' (resume)' || true )
   baseline           $BASELINE_CHILDREN children x $BASELINE_WAVES waves (~$((BASELINE_CHILDREN * BASELINE_WAVES)) child runs)
   groups             ${#GROUP_NAME[@]} group(s) x $GROUP_WAVES waves
-  individual runs    $INDIVIDUAL_RUNS per CPU (failing groups' CPUs, or all $ncpus_online online CPUs)
+  individual runs    $INDIVIDUAL_RUNS per CPU ($( [[ "$RUN_SCHEMA_VERSION" == 2 ]] && printf 'all %s usable CPUs, seeded position-balanced order' "$ncpus_online" || printf "failing groups' CPUs, or all %s usable CPUs" "$ncpus_online" ))
   CPU selection      $cpu_policy
   redo phases        ${REDO_PLAN[*]:-none}
   frequency A/B/A    manual step (sudo ./frequency-ab.sh; never automatic)
   gdb capture        $( [[ "$SKIP_GDB" == "1" ]] && printf 'skipped' || printf 'up to %s runs using %s' "$GDB_MAX_RUNS" "$cpu_policy" )
+EOF
+  if [[ "$RUN_SCHEMA_VERSION" == 2 ]]; then
+    printf '  protocol seed      %s\n' "$PROTOCOL_SEED"
+    printf '  telemetry          %s ms interval (descriptive; read-only)\n' "$TELEMETRY_INTERVAL_MS"
+    if [[ "$SKIP_PINNED_CONCURRENT" == 1 ]]; then
+      printf '  pinned-concurrent  skipped by configuration\n'
+    elif [[ -n "$STATE_DIR" ]] && phase_is_done pinned-concurrent &&
+      ! phase_redo_is_authorized pinned-concurrent; then
+      printf '  pinned-concurrent  already complete in this bundle\n'
+    elif pinned_concurrent_unavailable_decision_present &&
+      ! phase_redo_is_authorized pinned-concurrent; then
+      printf '  pinned-concurrent  terminally unavailable in this bundle (--redo pinned-concurrent required to reassess)\n'
+    elif ((${#CONCURRENT_NAME[@]} == 0)); then
+      printf '  pinned-concurrent  unavailable (%s)\n' \
+        "${PINNED_CONCURRENT_UNAVAILABLE_REASON:-no safe topology context}"
+    elif pinned_concurrent_should_run; then
+      printf '  pinned-concurrent  %s context(s) x %s rounds (%s waves, ~%s child runs)\n' \
+        "${#CONCURRENT_NAME[@]}" "$PINNED_CONCURRENT_ROUNDS" \
+        "$concurrent_waves" "$concurrent_child_runs"
+    else
+      printf '  pinned-concurrent  not scheduled (resume state requires validation)\n'
+    fi
+  fi
+  cat << EOF
 
 Discovered topology:
   online CPUs        $ONLINE_CPUS
   P-cores            ${P_CORES:-none detected}
   E-cores            ${E_CORES:-none detected}
 EOF
-  local i
   for ((i = 0; i < ${#GROUP_NAME[@]}; i++)); do
     printf '  group %-18s cpus=%-10s children=%s\n' \
       "${GROUP_NAME[$i]}" "${GROUP_CPUS[$i]}" "$(group_children "${GROUP_CPUS[$i]}")"
   done
+  if pinned_concurrent_should_run; then
+    for ((i = 0; i < ${#CONCURRENT_NAME[@]}; i++)); do
+      printf '  context %-16s cpus=%-10s controller=%s\n' \
+        "${CONCURRENT_NAME[$i]}" "${CONCURRENT_CPUS[$i]}" "${CONCURRENT_CONTROLLER[$i]}"
+    done
+  fi
   cat << EOF
 
 Rough duration estimate (very approximate, ~6s/wave, ~3s/single run):
   baseline           ~$((BASELINE_WAVES * 6 / 60 + 1)) min
   groups             ~$(( ${#GROUP_NAME[@]} * GROUP_WAVES * 6 / 60 + 1)) min
   individual         ~$(( ncpus_online * INDIVIDUAL_RUNS * 3 / 60 + 1)) min worst case
+$(if pinned_concurrent_should_run; then printf '  pinned-concurrent  ~%s min (peak %s concurrent children)\n' "$((concurrent_waves * 6 / 60 + 1))" "$concurrent_peak"; fi)
   frequency A/B/A    ~$(( 3 * INDIVIDUAL_RUNS * 3 / 60 + 1)) min (manual: sudo ./frequency-ab.sh)
   gdb                ~$(( GDB_MAX_RUNS * 40 / 60 + 1)) min worst case
 EOF
@@ -4323,7 +6193,7 @@ EOF
 
 # ---------------------------------------------------------------------------
 main() {
-  local caller_dir
+  local caller_dir phase_total=7 frequency_phase=5 gdb_phase=6 report_phase=7
   caller_dir="$(pwd -P)"
   pre_pass "$@"
 
@@ -4374,6 +6244,7 @@ main() {
     else
       bundle_mutable_graph_validate
       load_stored_config "$OUT_DIR"
+      validate_loaded_schema_artifacts
       # Stored values are already concrete; do not re-apply the mode preset.
     fi
   fi
@@ -4392,6 +6263,12 @@ main() {
   # interrupted fresh initialization instead runs fresh on the same directory.
   ((fresh_init_recovered == 0)) || RESUME_DIR=""
   validate_config
+  if [[ "$RUN_SCHEMA_VERSION" == 2 ]]; then
+    phase_total=8
+    frequency_phase=6
+    gdb_phase=7
+    report_phase=8
+  fi
 
   # A pending redo is authoritative for its embedded persisted configuration.
   # Read and reconcile it before dependency checks, topology discovery,
@@ -4445,6 +6322,7 @@ main() {
   # Consent must precede every bundle mutation, especially redo archival and
   # metadata rewrites on an existing bundle.
   safety_gate
+  resolve_protocol_seed
   print_plan
 
   if [[ -z "$RESUME_DIR" ]]; then
@@ -4491,12 +6369,17 @@ main() {
       diag_die "cannot safely create run metadata"
     {
       printf 'MODE=%s\n' "$MODE"
+      printf 'RUN_SCHEMA_VERSION=%s\n' "$RUN_SCHEMA_VERSION"
       printf 'START_EPOCH=%s\n' "$(date +%s)"
       printf 'START_ISO=%s\n' "$(date -Is)"
       printf 'BASELINE_CHILDREN=%s\n' "$BASELINE_CHILDREN"
       printf 'BASELINE_WAVES=%s\n' "$BASELINE_WAVES"
       printf 'GROUP_WAVES=%s\n' "$GROUP_WAVES"
       printf 'INDIVIDUAL_RUNS=%s\n' "$INDIVIDUAL_RUNS"
+      printf 'PINNED_CONCURRENT_ROUNDS=%s\n' "$PINNED_CONCURRENT_ROUNDS"
+      printf 'PROTOCOL_SEED=%s\n' "$PROTOCOL_SEED"
+      printf 'SKIP_PINNED_CONCURRENT=%s\n' "$SKIP_PINNED_CONCURRENT"
+      printf 'TELEMETRY_INTERVAL_MS=%s\n' "$TELEMETRY_INTERVAL_MS"
       printf 'GDB_MAX_RUNS=%s\n' "$GDB_MAX_RUNS"
       printf 'SKIP_GDB=%s\n' "$SKIP_GDB"
       printf 'CPU_TARGET=%s\n' "$CPU_TARGET"
@@ -4524,9 +6407,9 @@ main() {
   if phase_is_done preflight; then
     preflight_evidence_is_complete --validate-complete ||
       diag_die "completed preflight phase has missing, stale, or invalid evidence; preserve it and resume with --redo preflight"
-    diag_log "phase 1/7 preflight: already done, skipping (resume)"
+    diag_log "phase 1/$phase_total preflight: already done, skipping (resume)"
   else
-    diag_log "phase 1/7: preflight and environment collection"
+    diag_log "phase 1/$phase_total: preflight and environment collection"
     phase_preflight
   fi
 
@@ -4534,9 +6417,9 @@ main() {
   if phase_is_done baseline; then
     baseline_evidence_is_complete ||
       diag_die "completed baseline phase has missing or invalid evidence; preserve it and resume with --redo baseline"
-    diag_log "phase 2/7 baseline: already done, skipping (resume)"
+    diag_log "phase 2/$phase_total baseline: already done, skipping (resume)"
   else
-    diag_log "phase 2/7: baseline reproduction"
+    diag_log "phase 2/$phase_total: baseline reproduction"
     phase_baseline
   fi
 
@@ -4544,9 +6427,9 @@ main() {
   if phase_is_done groups; then
     groups_evidence_is_complete ||
       diag_die "completed groups phase has missing, stale, or invalid evidence; preserve it and resume with --redo groups"
-    diag_log "phase 3/7 groups: already done, skipping (resume)"
+    diag_log "phase 3/$phase_total groups: already done, skipping (resume)"
   else
-    diag_log "phase 3/7: CPU-group isolation (${#GROUP_NAME[@]} groups x $GROUP_WAVES waves)"
+    diag_log "phase 3/$phase_total: CPU-group isolation (${#GROUP_NAME[@]} groups x $GROUP_WAVES waves)"
     phase_groups
   fi
 
@@ -4561,18 +6444,73 @@ main() {
   if phase_is_done individual; then
     individual_phase_is_complete_and_matches_expected "$individual_should_run" ||
       diag_die "completed individual phase does not match the validated group target policy; preserve it and resume with --redo individual"
-    diag_log "phase 4/7 individual: already done, skipping (resume)"
+    diag_log "phase 4/$phase_total individual: already done, skipping (resume)"
   else
     if ((individual_should_run == 1)); then
-      diag_log "phase 4/7: individual CPU isolation (cpus $INDIVIDUAL_TARGET_CPUS, $INDIVIDUAL_RUNS runs each)"
-      phase_individual
+      diag_log "phase 4/$phase_total: individual CPU isolation (cpus $INDIVIDUAL_TARGET_CPUS, $INDIVIDUAL_RUNS runs each)"
+      if [[ "$RUN_SCHEMA_VERSION" == 2 ]]; then
+        phase_individual_v5
+      else
+        phase_individual
+      fi
     else
-      diag_log "phase 4/7: no failing group in quick mode; skipping individual tests"
+      diag_log "phase 4/$phase_total: no failing group in quick mode; skipping individual tests"
       phase_individual_skipped
     fi
   fi
 
-  # Determine the CPU for phases 5/6.
+  # ---- schema-2 phase 5 ----
+  # This phase is deliberately absent from legacy bundles. A configured skip
+  # remains explicit and marker-free; an interrupted attempt must be archived
+  # with --redo instead of being silently relabelled as skipped. A
+  # topology-unavailable decision
+  # is instead recorded in its own source-group-bound terminal envelope so
+  # companion publishers and later report-only resumes cannot accidentally
+  # turn it into a new workload when the usable topology changes.
+  if [[ "$RUN_SCHEMA_VERSION" == 2 ]]; then
+    if phase_is_done pinned-concurrent; then
+      ! pinned_concurrent_unavailable_decision_present ||
+        diag_die "completed pinned-concurrent evidence conflicts with a terminal-unavailable decision; preserve both and use --redo pinned-concurrent"
+      [[ "$SKIP_PINNED_CONCURRENT" == 0 && ${#CONCURRENT_NAME[@]} -gt 0 ]] ||
+        diag_die "completed pinned-concurrent evidence conflicts with the stored skip/topology state; preserve it and use --redo pinned-concurrent"
+      pinned_concurrent_evidence_is_complete ||
+        diag_die "completed pinned-concurrent phase has missing, stale, or invalid evidence; preserve it and resume with --redo pinned-concurrent"
+      diag_log "phase 5/$phase_total pinned-concurrent: already done, skipping (resume)"
+    elif pinned_concurrent_unavailable_decision_present; then
+      [[ "$SKIP_PINNED_CONCURRENT" == 0 ]] ||
+        diag_die "pinned-concurrent terminal-unavailable evidence conflicts with the stored explicit skip; preserve it and use --redo pinned-concurrent"
+      ! phase_redo_is_authorized pinned-concurrent ||
+        diag_die "pinned-concurrent redo left its terminal-unavailable decision in place; retry --redo pinned-concurrent"
+      ! pinned_concurrent_workload_attempt_is_meaningful ||
+        diag_die "pinned-concurrent terminal-unavailable evidence conflicts with workload artifacts; preserve them and use --redo pinned-concurrent"
+      pinned_concurrent_unavailable_state_read ||
+        diag_die "pinned-concurrent terminal-unavailable evidence is unsafe or disagrees with its source groups; preserve it and use --redo pinned-concurrent"
+      if [[ "$PINNED_CONCURRENT_UNAVAILABLE_STATE" == recoverable ]]; then
+        pinned_concurrent_unavailable_publish ||
+          diag_die "cannot recover the pinned-concurrent terminal-unavailable publication"
+      fi
+      [[ "$PINNED_CONCURRENT_UNAVAILABLE_STATE" == complete ]] ||
+        diag_die "pinned-concurrent terminal-unavailable evidence is not complete"
+      diag_warn "phase 5/$phase_total: pinned-concurrent remains unavailable by its recorded terminal decision (use --redo pinned-concurrent to request a new topology assessment)"
+    elif [[ "$SKIP_PINNED_CONCURRENT" == 1 ]]; then
+      pinned_concurrent_attempt_is_meaningful &&
+        diag_die "an incomplete pinned-concurrent attempt exists; archive it with --redo pinned-concurrent before applying --skip-pinned-concurrent"
+      diag_log "phase 5/$phase_total: pinned-concurrent explicitly skipped"
+    elif ((${#CONCURRENT_NAME[@]} == 0)); then
+      pinned_concurrent_attempt_is_meaningful &&
+        diag_die "an incomplete pinned-concurrent attempt no longer matches usable topology; preserve it and use --redo pinned-concurrent"
+      pinned_concurrent_unavailable_publish ||
+        diag_die "cannot publish the source-group-bound pinned-concurrent unavailable decision"
+      diag_warn "phase 5/$phase_total: pinned-concurrent unavailable: ${PINNED_CONCURRENT_UNAVAILABLE_REASON:-no safe topology context}"
+    elif pinned_concurrent_should_run; then
+      diag_log "phase 5/$phase_total: pinned-concurrent topology contexts (${#CONCURRENT_NAME[@]} contexts x $PINNED_CONCURRENT_ROUNDS rounds)"
+      phase_pinned_concurrent
+    else
+      diag_die "pinned-concurrent execution decision is internally inconsistent"
+    fi
+  fi
+
+  # Determine the CPU for the manual frequency and GDB phases.
   local target_cpu=""
   if [[ -n "$WORST_CPU_OVERRIDE" ]]; then
     target_cpu="$WORST_CPU_OVERRIDE"
@@ -4583,31 +6521,32 @@ main() {
     diag_die "resolved automatic worst CPU $target_cpu is not in the usable CPU set ($ONLINE_CPUS); resume using --cpu auto after redoing individual evidence"
   fi
 
-  # ---- phase 5 (manual; see frequency-ab.sh) ----
+  # ---- manual frequency phase (see frequency-ab.sh) ----
   if phase_is_done frequency; then
     frequency_result_is_complete "$target_cpu" --complete ||
       diag_die "completed frequency evidence is invalid or inconsistent; resume with --redo frequency"
-    diag_log "phase 5/7 frequency: already done, skipping (resume)"
+    diag_log "phase $frequency_phase/$phase_total frequency: already done, skipping (resume)"
   elif frequency_result_is_complete "$target_cpu"; then
-    diag_log "phase 5/7: results from a manual frequency-ab.sh run found; incorporating"
+    diag_log "phase $frequency_phase/$phase_total: results from a manual frequency-ab.sh run found; incorporating"
     mark_done frequency
   elif [[ -z "$target_cpu" ]]; then
-    diag_warn "phase 5/7: no failing CPU identified; skipping frequency A/B/A"
+    diag_warn "phase $frequency_phase/$phase_total: no failing CPU identified; skipping frequency A/B/A"
   else
-    diag_log "phase 5/7: frequency A/B/A (manual step, run with sudo)"
+    diag_log "phase $frequency_phase/$phase_total: frequency A/B/A (manual step, run with sudo)"
     phase_frequency "$target_cpu"
   fi
 
-  # ---- phase 6 ----
+  # ---- GDB phase ----
   if phase_is_done gdb; then
     gdb_completed_resume_gate
-    diag_log "phase 6/7 gdb: already done, skipping (resume)"
+    diag_log "phase $gdb_phase/$phase_total gdb: already done, skipping (resume)"
   else
+    diag_log "phase $gdb_phase/$phase_total: GDB fault-signature capture"
     phase_gdb_dispatch "$target_cpu"
   fi
 
-  # ---- phase 7 ----
-  diag_log "phase 7/7: statistics, report, manifest"
+  # ---- report phase ----
+  diag_log "phase $report_phase/$phase_total: statistics, report, manifest"
   # A run that reaches here completed fully; clear any interrupted flag
   # left over from a previous, interrupted attempt on this bundle.
   meta_set INTERRUPTED 0

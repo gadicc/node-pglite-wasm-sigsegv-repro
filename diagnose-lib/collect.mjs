@@ -9,6 +9,8 @@
 //   results/groups.tsv         one group per line
 //   results/individual.tsv     cpu, run, rc, elapsed
 //   results/individual.meta    target CPUs, runs per CPU, skip/completion state
+//   results/pinned-concurrent.* exact-CPU concurrent plan and outcomes
+//   results/telemetry-*.{tsv,meta} digest-bound read-only telemetry segments
 //   results/frequency-ab.tsv   leg, run, rc, elapsed
 //   results/frequency-ab.meta  leg configuration + restore status
 //   results/gdb.manifest     authoritative gdb evidence envelope
@@ -48,13 +50,34 @@ import {
   assessIndividual as assessIndividualEnvelopeRows,
   inspectIndividualEvidence,
 } from "./individual-evidence.mjs";
+import {
+  PINNED_CONCURRENT_SCHEDULE_ALGORITHM,
+  assessPinnedConcurrentEvidence,
+  parsePinnedConcurrentCpuList,
+} from "./pinned-concurrent-evidence.mjs";
 import { assessPreflightEvidence } from "./preflight-evidence.mjs";
 import { assessRootChecksEvidence } from "./root-checks-evidence.mjs";
+import { TELEMETRY_PHASES, assessTelemetryEvidence } from "./telemetry-evidence.mjs";
+import { associateTelemetryRuns } from "./telemetry-association.mjs";
+import { computeTelemetryWorkloadBinding } from "./telemetry-workload-binding.mjs";
+import {
+  buildBalancedGroupOrders,
+  buildConcurrentLaunchOrders,
+} from "./pinned-runner.mjs";
 
 const RUN_CONFIG_KEYS = new Set([
-  "MODE", "BASELINE_CHILDREN", "BASELINE_WAVES", "GROUP_WAVES",
-  "INDIVIDUAL_RUNS", "GDB_MAX_RUNS", "SKIP_GDB", "CPU_TARGET",
+  "MODE", "RUN_SCHEMA_VERSION", "BASELINE_CHILDREN", "BASELINE_WAVES", "GROUP_WAVES",
+  "INDIVIDUAL_RUNS", "PINNED_CONCURRENT_ROUNDS", "PROTOCOL_SEED",
+  "SKIP_PINNED_CONCURRENT", "TELEMETRY_INTERVAL_MS", "GDB_MAX_RUNS", "SKIP_GDB", "CPU_TARGET",
 ]);
+
+const SCHEMA_2_CONFIG_KEYS = [
+  "RUN_SCHEMA_VERSION",
+  "PINNED_CONCURRENT_ROUNDS",
+  "PROTOCOL_SEED",
+  "SKIP_PINNED_CONCURRENT",
+  "TELEMETRY_INTERVAL_MS",
+];
 
 function storedCpuTargetConfig(values, duplicateConfig) {
   if (duplicateConfig.has("CPU_TARGET")) {
@@ -138,6 +161,44 @@ function readStoredRunMetadata(outDir) {
   const waves = canonicalUint(values.BASELINE_WAVES);
   const groupWaves = duplicateConfig.has("GROUP_WAVES") ? null : canonicalUint(values.GROUP_WAVES);
   const cpuTargetConfig = storedCpuTargetConfig(values, duplicateConfig);
+  const runSchemaVersion = Object.hasOwn(values, "RUN_SCHEMA_VERSION")
+    ? canonicalUint(values.RUN_SCHEMA_VERSION)
+    : 1;
+  let pinnedConcurrentRounds = null;
+  let protocolSeed = null;
+  let skipPinnedConcurrent = null;
+  let telemetryIntervalMs = null;
+  if (runSchemaVersion !== 1 && runSchemaVersion !== 2) {
+    reasons.push("stored RUN_SCHEMA_VERSION is not 1 or 2");
+  } else if (runSchemaVersion === 2) {
+    for (const key of SCHEMA_2_CONFIG_KEYS) {
+      if (!Object.hasOwn(values, key)) reasons.push(`schema 2 stored run metadata is missing ${key}`);
+    }
+    pinnedConcurrentRounds = canonicalUint(values.PINNED_CONCURRENT_ROUNDS);
+    protocolSeed = canonicalUint(values.PROTOCOL_SEED);
+    skipPinnedConcurrent = values.SKIP_PINNED_CONCURRENT === "0"
+      ? false
+      : values.SKIP_PINNED_CONCURRENT === "1"
+        ? true
+        : null;
+    telemetryIntervalMs = canonicalUint(values.TELEMETRY_INTERVAL_MS);
+    if (pinnedConcurrentRounds === null || pinnedConcurrentRounds < 1) {
+      reasons.push("stored PINNED_CONCURRENT_ROUNDS is missing or not a canonical safe positive integer");
+    }
+    if (protocolSeed === null || protocolSeed > 0xffff_ffff) {
+      reasons.push("stored PROTOCOL_SEED is missing or not a canonical uint32");
+    }
+    if (skipPinnedConcurrent === null) {
+      reasons.push("stored SKIP_PINNED_CONCURRENT is missing or not 0 or 1");
+    }
+    if (telemetryIntervalMs === null || telemetryIntervalMs < 50 || telemetryIntervalMs > 60_000) {
+      reasons.push("stored TELEMETRY_INTERVAL_MS is missing or outside 50..60000");
+    }
+  } else {
+    for (const key of SCHEMA_2_CONFIG_KEYS.slice(1)) {
+      if (Object.hasOwn(values, key)) reasons.push(`legacy stored run metadata unexpectedly contains ${key}`);
+    }
+  }
   if (children === null || children < 1) {
     reasons.push("stored BASELINE_CHILDREN is missing or not a canonical safe positive integer");
   }
@@ -153,6 +214,15 @@ function readStoredRunMetadata(outDir) {
     baselineChildren: children !== null && children > 0 ? children : null,
     baselineWaves: waves !== null && waves > 0 ? waves : null,
     groupWaves: groupWaves !== null && groupWaves > 0 ? groupWaves : null,
+    runSchemaVersion: runSchemaVersion === 1 || runSchemaVersion === 2 ? runSchemaVersion : null,
+    pinnedConcurrentRounds:
+      pinnedConcurrentRounds !== null && pinnedConcurrentRounds > 0 ? pinnedConcurrentRounds : null,
+    protocolSeed: protocolSeed !== null && protocolSeed <= 0xffff_ffff ? protocolSeed : null,
+    skipPinnedConcurrent,
+    telemetryIntervalMs:
+      telemetryIntervalMs !== null && telemetryIntervalMs >= 50 && telemetryIntervalMs <= 60_000
+        ? telemetryIntervalMs
+        : null,
     cpuTargetConfig,
     status: reasons.length > 0 ? "invalid" : "complete",
     reasons: [...new Set(reasons)],
@@ -469,7 +539,14 @@ export function selectWorstIndividualCpu(records) {
 
 export { assessIndividualEnvelopeRows as assessIndividual };
 
-export function reconcileIndividualWithGroups(assessment, meta, groupsAssessment, mode, configuredRuns) {
+export function reconcileIndividualWithGroups(
+  assessment,
+  meta,
+  groupsAssessment,
+  mode,
+  configuredRuns,
+  configuredProtocolSeed = null,
+) {
   if (assessment.status === "not-run") return assessment;
   const reasons = [...assessment.reasons];
   let status = assessment.status;
@@ -485,14 +562,18 @@ export function reconcileIndividualWithGroups(assessment, meta, groupsAssessment
     const commonMismatch = !expected ||
       meta.TARGET_CPUS !== expected.targetCpus ||
       meta.SKIPPED !== (expected.skipped ? "1" : "0") ||
-      canonicalUint(configuredRuns) === null || meta.RUNS_PER_CPU !== configuredRuns;
-    const provenanceMismatch = meta.VERSION === "4" || meta.VERSION === "3" || meta.VERSION === "2"
+      canonicalUint(configuredRuns) === null || meta.RUNS_PER_CPU !== configuredRuns ||
+      (meta.VERSION === "5" &&
+        (canonicalUint(String(configuredProtocolSeed ?? "")) === null ||
+          meta.SCHEDULE_SEED !== String(configuredProtocolSeed)));
+    const provenanceMismatch = meta.VERSION === "5" || meta.VERSION === "4" ||
+      meta.VERSION === "3" || meta.VERSION === "2"
       ? meta.TARGET_POLICY !== expected?.targetPolicy ||
         meta.GROUP_PLAN_DIGEST !== expected?.groupPlanDigest
       : meta.VERSION !== "1";
-    // Version 4 envelopes bind the exact validated groups generation: a
+    // Versions 4 and 5 bind the exact validated groups generation: a
     // reproducible plan digest alone no longer authorizes redone evidence.
-    const generationMismatch = meta.VERSION === "4" &&
+    const generationMismatch = (meta.VERSION === "4" || meta.VERSION === "5") &&
       meta.GROUP_GENERATION !== expected?.groupGeneration;
     if (commonMismatch || provenanceMismatch) {
       reasons.push("individual target policy does not match the validated group evidence generation");
@@ -980,6 +1061,726 @@ function bundleReadinessTokenExists(outDir) {
   }
 }
 
+const PINNED_CONCURRENT_UNAVAILABLE_META_MAX_BYTES = 512;
+const PINNED_CONCURRENT_UNAVAILABLE_REASON = "no-safe-topology-context";
+
+function readOwnedSingleLinkArtifact(file, maxBytes, label) {
+  let pathStat;
+  try {
+    pathStat = lstatSync(file);
+  } catch (error) {
+    if (error?.code === "ENOENT") return { present: false, buffer: null, reasons: [] };
+    return { present: true, buffer: null, reasons: [`${label} could not be inspected`] };
+  }
+  const reasons = [];
+  const expectedUid = typeof process.getuid === "function" ? process.getuid() : null;
+  let parentStat;
+  try {
+    parentStat = lstatSync(path.dirname(file));
+  } catch {
+    parentStat = null;
+  }
+  if (parentStat === null || !parentStat.isDirectory() || parentStat.isSymbolicLink() ||
+      (expectedUid !== null && parentStat.uid !== expectedUid)) {
+    reasons.push(`${label} parent must be an owned real directory`);
+  }
+  if (!pathStat.isFile() || pathStat.isSymbolicLink() || pathStat.nlink !== 1 ||
+      (expectedUid !== null && pathStat.uid !== expectedUid)) {
+    reasons.push(`${label} must be an owned single-link regular file`);
+  }
+  if (!Number.isSafeInteger(pathStat.size) || pathStat.size < 0 || pathStat.size > maxBytes) {
+    reasons.push(`${label} exceeds its evidence size limit`);
+  }
+  if (reasons.length > 0) return { present: true, buffer: null, reasons };
+
+  let fd;
+  try {
+    fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const before = fstatSync(fd);
+    if (!before.isFile() || before.nlink !== 1 || before.size !== pathStat.size ||
+        before.dev !== pathStat.dev || before.ino !== pathStat.ino ||
+        (expectedUid !== null && before.uid !== expectedUid)) {
+      return { present: true, buffer: null, reasons: [`${label} changed before it could be read safely`] };
+    }
+    const buffer = Buffer.alloc(before.size);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const count = readSync(fd, buffer, offset, buffer.length - offset, null);
+      if (count === 0) {
+        return { present: true, buffer: null, reasons: [`${label} ended before its validated size`] };
+      }
+      offset += count;
+    }
+    const extra = Buffer.allocUnsafe(1);
+    if (readSync(fd, extra, 0, 1, null) !== 0) {
+      return { present: true, buffer: null, reasons: [`${label} grew while it was being read`] };
+    }
+    const after = fstatSync(fd);
+    if (after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size ||
+        after.nlink !== 1 || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) {
+      return { present: true, buffer: null, reasons: [`${label} changed while it was being read`] };
+    }
+    return { present: true, buffer, reasons: [] };
+  } catch {
+    return { present: true, buffer: null, reasons: [`${label} could not be read safely`] };
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // The read result is already fail-closed.
+      }
+    }
+  }
+}
+
+function inspectPinnedConcurrentUnavailableEnvelope(outDir) {
+  const root = path.resolve(outDir);
+  const metaRead = readOwnedSingleLinkArtifact(
+    path.join(root, "results", "pinned-concurrent.unavailable.meta"),
+    PINNED_CONCURRENT_UNAVAILABLE_META_MAX_BYTES,
+    "pinned-concurrent unavailable metadata",
+  );
+  const markerRead = readOwnedSingleLinkArtifact(
+    path.join(root, "state", "phase-pinned-concurrent-unavailable.done"),
+    0,
+    "pinned-concurrent unavailable completion marker",
+  );
+  const present = metaRead.present || markerRead.present;
+  if (!present) return { present: false, status: "not-run", reasons: [], meta: null };
+
+  const reasons = [...metaRead.reasons, ...markerRead.reasons];
+  if (!metaRead.present) reasons.push("pinned-concurrent unavailable metadata is missing");
+  if (!markerRead.present) reasons.push("pinned-concurrent unavailable completion marker is missing");
+  if (markerRead.buffer !== null && markerRead.buffer.length !== 0) {
+    reasons.push("pinned-concurrent unavailable completion marker must be empty");
+  }
+
+  let meta = null;
+  if (metaRead.buffer !== null) {
+    const match = metaRead.buffer.toString("utf8").match(
+      /^VERSION=1\nSOURCE_GROUP_GENERATION=([a-f0-9]{32})\nSOURCE_GROUP_PLAN_DIGEST=([a-f0-9]{64})\nREASON=no-safe-topology-context\n$/,
+    );
+    if (match === null) {
+      reasons.push("pinned-concurrent unavailable metadata is not the exact canonical envelope");
+    } else {
+      meta = {
+        VERSION: "1",
+        SOURCE_GROUP_GENERATION: match[1],
+        SOURCE_GROUP_PLAN_DIGEST: match[2],
+        REASON: PINNED_CONCURRENT_UNAVAILABLE_REASON,
+      };
+    }
+  }
+  return {
+    present: true,
+    status: reasons.length === 0 ? "complete" : "invalid",
+    reasons: [...new Set(reasons)],
+    meta,
+  };
+}
+
+function pinnedConcurrentWorkloadArtifactsPresent(outDir) {
+  const root = path.resolve(outDir);
+  const expectedUid = typeof process.getuid === "function" ? process.getuid() : null;
+  for (const relative of [
+    "results/pinned-concurrent.meta",
+    "results/pinned-concurrent.groups.tsv",
+    "results/pinned-concurrent.plan.tsv",
+    "results/pinned-concurrent.tsv",
+    "results/pinned-concurrent.boundaries.ndjson",
+    "state/phase-pinned-concurrent.done",
+    "logs/pinned-concurrent",
+    "state/pinned-concurrent-waves",
+    "state/pinned-concurrent-finalize",
+    "results/telemetry-pinned-concurrent.tsv",
+    "results/telemetry-pinned-concurrent.meta",
+    "telemetry/pinned-concurrent",
+    "state/telemetry-pinned-concurrent",
+  ]) {
+    const artifact = path.join(root, relative);
+    try {
+      const artifactStat = lstatSync(artifact);
+      if (artifactStat.isDirectory() && !artifactStat.isSymbolicLink()) {
+        const parentStat = lstatSync(path.dirname(artifact));
+        const ownedRealParents = parentStat.isDirectory() && !parentStat.isSymbolicLink() &&
+          (expectedUid === null || (parentStat.uid === expectedUid && artifactStat.uid === expectedUid));
+        if (ownedRealParents && readdirSync(artifact).length === 0) continue;
+      }
+      return true;
+    } catch (error) {
+      if (error?.code !== "ENOENT") return true;
+    }
+  }
+  return false;
+}
+
+function pinnedConcurrentSummary(assessment, authoritative) {
+  const outcomes = assessment.descriptiveOutcomes;
+  if (outcomes === null || outcomes === undefined) return null;
+  return {
+    generation: assessment.meta?.GENERATION ?? null,
+    sourceGroupGeneration: assessment.meta?.SOURCE_GROUP_GENERATION ?? null,
+    sourceGroupPlanDigest: assessment.meta?.SOURCE_GROUP_PLAN_DIGEST ?? null,
+    roundsPerContext: num(assessment.meta?.ROUNDS_PER_CONTEXT),
+    scheduleSeed: num(assessment.meta?.SCHEDULE_SEED),
+    scheduleAlgorithm: assessment.meta?.SCHEDULE_ALGORITHM ?? null,
+    groups: assessment.groups.map((group) => ({
+      group: group.group,
+      kind: group.kind,
+      cpus: group.cpus,
+      cluster: group.cluster,
+      controllerCpu: group.controller_cpu,
+      rounds: group.rounds,
+    })),
+    waves: outcomes.waves,
+    totalWaves: assessment.totalWaveCount,
+    failedWaves: outcomes.failedWaves,
+    childRuns: outcomes.childRuns,
+    sigsegv: outcomes.sigsegv,
+    perGroup: outcomes.perGroup,
+    perCpu: outcomes.perCpu.map((record) => ({
+      context: record.group,
+      group: record.group,
+      cpu: record.cpu,
+      runs: record.runs,
+      failures: record.sigsegv,
+      sigsegv: record.sigsegv,
+    })),
+    authoritative,
+  };
+}
+
+function sameCpuSet(left, right) {
+  return left.length === right.length && left.every((cpu, index) => cpu === right[index]);
+}
+
+export function validatePinnedConcurrentContexts(groups, sourceEntries) {
+  if (!Array.isArray(groups) || !Array.isArray(sourceEntries) || sourceEntries.length === 0) {
+    return ["pinned-concurrent contexts cannot be reconciled without source group rows"];
+  }
+  const reasons = [];
+  const byName = new Map(groups.map((group) => [group.group, group]));
+  const sourceNames = new Set(sourceEntries.map((entry) => entry.name));
+  const used = new Set();
+  const usable = new Set();
+  for (const source of sourceEntries) {
+    for (const cpu of parsePinnedConcurrentCpuList(source.cpus) ?? []) usable.add(cpu);
+  }
+  const checkController = (context) => {
+    if (!usable.has(context.controller_cpu)) {
+      reasons.push(`pinned-concurrent context ${context.group} has a controller outside the source usable CPU set`);
+    }
+  };
+  for (const source of sourceEntries) {
+    const sourceCpus = parsePinnedConcurrentCpuList(source.cpus);
+    const sourceCluster = source.clusterId ?? "-";
+    const exact = byName.get(source.name);
+    const left = byName.get(`${source.name}-a`);
+    const right = byName.get(`${source.name}-b`);
+    if (exact !== undefined) {
+      used.add(exact.group);
+      checkController(exact);
+      if (left !== undefined || right !== undefined) {
+        reasons.push(`pinned-concurrent source group ${source.name} has both exact and partitioned contexts`);
+      }
+      if (exact.kind !== source.kind || exact.cpus !== source.cpus || exact.cluster !== sourceCluster) {
+        reasons.push(`pinned-concurrent context ${source.name} disagrees with its source group identity`);
+      }
+      continue;
+    }
+    if (left === undefined || right === undefined) {
+      reasons.push(`pinned-concurrent source group ${source.name} has no exact context or complete a/b partition`);
+      continue;
+    }
+    used.add(left.group);
+    used.add(right.group);
+    checkController(left);
+    checkController(right);
+    const leftCpus = parsePinnedConcurrentCpuList(left.cpus) ?? [];
+    const rightCpus = parsePinnedConcurrentCpuList(right.cpus) ?? [];
+    const union = [...new Set([...leftCpus, ...rightCpus])].sort((a, b) => a - b);
+    const overlap = leftCpus.some((cpu) => rightCpus.includes(cpu));
+    const expectedKind = `${source.kind}-partition`;
+    if (left.kind !== expectedKind || right.kind !== expectedKind ||
+        left.cluster !== "-" || right.cluster !== "-" || overlap ||
+        sourceCpus === null || !sameCpuSet(union, sourceCpus)) {
+      reasons.push(`pinned-concurrent a/b contexts for ${source.name} are not an exact source-group partition`);
+    }
+  }
+  for (const group of groups) {
+    if (!used.has(group.group) && !sourceNames.has(group.group)) {
+      reasons.push(`pinned-concurrent context ${group.group} has no source group`);
+    }
+  }
+  return [...new Set(reasons)];
+}
+
+function pinnedConcurrentContextSeed(seed, context, cpus) {
+  const identity = [
+    "pinned-concurrent-launch-v1",
+    String(seed),
+    context.group,
+    context.kind,
+    cpus.join(","),
+    context.cluster,
+    String(context.controller_cpu),
+  ].join("\0");
+  return createHash("sha256").update(identity).digest().readUInt32BE(0);
+}
+
+export function buildExpectedPinnedConcurrentPlanRows(groups, rounds, seed) {
+  const contexts = groups.map((group) => {
+    const cpus = parsePinnedConcurrentCpuList(group.cpus);
+    if (cpus === null) throw new TypeError(`pinned-concurrent context ${group.group} has invalid CPUs`);
+    return { ...group, cpus };
+  });
+  const groupOrders = buildBalancedGroupOrders(contexts.length, rounds, seed);
+  const launchOrders = new Map(contexts.map((context) => [
+    context.group,
+    buildConcurrentLaunchOrders(
+      context.cpus,
+      rounds,
+      pinnedConcurrentContextSeed(seed, context, context.cpus),
+    ),
+  ]));
+  const rows = [];
+  let ordinal = 0;
+  for (let roundIndex = 0; roundIndex < rounds; roundIndex += 1) {
+    for (let groupIndex = 0; groupIndex < groupOrders[roundIndex].length; groupIndex += 1) {
+      const context = contexts[groupOrders[roundIndex][groupIndex]];
+      const launches = launchOrders.get(context.group)[roundIndex];
+      for (let launchIndex = 0; launchIndex < launches.length; launchIndex += 1) {
+        rows.push({
+          ordinal: ++ordinal,
+          round: roundIndex + 1,
+          group_position: groupIndex + 1,
+          group: context.group,
+          controller_cpu: context.controller_cpu,
+          launch_position: launchIndex + 1,
+          cpu: launches[launchIndex],
+        });
+      }
+    }
+  }
+  return rows;
+}
+
+function collectPinnedConcurrent(outDir, runMetaState, groupsAssessment) {
+  const schema2 = runMetaState.runSchemaVersion === 2;
+  const trustedConfig = schema2 && runMetaState.status === "complete";
+  const expectations = trustedConfig
+    ? {
+        roundsPerContext: runMetaState.pinnedConcurrentRounds,
+        scheduleSeed: runMetaState.protocolSeed,
+        scheduleAlgorithm: PINNED_CONCURRENT_SCHEDULE_ALGORITHM,
+        ...(groupsAssessment.status === "complete"
+          ? {
+              sourceGroupGeneration: groupsAssessment.meta.GENERATION,
+              sourceGroupPlanDigest: groupsAssessment.meta.PLAN_DIGEST,
+            }
+          : {}),
+      }
+    : {};
+  const unavailable = inspectPinnedConcurrentUnavailableEnvelope(outDir);
+  if (unavailable.present) {
+    const reasons = [...unavailable.reasons];
+    if (pinnedConcurrentWorkloadArtifactsPresent(outDir)) {
+      reasons.push("pinned-concurrent unavailable evidence contradicts workload or telemetry artifacts");
+    }
+    if (!trustedConfig) {
+      reasons.push("pinned-concurrent unavailable evidence requires a complete schema-2 run configuration");
+    } else if (runMetaState.skipPinnedConcurrent) {
+      reasons.push("pinned-concurrent unavailable evidence contradicts the configured explicit skip");
+    }
+    if (groupsAssessment.status !== "complete") {
+      reasons.push("pinned-concurrent unavailable evidence requires complete validated source groups");
+    } else if (unavailable.meta !== null &&
+        (unavailable.meta.SOURCE_GROUP_GENERATION !== groupsAssessment.meta.GENERATION ||
+         unavailable.meta.SOURCE_GROUP_PLAN_DIGEST !== groupsAssessment.meta.PLAN_DIGEST)) {
+      reasons.push("pinned-concurrent unavailable evidence does not match the validated source group generation and plan digest");
+    }
+    if (unavailable.status === "complete" && reasons.length === 0) {
+      return {
+        status: {
+          status: "unavailable",
+          reasons: [
+            "no safe controller CPU outside an active topology context was available; the pinned-concurrent workload was not launched",
+          ],
+          authoritative: false,
+          unavailableReason: PINNED_CONCURRENT_UNAVAILABLE_REASON,
+          completedWaveCount: 0,
+          totalWaveCount: 0,
+          discardedTailRowCount: 0,
+        },
+        summary: null,
+        assessment: null,
+      };
+    }
+    return {
+      status: {
+        status: "invalid",
+        reasons: [...new Set(reasons.length > 0
+          ? reasons
+          : ["pinned-concurrent unavailable evidence is invalid"])],
+        authoritative: false,
+        completedWaveCount: 0,
+        totalWaveCount: 0,
+        discardedTailRowCount: 0,
+      },
+      summary: null,
+      assessment: null,
+    };
+  }
+  let assessment = assessPinnedConcurrentEvidence(outDir, expectations);
+  let scheduleReason = null;
+  if (trustedConfig && !runMetaState.skipPinnedConcurrent &&
+      assessment.status !== "not-run" && assessment.status !== "invalid" &&
+      Array.isArray(assessment.groups) && assessment.groups.length > 0) {
+    try {
+      const expectedPlanRows = buildExpectedPinnedConcurrentPlanRows(
+        assessment.groups,
+        runMetaState.pinnedConcurrentRounds,
+        runMetaState.protocolSeed,
+      );
+      assessment = assessPinnedConcurrentEvidence(outDir, {
+        ...expectations,
+        expectedGroupsRows: assessment.groups,
+        expectedPlanRows,
+      });
+    } catch {
+      scheduleReason = "pinned-concurrent seeded schedule could not be regenerated safely";
+    }
+  }
+
+  if (trustedConfig && runMetaState.skipPinnedConcurrent) {
+    const contradictory = pinnedConcurrentWorkloadArtifactsPresent(outDir);
+    return {
+      status: {
+        status: contradictory ? "invalid" : "skipped",
+        reasons: contradictory
+          ? ["stored configuration skips pinned-concurrent work but workload evidence artifacts are present"]
+          : ["stored schema-2 configuration explicitly skips the pinned-concurrent phase"],
+        authoritative: false,
+        completedWaveCount: 0,
+        totalWaveCount: 0,
+        discardedTailRowCount: 0,
+      },
+      summary: null,
+      assessment,
+    };
+  }
+
+  let status = assessment.status;
+  const reasons = [...assessment.reasons];
+  if (scheduleReason !== null) {
+    status = "invalid";
+    reasons.push(scheduleReason);
+  } else if (!schema2 && status !== "not-run") {
+    status = "invalid";
+    reasons.push("legacy run metadata cannot authorize schema-2 pinned-concurrent evidence");
+  } else if (schema2 && !trustedConfig && status !== "not-run") {
+    status = "invalid";
+    reasons.push("stored schema-2 run configuration cannot authorize pinned-concurrent expectations");
+  } else if (trustedConfig && !runMetaState.skipPinnedConcurrent &&
+      groupsAssessment.status !== "complete" && status !== "not-run") {
+    if (status === "complete") status = "incomplete";
+    reasons.push("validated group evidence is unavailable for pinned-concurrent source provenance");
+  } else if (trustedConfig && groupsAssessment.status === "complete" && status !== "not-run") {
+    const contextReasons = validatePinnedConcurrentContexts(assessment.groups, groupsAssessment.entries);
+    if (contextReasons.length > 0) {
+      status = "invalid";
+      reasons.push(...contextReasons);
+    }
+  }
+  const authoritative = status === "complete" && assessment.authoritative === true;
+  return {
+    status: {
+      status,
+      reasons: [...new Set(reasons)],
+      authoritative,
+      completedWaveCount: assessment.completedWaveCount ?? 0,
+      totalWaveCount: assessment.totalWaveCount ?? 0,
+      discardedTailRowCount: assessment.discardedTailRowCount ?? 0,
+    },
+    summary: pinnedConcurrentSummary(assessment, authoritative),
+    assessment,
+  };
+}
+
+function noTurboPointValue(point) {
+  return point?.noTurbo === 0 || point?.noTurbo === 1
+    ? String(point.noTurbo)
+    : "unavailable";
+}
+
+function telemetrySummary(assessment) {
+  return {
+    generation: assessment.meta?.GENERATION ?? null,
+    intervalMs: num(assessment.meta?.INTERVAL_MS),
+    boundaryCoverage: assessment.boundaryCoverage ?? null,
+    noTurbo: assessment.noTurbo ?? null,
+    workloadBinding: assessment.workloadBinding ?? null,
+    segments: (assessment.segments ?? []).map((segment) => ({
+      segment: segment.segment,
+      tag: segment.tag,
+      status: segment.status,
+      logStatus: segment.logStatus,
+      coverage: segment.coverage,
+      summary: segment.summary,
+      boundary: segment.boundary,
+    })),
+    authoritative: false,
+  };
+}
+
+function telemetryBindingExpectation(outDir, phase) {
+  try {
+    return { binding: computeTelemetryWorkloadBinding(phase, outDir), reason: null };
+  } catch (error) {
+    return {
+      binding: null,
+      reason: `owning ${phase} workload binding is unavailable: ${error?.message ?? String(error)}`,
+    };
+  }
+}
+
+function reconcileTelemetryWorkloadBinding(meta, expected) {
+  if (expected === null) return false;
+  const expectedBoundarySha = expected.workloadBoundariesSha256 ?? "-";
+  const expectedBoundaryRows = expected.workloadBoundaryRowCount === undefined
+    ? "-"
+    : String(expected.workloadBoundaryRowCount);
+  return meta?.VERSION === "2" &&
+    meta.WORKLOAD_GENERATION === expected.workloadGeneration &&
+    meta.WORKLOAD_BINDING_SHA256 === expected.workloadBindingSha256 &&
+    meta.WORKLOAD_BOUNDARIES_SHA256 === expectedBoundarySha &&
+    meta.WORKLOAD_BOUNDARY_ROW_COUNT === expectedBoundaryRows;
+}
+
+function collectTelemetry(outDir, runMetaState, options = {}) {
+  const statuses = {};
+  const summaries = {};
+  const assessments = {};
+  const schema2 = runMetaState.runSchemaVersion === 2;
+  const trustedConfig = schema2 && runMetaState.status === "complete";
+  for (const phase of TELEMETRY_PHASES) {
+    const expected = telemetryBindingExpectation(outDir, phase);
+    const native = assessTelemetryEvidence(outDir, {
+      phase,
+      ...(trustedConfig ? { intervalMs: runMetaState.telemetryIntervalMs } : {}),
+      requireProductionRoots: options.requireProductionRoots !== false,
+    });
+    let status = native.status;
+    const reasons = [...native.reasons];
+    const bindingReconciled = reconcileTelemetryWorkloadBinding(native.meta, expected.binding);
+    if (!schema2 && status !== "not-run") {
+      status = "invalid";
+      reasons.push("legacy run metadata cannot authorize schema-2 telemetry evidence");
+    } else if (schema2 && !trustedConfig && status !== "not-run") {
+      status = "invalid";
+      reasons.push("stored schema-2 run configuration cannot authorize telemetry expectations");
+    } else if (status !== "not-run" && !bindingReconciled) {
+      status = "invalid";
+      reasons.push(expected.reason ?? "telemetry metadata does not bind the exact owning workload evidence");
+    }
+    const assessment = {
+      ...native,
+      status,
+      reasons: [...new Set(reasons)],
+      workloadBinding: expected.binding === null ? null : {
+        workloadGeneration: expected.binding.workloadGeneration,
+        workloadBindingSha256: expected.binding.workloadBindingSha256,
+        workloadBoundariesSha256: expected.binding.workloadBoundariesSha256 ?? null,
+        workloadBoundaryRowCount: expected.binding.workloadBoundaryRowCount ?? null,
+        reconciled: bindingReconciled,
+      },
+    };
+    assessments[phase] = assessment;
+    statuses[phase] = {
+      status,
+      reasons: assessment.reasons,
+      authoritative: false,
+      noTurboStatus: assessment.noTurbo?.status ?? "not-run",
+      workloadBindingReconciled: bindingReconciled,
+    };
+    if (native.status !== "not-run") summaries[phase] = telemetrySummary(assessment);
+  }
+  return { statuses, summaries, assessments };
+}
+
+function completeWorkloadPhases(results) {
+  const phases = [];
+  if (results.baselineStatus?.status === "complete") phases.push("baseline");
+  if (results.groupsStatus?.status === "complete") phases.push("groups");
+  if (results.individualStatus?.status === "complete") phases.push("individual");
+  if (results.pinnedConcurrentStatus?.status === "complete") phases.push("pinned-concurrent");
+  if (results.gdb?.status === "captured" || results.gdb?.status === "no-fault") phases.push("gdb");
+  return phases;
+}
+
+function summarizeExactBoundaryNoTurbo(boundaries) {
+  if (!Array.isArray(boundaries) || boundaries.length === 0) return null;
+  const observations = boundaries.flatMap((boundary) => [boundary.noTurboStart, boundary.noTurboEnd]);
+  const values = observations
+    .filter((value) => value === 0 || value === 1)
+    .map(String);
+  const distinct = [...new Set(values)].sort();
+  return {
+    status: values.length === observations.length && distinct.length === 1 ? "complete" : "degraded",
+    observedValues: distinct,
+    validObservations: values.length,
+    totalObservations: observations.length,
+    unavailableObservations: observations.length - values.length,
+    changed: distinct.length > 1,
+  };
+}
+
+function unavailableAssociation(phase, telemetry, runs, workloadBinding) {
+  return {
+    status: telemetry?.status === "not-run" ? "not-run" : "degraded",
+    reasons: telemetry?.status === "not-run"
+      ? ["telemetry was not collected for the exact-CPU workload"]
+      : [...new Set(telemetry?.reasons ?? ["telemetry is not valid for exact-run association"])],
+    phase,
+    totalRuns: runs.length,
+    joinedRuns: 0,
+    recentPreRuns: 0,
+    duringCoveredRuns: 0,
+    workloadBinding,
+    topology: [],
+    byContextOutcome: [],
+    byCpu: [],
+  };
+}
+
+function collectExactTelemetryAssociation(phase, telemetry, runs, binding) {
+  const workloadBinding = {
+    generation: binding.generation,
+    boundariesSha256: binding.boundariesSha256,
+    boundaryRowCount: binding.boundaryRowCount,
+    reconciled: telemetry?.workloadBinding?.reconciled === true,
+  };
+  if (telemetry?.status !== "complete" || workloadBinding.reconciled !== true) {
+    return unavailableAssociation(phase, telemetry, runs, workloadBinding);
+  }
+  return {
+    phase,
+    ...associateTelemetryRuns({
+      telemetryAssessment: telemetry,
+      runs,
+      workloadGeneration: binding.generation,
+      workloadBoundariesSha256: binding.boundariesSha256,
+      workloadBoundaryRowCount: binding.boundaryRowCount,
+      workloadBindingReconciled: true,
+    }),
+  };
+}
+
+function exactIndividualRuns(results, boundaries) {
+  if (!Array.isArray(results) || !Array.isArray(boundaries) || results.length !== boundaries.length) return null;
+  const runs = boundaries.map((boundary, index) => {
+    const result = results[index];
+    if (result.ordinal !== boundary.ordinal || result.cpu !== boundary.cpu || result.run !== boundary.round) return null;
+    return {
+      ...boundary,
+      context: "isolated",
+      outcome: result.rc === 139 ? "sigsegv" : "pass",
+    };
+  });
+  return runs.some((run) => run === null) ? null : runs;
+}
+
+function exactPinnedConcurrentRuns(assessment) {
+  const rows = assessment?.authoritativeRows;
+  const boundaries = assessment?.authoritativeBoundaries;
+  if (!Array.isArray(rows) || !Array.isArray(boundaries) || rows.length !== boundaries.length) return null;
+  const runs = boundaries.map((boundary, index) => {
+    const row = rows[index];
+    if (boundary.ordinal !== index + 1 || row.cpu !== boundary.cpu || row.group !== boundary.group ||
+        row.round !== boundary.round || row.launch_position !== boundary.launchPosition) return null;
+    return {
+      ...boundary,
+      context: boundary.group,
+      outcome: row.rc === 139 ? "sigsegv" : "pass",
+    };
+  });
+  return runs.some((run) => run === null) ? null : runs;
+}
+
+export function summarizeNoTurboCondition(
+  telemetryAssessments,
+  relevantPhases,
+  exactBoundaries = {},
+  exactAssociations = {},
+) {
+  if (relevantPhases.length === 0) return { status: "not-run", phases: [] };
+  const phases = relevantPhases.map((phase) => {
+    const assessment = telemetryAssessments[phase];
+    const segments = [...(assessment?.segments ?? [])].sort((left, right) => left.segment - right.segment);
+    const first = segments[0]?.boundary?.start;
+    const last = segments.at(-1)?.boundary?.end;
+    const noTurbo = assessment?.noTurbo;
+    const workloadBoundary = exactBoundaries[phase] ?? null;
+    const workloadAssociation = exactAssociations[phase] ?? null;
+    const exactPhase = phase === "individual" || phase === "pinned-concurrent";
+    const bindingReconciled = assessment?.workloadBinding?.reconciled === true;
+    const associatedRunCount = workloadAssociation?.totalRuns;
+    const exactBoundaryComplete = exactPhase
+      ? workloadBoundary?.status === "complete" && workloadBoundary.totalObservations > 0 &&
+        workloadBoundary.validObservations === workloadBoundary.totalObservations &&
+        workloadBoundary.unavailableObservations === 0 &&
+        Array.isArray(workloadBoundary.observedValues) &&
+        workloadBoundary.observedValues.length === 1 &&
+        Number.isSafeInteger(associatedRunCount) && associatedRunCount > 0 &&
+        associatedRunCount <= Math.floor(Number.MAX_SAFE_INTEGER / 2) &&
+        workloadBoundary.totalObservations === associatedRunCount * 2
+      : workloadBoundary === null;
+    const workloadAssociationComplete = exactPhase
+      ? workloadAssociation?.status === "complete" && workloadAssociation.totalRuns > 0 &&
+        workloadAssociation.joinedRuns === workloadAssociation.totalRuns &&
+        workloadAssociation.recentPreRuns === workloadAssociation.totalRuns &&
+        workloadAssociation.duringCoveredRuns === workloadAssociation.totalRuns
+      : workloadAssociation === null;
+    const complete = assessment?.status === "complete" && noTurbo?.status === "complete" &&
+      noTurbo.changed === false && bindingReconciled && exactBoundaryComplete && workloadAssociationComplete &&
+      workloadBoundary?.changed !== true;
+    return {
+      phase,
+      status: complete
+        ? "complete"
+        : assessment?.status === "complete"
+          ? "degraded"
+          : assessment?.status ?? "not-run",
+      startNoTurbo: noTurboPointValue({ noTurbo: first?.noTurbo }),
+      endNoTurbo: noTurboPointValue({ noTurbo: last?.noTurbo }),
+      sampledValues: noTurbo?.sampledValues ?? [],
+      boundaryValues: noTurbo?.boundaryValues ?? [],
+      validSamples: noTurbo?.validSamples ?? 0,
+      totalSamples: noTurbo?.totalSamples ?? 0,
+      validBoundaries: noTurbo?.validBoundaries ?? 0,
+      totalBoundaries: noTurbo?.totalBoundaries ?? 0,
+      unavailableSamples: noTurbo?.unavailableSamples ?? 0,
+      transientSamples: noTurbo?.transientSamples ?? 0,
+      workloadBindingReconciled: bindingReconciled,
+      workloadAssociationComplete,
+      workloadAssociationJoinedRuns: workloadAssociation?.joinedRuns ?? 0,
+      workloadAssociationTotalRuns: workloadAssociation?.totalRuns ?? 0,
+      workloadAssociationRecentPreRuns: workloadAssociation?.recentPreRuns ?? 0,
+      workloadAssociationDuringCoveredRuns: workloadAssociation?.duringCoveredRuns ?? 0,
+      workloadBoundaryValues: workloadBoundary?.observedValues ?? [],
+      validWorkloadBoundaryObservations: workloadBoundary?.validObservations ?? 0,
+      totalWorkloadBoundaryObservations: workloadBoundary?.totalObservations ?? 0,
+      unavailableWorkloadBoundaryObservations: workloadBoundary?.unavailableObservations ?? 0,
+      changed: noTurbo?.changed === true || workloadBoundary?.changed === true,
+    };
+  });
+  return {
+    status: phases.every(({ status }) => status === "complete") ? "complete" : "degraded",
+    phases,
+  };
+}
+
 export function collect(outDir, options = {}) {
   const outputFile = options.outputFile ?? path.join(outDir, "results.json");
   const exclusiveOutput = options.exclusiveOutput === true;
@@ -999,11 +1800,12 @@ export function collect(outDir, options = {}) {
     : { status: "invalid", reasons: ["bundle root cannot authorize root-checks evidence"], generation: null };
 
   const results = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     outDir: ".",
     collectedAt: new Date().toISOString(),
     config: {
       mode: meta.MODE ?? null,
+      runSchemaVersion: runMetaState.runSchemaVersion ?? null,
       startedAt: meta.START_ISO ?? null,
       startEpoch: num(meta.START_EPOCH),
       endEpoch: num(meta.END_EPOCH),
@@ -1011,6 +1813,10 @@ export function collect(outDir, options = {}) {
       baselineWaves: runMetaState.baselineWaves ?? null,
       groupWaves: runMetaState.groupWaves ?? null,
       individualRuns: num(meta.INDIVIDUAL_RUNS),
+      pinnedConcurrentRounds: runMetaState.pinnedConcurrentRounds ?? null,
+      protocolSeed: runMetaState.protocolSeed ?? null,
+      skipPinnedConcurrent: runMetaState.skipPinnedConcurrent ?? null,
+      telemetryIntervalMs: runMetaState.telemetryIntervalMs ?? null,
       gdbMaxRuns: num(meta.GDB_MAX_RUNS),
       cpuTarget: runMetaState.cpuTargetConfig?.status === "complete"
         ? runMetaState.cpuTargetConfig.cpu
@@ -1121,7 +1927,12 @@ export function collect(outDir, options = {}) {
   }
 
   // --- individual ---
-  const individualEvidence = inspectIndividualEvidence(outDir);
+  const individualExactResults = [];
+  const individualExactBoundaries = [];
+  const individualEvidence = inspectIndividualEvidence(outDir, {
+    onV5Result: (row) => individualExactResults.push(row),
+    onV5Boundary: (row) => individualExactBoundaries.push(row),
+  });
   const individualRows = individualEvidence.rows;
   const individualMetaState = individualEvidence.metaState;
   const individualAssessment = reconcileIndividualWithGroups(assessIndividualEnvelopeRows(
@@ -1129,7 +1940,10 @@ export function collect(outDir, options = {}) {
     individualMetaState.values,
     individualEvidence.phaseDone,
     individualMetaState,
-  ), individualMetaState.values, groupsAssessment, meta.MODE, meta.INDIVIDUAL_RUNS);
+  ), individualMetaState.values, groupsAssessment,
+  runMetaState.runSchemaVersion === 2 ? "schema2" : meta.MODE,
+  meta.INDIVIDUAL_RUNS,
+  runMetaState.protocolSeed);
   const { acceptedRows, acceptedSummaries, ...individualStatus } = individualAssessment;
   results.individualStatus = individualStatus;
   if (acceptedSummaries?.length > 0) results.individual = acceptedSummaries;
@@ -1139,6 +1953,11 @@ export function collect(outDir, options = {}) {
   } else results.worstCpu = null;
   const expectedCpuState = resolveExpectedCpu(runMetaState, individualStatus, results.worstCpu);
   results.cpuSelectionStatus = expectedCpuState;
+
+  // --- exact-CPU pinned-concurrent topology contexts ---
+  const pinnedConcurrent = collectPinnedConcurrent(outDir, runMetaState, groupsAssessment);
+  results.pinnedConcurrentStatus = pinnedConcurrent.status;
+  if (pinnedConcurrent.summary !== null) results.pinnedConcurrent = pinnedConcurrent.summary;
 
   // --- frequency A/B/A ---
   const frequencyEvidence = inspectFrequencyEvidence(outDir, { expectedCpuState });
@@ -1167,6 +1986,61 @@ export function collect(outDir, options = {}) {
   // --- gdb ---
   const gdbAssessment = assessGdbPhase(outDir, runMetaState, expectedCpuState);
   if (gdbAssessment !== null) results.gdb = gdbAssessment;
+
+  // --- sampled read-only telemetry ---
+  // Telemetry deliberately does not feed back into any workload phase status.
+  // It qualifies only the independently reported operating condition.
+  const telemetry = collectTelemetry(outDir, runMetaState, {
+    requireProductionRoots: options.requireProductionTelemetryRoots !== false,
+  });
+  results.telemetryStatus = telemetry.statuses;
+  results.telemetry = telemetry.summaries;
+  results.telemetryAssociations = {};
+  const exactBoundaryConditions = {};
+  if (individualStatus.status === "complete" && individualStatus.metadataVersion === "5") {
+    const exactRuns = exactIndividualRuns(individualExactResults, individualExactBoundaries);
+    const binding = {
+      generation: individualMetaState.values.GENERATION,
+      boundariesSha256: individualMetaState.values.BOUNDARIES_SHA256,
+      boundaryRowCount: num(individualMetaState.values.BOUNDARY_ROW_COUNT),
+    };
+    if (exactRuns !== null) {
+      results.telemetryAssociations.individual = collectExactTelemetryAssociation(
+        "individual",
+        telemetry.assessments.individual,
+        exactRuns,
+        binding,
+      );
+      exactBoundaryConditions.individual = summarizeExactBoundaryNoTurbo(individualExactBoundaries);
+    }
+  }
+  if (pinnedConcurrent.status.status === "complete" &&
+      pinnedConcurrent.status.authoritative === true) {
+    const exactRuns = exactPinnedConcurrentRuns(pinnedConcurrent.assessment);
+    const metaValues = pinnedConcurrent.assessment?.meta ?? {};
+    const binding = {
+      generation: metaValues.GENERATION,
+      boundariesSha256: metaValues.BOUNDARIES_SHA256,
+      boundaryRowCount: num(metaValues.BOUNDARY_ROW_COUNT),
+    };
+    if (exactRuns !== null) {
+      results.telemetryAssociations["pinned-concurrent"] = collectExactTelemetryAssociation(
+        "pinned-concurrent",
+        telemetry.assessments["pinned-concurrent"],
+        exactRuns,
+        binding,
+      );
+      exactBoundaryConditions["pinned-concurrent"] = summarizeExactBoundaryNoTurbo(
+        pinnedConcurrent.assessment.authoritativeBoundaries,
+      );
+    }
+  }
+  results.noTurboCondition = summarizeNoTurboCondition(
+    telemetry.assessments,
+    completeWorkloadPhases(results),
+    exactBoundaryConditions,
+    results.telemetryAssociations,
+  );
 
   writeCollectedResults(outputFile, results, exclusiveOutput);
   return results;

@@ -11,10 +11,19 @@ import {
 } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import {
+  MAX_SCHEDULE_ENTRIES,
+  MAX_SEED,
+  buildIsolatedOrders,
+} from "./pinned-runner.mjs";
 
 export const INDIVIDUAL_META_MAX_BYTES = 1024 * 1024;
 export const INDIVIDUAL_TSV_FALLBACK_MAX_BYTES = 1024 * 1024;
 export const INDIVIDUAL_ROW_MAX_BYTES = 44n;
+export const INDIVIDUAL_PLAN_FALLBACK_MAX_BYTES = 1024 * 1024;
+export const INDIVIDUAL_PLAN_ROW_MAX_BYTES = 64n;
+export const INDIVIDUAL_BOUNDARIES_FALLBACK_MAX_BYTES = 1024 * 1024;
+export const INDIVIDUAL_BOUNDARY_ROW_MAX_BYTES = 512n;
 // Preserve the first 65,536 exact failed-run details across an ordinary
 // practical bundle without allowing an all-SIGSEGV input to turn collector
 // output back into an O(row count) allocation. Per-CPU counts remain exact
@@ -26,7 +35,19 @@ const ALLOWED_META_KEYS = new Set([
   "VERSION", "TARGET_CPUS", "RUNS_PER_CPU", "SKIPPED", "COMPLETED",
   "SKIP_REASON", "TARGET_POLICY", "GROUP_PLAN_DIGEST", "GROUP_GENERATION",
   "GENERATION", "ROWS_SHA256", "ROWS_BYTES", "ROW_COUNT",
+  "PROTOCOL", "SCHEDULE_SEED", "SCHEDULE_ALGORITHM",
+  "PLAN_SHA256", "PLAN_BYTES", "PLAN_ROW_COUNT",
+  "BOUNDARIES_SHA256", "BOUNDARIES_BYTES", "BOUNDARY_ROW_COUNT",
 ]);
+
+const V5_ONLY_META_KEYS = [
+  "PROTOCOL", "SCHEDULE_SEED", "SCHEDULE_ALGORITHM",
+  "PLAN_SHA256", "PLAN_BYTES", "PLAN_ROW_COUNT",
+  "BOUNDARIES_SHA256", "BOUNDARIES_BYTES", "BOUNDARY_ROW_COUNT",
+];
+const PLAN_HEADER = "ordinal\tround\tposition\tcpu";
+const V5_PROTOCOL = "isolated-interleaved-v1";
+const V5_SCHEDULE_ALGORITHM = "balanced-cyclic-v1";
 
 function sameIdentity(left, right) {
   return left.dev === right.dev && left.ino === right.ino;
@@ -341,7 +362,7 @@ function newCpuSummary(cpu) {
   };
 }
 
-function createRowAccumulator(targets, expected, batch = null) {
+function createRowAccumulator(targets, expected, batch = null, options = {}) {
   const counts = new Map(targets ? [...targets].map((cpu) => [cpu, 0]) : []);
   const sigsegv = new Map(targets ? [...targets].map((cpu) => [cpu, 0]) : []);
   const byCpu = new Map();
@@ -350,12 +371,24 @@ function createRowAccumulator(targets, expected, batch = null) {
   let batchRows = 0;
   let batchSigsegv = 0;
   let retainedFailureDetails = 0;
+  const planOrders = options.planOrders ?? null;
+  const authorityRowLimit = options.authorityRowLimit ?? Number.MAX_SAFE_INTEGER;
+  const onAcceptedRow = typeof options.onAcceptedRow === "function"
+    ? options.onAcceptedRow
+    : null;
+  let exactPlanPrefix = true;
+  let validatedPlanPrefixRows = 0;
 
   const reject = (cpu = null, ambiguous = false) => {
     invalidRows = true;
-    if (ambiguous && cpu !== null && targets?.has(cpu)) ambiguousCpus.add(cpu);
+    if (planOrders !== null) exactPlanPrefix = false;
+    else if (ambiguous && cpu !== null && targets?.has(cpu)) ambiguousCpus.add(cpu);
   };
-  const acceptFields = (fields) => {
+  const acceptFields = (fields, ordinal = null) => {
+    if (planOrders !== null && !exactPlanPrefix) {
+      invalidRows = true;
+      return;
+    }
     if (fields.length !== 4) {
       const cpu = canonicalUint(fields[0]);
       reject(cpu, true);
@@ -375,6 +408,17 @@ function createRowAccumulator(targets, expected, batch = null) {
       reject(cpu, true);
       return;
     }
+    if (planOrders !== null) {
+      const cpuCount = planOrders[0]?.length ?? 0;
+      const planIndex = ordinal === null ? -1 : ordinal - 1;
+      const roundIndex = cpuCount === 0 ? -1 : Math.floor(planIndex / cpuCount);
+      const positionIndex = cpuCount === 0 ? -1 : planIndex % cpuCount;
+      if (planIndex < 0 || roundIndex >= planOrders.length ||
+          cpu !== planOrders[roundIndex][positionIndex] || run !== roundIndex + 1) {
+        reject(cpu, true);
+        return;
+      }
+    }
     const next = (counts.get(cpu) ?? 0) + 1;
     if (run !== next) {
       reject(cpu, true);
@@ -385,6 +429,11 @@ function createRowAccumulator(targets, expected, batch = null) {
       reject();
       return;
     }
+
+    if (planOrders !== null) validatedPlanPrefixRows += 1;
+    if (ordinal !== null && ordinal > authorityRowLimit) return;
+
+    onAcceptedRow?.({ ordinal, cpu, run, rc, elapsedSec: elapsed });
 
     let record = byCpu.get(cpu);
     if (!record) {
@@ -420,7 +469,7 @@ function createRowAccumulator(targets, expected, batch = null) {
       (total, record) => total + BigInt(record.failedRunsOmitted ?? 0),
       0n,
     );
-    return {
+    const result = {
       counts,
       sigsegv,
       summaries,
@@ -433,6 +482,8 @@ function createRowAccumulator(targets, expected, batch = null) {
         : omittedDetails.toString(),
       failedRunDetailsOmittedIsDecimalString: omittedDetails > BigInt(Number.MAX_SAFE_INTEGER),
     };
+    if (planOrders !== null) result.validatedPlanPrefixRows = validatedPlanPrefixRows;
+    return result;
   };
   return { acceptFields, reject, finish };
 }
@@ -451,11 +502,11 @@ function inspectOpenedRows(opened, expectedRows, targets, expected, options = {}
     rowCount: 0,
     inspectedBytes: 0,
     completeRead: false,
-    summary: createRowAccumulator(targets, expected, options.batch).finish(),
+    summary: createRowAccumulator(targets, expected, options.batch, options).finish(),
   };
   if (!opened.present || opened.fd === undefined || opened.errors.length > 0) return base;
 
-  const accumulator = createRowAccumulator(targets, expected, options.batch);
+  const accumulator = createRowAccumulator(targets, expected, options.batch, options);
   const hash = createHash("sha256");
   const readBuffer = Buffer.allocUnsafe(BUFFER_BYTES);
   // A logical row may be at most 44 bytes including its newline. Canonical
@@ -478,7 +529,10 @@ function inspectOpenedRows(opened, expectedRows, targets, expected, options = {}
       stopped = true;
       return;
     }
-    accumulator.acceptFields(lineBuffer.subarray(0, lineLength).toString("utf8").split("\t"));
+    accumulator.acceptFields(
+      lineBuffer.subarray(0, lineLength).toString("utf8").split("\t"),
+      rowCount <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(rowCount) : null,
+    );
     lineLength = 0;
   };
 
@@ -550,6 +604,246 @@ function inspectOpenedRows(opened, expectedRows, targets, expected, options = {}
   return base;
 }
 
+function normalizePlanCpus(cpus) {
+  if (!Array.isArray(cpus) || cpus.length === 0) {
+    throw new TypeError("target CPUs must be a non-empty array");
+  }
+  let previous = -1;
+  return cpus.map((cpu) => {
+    if (!Number.isSafeInteger(cpu) || cpu < 0 || cpu > 65535 || cpu <= previous) {
+      throw new TypeError("target CPUs must be unique, strictly increasing integers from 0 through 65535");
+    }
+    previous = cpu;
+    return cpu;
+  });
+}
+
+export function renderIndividualPlan(targetCpus, roundCount, seed) {
+  const cpus = normalizePlanCpus(targetCpus);
+  if (!Number.isSafeInteger(roundCount) || roundCount < 1) {
+    throw new TypeError("round count must be a positive safe integer");
+  }
+  if (!Number.isSafeInteger(seed) || seed < 0 || seed > MAX_SEED) {
+    throw new TypeError(`schedule seed must be an integer from 0 through ${MAX_SEED}`);
+  }
+  const orders = buildIsolatedOrders(cpus, roundCount, seed);
+  const lines = [PLAN_HEADER];
+  let ordinal = 0;
+  for (let round = 0; round < orders.length; round += 1) {
+    for (let position = 0; position < orders[round].length; position += 1) {
+      ordinal += 1;
+      lines.push(`${ordinal}\t${round + 1}\t${position + 1}\t${orders[round][position]}`);
+    }
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function v5Schedule(meta) {
+  const targets = parseCanonicalCpuList(meta.TARGET_CPUS);
+  const rounds = canonicalUint(meta.RUNS_PER_CPU);
+  const seed = canonicalUint(meta.SCHEDULE_SEED);
+  if (!targets || targets.size === 0 || rounds === null || rounds < 1 ||
+      seed === null || seed > MAX_SEED || BigInt(targets.size) * BigInt(rounds) > BigInt(MAX_SCHEDULE_ENTRIES)) {
+    return { targets, rounds, seed, orders: null, expectedRows: null };
+  }
+  try {
+    const orders = buildIsolatedOrders([...targets], rounds, seed);
+    return { targets, rounds, seed, orders, expectedRows: targets.size * rounds };
+  } catch {
+    return { targets, rounds, seed, orders: null, expectedRows: null };
+  }
+}
+
+function inspectOpenedLineArtifact(opened, options) {
+  const base = {
+    present: opened.present,
+    errors: [...opened.errors],
+    bytes: opened.stat?.size <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(opened.stat.size) : null,
+    sha256: null,
+    rowCount: 0,
+    inspectedBytes: 0,
+    completeRead: false,
+  };
+  if (!opened.present) {
+    base.errors.push(`${options.label} is missing`);
+    return base;
+  }
+  if (opened.fd === undefined || opened.errors.length > 0) return base;
+
+  const hash = createHash("sha256");
+  const readBuffer = Buffer.allocUnsafe(BUFFER_BYTES);
+  const lineBuffer = Buffer.alloc(options.maxLineBytes);
+  const maximumRows = BigInt(options.maximumRows);
+  let lineLength = 0;
+  let physicalLine = 0;
+  let inspectedBytes = 0n;
+  let stopped = false;
+  let reachedEof = false;
+
+  const acceptLine = () => {
+    const line = lineBuffer.subarray(0, lineLength).toString("utf8");
+    lineLength = 0;
+    physicalLine += 1;
+    if (options.header !== null && physicalLine === 1) {
+      if (line !== options.header) base.errors.push(`${options.label} has a malformed header`);
+      return;
+    }
+    const row = options.header === null ? physicalLine : physicalLine - 1;
+    if (BigInt(row) > maximumRows) {
+      base.errors.push(`${options.label} exceeds the expected row limit`);
+      stopped = true;
+      return;
+    }
+    base.rowCount = row;
+    options.acceptLine(line, row, base.errors);
+  };
+
+  try {
+    while (!stopped) {
+      const count = readSync(opened.fd, readBuffer, 0, readBuffer.length, null);
+      if (count === 0) {
+        reachedEof = true;
+        break;
+      }
+      inspectedBytes += BigInt(count);
+      hash.update(readBuffer.subarray(0, count));
+      for (let index = 0; index < count; index += 1) {
+        const byte = readBuffer[index];
+        if (byte === 0x0a) {
+          acceptLine();
+          if (stopped) break;
+        } else if (lineLength === lineBuffer.length) {
+          base.errors.push(`${options.label} contains an overlong line`);
+          stopped = true;
+          break;
+        } else {
+          lineBuffer[lineLength] = byte;
+          lineLength += 1;
+        }
+      }
+    }
+    if (reachedEof && lineLength > 0) {
+      base.errors.push(`${options.label} must end with a newline`);
+    }
+  } catch {
+    base.errors.push(`${options.label} could not be read safely`);
+  }
+
+  base.completeRead = reachedEof && !stopped;
+  base.inspectedBytes = Number(inspectedBytes <= BigInt(Number.MAX_SAFE_INTEGER)
+    ? inspectedBytes
+    : BigInt(Number.MAX_SAFE_INTEGER));
+  if (options.header !== null && physicalLine === 0) {
+    base.errors.push(`${options.label} is missing its header`);
+  }
+  base.errors = [...new Set(base.errors)];
+  if (base.completeRead && base.errors.length === 0) base.sha256 = hash.digest("hex");
+  return base;
+}
+
+function inspectOpenedPlan(opened, schedule) {
+  const expectedRows = schedule.expectedRows ?? 0;
+  const state = inspectOpenedLineArtifact(opened, {
+    label: "individual plan",
+    header: PLAN_HEADER,
+    maxLineBytes: Number(INDIVIDUAL_PLAN_ROW_MAX_BYTES),
+    maximumRows: expectedRows,
+    acceptLine(line, ordinal, errors) {
+      if (schedule.orders === null) {
+        errors.push("individual plan cannot be validated against an invalid schedule");
+        return;
+      }
+      const cpuCount = schedule.orders[0].length;
+      const round = Math.floor((ordinal - 1) / cpuCount) + 1;
+      const position = ((ordinal - 1) % cpuCount) + 1;
+      const expected = `${ordinal}\t${round}\t${position}\t${schedule.orders[round - 1][position - 1]}`;
+      if (line !== expected) errors.push("individual plan contains a malformed or out-of-order row");
+    },
+  });
+  if (state.rowCount !== expectedRows) {
+    state.errors.push("individual plan does not contain every expected row");
+    state.sha256 = null;
+  }
+  state.errors = [...new Set(state.errors)];
+  return state;
+}
+
+function canonicalDecimalBigInt(value) {
+  if (typeof value !== "string" || value.length > 32 || !/^(0|[1-9][0-9]*)$/.test(value)) return null;
+  try {
+    return BigInt(value);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeBoundaryNoTurbo(value) {
+  if (value === 0 || value === 1) return value;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  if (!new Set(["unavailable", "invalid"]).has(value.status) ||
+      typeof value.errorCode !== "string" || !/^[A-Z][A-Z0-9_]{0,63}$/.test(value.errorCode)) return null;
+  return { status: value.status, errorCode: value.errorCode };
+}
+
+function normalizeBoundaryRecord(value, ordinal, schedule) {
+  if (value === null || typeof value !== "object" || Array.isArray(value) || schedule.orders === null) return null;
+  const cpuCount = schedule.orders[0].length;
+  const round = Math.floor((ordinal - 1) / cpuCount) + 1;
+  const position = ((ordinal - 1) % cpuCount) + 1;
+  const cpu = schedule.orders[round - 1]?.[position - 1];
+  if (value.ordinal !== ordinal || value.round !== round || value.position !== position || value.cpu !== cpu ||
+      !Number.isSafeInteger(value.startUnixMs) || value.startUnixMs < 0 ||
+      !Number.isSafeInteger(value.endUnixMs) || value.endUnixMs < value.startUnixMs) return null;
+  const startMonotonicNs = canonicalDecimalBigInt(value.startMonotonicNs);
+  const endMonotonicNs = canonicalDecimalBigInt(value.endMonotonicNs);
+  const durationNs = canonicalDecimalBigInt(value.durationNs);
+  if (startMonotonicNs === null || endMonotonicNs === null || durationNs === null ||
+      endMonotonicNs < startMonotonicNs || durationNs !== endMonotonicNs - startMonotonicNs ||
+      durationNs > BigInt(Number.MAX_SAFE_INTEGER) || !Number.isFinite(value.durationMs) ||
+      value.durationMs < 0 || value.durationMs !== Number(durationNs) / 1_000_000) return null;
+  const noTurboStart = normalizeBoundaryNoTurbo(value.noTurboStart);
+  const noTurboEnd = normalizeBoundaryNoTurbo(value.noTurboEnd);
+  if (noTurboStart === null || noTurboEnd === null) return null;
+  return {
+    ordinal,
+    round,
+    position,
+    cpu,
+    startUnixMs: value.startUnixMs,
+    endUnixMs: value.endUnixMs,
+    startMonotonicNs: value.startMonotonicNs,
+    endMonotonicNs: value.endMonotonicNs,
+    durationNs: value.durationNs,
+    durationMs: value.durationMs,
+    noTurboStart,
+    noTurboEnd,
+  };
+}
+
+function inspectOpenedBoundaries(opened, schedule, options = {}) {
+  return inspectOpenedLineArtifact(opened, {
+    label: "individual boundaries",
+    header: null,
+    maxLineBytes: Number(INDIVIDUAL_BOUNDARY_ROW_MAX_BYTES),
+    maximumRows: schedule.expectedRows ?? 0,
+    acceptLine(line, ordinal, errors) {
+      let parsed;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        errors.push("individual boundaries contain malformed or noncanonical JSON");
+        return;
+      }
+      const normalized = normalizeBoundaryRecord(parsed, ordinal, schedule);
+      if (normalized === null || JSON.stringify(normalized) !== line) {
+        errors.push("individual boundaries contain malformed or noncanonical JSON");
+        return;
+      }
+      options.onAcceptedBoundary?.(normalized);
+    },
+  });
+}
+
 export function assessIndividual(rows, meta, phaseDone, metaState = {}) {
   const present = metaState.present ?? Object.keys(meta).length > 0;
   const reasons = [...(metaState.errors ?? [])];
@@ -564,17 +858,22 @@ export function assessIndividual(rows, meta, phaseDone, metaState = {}) {
     reasons.push("individual metadata is missing required fields");
     invalid = true;
   }
-  if (meta.VERSION !== "1" && meta.VERSION !== "2" && meta.VERSION !== "3" && meta.VERSION !== "4") {
+  if (meta.VERSION !== "1" && meta.VERSION !== "2" && meta.VERSION !== "3" &&
+      meta.VERSION !== "4" && meta.VERSION !== "5") {
     reasons.push("individual metadata version is missing or unsupported");
     invalid = true;
   }
-  const provenanceRequired = meta.VERSION === "2" || meta.VERSION === "3" || meta.VERSION === "4";
+  const isV5 = meta.VERSION === "5";
+  const provenanceRequired = meta.VERSION === "2" || meta.VERSION === "3" || meta.VERSION === "4" || isV5;
   if (provenanceRequired) {
     if (!Object.hasOwn(meta, "TARGET_POLICY") || !Object.hasOwn(meta, "GROUP_PLAN_DIGEST")) {
       reasons.push("individual metadata is missing target provenance fields");
       invalid = true;
     }
-    if (!["failed-groups", "all-group-cpus", "quick-skip"].includes(meta.TARGET_POLICY) ||
+    const validPolicy = isV5
+      ? meta.TARGET_POLICY === "all-usable-cpus"
+      : ["failed-groups", "all-group-cpus", "quick-skip"].includes(meta.TARGET_POLICY);
+    if (!validPolicy ||
         !/^[a-f0-9]{64}$/.test(meta.GROUP_PLAN_DIGEST ?? "")) {
       reasons.push("individual target provenance is malformed");
       invalid = true;
@@ -582,7 +881,7 @@ export function assessIndividual(rows, meta, phaseDone, metaState = {}) {
   } else if (Object.hasOwn(meta, "TARGET_POLICY") || Object.hasOwn(meta, "GROUP_PLAN_DIGEST") ||
     Object.hasOwn(meta, "GROUP_GENERATION") || Object.hasOwn(meta, "GENERATION") ||
     Object.hasOwn(meta, "ROWS_SHA256") || Object.hasOwn(meta, "ROWS_BYTES") ||
-    Object.hasOwn(meta, "ROW_COUNT")) {
+    Object.hasOwn(meta, "ROW_COUNT") || V5_ONLY_META_KEYS.some((key) => Object.hasOwn(meta, key))) {
     reasons.push("legacy individual metadata contains unsupported provenance fields");
     invalid = true;
   }
@@ -638,6 +937,93 @@ export function assessIndividual(rows, meta, phaseDone, metaState = {}) {
         (meta.ROWS_SHA256 !== metaState.rowsSha256 ||
           rowsBytes !== metaState.rowsBytes || rowCount !== metaState.rowCount)) {
         reasons.push("individual results do not match their recorded row binding");
+        invalid = true;
+      }
+    }
+  }
+  if (!isV5 && V5_ONLY_META_KEYS.some((key) => Object.hasOwn(meta, key))) {
+    reasons.push("pre-V5 individual metadata contains unsupported interleaved protocol fields");
+    invalid = true;
+  }
+  if (isV5) {
+    const requiredV5 = [
+      "GENERATION", "GROUP_GENERATION", "PROTOCOL", "SCHEDULE_SEED", "SCHEDULE_ALGORITHM",
+      "PLAN_SHA256", "PLAN_BYTES", "PLAN_ROW_COUNT",
+    ];
+    if (requiredV5.some((key) => !Object.hasOwn(meta, key))) {
+      reasons.push("version 5 individual metadata is missing required protocol or plan fields");
+      invalid = true;
+    }
+    if (!/^[a-f0-9]{32}$/.test(meta.GENERATION ?? "")) {
+      reasons.push("individual evidence generation is missing or invalid");
+      invalid = true;
+    }
+    if (!/^[a-f0-9]{32}$/.test(meta.GROUP_GENERATION ?? "")) {
+      reasons.push("individual group generation is missing or invalid");
+      invalid = true;
+    }
+    const schedule = v5Schedule(meta);
+    if (meta.PROTOCOL !== V5_PROTOCOL || meta.SCHEDULE_ALGORITHM !== V5_SCHEDULE_ALGORITHM ||
+        schedule.orders === null) {
+      reasons.push("version 5 individual schedule metadata is malformed or unsupported");
+      invalid = true;
+    }
+    const planBytes = canonicalUint(meta.PLAN_BYTES);
+    const planRowCount = canonicalUint(meta.PLAN_ROW_COUNT);
+    if (!/^[a-f0-9]{64}$/.test(meta.PLAN_SHA256 ?? "") || planBytes === null || planRowCount === null ||
+        (schedule.expectedRows !== null && planRowCount !== schedule.expectedRows)) {
+      reasons.push("individual plan binding fields are malformed");
+      invalid = true;
+    } else if (metaState.enforceBinding === true &&
+      (meta.PLAN_SHA256 !== metaState.planSha256 || planBytes !== metaState.planBytes ||
+        planRowCount !== metaState.planRowCount)) {
+      reasons.push("individual plan does not match its recorded binding");
+      invalid = true;
+    }
+
+    const rowBindingKeys = ["ROWS_SHA256", "ROWS_BYTES", "ROW_COUNT"];
+    const boundaryBindingKeys = ["BOUNDARIES_SHA256", "BOUNDARIES_BYTES", "BOUNDARY_ROW_COUNT"];
+    const rowBindingPresent = rowBindingKeys.every((key) => Object.hasOwn(meta, key));
+    const boundaryBindingPresent = boundaryBindingKeys.every((key) => Object.hasOwn(meta, key));
+    const anyTerminalBinding = [...rowBindingKeys, ...boundaryBindingKeys]
+      .some((key) => Object.hasOwn(meta, key));
+    if (completed === true && (!rowBindingPresent || !boundaryBindingPresent)) {
+      reasons.push("completed version 5 metadata is missing terminal row or boundary bindings");
+      invalid = true;
+    }
+    if (completed === false && anyTerminalBinding) {
+      reasons.push("incomplete version 5 metadata contains terminal row or boundary bindings");
+      invalid = true;
+    }
+    if (anyTerminalBinding && (!rowBindingPresent || !boundaryBindingPresent)) {
+      reasons.push("version 5 terminal bindings are only partially present");
+      invalid = true;
+    }
+    if (rowBindingPresent) {
+      const rowsBytes = canonicalUint(meta.ROWS_BYTES);
+      const rowCount = canonicalUint(meta.ROW_COUNT);
+      if (!/^[a-f0-9]{64}$/.test(meta.ROWS_SHA256 ?? "") || rowsBytes === null || rowCount === null) {
+        reasons.push("individual row binding fields are malformed");
+        invalid = true;
+      } else if (metaState.enforceBinding === true &&
+        (meta.ROWS_SHA256 !== metaState.rowsSha256 || rowsBytes !== metaState.rowsBytes ||
+          rowCount !== metaState.rowCount)) {
+        reasons.push("individual results do not match their recorded row binding");
+        invalid = true;
+      }
+    }
+    if (boundaryBindingPresent) {
+      const boundariesBytes = canonicalUint(meta.BOUNDARIES_BYTES);
+      const boundaryRowCount = canonicalUint(meta.BOUNDARY_ROW_COUNT);
+      if (!/^[a-f0-9]{64}$/.test(meta.BOUNDARIES_SHA256 ?? "") ||
+          boundariesBytes === null || boundaryRowCount === null) {
+        reasons.push("individual boundary binding fields are malformed");
+        invalid = true;
+      } else if (metaState.enforceBinding === true &&
+        (meta.BOUNDARIES_SHA256 !== metaState.boundariesSha256 ||
+          boundariesBytes !== metaState.boundariesBytes ||
+          boundaryRowCount !== metaState.boundaryRowCount)) {
+        reasons.push("individual boundaries do not match their recorded binding");
         invalid = true;
       }
     }
@@ -718,6 +1104,29 @@ export function assessIndividual(rows, meta, phaseDone, metaState = {}) {
       : [...targetSet].some((cpu) => (nextRun.get(cpu) ?? 1) !== runsPerCpu + 1);
     if (missing) reasons.push("individual results do not contain every expected per-CPU run");
   }
+  const observedBoundaryCount = metaState.boundaryRowCount ?? 0;
+  const commonPrefixRowCount = isV5
+    ? Math.min(streamedRows?.validatedPlanPrefixRows ?? observedRowCount, observedBoundaryCount)
+    : null;
+  if (isV5 && metaState.metadataOnly !== true) {
+    const expectedV5Rows = v5Schedule(meta).expectedRows;
+    if (observedRowCount !== observedBoundaryCount) {
+      reasons.push("individual results and boundaries have different validated prefix lengths");
+    }
+    if (completed === true && expectedV5Rows !== null &&
+        (observedRowCount !== expectedV5Rows || observedBoundaryCount !== expectedV5Rows)) {
+      reasons.push("completed version 5 evidence does not contain every planned result and boundary");
+      invalid = true;
+    }
+    if (completed === true && !phaseDone) {
+      reasons.push("completed version 5 evidence is missing its completion marker");
+      invalid = true;
+    }
+    if (completed === false && phaseDone) {
+      reasons.push("incomplete version 5 evidence has a completion marker");
+      invalid = true;
+    }
+  }
   if (!phaseDone) reasons.push("phase completion marker is missing");
   if (completed === false) reasons.push("individual metadata is not marked complete");
 
@@ -740,6 +1149,14 @@ export function assessIndividual(rows, meta, phaseDone, metaState = {}) {
     groupPlanDigest: meta.GROUP_PLAN_DIGEST ?? null,
     groupGeneration: meta.GROUP_GENERATION ?? null,
   };
+  if (isV5) Object.assign(result, {
+    protocol: meta.PROTOCOL ?? null,
+    scheduleSeed: canonicalUint(meta.SCHEDULE_SEED),
+    scheduleAlgorithm: meta.SCHEDULE_ALGORITHM ?? null,
+    commonPrefixRowCount,
+    boundaryRowCount: observedBoundaryCount,
+    planRowCount: metaState.planRowCount ?? null,
+  });
   const omittedDetails = streamedRows?.failedRunDetailsOmitted ?? 0;
   if (omittedDetails !== 0 && omittedDetails !== "0") {
     result.failedRunDetailsTruncated = true;
@@ -791,6 +1208,8 @@ export function inspectIndividualEvidence(outDir, options = {}) {
   const anchoredMarker = fdChildPath(stateDirectory, "phase-individual.done");
   const anchoredMeta = fdChildPath(resultsDirectory, "individual.meta");
   const anchoredRows = fdChildPath(resultsDirectory, "individual.tsv");
+  const anchoredPlan = fdChildPath(resultsDirectory, "individual.plan.tsv");
+  const anchoredBoundaries = fdChildPath(resultsDirectory, "individual.boundaries.ndjson");
   // A completion marker is an authority input, so hold its descriptor from
   // before metadata inspection until after the bound rows are verified.
   const markerOpened = stateSafe
@@ -806,8 +1225,13 @@ export function inspectIndividualEvidence(outDir, options = {}) {
   let markerBytes = Buffer.alloc(0);
   let rowsOpened;
   let rowsState;
+  let planOpened;
+  let planState = null;
+  let boundariesOpened;
+  let boundariesState = null;
   let metaState;
   let expectedRows = null;
+  let isV5 = false;
   try {
     markerBytes = readOpenedPath(markerOpened, 0);
     metaBytes = readOpenedPath(metaOpened, INDIVIDUAL_META_MAX_BYTES);
@@ -816,6 +1240,18 @@ export function inspectIndividualEvidence(outDir, options = {}) {
       bytes: metaOpened.errors.length === 0 ? metaBytes : null,
       errors: metaOpened.errors,
     });
+    isV5 = metaState.values.VERSION === "5";
+    const schedule = isV5 ? v5Schedule(metaState.values) : null;
+    const v5RequiredOwner = isV5
+      ? (requiredOwner ?? process.geteuid?.() ?? process.getuid())
+      : requiredOwner;
+    if (isV5 && v5RequiredOwner !== null) {
+      for (const opened of [metaOpened, markerOpened]) {
+        if (opened.present && opened.stat !== undefined && opened.stat.uid !== BigInt(v5RequiredOwner)) {
+          opened.errors.push(`${opened.label} must be owned by the current user`);
+        }
+      }
+    }
     const targets = parseCanonicalCpuList(metaState.values.TARGET_CPUS);
     const runs = canonicalUint(metaState.values.RUNS_PER_CPU);
     if (metaState.values.SKIPPED === "1" && metaState.values.TARGET_CPUS === "" && runs !== null && runs > 0) {
@@ -823,33 +1259,73 @@ export function inspectIndividualEvidence(outDir, options = {}) {
     } else if (metaState.values.SKIPPED === "0" && targets && runs !== null && runs > 0) {
       expectedRows = BigInt(targets.size) * BigInt(runs);
     }
+    if (isV5 && schedule.expectedRows !== null) expectedRows = BigInt(schedule.expectedRows);
     const rowMaxBytes = expectedRows === null
       ? BigInt(INDIVIDUAL_TSV_FALLBACK_MAX_BYTES)
       : expectedRows * INDIVIDUAL_ROW_MAX_BYTES;
     rowsOpened = resultsSafe
-      ? openStablePath(anchoredRows, rowMaxBytes, "individual results", requiredOwner)
+      ? openStablePath(anchoredRows, rowMaxBytes, "individual results", v5RequiredOwner)
       : unavailable(path.join(publicResultsDir, "individual.tsv"), "individual results", "individual results cannot be trusted through an unsafe results directory");
-    rowsState = inspectOpenedRows(rowsOpened, expectedRows, targets, runs);
+    if (isV5) {
+      const planMaxBytes = expectedRows === null
+        ? BigInt(INDIVIDUAL_PLAN_FALLBACK_MAX_BYTES)
+        : BigInt(Buffer.byteLength(`${PLAN_HEADER}\n`)) + expectedRows * INDIVIDUAL_PLAN_ROW_MAX_BYTES;
+      const boundariesMaxBytes = expectedRows === null
+        ? BigInt(INDIVIDUAL_BOUNDARIES_FALLBACK_MAX_BYTES)
+        : expectedRows * INDIVIDUAL_BOUNDARY_ROW_MAX_BYTES;
+      planOpened = resultsSafe
+        ? openStablePath(anchoredPlan, planMaxBytes, "individual plan", v5RequiredOwner)
+        : unavailable(path.join(publicResultsDir, "individual.plan.tsv"), "individual plan", "individual plan cannot be trusted through an unsafe results directory");
+      boundariesOpened = resultsSafe
+        ? openStablePath(anchoredBoundaries, boundariesMaxBytes, "individual boundaries", v5RequiredOwner)
+        : unavailable(path.join(publicResultsDir, "individual.boundaries.ndjson"), "individual boundaries", "individual boundaries cannot be trusted through an unsafe results directory");
+      planState = inspectOpenedPlan(planOpened, schedule);
+      boundariesState = inspectOpenedBoundaries(boundariesOpened, schedule, {
+        onAcceptedBoundary: typeof options.onV5Boundary === "function"
+          ? options.onV5Boundary
+          : undefined,
+      });
+    }
+    rowsState = inspectOpenedRows(rowsOpened, expectedRows, targets, runs, isV5 ? {
+      planOrders: schedule.orders,
+      authorityRowLimit: boundariesState?.rowCount ?? 0,
+      onAcceptedRow: typeof options.onV5Result === "function"
+        ? options.onV5Result
+        : undefined,
+    } : {});
+    if (isV5 && !rowsState.present) rowsState.errors.push("individual results are missing");
     options.beforeFinalVerify?.();
     verifyOpenedPath(rowsOpened, rowsState.inspectedBytes, rowsState.completeRead);
+    if (isV5) {
+      verifyOpenedPath(planOpened, planState.inspectedBytes, planState.completeRead);
+      verifyOpenedPath(boundariesOpened, boundariesState.inspectedBytes, boundariesState.completeRead);
+    }
     verifyOpenedPath(metaOpened, metaBytes.length);
     verifyOpenedPath(markerOpened, markerBytes.length);
     options.beforeDirectoryVerify?.();
     for (const directory of directories) verifyStableDirectory(directory);
   } finally {
     closeQuietly(rowsOpened?.fd);
+    closeQuietly(planOpened?.fd);
+    closeQuietly(boundariesOpened?.fd);
     closeQuietly(metaOpened.fd);
     closeQuietly(markerOpened.fd);
     for (const directory of directories) closeQuietly(directory.fd);
   }
 
   rowsState.errors = [...new Set([...rowsState.errors, ...rowsOpened.errors])];
+  if (planState !== null) planState.errors = [...new Set([...planState.errors, ...planOpened.errors])];
+  if (boundariesState !== null) {
+    boundariesState.errors = [...new Set([...boundariesState.errors, ...boundariesOpened.errors])];
+  }
   const markerErrors = [...markerOpened.errors];
   if (markerOpened.present && markerBytes.length !== 0) {
     markerErrors.push("individual completion marker must be empty");
   }
   const finalLayoutErrors = directories.flatMap((entry) => entry.errors);
-  if (rowsOpened.errors.length > 0 || metaOpened.errors.length > 0 ||
+  if (rowsOpened.errors.length > 0 || (planState?.errors.length ?? 0) > 0 ||
+    (boundariesState?.errors.length ?? 0) > 0 || (planOpened?.errors.length ?? 0) > 0 ||
+    (boundariesOpened?.errors.length ?? 0) > 0 || metaOpened.errors.length > 0 ||
     markerOpened.errors.length > 0 || finalLayoutErrors.length > 0) {
     // A pathname/descriptor or directory stability failure means even a
     // descriptive aggregate cannot be attributed to the inspected bundle.
@@ -863,6 +1339,8 @@ export function inspectIndividualEvidence(outDir, options = {}) {
   metaState.errors = [...new Set([
     ...finalLayoutErrors,
     ...rowsState.errors,
+    ...(planState?.errors ?? []),
+    ...(boundariesState?.errors ?? []),
     ...metaState.errors,
     ...metaOpened.errors,
     ...markerErrors,
@@ -872,12 +1350,22 @@ export function inspectIndividualEvidence(outDir, options = {}) {
   metaState.rowsBytes = rowsState.bytes;
   metaState.rowCount = rowsState.rowCount;
   metaState.rowSummary = rowsState.summary;
-  return {
+  if (isV5) Object.assign(metaState, {
+    planSha256: planState?.sha256 ?? null,
+    planBytes: planState?.bytes ?? null,
+    planRowCount: planState?.rowCount ?? null,
+    boundariesSha256: boundariesState?.sha256 ?? null,
+    boundariesBytes: boundariesState?.bytes ?? null,
+    boundaryRowCount: boundariesState?.rowCount ?? null,
+  });
+  const evidence = {
     rows: [],
     rowsState,
     metaState,
     phaseDone: markerOpened.present && markerErrors.length === 0,
   };
+  if (isV5) Object.assign(evidence, { planState, boundariesState });
+  return evidence;
 }
 
 export function assessIndividualEvidence(outDir, options = {}) {
@@ -890,6 +1378,90 @@ export function assessIndividualEvidence(outDir, options = {}) {
       evidence.phaseDone,
       evidence.metaState,
     ),
+  };
+}
+
+export function inspectIndividualV5Artifacts(options) {
+  if (options === null || typeof options !== "object" || Array.isArray(options)) {
+    throw new TypeError("V5 artifact options must be an object");
+  }
+  const targets = parseCanonicalCpuList(options.targetCpus);
+  const rounds = canonicalUint(options.runsPerCpu);
+  const seed = canonicalUint(options.scheduleSeed);
+  const requireComplete = options.requireComplete === true
+    ? true
+    : options.requireComplete === false
+      ? false
+      : null;
+  const errors = [];
+  if (!targets || rounds === null || rounds < 1 || seed === null || seed > MAX_SEED ||
+      requireComplete === null || BigInt(targets?.size ?? 0) * BigInt(rounds ?? 0) > BigInt(MAX_SCHEDULE_ENTRIES)) {
+    return { valid: false, errors: ["version 5 artifact bounds are invalid"] };
+  }
+  const schedule = v5Schedule({
+    TARGET_CPUS: options.targetCpus,
+    RUNS_PER_CPU: options.runsPerCpu,
+    SCHEDULE_SEED: options.scheduleSeed,
+  });
+  if (schedule.orders === null) return { valid: false, errors: ["version 5 artifact schedule is invalid"] };
+  const owner = options.requiredOwner ?? process.geteuid?.() ?? process.getuid();
+  const expectedRows = BigInt(schedule.expectedRows);
+  const planOpened = openStablePath(
+    options.planFile,
+    BigInt(Buffer.byteLength(`${PLAN_HEADER}\n`)) + expectedRows * INDIVIDUAL_PLAN_ROW_MAX_BYTES,
+    "individual plan",
+    owner,
+  );
+  const boundariesOpened = openStablePath(
+    options.boundariesFile,
+    expectedRows * INDIVIDUAL_BOUNDARY_ROW_MAX_BYTES,
+    "individual boundaries",
+    owner,
+  );
+  const rowsOpened = openStablePath(
+    options.rowsFile,
+    expectedRows * INDIVIDUAL_ROW_MAX_BYTES,
+    "individual results",
+    owner,
+  );
+  let planState;
+  let boundariesState;
+  let rowsState;
+  try {
+    planState = inspectOpenedPlan(planOpened, schedule);
+    boundariesState = inspectOpenedBoundaries(boundariesOpened, schedule);
+    rowsState = inspectOpenedRows(rowsOpened, expectedRows, targets, rounds, {
+      planOrders: schedule.orders,
+      authorityRowLimit: boundariesState.rowCount,
+    });
+    if (!rowsState.present) rowsState.errors.push("individual results are missing");
+    verifyOpenedPath(planOpened, planState.inspectedBytes, planState.completeRead);
+    verifyOpenedPath(boundariesOpened, boundariesState.inspectedBytes, boundariesState.completeRead);
+    verifyOpenedPath(rowsOpened, rowsState.inspectedBytes, rowsState.completeRead);
+  } finally {
+    closeQuietly(planOpened.fd);
+    closeQuietly(boundariesOpened.fd);
+    closeQuietly(rowsOpened.fd);
+  }
+  planState.errors = [...new Set([...planState.errors, ...planOpened.errors])];
+  boundariesState.errors = [...new Set([...boundariesState.errors, ...boundariesOpened.errors])];
+  rowsState.errors = [...new Set([...rowsState.errors, ...rowsOpened.errors])];
+  errors.push(...planState.errors, ...boundariesState.errors, ...rowsState.errors);
+  if (requireComplete &&
+      (rowsState.rowCount !== schedule.expectedRows || boundariesState.rowCount !== schedule.expectedRows)) {
+    errors.push("version 5 artifacts are not complete");
+  }
+  return {
+    valid: errors.length === 0,
+    errors: [...new Set(errors)],
+    expectedRowCount: schedule.expectedRows,
+    commonPrefixRowCount: Math.min(
+      rowsState.summary.validatedPlanPrefixRows ?? rowsState.rowCount,
+      boundariesState.rowCount,
+    ),
+    planState,
+    rowsState,
+    boundariesState,
   };
 }
 
@@ -928,7 +1500,7 @@ function inspectRowsFile(file, targetsText, expectedText, options = {}) {
 }
 
 function validateMetaForShell(metaState) {
-  const assessment = assessIndividual([], metaState.values, false, metaState);
+  const assessment = assessIndividual([], metaState.values, false, { ...metaState, metadataOnly: true });
   const onlyExpectedIncompleteReasons = new Set([
     "individual results do not contain every expected per-CPU run",
     "phase completion marker is missing",
@@ -939,11 +1511,17 @@ function validateMetaForShell(metaState) {
 }
 
 function printShellMeta(values) {
-  for (const key of [
+  const keys = [
     "VERSION", "TARGET_CPUS", "RUNS_PER_CPU", "SKIPPED", "COMPLETED",
     "TARGET_POLICY", "GROUP_PLAN_DIGEST", "GROUP_GENERATION", "GENERATION",
     "ROWS_SHA256", "ROWS_BYTES", "ROW_COUNT",
-  ]) {
+  ];
+  if (values.VERSION === "5") keys.push(
+    "PROTOCOL", "SCHEDULE_SEED", "SCHEDULE_ALGORITHM",
+    "PLAN_SHA256", "PLAN_BYTES", "PLAN_ROW_COUNT",
+    "BOUNDARIES_SHA256", "BOUNDARIES_BYTES", "BOUNDARY_ROW_COUNT",
+  );
+  for (const key of keys) {
     console.log(`${key}=${values[key] ?? ""}`);
   }
   console.log(`SKIP_REASON_PRESENT=${Object.hasOwn(values, "SKIP_REASON") ? 1 : 0}`);
@@ -976,12 +1554,68 @@ function worstCpuFromSummaries(summaries) {
 }
 
 function usage() {
-  console.error("usage: individual-evidence.mjs <meta|rows|binding|empty-binding|count|batch|bundle> ...");
+  console.error("usage: individual-evidence.mjs <meta|rows|binding|empty-binding|count|batch|bundle|v5-plan|v5-binding|v5-bundle> ...");
   process.exitCode = 2;
 }
 
 function main(argv) {
   const [command, ...args] = argv;
+  if (command === "v5-plan" && args.length === 3) {
+    const targets = parseCanonicalCpuList(args[0]);
+    const rounds = canonicalUint(args[1]);
+    const seed = canonicalUint(args[2]);
+    if (!targets || rounds === null || rounds < 1 || seed === null || seed > MAX_SEED) {
+      process.exitCode = 1;
+    } else {
+      try {
+        process.stdout.write(renderIndividualPlan([...targets], rounds, seed));
+      } catch {
+        process.exitCode = 1;
+      }
+    }
+    return;
+  }
+  if (command === "v5-binding" && args.length === 7) {
+    const requireComplete = args[6] === "1" ? true : args[6] === "0" ? false : null;
+    const inspected = inspectIndividualV5Artifacts({
+      planFile: args[0],
+      rowsFile: args[1],
+      boundariesFile: args[2],
+      targetCpus: args[3],
+      runsPerCpu: args[4],
+      scheduleSeed: args[5],
+      requireComplete,
+    });
+    if (!inspected.valid) {
+      process.exitCode = 1;
+    } else {
+      console.log(`PLAN_SHA256=${inspected.planState.sha256}`);
+      console.log(`PLAN_BYTES=${inspected.planState.bytes}`);
+      console.log(`PLAN_ROW_COUNT=${inspected.planState.rowCount}`);
+      console.log(`RESULT_PREFIX_ROW_COUNT=${inspected.rowsState.rowCount}`);
+      console.log(`BOUNDARY_PREFIX_ROW_COUNT=${inspected.boundariesState.rowCount}`);
+      console.log(`COMMON_PREFIX_ROW_COUNT=${inspected.commonPrefixRowCount}`);
+      if (requireComplete) {
+        console.log(`ROWS_SHA256=${inspected.rowsState.sha256}`);
+        console.log(`ROWS_BYTES=${inspected.rowsState.bytes}`);
+        console.log(`ROW_COUNT=${inspected.rowsState.rowCount}`);
+        console.log(`BOUNDARIES_SHA256=${inspected.boundariesState.sha256}`);
+        console.log(`BOUNDARIES_BYTES=${inspected.boundariesState.bytes}`);
+        console.log(`BOUNDARY_ROW_COUNT=${inspected.boundariesState.rowCount}`);
+      }
+    }
+    return;
+  }
+  if (command === "v5-bundle" && args.length === 1) {
+    const { evidence, assessment } = assessIndividualEvidence(args[0], {
+      requiredOwner: process.geteuid?.() ?? process.getuid(),
+    });
+    console.log(`STATUS=${assessment.status}`);
+    printShellMeta(evidence.metaState.values);
+    console.log(`COMMON_PREFIX_ROW_COUNT=${assessment.commonPrefixRowCount ?? ""}`);
+    if (assessment.metadataVersion !== "5" || assessment.status === "invalid") process.exitCode = 1;
+    return;
+  }
   if (command === "meta" && args.length === 1) {
     const state = parseIndividualMeta(readStableRegularFile(
       args[0], INDIVIDUAL_META_MAX_BYTES, "individual metadata",

@@ -19,8 +19,10 @@ import {
   INDIVIDUAL_META_MAX_BYTES,
   INDIVIDUAL_FAILED_RUN_DETAIL_LIMIT,
   assessIndividualEvidence,
+  inspectIndividualV5Artifacts,
   inspectIndividualEvidence,
   readStableRegularFile,
+  renderIndividualPlan,
 } from "../individual-evidence.mjs";
 
 const tmpDirs = [];
@@ -56,6 +58,84 @@ function writeBundle(rows = "19\t1\t139\t2\n", metadata = {}) {
   return dir;
 }
 
+function boundaryLine(planRow, ordinal) {
+  const [, roundText, positionText, cpuText] = planRow.split("\t");
+  const startUnixMs = 1_800_000_000_000 + ordinal * 1_000;
+  const startMonotonicNs = 5_000_000_000n + BigInt(ordinal) * 1_000_000_000n;
+  const durationNs = ordinal % 2 === 0 ? 250_000_123n : 1_000_000_000n;
+  const noTurboEnd = ordinal % 3 === 0
+    ? { status: "unavailable", errorCode: "ENOENT" }
+    : ordinal % 3 === 1
+      ? { status: "invalid", errorCode: "UNEXPECTED_VALUE" }
+      : 0;
+  return JSON.stringify({
+    ordinal,
+    round: Number(roundText),
+    position: Number(positionText),
+    cpu: Number(cpuText),
+    startUnixMs,
+    endUnixMs: startUnixMs + Number(durationNs / 1_000_000n),
+    startMonotonicNs: startMonotonicNs.toString(),
+    endMonotonicNs: (startMonotonicNs + durationNs).toString(),
+    durationNs: durationNs.toString(),
+    durationMs: Number(durationNs) / 1_000_000,
+    noTurboStart: 1,
+    noTurboEnd,
+  });
+}
+
+function replaceMetaField(metaPath, key, value) {
+  const before = readFileSync(metaPath, "utf8");
+  const expression = new RegExp(`^${key}=.*$`, "m");
+  assert.match(before, expression);
+  writeFileSync(metaPath, before.replace(expression, `${key}=${value}`));
+}
+
+function writeV5Bundle(options = {}) {
+  const dir = tempDir();
+  mkdirSync(path.join(dir, "results"));
+  mkdirSync(path.join(dir, "state"));
+  const cpus = [8, 9, 10];
+  const runs = 2;
+  const seed = options.seed ?? 20260809;
+  const plan = renderIndividualPlan(cpus, runs, seed);
+  const planRows = plan.trimEnd().split("\n").slice(1);
+  const resultCount = options.resultCount ?? planRows.length;
+  const boundaryCount = options.boundaryCount ?? resultCount;
+  const rows = planRows.slice(0, resultCount).map((row, index) => {
+    const [, round, , cpu] = row.split("\t");
+    return `${cpu}\t${round}\t${index === 1 ? 139 : 0}\t${index + 1}\n`;
+  }).join("");
+  const boundaries = planRows.slice(0, boundaryCount)
+    .map((row, index) => `${boundaryLine(row, index + 1)}\n`).join("");
+  const results = path.join(dir, "results");
+  const planPath = path.join(results, "individual.plan.tsv");
+  const rowsPath = path.join(results, "individual.tsv");
+  const boundariesPath = path.join(results, "individual.boundaries.ndjson");
+  const metaPath = path.join(results, "individual.meta");
+  writeFileSync(planPath, plan);
+  writeFileSync(rowsPath, rows);
+  writeFileSync(boundariesPath, boundaries);
+  const completed = options.completed ?? true;
+  const terminal = completed
+    ? `ROWS_SHA256=${sha256(Buffer.from(rows))}\nROWS_BYTES=${Buffer.byteLength(rows)}\nROW_COUNT=${resultCount}\n` +
+      `BOUNDARIES_SHA256=${sha256(Buffer.from(boundaries))}\n` +
+      `BOUNDARIES_BYTES=${Buffer.byteLength(boundaries)}\nBOUNDARY_ROW_COUNT=${boundaryCount}\n`
+    : "";
+  writeFileSync(
+    metaPath,
+    `VERSION=5\nGENERATION=${"a".repeat(32)}\nTARGET_CPUS=8-10\nRUNS_PER_CPU=${runs}\n` +
+      `TARGET_POLICY=all-usable-cpus\nGROUP_PLAN_DIGEST=${"b".repeat(64)}\n` +
+      `GROUP_GENERATION=${"c".repeat(32)}\nPROTOCOL=isolated-interleaved-v1\n` +
+      `SCHEDULE_SEED=${seed}\nSCHEDULE_ALGORITHM=balanced-cyclic-v1\n` +
+      `PLAN_SHA256=${sha256(Buffer.from(plan))}\nPLAN_BYTES=${Buffer.byteLength(plan)}\n` +
+      `PLAN_ROW_COUNT=${planRows.length}\nSKIPPED=0\nCOMPLETED=${completed ? 1 : 0}\n` + terminal +
+      (options.extraMeta ?? ""),
+  );
+  if (completed) writeFileSync(path.join(dir, "state", "phase-individual.done"), "");
+  return { dir, plan, planRows, rows, boundaries, planPath, rowsPath, boundariesPath, metaPath };
+}
+
 test("individual evidence accepts a stable V4 envelope with exact row bindings", () => {
   const dir = writeBundle();
   const { assessment } = assessIndividualEvidence(dir);
@@ -72,6 +152,237 @@ test("individual evidence accepts a stable V4 envelope with exact row bindings",
     invalidRuns: [],
     failedRuns: [{ run: 1, rc: 139, signal: "SIGSEGV", elapsedSec: 2 }],
   }]);
+});
+
+test("version 5 accepts a complete digest-bound interleaved plan and boundaries", () => {
+  const fixture = writeV5Bundle();
+  const { evidence, assessment } = assessIndividualEvidence(fixture.dir);
+  assert.equal(assessment.status, "complete", assessment.reasons.join("; "));
+  assert.equal(assessment.metadataVersion, "5");
+  assert.equal(assessment.protocol, "isolated-interleaved-v1");
+  assert.equal(assessment.scheduleSeed, 20260809);
+  assert.equal(assessment.scheduleAlgorithm, "balanced-cyclic-v1");
+  assert.equal(assessment.planRowCount, 6);
+  assert.equal(assessment.boundaryRowCount, 6);
+  assert.equal(assessment.commonPrefixRowCount, 6);
+  assert.equal(assessment.acceptedSummaries.reduce((total, row) => total + row.runs, 0), 6);
+  assert.equal(assessment.acceptedSummaries.reduce((total, row) => total + row.sigsegv, 0), 1);
+  assert.equal(evidence.planState.sha256, sha256(Buffer.from(fixture.plan)));
+  assert.equal(evidence.boundariesState.sha256, sha256(Buffer.from(fixture.boundaries)));
+
+  const standalone = inspectIndividualV5Artifacts({
+    planFile: fixture.planPath,
+    rowsFile: fixture.rowsPath,
+    boundariesFile: fixture.boundariesPath,
+    targetCpus: "8-10",
+    runsPerCpu: "2",
+    scheduleSeed: "20260809",
+    requireComplete: true,
+  });
+  assert.equal(standalone.valid, true, standalone.errors.join("; "));
+  assert.equal(standalone.commonPrefixRowCount, 6);
+});
+
+test("version 5 exposes exact validated result and boundary rows to a bounded collector", () => {
+  const fixture = writeV5Bundle();
+  const results = [];
+  const boundaries = [];
+  const evidence = inspectIndividualEvidence(fixture.dir, {
+    onV5Result: (row) => results.push(row),
+    onV5Boundary: (row) => boundaries.push(row),
+  });
+  const assessment = assessIndividualEvidence(fixture.dir).assessment;
+  assert.equal(assessment.status, "complete", assessment.reasons.join("; "));
+  assert.equal(evidence.metaState.errors.length, 0, evidence.metaState.errors.join("; "));
+  assert.equal(results.length, 6);
+  assert.equal(boundaries.length, 6);
+  assert.deepEqual(results[1], {
+    ordinal: 2,
+    cpu: Number(fixture.planRows[1].split("\t")[3]),
+    run: 1,
+    rc: 139,
+    elapsedSec: 2,
+  });
+  assert.equal(boundaries[1].ordinal, results[1].ordinal);
+  assert.equal(boundaries[1].cpu, results[1].cpu);
+  assert.equal(boundaries[1].round, results[1].run);
+});
+
+test("version 5 incomplete evidence exposes only its exact mid-round common prefix", () => {
+  const fixture = writeV5Bundle({ completed: false, resultCount: 4, boundaryCount: 4 });
+  const { assessment } = assessIndividualEvidence(fixture.dir);
+  assert.equal(assessment.status, "incomplete", assessment.reasons.join("; "));
+  assert.equal(assessment.commonPrefixRowCount, 4);
+  assert.equal(assessment.acceptedSummaries.reduce((total, row) => total + row.runs, 0), 4);
+  assert.match(assessment.reasons.join("; "), /not marked complete/);
+  assert.doesNotMatch(assessment.reasons.join("; "), /different validated prefix lengths/);
+
+  const uneven = writeV5Bundle({ completed: false, resultCount: 4, boundaryCount: 3 });
+  const unevenAssessment = assessIndividualEvidence(uneven.dir).assessment;
+  assert.equal(unevenAssessment.status, "incomplete", unevenAssessment.reasons.join("; "));
+  assert.equal(unevenAssessment.commonPrefixRowCount, 3);
+  assert.equal(unevenAssessment.acceptedSummaries.reduce((total, row) => total + row.runs, 0), 3);
+  assert.match(unevenAssessment.reasons.join("; "), /different validated prefix lengths/);
+});
+
+test("version 5 rejects schedule seed, plan order, row order, and boundary tampering", () => {
+  const seed = writeV5Bundle();
+  replaceMetaField(seed.metaPath, "SCHEDULE_SEED", "20260810");
+  assert.equal(assessIndividualEvidence(seed.dir).assessment.status, "invalid");
+
+  const plan = writeV5Bundle();
+  const planLines = plan.plan.trimEnd().split("\n");
+  [planLines[1], planLines[2]] = [planLines[2], planLines[1]];
+  const reorderedPlan = `${planLines.join("\n")}\n`;
+  writeFileSync(plan.planPath, reorderedPlan);
+  replaceMetaField(plan.metaPath, "PLAN_SHA256", sha256(Buffer.from(reorderedPlan)));
+  replaceMetaField(plan.metaPath, "PLAN_BYTES", String(Buffer.byteLength(reorderedPlan)));
+  const planAssessment = assessIndividualEvidence(plan.dir).assessment;
+  assert.equal(planAssessment.status, "invalid");
+  assert.match(planAssessment.reasons.join("; "), /plan.*out-of-order/);
+
+  const rows = writeV5Bundle();
+  const rowLines = rows.rows.trimEnd().split("\n");
+  [rowLines[0], rowLines[1]] = [rowLines[1], rowLines[0]];
+  const reorderedRows = `${rowLines.join("\n")}\n`;
+  writeFileSync(rows.rowsPath, reorderedRows);
+  replaceMetaField(rows.metaPath, "ROWS_SHA256", sha256(Buffer.from(reorderedRows)));
+  replaceMetaField(rows.metaPath, "ROWS_BYTES", String(Buffer.byteLength(reorderedRows)));
+  const rowsAssessment = assessIndividualEvidence(rows.dir).assessment;
+  assert.equal(rowsAssessment.status, "invalid");
+  assert.equal(rowsAssessment.commonPrefixRowCount, 0);
+  assert.equal(rowsAssessment.acceptedSummaries.reduce((total, row) => total + row.runs, 0), 0);
+
+  const boundaries = writeV5Bundle();
+  const boundaryLines = boundaries.boundaries.trimEnd().split("\n");
+  const changed = JSON.parse(boundaryLines[0]);
+  changed.ordinal = 2;
+  boundaryLines[0] = JSON.stringify(changed);
+  const reorderedBoundaries = `${boundaryLines.join("\n")}\n`;
+  writeFileSync(boundaries.boundariesPath, reorderedBoundaries);
+  replaceMetaField(boundaries.metaPath, "BOUNDARIES_SHA256", sha256(Buffer.from(reorderedBoundaries)));
+  replaceMetaField(boundaries.metaPath, "BOUNDARIES_BYTES", String(Buffer.byteLength(reorderedBoundaries)));
+  const boundaryAssessment = assessIndividualEvidence(boundaries.dir).assessment;
+  assert.equal(boundaryAssessment.status, "invalid");
+  assert.match(boundaryAssessment.reasons.join("; "), /noncanonical JSON/);
+});
+
+test("version 5 rejects noncanonical boundary JSON, binding tamper, and unknown metadata", () => {
+  const noncanonical = writeV5Bundle();
+  const boundaryLines = noncanonical.boundaries.trimEnd().split("\n");
+  const first = JSON.parse(boundaryLines[0]);
+  boundaryLines[0] = JSON.stringify({ cpu: first.cpu, ...first });
+  const bytes = `${boundaryLines.join("\n")}\n`;
+  writeFileSync(noncanonical.boundariesPath, bytes);
+  replaceMetaField(noncanonical.metaPath, "BOUNDARIES_SHA256", sha256(Buffer.from(bytes)));
+  replaceMetaField(noncanonical.metaPath, "BOUNDARIES_BYTES", String(Buffer.byteLength(bytes)));
+  assert.equal(assessIndividualEvidence(noncanonical.dir).assessment.status, "invalid");
+
+  const binding = writeV5Bundle();
+  replaceMetaField(binding.metaPath, "PLAN_SHA256", "d".repeat(64));
+  assert.match(
+    assessIndividualEvidence(binding.dir).assessment.reasons.join("; "),
+    /plan does not match its recorded binding/,
+  );
+
+  const unknown = writeV5Bundle({ extraMeta: "UNEXPECTED_FIELD=1\n" });
+  const unknownAssessment = assessIndividualEvidence(unknown.dir).assessment;
+  assert.equal(unknownAssessment.status, "invalid");
+  assert.match(unknownAssessment.reasons.join("; "), /unknown field/);
+});
+
+test("version 5 boundary timing/sensor invariants and completion marker are strict", () => {
+  const timing = writeV5Bundle();
+  const timingLines = timing.boundaries.trimEnd().split("\n");
+  const changedTiming = JSON.parse(timingLines[0]);
+  changedTiming.durationMs += 1;
+  timingLines[0] = JSON.stringify(changedTiming);
+  const timingBytes = `${timingLines.join("\n")}\n`;
+  writeFileSync(timing.boundariesPath, timingBytes);
+  replaceMetaField(timing.metaPath, "BOUNDARIES_SHA256", sha256(Buffer.from(timingBytes)));
+  replaceMetaField(timing.metaPath, "BOUNDARIES_BYTES", String(Buffer.byteLength(timingBytes)));
+  assert.equal(assessIndividualEvidence(timing.dir).assessment.status, "invalid");
+
+  const sensor = writeV5Bundle();
+  const sensorLines = sensor.boundaries.trimEnd().split("\n");
+  const changedSensor = JSON.parse(sensorLines[0]);
+  changedSensor.noTurboEnd = { status: "unavailable", errorCode: "lowercase" };
+  sensorLines[0] = JSON.stringify(changedSensor);
+  const sensorBytes = `${sensorLines.join("\n")}\n`;
+  writeFileSync(sensor.boundariesPath, sensorBytes);
+  replaceMetaField(sensor.metaPath, "BOUNDARIES_SHA256", sha256(Buffer.from(sensorBytes)));
+  replaceMetaField(sensor.metaPath, "BOUNDARIES_BYTES", String(Buffer.byteLength(sensorBytes)));
+  assert.equal(assessIndividualEvidence(sensor.dir).assessment.status, "invalid");
+
+  const missingMarker = writeV5Bundle();
+  rmSync(path.join(missingMarker.dir, "state", "phase-individual.done"));
+  assert.equal(assessIndividualEvidence(missingMarker.dir).assessment.status, "invalid");
+
+  const prematureMarker = writeV5Bundle({ completed: false, resultCount: 1, boundaryCount: 1 });
+  writeFileSync(path.join(prematureMarker.dir, "state", "phase-individual.done"), "");
+  assert.equal(assessIndividualEvidence(prematureMarker.dir).assessment.status, "invalid");
+});
+
+test("version 5 rejects unsafe plan and boundary files and foreign ownership", () => {
+  for (const property of ["planPath", "boundariesPath"]) {
+    const symlink = writeV5Bundle();
+    const file = symlink[property];
+    renameSync(file, `${file}.real`);
+    symlinkSync(`${file}.real`, file);
+    assert.equal(assessIndividualEvidence(symlink.dir).assessment.status, "invalid", `symlink ${property}`);
+
+    const hardlink = writeV5Bundle();
+    linkSync(hardlink[property], `${hardlink[property]}.second-link`);
+    assert.equal(assessIndividualEvidence(hardlink.dir).assessment.status, "invalid", `hardlink ${property}`);
+  }
+
+  const owner = writeV5Bundle();
+  const wrongOwner = (process.geteuid?.() ?? process.getuid()) + 1;
+  const ownerAssessment = assessIndividualEvidence(owner.dir, { requiredOwner: wrongOwner }).assessment;
+  assert.equal(ownerAssessment.status, "invalid");
+  assert.match(ownerAssessment.reasons.join("; "), /owned by the current user/);
+});
+
+test("version 5 rejects huge plan/boundary artifacts and terminal fields on an incomplete run", () => {
+  const hugePlan = writeV5Bundle();
+  writeFileSync(hugePlan.planPath, Buffer.alloc(412, 0x31));
+  assert.match(assessIndividualEvidence(hugePlan.dir).assessment.reasons.join("; "), /plan exceeds.*size limit/);
+
+  const hugeBoundaries = writeV5Bundle();
+  writeFileSync(hugeBoundaries.boundariesPath, Buffer.alloc(6 * 512 + 1, 0x31));
+  assert.match(assessIndividualEvidence(hugeBoundaries.dir).assessment.reasons.join("; "), /boundaries exceeds.*size limit/);
+
+  const incomplete = writeV5Bundle({ completed: false, resultCount: 1, boundaryCount: 1 });
+  writeFileSync(
+    incomplete.metaPath,
+    `${readFileSync(incomplete.metaPath, "utf8")}ROWS_SHA256=${sha256(Buffer.from(incomplete.rows))}\n` +
+      `ROWS_BYTES=${Buffer.byteLength(incomplete.rows)}\nROW_COUNT=1\n`,
+  );
+  const incompleteAssessment = assessIndividualEvidence(incomplete.dir).assessment;
+  assert.equal(incompleteAssessment.status, "invalid");
+  assert.match(incompleteAssessment.reasons.join("; "), /terminal row or boundary bindings|partially present/);
+});
+
+test("version 5 shell commands generate plans and validate complete bindings", () => {
+  const fixture = writeV5Bundle();
+  const script = path.join(path.dirname(new URL(import.meta.url).pathname), "..", "individual-evidence.mjs");
+  const generated = spawnSync(process.execPath, [script, "v5-plan", "8-10", "2", "20260809"]);
+  assert.equal(generated.status, 0, generated.stderr.toString());
+  assert.equal(generated.stdout.toString(), fixture.plan);
+
+  const binding = spawnSync(process.execPath, [
+    script, "v5-binding", fixture.planPath, fixture.rowsPath, fixture.boundariesPath,
+    "8-10", "2", "20260809", "1",
+  ]);
+  assert.equal(binding.status, 0, binding.stderr.toString());
+  assert.match(binding.stdout.toString(), new RegExp(`^PLAN_SHA256=${sha256(Buffer.from(fixture.plan))}$`, "m"));
+  assert.match(binding.stdout.toString(), /^ROW_COUNT=6$/m);
+  assert.match(binding.stdout.toString(), /^BOUNDARY_ROW_COUNT=6$/m);
+
+  const bundle = spawnSync(process.execPath, [script, "v5-bundle", fixture.dir]);
+  assert.equal(bundle.status, 0, bundle.stderr.toString());
+  assert.match(bundle.stdout.toString(), /^STATUS=complete$/m);
+  assert.match(bundle.stdout.toString(), /^COMMON_PREFIX_ROW_COUNT=6$/m);
 });
 
 test("version 4 individual evidence requires the exact validated groups generation", () => {

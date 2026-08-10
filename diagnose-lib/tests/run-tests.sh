@@ -13,6 +13,27 @@ FIX="$LIB/tests/fixtures"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+# Keep every main-script test hermetic even when a fixture unexpectedly gets
+# farther than intended. Capture the real interpreter before prepending a
+# fail-closed wrapper; diagnostic helpers still run normally, while the two
+# memory-intensive workload entrypoints can never be launched by this suite.
+DIAG_TEST_REAL_NODE_BIN="$(command -v node)"
+DIAG_TEST_HERMETIC_BIN="$TMP/hermetic-bin"
+mkdir -p "$DIAG_TEST_HERMETIC_BIN"
+cat > "$DIAG_TEST_HERMETIC_BIN/node" << 'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  repro.mjs | child.mjs | */repro.mjs | */child.mjs)
+    printf 'test harness refused workload entrypoint: %s\n' "$1" >&2
+    exit 97
+    ;;
+esac
+exec "$DIAG_TEST_REAL_NODE_BIN" "$@"
+EOF
+chmod +x "$DIAG_TEST_HERMETIC_BIN/node"
+export DIAG_TEST_REAL_NODE_BIN
+export PATH="$DIAG_TEST_HERMETIC_BIN:$PATH"
+
 pass=0
 fail=0
 
@@ -1041,7 +1062,7 @@ mkdir -p "$PIPELINE_DIR/bin" "$PIPELINE_DIR/out"
 # The fake node keeps every workload invocation synthetic. Only the bounded
 # GDB transcript helper and the GDB evidence module are delegated to the real
 # node binary.
-REAL_NODE_BIN="$(command -v node)"
+REAL_NODE_BIN="$DIAG_TEST_REAL_NODE_BIN"
 cat > "$PIPELINE_DIR/bin/node" << 'EOF'
 #!/usr/bin/env bash
 case "${1:-}" in
@@ -1965,16 +1986,22 @@ check_eq "resume graph accepts absent subordinate directories without creating t
   "$([[ $sparse_graph_rc -eq 0 && "$sparse_tree_after" == "$sparse_tree_before" ]] && echo 1 || echo 0)"
 
 mutable_directory_rejected=0
-for mutable_relative in state logs env freq gdb logs/individual logs/gdb; do
+for mutable_relative in \
+  state logs env freq gdb telemetry \
+  logs/individual logs/gdb logs/pinned-concurrent \
+  state/individual-attempts state/individual-finalize \
+  state/pinned-concurrent-waves state/pinned-concurrent-finalize \
+  state/telemetry-baseline state/telemetry-groups state/telemetry-individual \
+  state/telemetry-pinned-concurrent state/telemetry-gdb \
+  telemetry/baseline telemetry/groups telemetry/individual \
+  telemetry/pinned-concurrent telemetry/gdb; do
   mutable_slug="${mutable_relative//\//-}"
   MUTABLE_ROOT="$TMP/mutable-directory-$mutable_slug"
   MUTABLE_BUNDLE="$MUTABLE_ROOT/bundle"
   MUTABLE_EXTERNAL="$MUTABLE_ROOT/external"
   mkdir -p "$MUTABLE_EXTERNAL"
   write_mutable_graph_fixture "$MUTABLE_BUNDLE"
-  if [[ "$mutable_relative" == logs/individual || "$mutable_relative" == logs/gdb ]]; then
-    mkdir -p "$MUTABLE_BUNDLE/logs"
-  fi
+  mkdir -p "$MUTABLE_BUNDLE/$(dirname -- "$mutable_relative")"
   ln -s "$MUTABLE_EXTERNAL" "$MUTABLE_BUNDLE/$mutable_relative"
   timeout --signal=TERM --kill-after=1 5 \
     "$REPO_ROOT/diagnose.sh" --resume "$MUTABLE_BUNDLE" --yes \
@@ -1987,7 +2014,7 @@ for mutable_relative in state logs env freq gdb logs/individual logs/gdb; do
   fi
 done
 check_eq "resume rejects symlinked mutable directories before readiness revocation" \
-  "7" "$mutable_directory_rejected"
+  "23" "$mutable_directory_rejected"
 
 INITIALIZING_META_BUNDLE="$TMP/mutable-initializing-meta/bundle"
 write_mutable_graph_fixture "$INITIALIZING_META_BUNDLE"
@@ -2002,16 +2029,25 @@ echo "== fresh-init interrupted recovery =="
 # artifact set main() creates before the first phase mutation. --resume must
 # recover exactly that tree and continue as a fresh run on the same
 # directory; anything beyond the set keeps the old resume behavior (ordinary
-# validation, tree untouched). The fake node keeps every workload invocation
-# synthetic, so a recovered run proceeds through the fresh path and dies
-# deterministically in phase 1 evidence generation -- well past the old
+# validation, tree untouched). The fake node refuses every workload invocation,
+# delegates only the random-generation primitive needed during setup, and makes
+# phase 1 evidence generation fail deterministically -- well past the old
 # "not a safe diagnostic bundle" rejection.
 INIT_FAKE_BIN="$TMP/fresh-init-fake-bin"
 mkdir -p "$INIT_FAKE_BIN"
 cat > "$INIT_FAKE_BIN/node" << 'EOF'
 #!/usr/bin/env bash
 case "${1:-}" in
+  -e) exec "$REAL_NODE_BIN" "$@" ;;
+  */diagnose-lib/preflight-evidence.mjs)
+    printf 'synthetic preflight evidence failure\n' >&2
+    exit 1
+    ;;
   */diagnose-lib/gdb-attempt-io.mjs | */diagnose-lib/gdb-evidence.mjs) exec "$REAL_NODE_BIN" "$@" ;;
+  repro.mjs | child.mjs | */repro.mjs | */child.mjs)
+    printf 'fresh-init fixture refused workload entrypoint: %s\n' "$1" >&2
+    exit 97
+    ;;
 esac
 printf 'synthetic workload output\n'
 exit 0
@@ -2094,7 +2130,7 @@ fresh_init_recovery_observed() {
     grep -q 'recovered an interrupted fresh bundle initialization' "$output" &&
     ! grep -q 'not a safe diagnostic bundle' "$output" &&
     ! grep -q 'is not empty' "$output" &&
-    grep -q 'phase 1/7: preflight' "$output" &&
+    grep -q 'phase 1/8: preflight' "$output" &&
     grep -qF "out dir            $bundle" "$output" &&
     ! grep -q '(resume)' "$output" &&
     [[ -f "$bundle/results/meta.env" && ! -L "$bundle/results/meta.env" ]] &&
@@ -4543,6 +4579,7 @@ echo "== --redo phase handling =="
 preflight_redo_plan="$(
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   REDO_PHASES=preflight
   build_redo_plan
   printf '%s\n' "${REDO_PLAN[*]}"
@@ -4608,6 +4645,7 @@ EOF
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$PREFLIGHT_REDO"
   STATE_DIR="$PREFLIGHT_REDO/state"
   META_FILE="$PREFLIGHT_REDO/results/meta.env"
@@ -4742,6 +4780,7 @@ printf 'COMPLETED_PHASES=gdb\n' > "$GB/results/meta.env"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$GB"
   STATE_DIR="$GB/state"
   META_FILE="$GB/results/meta.env"
@@ -4830,6 +4869,7 @@ printf 'COMPLETED_PHASES=baseline\n' > "$GDB_RETRY_RB/results/meta.env"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$GDB_RETRY_RB"
   STATE_DIR="$GDB_RETRY_RB/state"
   META_FILE="$GDB_RETRY_RB/results/meta.env"
@@ -4867,6 +4907,7 @@ printf 'COMPLETED_PHASES=baseline\n' > "$GDB_RETRY_FAIL_RB/results/meta.env"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$GDB_RETRY_FAIL_RB"
   STATE_DIR="$GDB_RETRY_FAIL_RB/state"
   META_FILE="$GDB_RETRY_FAIL_RB/results/meta.env"
@@ -4891,6 +4932,7 @@ check_eq "incomplete GDB archive failure leaves a recoverable transaction" "1" "
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$GDB_RETRY_FAIL_RB"
   STATE_DIR="$GDB_RETRY_FAIL_RB/state"
   META_FILE="$GDB_RETRY_FAIL_RB/results/meta.env"
@@ -4918,6 +4960,7 @@ printf 'COMPLETED_PHASES=baseline\n' > "$GDB_SKIP_ORDER_RB/results/meta.env"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$GDB_SKIP_ORDER_RB"
   STATE_DIR="$GDB_SKIP_ORDER_RB/state"
   META_FILE="$GDB_SKIP_ORDER_RB/results/meta.env"
@@ -4953,6 +4996,7 @@ run_gdb_dispatch_fixture() {
   (
     DIAG_SOURCE_ONLY=1
     source "$REPO_ROOT/diagnose.sh"
+    RUN_SCHEMA_VERSION=1
     OUT_DIR="$bundle" STATE_DIR="$bundle/state" META_FILE="$bundle/results/meta.env"
     GDB_MAX_RUNS=6 GDB_MAX_CAPTURES=3 SKIP_GDB="$skip_gdb"
     export PATH="$PIPELINE_DIR/bin:$PATH" REAL_NODE_BIN="$REAL_NODE_BIN"
@@ -5163,6 +5207,7 @@ printf 'COMPLETED_PHASES=frequency\n' > "$FB/results/meta.env"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$FB"
   STATE_DIR="$FB/state"
   META_FILE="$FB/results/meta.env"
@@ -5250,6 +5295,7 @@ EOF
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$DEPENDENT_RB"
   STATE_DIR="$DEPENDENT_RB/state"
   META_FILE="$DEPENDENT_RB/results/meta.env"
@@ -5296,6 +5342,7 @@ EOF
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$REDO_FAIL_RB"
   STATE_DIR="$REDO_FAIL_RB/state"
   META_FILE="$REDO_FAIL_RB/results/meta.env"
@@ -5324,6 +5371,7 @@ check_eq "redo move failure leaves a private recoverable transaction" "1" "$redo
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$REDO_FAIL_RB"
   STATE_DIR="$REDO_FAIL_RB/state"
   META_FILE="$REDO_FAIL_RB/results/meta.env"
@@ -5348,6 +5396,7 @@ printf 'COMPLETED_PHASES=individual,frequency,gdb\n' > "$REDO_SIGNAL_RB/results/
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$REDO_SIGNAL_RB"
   STATE_DIR="$REDO_SIGNAL_RB/state"
   META_FILE="$REDO_SIGNAL_RB/results/meta.env"
@@ -5377,6 +5426,7 @@ check_eq "SIGTERM during redo preserves recovery state and skips partial finaliz
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$REDO_SIGNAL_RB"
   STATE_DIR="$REDO_SIGNAL_RB/state"
   META_FILE="$REDO_SIGNAL_RB/results/meta.env"
@@ -5440,6 +5490,7 @@ cp "$REDO_EXACT_RETRY/run.log" "$REDO_EXACT_RETRY/run.before"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$REDO_EXACT_RETRY"
   STATE_DIR="$REDO_EXACT_RETRY/state"
   META_FILE="$REDO_EXACT_RETRY/results/meta.env"
@@ -5475,6 +5526,7 @@ cp "$REDO_EXACT_RETRY/results/meta.env" "$REDO_EXACT_RETRY/conflict.before"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$REDO_EXACT_RETRY"
   STATE_DIR="$REDO_EXACT_RETRY/state"
   META_FILE="$REDO_EXACT_RETRY/results/meta.env"
@@ -5495,6 +5547,7 @@ check_eq "conflicting pending retry fails before bundle mutation" "1" "$redo_con
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$REDO_EXACT_RETRY"
   STATE_DIR="$REDO_EXACT_RETRY/state"
   META_FILE="$REDO_EXACT_RETRY/results/meta.env"
@@ -5526,6 +5579,7 @@ cp "$REDO_CONFIG_RENAME/results/meta.env" "$REDO_CONFIG_RENAME/meta.before"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$REDO_CONFIG_RENAME"
   STATE_DIR="$REDO_CONFIG_RENAME/state"
   META_FILE="$REDO_CONFIG_RENAME/results/meta.env"
@@ -5548,6 +5602,7 @@ check_eq "config rename failure leaves recoverable archive with old metadata" "1
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$REDO_CONFIG_RENAME"
   STATE_DIR="$REDO_CONFIG_RENAME/state"
   META_FILE="$REDO_CONFIG_RENAME/results/meta.env"
@@ -5570,6 +5625,7 @@ redo_atomic_bundle_setup "$REDO_POST_META"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$REDO_POST_META"
   STATE_DIR="$REDO_POST_META/state"
   META_FILE="$REDO_POST_META/results/meta.env"
@@ -5590,6 +5646,7 @@ check_eq "post-config pre-unlink interruption retains the committed target and m
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$REDO_POST_META"
   STATE_DIR="$REDO_POST_META/state"
   META_FILE="$REDO_POST_META/results/meta.env"
@@ -5715,6 +5772,7 @@ check_eq "V2 grammar accepts exact legacy/current profiles and rejects malformed
 generated_config_rows="$(
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   MODE=quick BASELINE_CHILDREN=8 BASELINE_WAVES=10 GROUP_WAVES=10
   INDIVIDUAL_RUNS=5 GDB_MAX_RUNS=6 SKIP_GDB=0 CPU_TARGET=auto
   redo_write_config_records
@@ -5851,6 +5909,7 @@ touch "$CPU_EVIDENCE_RB/state/phase-individual.done"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   RESUME_DIR="$CPU_EVIDENCE_RB" OUT_DIR="$CPU_EVIDENCE_RB" STATE_DIR="$CPU_EVIDENCE_RB/state"
   META_FILE="$CPU_EVIDENCE_RB/results/meta.env" CPU_TARGET=auto
   validate_completed_phase_overrides
@@ -5859,6 +5918,7 @@ check_eq "auto CPU policy accepts matching completed GDB evidence" "0" "$?"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   RESUME_DIR="$CPU_EVIDENCE_RB" OUT_DIR="$CPU_EVIDENCE_RB" STATE_DIR="$CPU_EVIDENCE_RB/state"
   META_FILE="$CPU_EVIDENCE_RB/results/meta.env" CPU_TARGET="$TEST_OTHER_CPU"
   validate_completed_phase_overrides
@@ -5869,6 +5929,7 @@ check_eq "incompatible completed GDB CPU requires redo even without an explicit 
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   RESUME_DIR="$CPU_EVIDENCE_RB" OUT_DIR="$CPU_EVIDENCE_RB" STATE_DIR="$CPU_EVIDENCE_RB/state"
   META_FILE="$CPU_EVIDENCE_RB/results/meta.env" CPU_TARGET="$TEST_OTHER_CPU"
   REDO_PLAN=(gdb)
@@ -5880,6 +5941,7 @@ rm -f "$CPU_EVIDENCE_RB/results/individual.meta" "$CPU_EVIDENCE_RB/results/indiv
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   RESUME_DIR="$CPU_EVIDENCE_RB" OUT_DIR="$CPU_EVIDENCE_RB" STATE_DIR="$CPU_EVIDENCE_RB/state"
   META_FILE="$CPU_EVIDENCE_RB/results/meta.env" CPU_TARGET=auto
   validate_completed_phase_overrides
@@ -6322,6 +6384,7 @@ cp "$INDIVIDUAL_LEGACY/results/individual.tsv" "$INDIVIDUAL_LEGACY/before.tsv"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$INDIVIDUAL_LEGACY"
   STATE_DIR="$INDIVIDUAL_LEGACY/state"
   META_FILE="$INDIVIDUAL_LEGACY/results/meta.env"
@@ -6340,6 +6403,7 @@ printf 'COMPLETED_PHASES=\n' > "$INDIVIDUAL_COMPLETE/results/meta.env"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$INDIVIDUAL_COMPLETE"
   STATE_DIR="$INDIVIDUAL_COMPLETE/state"
   META_FILE="$INDIVIDUAL_COMPLETE/results/meta.env"
@@ -6359,6 +6423,7 @@ printf 'COMPLETED_PHASES=\n' > "$INDIVIDUAL_SKIPPED/results/meta.env"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$INDIVIDUAL_SKIPPED"
   STATE_DIR="$INDIVIDUAL_SKIPPED/state"
   META_FILE="$INDIVIDUAL_SKIPPED/results/meta.env"
@@ -6380,6 +6445,7 @@ printf 'COMPLETED_PHASES=\n' > "$INDIVIDUAL_FRESH_AFTER_REDO/results/meta.env"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$INDIVIDUAL_FRESH_AFTER_REDO"
   STATE_DIR="$INDIVIDUAL_FRESH_AFTER_REDO/state"
   META_FILE="$INDIVIDUAL_FRESH_AFTER_REDO/results/meta.env"
@@ -6405,6 +6471,7 @@ printf 'COMPLETED_PHASES=\n' > "$INDIVIDUAL_FRESH_SKIP_AFTER_REDO/results/meta.e
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$INDIVIDUAL_FRESH_SKIP_AFTER_REDO"
   STATE_DIR="$INDIVIDUAL_FRESH_SKIP_AFTER_REDO/state"
   META_FILE="$INDIVIDUAL_FRESH_SKIP_AFTER_REDO/results/meta.env"
@@ -6434,6 +6501,7 @@ touch "$WORST_CPU_DIR/state/phase-individual.done"
 worst_cpu_out="$(
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$WORST_CPU_DIR"
   worst_cpu
 )"
@@ -6444,6 +6512,7 @@ write_individual_v4_meta "$WORST_CPU_DIR" 3-4 2 failed-groups \
 worst_cpu_out="$(
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$WORST_CPU_DIR"
   worst_cpu
 )"
@@ -6576,6 +6645,7 @@ mkdir -p "$GDB_MALFORMED_PHASE"/{results,state,logs/gdb,gdb}
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$GDB_MALFORMED_PHASE"
   STATE_DIR="$GDB_MALFORMED_PHASE/state"
   GDB_MAX_RUNS=6
@@ -6601,6 +6671,7 @@ mkdir -p "$GDB_DISAGREE_PHASE"/{results,state,logs/gdb,gdb}
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$GDB_DISAGREE_PHASE"
   STATE_DIR="$GDB_DISAGREE_PHASE/state"
   GDB_MAX_RUNS=6
@@ -7320,6 +7391,7 @@ printf 'BASELINE_CHILDREN=4\nBASELINE_WAVES=5\nCOMPLETED_PHASES=\n' > "$BASELINE
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$BASELINE_RUNNER"
   STATE_DIR="$BASELINE_RUNNER/state"
   META_FILE="$BASELINE_RUNNER/results/meta.env"
@@ -7343,6 +7415,7 @@ for relative in results/baseline.meta logs/baseline/run1.log state/phase-baselin
   (
     DIAG_SOURCE_ONLY=1
     source "$REPO_ROOT/diagnose.sh"
+    RUN_SCHEMA_VERSION=1
     OUT_DIR="$guard"
     STATE_DIR="$guard/state"
     baseline_prepare_fresh_targets
@@ -7357,6 +7430,7 @@ ln -s "$TMP/outside-baseline-samples" "$BASELINE_SYMLINK_GUARD/freq/baseline.sam
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$BASELINE_SYMLINK_GUARD"
   STATE_DIR="$BASELINE_SYMLINK_GUARD/state"
   baseline_prepare_fresh_targets
@@ -7372,6 +7446,7 @@ printf 'BASELINE_CHILDREN=4\nBASELINE_WAVES=5\nGROUP_WAVES=5\nCOMPLETED_PHASES=\
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$GROUPS_RUNNER"
   STATE_DIR="$GROUPS_RUNNER/state"
   META_FILE="$GROUPS_RUNNER/results/meta.env"
@@ -7396,6 +7471,7 @@ check_eq "groups validates its exact plan envelope before publishing completion"
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$GROUPS_RUNNER" STATE_DIR="$GROUPS_RUNNER/state" GROUP_WAVES=5
   GROUP_NAME=(pcores ecluster-64) GROUP_KIND=(pcore ecluster)
   GROUP_CPUS=(0-3 16-19) GROUP_CLUSTER=(- 64)
@@ -7407,6 +7483,7 @@ full_runner_target="$(
  (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$GROUPS_RUNNER" STATE_DIR="$GROUPS_RUNNER/state" GROUP_WAVES=5 MODE=full
   GROUP_NAME=(pcores ecluster-64) GROUP_KIND=(pcore ecluster)
   GROUP_CPUS=(0-3 16-19) GROUP_CLUSTER=(- 64)
@@ -7437,6 +7514,7 @@ full_stale_resume="$(
  (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$FULL_TARGET_RESUME" INDIVIDUAL_RUNS=1
   INDIVIDUAL_TARGET_CPUS=0-3,16-19 INDIVIDUAL_TARGET_POLICY=all-group-cpus
   INDIVIDUAL_GROUP_PLAN_DIGEST="$full_runner_digest"
@@ -7456,6 +7534,7 @@ full_current_resume="$(
  (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$FULL_TARGET_RESUME" INDIVIDUAL_RUNS=1
   INDIVIDUAL_TARGET_CPUS=0-3,16-19 INDIVIDUAL_TARGET_POLICY=all-group-cpus
   INDIVIDUAL_GROUP_PLAN_DIGEST="$full_runner_digest"
@@ -7470,6 +7549,7 @@ check_eq "full-mode resume accepts complete all-plan evidence" "1|1" "$full_curr
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$GROUPS_RUNNER" STATE_DIR="$GROUPS_RUNNER/state" GROUP_WAVES=5
   GROUP_NAME=(pcores ecluster-64) GROUP_KIND=(pcore ecluster)
   GROUP_CPUS=(0-3 20-23) GROUP_CLUSTER=(- 64)
@@ -7484,6 +7564,7 @@ printf 'BASELINE_CHILDREN=4\nBASELINE_WAVES=5\nGROUP_WAVES=5\nCOMPLETED_PHASES=\
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$GROUPS_PARTIAL" STATE_DIR="$GROUPS_PARTIAL/state" META_FILE="$GROUPS_PARTIAL/results/meta.env"
   DIAG_LOG_FILE="" GROUP_WAVES=5
   GROUP_NAME=(pcores) GROUP_KIND=(pcore) GROUP_CPUS=(0-3) GROUP_CLUSTER=(-)
@@ -7497,6 +7578,7 @@ groups_partial_before="$(sha256sum "$GROUPS_PARTIAL/results/groups.tsv" "$GROUPS
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$GROUPS_PARTIAL" STATE_DIR="$GROUPS_PARTIAL/state" META_FILE="$GROUPS_PARTIAL/results/meta.env"
   DIAG_LOG_FILE="" GROUP_WAVES=5
   GROUP_NAME=(pcores) GROUP_KIND=(pcore) GROUP_CPUS=(0-3) GROUP_CLUSTER=(-)
@@ -7524,6 +7606,7 @@ EOF
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$STALE_BIND"
   STATE_DIR="$STALE_BIND/state"
   META_FILE="$STALE_BIND/results/meta.env"
@@ -7553,6 +7636,7 @@ stale_gate_before_rc=0
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$STALE_BIND" STATE_DIR="$STALE_BIND/state" GROUP_WAVES=5 MODE=default INDIVIDUAL_RUNS=1
   GROUP_NAME=(pcores ecluster-64) GROUP_KIND=(pcore ecluster)
   GROUP_CPUS=(0-3 16-19) GROUP_CLUSTER=(- 64)
@@ -7566,6 +7650,7 @@ check_eq "completed individual evidence bound to the validated groups generation
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$STALE_BIND"
   STATE_DIR="$STALE_BIND/state"
   META_FILE="$STALE_BIND/results/meta.env"
@@ -7584,6 +7669,7 @@ check_eq "redo groups archives the exact previous groups generation" "1" \
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$STALE_BIND"
   STATE_DIR="$STALE_BIND/state"
   META_FILE="$STALE_BIND/results/meta.env"
@@ -7619,6 +7705,7 @@ stale_gate_output="$(
  (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$STALE_BIND" STATE_DIR="$STALE_BIND/state" GROUP_WAVES=5 MODE=default INDIVIDUAL_RUNS=1
   GROUP_NAME=(pcores ecluster-64) GROUP_KIND=(pcore ecluster)
   GROUP_CPUS=(0-3 16-19) GROUP_CLUSTER=(- 64)
@@ -7641,6 +7728,7 @@ stale_forged_gate_rc=0
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$STALE_BIND" STATE_DIR="$STALE_BIND/state" GROUP_WAVES=5 MODE=default INDIVIDUAL_RUNS=1
   GROUP_NAME=(pcores ecluster-64) GROUP_KIND=(pcore ecluster)
   GROUP_CPUS=(0-3 16-19) GROUP_CLUSTER=(- 64)
@@ -7663,6 +7751,7 @@ stale_v3_gate_output="$(
   (
     DIAG_SOURCE_ONLY=1
     source "$REPO_ROOT/diagnose.sh"
+    RUN_SCHEMA_VERSION=1
     OUT_DIR="$STALE_BIND" STATE_DIR="$STALE_BIND/state" GROUP_WAVES=5 MODE=default INDIVIDUAL_RUNS=1
     GROUP_NAME=(pcores ecluster-64) GROUP_KIND=(pcore ecluster)
     GROUP_CPUS=(0-3 16-19) GROUP_CLUSTER=(- 64)
@@ -7699,6 +7788,7 @@ ln -s "$TMP/outside-group-samples" "$GROUPS_TARGET_GUARD/freq/group-pcores.sampl
 (
   DIAG_SOURCE_ONLY=1
   source "$REPO_ROOT/diagnose.sh"
+  RUN_SCHEMA_VERSION=1
   OUT_DIR="$GROUPS_TARGET_GUARD" STATE_DIR="$GROUPS_TARGET_GUARD/state" GROUP_WAVES=5
   GROUP_NAME=(pcores) GROUP_KIND=(pcore) GROUP_CPUS=(0-3) GROUP_CLUSTER=(-)
   groups_prepare_fresh_targets
@@ -7740,6 +7830,15 @@ if (cd "$LIB" && node --test 'tests/*.test.mjs') > "$TMP/node-tests.log" 2>&1; t
 else
   bad "node --test stats+parsers"
   sed 's/^/    /' "$TMP/node-tests.log" >&2
+fi
+
+echo "== diagnose schema-2 shell integration =="
+if bash "$LIB/tests/diagnose-schema2-integration.test.sh" \
+  > "$TMP/diagnose-schema2-integration.log" 2>&1; then
+  ok "diagnose schema-2 shell integration"
+else
+  bad "diagnose schema-2 shell integration"
+  sed 's/^/    /' "$TMP/diagnose-schema2-integration.log" >&2
 fi
 
 echo "== end-to-end collect + report on synthetic bundle =="

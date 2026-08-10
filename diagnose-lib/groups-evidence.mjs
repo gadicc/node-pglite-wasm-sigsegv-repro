@@ -72,6 +72,11 @@ function validCluster(value) {
   if (value === "-") return true;
   if (value === "unknown") return true;
   if (canonicalUint(value, 65535) !== null) return true;
+  if (typeof value === "string" && /^topo:(unknown|0|[1-9][0-9]*):(unknown|0|[1-9][0-9]*)$/.test(value)) {
+    const [, packageId, clusterId] = value.split(":");
+    return (packageId === "unknown" || canonicalUint(packageId, 65535) !== null) &&
+      (clusterId === "unknown" || canonicalUint(clusterId, 65535) !== null);
+  }
   if (typeof value !== "string" || !value.startsWith("l2:") || value.length > 1027) return false;
   return parseCanonicalCpuList(value.slice(3)) !== null;
 }
@@ -201,7 +206,9 @@ function validatePlanRow(row, rowNumber, wavesExpected) {
   } else if (kind === "ecluster") {
     const expectedName = cluster.startsWith("l2:")
       ? `ecluster-l2-${createHash("sha256").update(cluster).digest("hex").slice(0, 12)}`
-      : `ecluster-${cluster}`;
+      : cluster.startsWith("topo:")
+        ? `ecluster-topo-${createHash("sha256").update(cluster).digest("hex").slice(0, 12)}`
+        : `ecluster-${cluster}`;
     if (name !== expectedName || cluster === "-") {
       reasons.push(`groups row ${rowNumber} has inconsistent ecluster identity fields`);
     }
@@ -240,11 +247,14 @@ export function groupsPlanDigest(planRows) {
 // accepted failures that have no child detail row; default falls back to the
 // stored plan when no group failed, while quick records an explicit skip.
 export function deriveIndividualTargetPolicy(groupsAssessment, mode) {
-  if (groupsAssessment?.status !== "complete" || !["quick", "default", "full"].includes(mode)) return null;
+  if (groupsAssessment?.status !== "complete" || !["quick", "default", "full", "schema2"].includes(mode)) return null;
   const failingEntries = groupsAssessment.entries.filter(({ parsed }) => parsed?.failedWaves > 0);
   let targetEntries;
   let targetPolicy;
-  if (mode === "full") {
+  if (mode === "schema2") {
+    targetEntries = groupsAssessment.entries;
+    targetPolicy = "all-usable-cpus";
+  } else if (mode === "full") {
     targetEntries = groupsAssessment.entries;
     targetPolicy = "all-group-cpus";
   } else if (failingEntries.length > 0) {

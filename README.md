@@ -50,8 +50,9 @@ npm run repro:sequential
 
 `diagnose.sh` automates the full investigation this repository documents:
 environment collection, baseline reproduction, CPU-group isolation,
-per-CPU isolation, GDB fault-signature capture, and a statistically honest
-Markdown report. It is meant to take a machine "from zero" to a reviewable
+seeded per-CPU isolation, exact-CPU pinned-concurrent topology contexts,
+read-only workload telemetry, GDB fault-signature capture, and a statistically
+honest Markdown report. It is meant to take a machine "from zero" to a reviewable
 evidence bundle with one command, and every conclusion in the generated
 report is derived from that run's own measurements — nothing is assumed
 from prior results. Known identifiers are minimized, but raw debugger and
@@ -67,7 +68,7 @@ third-party tool output must still be reviewed before sharing.
 
 Required: `bash`, `node` (with `npm ci` done here), `taskset`, `awk`, and
 standard coreutils. Optional (recorded in the report when missing, never
-fatal): `gdb` (phase 6), `turbostat` (preferred load-frequency sampling),
+fatal): `gdb` (phase 7), `turbostat` (preferred load-frequency sampling),
 `lscpu`, `journalctl`/`systemctl`, `intel-undervolt`, and Dell `cctk`.
 The runner never requires root and never elevates privileges itself.
 
@@ -161,19 +162,21 @@ frequency unavailable.
 
 ```sh
 npm ci
-./diagnose.sh --quick --yes      # ~10 minutes: small baseline, 10 group
-                                 # waves, 5 runs per CPU, 6 gdb runs
+./diagnose.sh --quick --yes      # short: 10 group waves, 5 isolated rounds
+                                 # per CPU, 5 pinned-concurrent rounds
 ./diagnose.sh --yes              # default: 16x50 baseline, 50 group waves,
-                                 # 50 runs per CPU, 12 gdb runs
+                                 # 200 isolated + 200 pinned-concurrent rounds
 ./diagnose.sh --full --yes       # hours: 16x100 baseline, 100 group waves,
-                                 # 100 runs on every online CPU, 24 gdb runs
+                                 # 400 isolated + 400 pinned-concurrent rounds
 ./diagnose.sh --dry-run          # print the resolved plan and exit
 ```
 
 `--yes` accepts the safety warning (required when not interactive).
-Useful overrides: `--individual-runs N`, `--group-waves N`,
+Useful overrides: `--individual-runs N`, `--pinned-concurrent-rounds N`,
+`--protocol-seed auto|N`, `--telemetry-interval-ms N`, `--group-waves N`,
 `--gdb-max-runs N` (bounded by the evidence envelope at 4096), `--skip-gdb`,
-`--run-gdb`, `--out-dir DIR`, and `--cpu N|auto`. The CPU selection policy is persisted in the bundle:
+`--run-gdb`, `--skip-pinned-concurrent`, `--run-pinned-concurrent`,
+`--out-dir DIR`, and `--cpu N|auto`. The CPU selection policy is persisted in the bundle:
 `auto` (the default) uses the worst failing CPU from validated individual
 results, while a number pins the manual frequency hint and GDB capture to that
 CPU. Use `--cpu auto` on resume to clear a previously fixed choice; completed
@@ -185,14 +188,22 @@ On resume, the stored GDB choice remains the default. Use `--run-gdb` to
 reverse an earlier `--skip-gdb`; if that skipped phase is already complete,
 also pass `--redo gdb` so its old terminal evidence is preserved first.
 
-### Targeted CPU follow-ups
+### Exact-CPU protocols and exploratory follow-ups
 
 The main group phase answers whether a *shared CPU affinity mask* reproduces
 the problem. It does not identify a CPU: the controller and its children can
-migrate anywhere inside that mask. The ordinary individual phase uses one
-direct, pinned child at a time, so it is attributable but does not reproduce
-the simultaneous group load. `targeted-cpu-test.mjs` supplies the two missing
-controlled comparisons while leaving all frequency settings untouched.
+migrate anywhere inside that mask. The schema-2 individual phase uses one
+direct, pinned child at a time on every usable logical CPU. Its immutable
+seeded plan interleaves CPUs in a position-balanced order, avoiding CPU-major
+batches while retaining exact CPU attribution. The separate pinned-concurrent
+phase launches one child per active logical CPU in each validated topology
+context, with the controller pinned outside the active set. This preserves
+simultaneous load while retaining exact child-to-CPU attribution. Contexts
+remain separate strata because sibling load and active-set size differ.
+
+`targeted-cpu-test.mjs` remains available for exploratory follow-ups outside
+the authoritative diagnostic bundle. It leaves all frequency settings
+untouched.
 
 First preserve the concurrent cluster load but pin one child to each CPU:
 
@@ -239,6 +250,16 @@ Everything lands in a timestamped bundle, `diagnostics/<UTC timestamp>/`
   `root-checks.sh` was run)
 - `logs/` — raw stdout/stderr per phase
 - `freq/` — frequency samples per phase
+- `telemetry/` — read-only, timestamped per-CPU `scaling_cur_freq`, dynamically
+  mapped core/package temperatures, and `intel_pstate/no_turbo` samples. Each
+  published telemetry envelope is digest-bound to the exact owning workload
+  generation; the groups binding covers its metadata, TSV, and every canonical
+  TSV-named outcome log, while exact-CPU phases also bind their per-child
+  boundary sidecar.
+- `results/individual.plan.tsv`, `results/individual.boundaries.ndjson` — the
+  immutable isolated schedule and exact per-attempt time/`no_turbo` boundaries
+- `results/pinned-concurrent.*` — topology contexts, immutable launch plan,
+  whole-wave outcomes, and exact per-child boundaries
 - `gdb/` — capture transcripts, bound by the authoritative generation-stamped
   `results/gdb.manifest` envelope (exact runner log, metadata, and transcript
   digests); `results/gdb.meta` is the legacy descriptive summary only
@@ -254,6 +275,15 @@ metadata, phase evidence, or derived outputs. An interruption can therefore
 leave useful old/new files behind an absent manifest, but those files are not a
 completed generation; rerunning `diagnose.sh --resume ... --yes` cleans any
 validated finalization candidates and regenerates the complete set.
+
+For a Dell support handoff, first run `sha256sum -c manifest.txt` from inside
+the completed bundle, then review `privacy-review.txt` and every raw file it
+flags. Archive and send the entire bundle directory, not `report.md` alone, so
+the report, machine-readable results, raw evidence, telemetry, and validation
+manifests remain reviewable together. Service tags and serial numbers are
+deliberately excluded; provide the service tag separately through the secure
+Dell support case or another Dell-approved secure channel rather than adding
+it to the bundle.
 
 Phases mark completion under `state/`; an interrupted run (SIGINT/SIGTERM
 writes a partial report first) can be resumed without discarding finished
@@ -297,12 +327,13 @@ deleted:
 ```
 
 Redoing preflight invalidates and repeats the complete downstream phase
-closure (`baseline`, `groups`, `individual`, `frequency`, and `gdb`). Its
+closure (`baseline`, `groups`, `individual`, `pinned-concurrent`, `frequency`,
+and `gdb`). Its
 archive includes the fixed environment snapshot and `env/root/`, so manual
 privileged reads from an older preflight generation cannot survive as current
 evidence.
 
-GDB capture attempts are not combined across resumes. Before phase 6 runs or
+GDB capture attempts are not combined across resumes. Before phase 7 runs or
 writes any terminal skip result, a prior incomplete attempt (metadata, capture
 transcripts, runner log, and any published or hidden manifest) and its stale
 derived reports are preserved together under one `state/superseded/`
@@ -319,9 +350,11 @@ confidence intervals. A group result such as `50/50` means 50 of 50 waves had
 at least one confirmed SIGSEGV; it does **not** mean every child failed. The
 separate child column gives the measured child failure count and percentage,
 without a child-level interval because children within a wave are correlated.
-A group row names an affinity mask, not the faulting CPU. CPU localization is
-descriptive because its sequential batches are not exchangeable and uses a
-different, single-process protocol from the group phase. A zero there means
+A group row names an affinity mask, not the faulting CPU. Exact-CPU localization
+is still descriptive: the seeded, position-balanced isolated schedule reduces
+systematic order bias but does not remove time, temperature, warm-up, or
+workload-drift confounding, and pinned-concurrent children within one wave are
+correlated. A zero there means
 only that this run did not reproduce under that protocol; it does not erase a
 failure captured in an older diagnostic session. For the prespecified frequency A/B/A reversal,
 each turbo-on leg is compared separately with the turbo-off leg using a
@@ -350,12 +383,13 @@ frequency suppressed it, whether the GDB fault matches the documented
 `intended + 2^42` signature, which hypotheses the collected configuration
 rules out, and what remains uncertain.
 
-**Clean-run statistics are one-sided.** Zero failures in `n` runs never
-prove a zero rate; the report shows the exact 95% upper bound
-`1 - 0.05^(1/n)` (approximately `3/n`). A CPU with 50 clean runs is only
-cleared of per-run rates above ~5.8%, and observed rates can drift between
-batches, so treat "clean" verdicts as exclusions of high rates, not proof
-of correct hardware. For GDB capture, `n` includes only attempts that actually
+**Zero-failure statistics are one-sided.** No failures observed in `n` runs
+never proves a zero rate; the report shows the exact pointwise 95% upper bound
+`1 - 0.05^(1/n)` (approximately `3/n`). Under the working assumption that
+attempts are independent and stationary, 50 runs with no failures observed
+have a nominal upper bound of ~5.8%. Temporal or thermal dependence can make
+that bound too narrow, so it is not proof of correct hardware. For GDB capture,
+`n` includes only attempts that actually
 ran the workload cleanly: debugger/runner errors are reported separately and
 never inflate the no-fault denominator. Every captured or no-fault conclusion
 requires the validated generation-bound manifest envelope; legacy bundles
@@ -439,9 +473,10 @@ universally required. Concurrency is the stable trigger in the measured Node
 configurations.
 
 > **Update (2026-07-31):** "Concurrency is the stable trigger" is superseded.
-> A single process pinned to a defective core reproduces the crash with no
-> other load; concurrency only ensured scheduler exposure to the defective
-> cores. See "Update (2026-07-31): isolated to three physical cores" below.
+> A single process pinned to one of the CPUs that failed in these tests
+> reproduces the crash with no other load; concurrency only ensured scheduler
+> exposure to those CPUs. See "Update (2026-07-31): failures localized to
+> three physical cores in these tests" below.
 
 ## Post-report flag and version sweep
 
@@ -477,7 +512,7 @@ Two consequences:
 
 > **Update (2026-07-31):** the "likely timing perturber" framing is also
 > superseded — no cross-process load is required. See "Update (2026-07-31):
-> isolated to three physical cores" below.
+> failures localized to three physical cores in these tests" below.
 
 ## Root-cause investigation (2026-07-30): platform-level address corruption
 
@@ -526,7 +561,10 @@ change CR2 (a linear address) at all.
   clean" control was insufficient sampling.
 - A second PC (i9-10885H, Comet Lake) passed 100/100 waves (1,600
   child-runs). On the affected machine a crash occurs roughly every 40-80
-  child-runs; the clean run is conclusive to better than 1e-14.
+  child-runs. Under an illustrative independent-child model at the
+  conservative 1/80 rate, the probability of 0/1,600 is about 1.82e-9.
+  Children within a wave share timing and machine state, so independence can
+  be optimistic; this is strong model-based contrast, not a conclusive bound.
 - Reproduced on kernels 6.18 (CachyOS) and 7.1.5 (Arch).
 - The affected machine's journal shows other applications (Chromium, and
   Electron/Signal V8 `int3` aborts) crashing with anomalous fault addresses
@@ -561,12 +599,12 @@ store address landing on a mapped page would silently corrupt memory. Next
 steps are firmware updates and stock BIOS settings on the affected machine
 and, if the behavior persists, an erratum report to Intel.
 
-### Update (2026-07-31): isolated to three physical cores
+### Update (2026-07-31): failures localized to three physical cores in these tests
 
-`taskset` isolation on the affected machine localized the defect to
-individual cores. CPUs 0-7 are P-cores; 8-23 are E-cores in four clusters
-of four sharing one L2 (sysfs cluster ids: 16 = cpus 8-11, 24 = cpus 12-15,
-64 = cpus 16-19, 72 = cpus 20-23).
+`taskset` isolation on the affected machine localized the observed failures
+to individual CPUs in this session. CPUs 0-7 are P-cores; 8-23 are E-cores in
+four clusters of four sharing one L2 (sysfs cluster ids: 16 = cpus 8-11,
+24 = cpus 12-15, 64 = cpus 16-19, 72 = cpus 20-23).
 
 | CPU set | Topology | Result |
 | --- | --- | --- |
@@ -576,8 +614,8 @@ of four sharing one L2 (sysfs cluster ids: 16 = cpus 8-11, 24 = cpus 12-15,
 | 16-19 | E-cluster 64 | SIGSEGV at wave 1 in both runs (3 + 3 of 8 child-runs) |
 | 20-23 | E-cluster 72 | SIGSEGV at wave 1 in both runs (1 + 2 of 8 child-runs) |
 
-Single-child pinning (one child per run, 50 waves per core) refined this to
-exactly one defective core per affected cluster:
+Single-child pinning (one child per run, 50 waves per core) observed failures
+on one CPU in each of the three affected clusters:
 
 | CPU | Result |
 | --- | --- |
@@ -586,10 +624,13 @@ exactly one defective core per affected cluster:
 | 19 | SIGSEGV at waves 2, 10, and 3 across three runs |
 | 21 | SIGSEGV at wave 22 (single observation) |
 
-The defective cores are 11, 19, and 21: one in each of three E-core
-clusters, none in cluster 24, none on a P-core (the P-core runs above gave
-every P-core full thread exposure across 1,200 clean child-runs). The
-defect is per-core, not cluster-shared logic such as the common L2.
+Failures were observed on CPUs 11, 19, and 21: one in each of three E-core
+clusters. No failure was observed in cluster 24 or on a P-core in these
+samples (the P-core runs above gave every P-core thread exposure across 1,200
+zero-failure child-runs). This localizes the observed failures to particular
+pinned CPUs and is more consistent with per-core susceptibility than a
+cluster-wide common failure, but finite zero-failure samples cannot exclude
+intermittent failures elsewhere or a shared mechanism.
 
 Running one child under the same gdb harness pinned to core 19
 (`capture-fault.sh`; transcripts `captures/cpu19-run{1,5,6}.txt`) captured
@@ -603,14 +644,15 @@ Consequences:
 
 - Concurrency is not required, superseding "concurrency is the stable
   trigger" and "cross-process machine load as the likely timing perturber"
-  above. A single process pinned to a defective core faults while its V8
+  above. A single process pinned to an observed failing CPU faults while its V8
   background threads sit idle. The earlier concurrency dependence, and the
   unpinned rate of one crash per 40-80 child-runs, were scheduler exposure
-  to three defective cores among 24.
+  to the three CPUs that failed in these tests among 24.
 - "Good core" verdicts are provisional at low rates: 50 clean single-child
   runs exclude per-run crash rates only above roughly 5%, and core 21's
   observed rate (1 in 22) sits at that boundary. Cluster 24's 400 fully
-  exposed child-runs remain conclusive even against a weak-core rate.
+  exposed zero-failure child-runs provide a stronger screen than the 50-run
+  samples, but they still do not prove a zero failure rate.
 - The minimal trigger no longer needs the wave harness:
   `while taskset -c 19 node child.mjs; do :; done` faults within a few
   runs in a single ~1.2 GiB process. This is a cheap oracle for firmware

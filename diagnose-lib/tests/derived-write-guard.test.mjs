@@ -38,7 +38,7 @@ test("standalone collection cannot invalidate a manifested bundle", () => {
 
   const explicit = path.join(root, ".results.json.candidate");
   assert.doesNotThrow(() => collect(root, { outputFile: explicit, exclusiveOutput: true }));
-  assert.match(readFileSync(explicit, "utf8"), /"schemaVersion": 1/);
+  assert.match(readFileSync(explicit, "utf8"), /"schemaVersion": 2/);
 });
 
 test("standalone report generation cannot invalidate a manifested bundle", () => {

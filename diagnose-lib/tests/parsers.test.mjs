@@ -541,8 +541,9 @@ test("renderReport: unclassified truncated failures are never called clean", () 
     },
   });
   assert.match(md, /Unclassified failures \(summary only\) \| 4/);
-  assert.match(md, /Workload failures occurred/);
+  assert.match(md, /No complete validated workload result is available/);
   assert.doesNotMatch(md, /No failure reproduced/);
+  assert.doesNotMatch(md, /\*\*The problem reproduced\*\*/);
 });
 
 test("renderReport: inconsistent clean-looking repro rows stay descriptive", () => {
@@ -550,6 +551,7 @@ test("renderReport: inconsistent clean-looking repro rows stay descriptive", () 
     collectedAt: "2026-08-02T00:00:00.000Z",
     config: {},
     environment: {},
+    baselineStatus: { status: "complete", reasons: [] },
     baseline: {
       children: 2,
       requestedWaves: 2,
@@ -570,6 +572,7 @@ test("renderReport: inconsistent clean-looking repro rows stay descriptive", () 
       issues: [{ code: "footer-row-count-mismatch", message: "footer disagrees with rows" }],
       log: "logs/baseline/run1.log",
     },
+    groupsStatus: { status: "complete", reasons: [] },
     groups: [{
       name: "pcores",
       cpus: "0-1",
@@ -592,7 +595,7 @@ test("renderReport: inconsistent clean-looking repro rows stay descriptive", () 
   });
   assert.match(md, /structurally inconsistent/);
   assert.match(md, /descriptive only; inconsistent structure/);
-  assert.match(md, /prevents a clean non-reproduction conclusion or rate bound/);
+  assert.match(md, /prevents a no-failure conclusion or rate bound/);
   assert.doesNotMatch(md, /\*\*No failure reproduced\*\*/);
   assert.doesNotMatch(md, /clean group\(s\): pcores/);
   assert.doesNotMatch(md, /0\/4 \(95% upper/);
@@ -603,6 +606,7 @@ test("renderReport: impossible failure counts never throw or get an interval", (
     collectedAt: "2026-08-02T00:00:00.000Z",
     config: {},
     environment: {},
+    baselineStatus: { status: "complete", reasons: [] },
     baseline: {
       children: 2,
       requestedWaves: 1,
@@ -616,6 +620,7 @@ test("renderReport: impossible failure counts never throw or get an interval", (
       completionStatus: "complete",
       log: "logs/baseline/run1.log",
     },
+    groupsStatus: { status: "complete", reasons: [] },
     groups: [{
       name: "bad-counts",
       cpus: "0-1",
@@ -665,6 +670,7 @@ test("renderReport: impossible failure counts never throw or get an interval", (
     collectedAt: "2026-08-02T00:00:00.000Z",
     config: {},
     environment: {},
+    baselineStatus: { status: "complete", reasons: [] },
     baseline: {
       children: 1,
       requestedWaves: 1,
@@ -816,6 +822,7 @@ test("renderReport: clean heterogeneous phases do not get a pooled rate bound", 
     collectedAt: "2026-08-02T00:00:00.000Z",
     config: {},
     environment: {},
+    baselineStatus: { status: "complete", reasons: [] },
     baseline: {
       children: 2,
       requestedWaves: 5,
@@ -835,6 +842,7 @@ test("renderReport: clean heterogeneous phases do not get a pooled rate bound", 
       partial: false,
       log: "logs/baseline/run1.log",
     },
+    groupsStatus: { status: "complete", reasons: [] },
     groups: [{
       name: "pcores",
       cpus: "0-7",
@@ -884,6 +892,7 @@ test("renderReport: identical child SIGSEGV counts have different clustered wave
     collectedAt: "2026-08-02T00:00:00.000Z",
     config: {},
     environment: {},
+    baselineStatus: { status: "complete", reasons: [] },
     baseline: {
       ...common,
       failedWaves: 1,
@@ -891,6 +900,7 @@ test("renderReport: identical child SIGSEGV counts have different clustered wave
       sigsegvWaveCount: 1,
       log: "logs/baseline/run1.log",
     },
+    groupsStatus: { status: "complete", reasons: [] },
     groups: [{
       ...common,
       name: "spread",
@@ -955,11 +965,12 @@ test("renderReport: legacy or impossible wave fields never fall back to child in
   assert.doesNotMatch(md, /\*\*No failure reproduced\*\*/);
 });
 
-test("renderReport: partial positive wave evidence reproduces but gets no interval", () => {
+test("renderReport: partial positive wave evidence stays descriptive and gets no interval", () => {
   const md = renderReport({
     collectedAt: "2026-08-02T00:00:00.000Z",
     config: {},
     environment: {},
+    baselineStatus: { status: "complete", reasons: [] },
     baseline: {
       children: 2,
       requestedWaves: 5,
@@ -982,7 +993,8 @@ test("renderReport: partial positive wave evidence reproduces but gets no interv
     },
   });
   assert.match(md, /1\/1 = 100\.0% \(descriptive only; partial structure\)/);
-  assert.match(md, /\*\*The problem reproduced\*\*/);
+  assert.match(md, /No complete validated workload result is available/);
+  assert.doesNotMatch(md, /\*\*The problem reproduced\*\*/);
   assert.doesNotMatch(md, /1\/1 = 100\.0% \[/);
 });
 
@@ -991,6 +1003,7 @@ test("renderReport: unresolved waves preclude a clean claim and zero bound", () 
     collectedAt: "2026-08-02T00:00:00.000Z",
     config: {},
     environment: {},
+    baselineStatus: { status: "complete", reasons: [] },
     baseline: {
       children: 2,
       requestedWaves: 2,
@@ -1110,6 +1123,7 @@ function renderFrequencyCase(a1Failures, bFailures, a2Failures, overrides = {}) 
     collectedAt: "2026-08-02T00:00:00.000Z",
     config: {},
     environment: {},
+    frequencyAbStatus: { status: "complete", reasons: [] },
     frequencyAb: {
       cpu: 19,
       restored: true,
@@ -1212,7 +1226,7 @@ test("renderReport: GDB no-fault bound uses only clean attempts", () => {
     },
   });
   assert.match(md, /6 pinned attempt/);
-  assert.match(md, /1 clean and 5 runner error/);
+  assert.match(md, /1 completed without a captured fault and 5 runner error/);
   assert.match(md, /95% upper bound per attempt is 95\.0%/);
   assert.match(md, /n=1/);
   assert.doesNotMatch(md, /39\.3%/);
