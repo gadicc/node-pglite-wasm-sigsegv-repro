@@ -593,7 +593,7 @@ function parseLaunchProtocol(bytes, cpu) {
   if (bytes.length === 0 || bytes.length > MAX_LAUNCH_PROTOCOL_BYTES || bytes.at(-1) !== 0x0a) return null;
   let value;
   try {
-    value = JSON.parse(bytes.toString("utf8", 0, -1));
+    value = JSON.parse(bytes.subarray(0, -1).toString("utf8"));
   } catch {
     return null;
   }

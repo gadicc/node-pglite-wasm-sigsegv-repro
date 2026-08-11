@@ -361,6 +361,57 @@ function scriptedLauncher(script = {}) {
   return { launcher, requests, cancelSignals };
 }
 
+test("runPinnedChild V2 accepts a canonical private worker result frame", async () => {
+  const child = new EventEmitter();
+  child.pid = 42_426;
+  child.stderr = new PassThrough();
+  const launchProtocol = new PassThrough();
+  const workerResult = {
+    version: 1,
+    cpu: 12,
+    launchState: "launched",
+    exitCode: 0,
+    signal: null,
+    canceled: false,
+    launchError: null,
+    stderr: {
+      sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      bytes: "0",
+      excerptBase64: "",
+      excerptBytes: 0,
+      truncated: false,
+    },
+  };
+  const launcher = () => {
+    setImmediate(() => {
+      launchProtocol.end(`${JSON.stringify(workerResult)}\n`);
+      child.stderr.end();
+      child.emit("exit", 0, null);
+      child.emit("close", 0, null);
+    });
+    return {
+      child,
+      launchProtocol,
+      cancel() { return true; },
+    };
+  };
+
+  const result = await runPinnedChild({
+    runnerVersion: 2,
+    cpu: 12,
+    command: "/mock/node",
+    launcher,
+    clock: scriptedClock(),
+    noTurboReader: scriptedNoTurbo([0, 0]),
+  });
+
+  assert.equal(result.outcome, "pass");
+  assert.equal(result.validOutcome, true);
+  assert.equal(result.launchState, "launched");
+  assert.equal(result.launchError, null);
+  assert.deepEqual(result.stderrEvidence, workerResult.stderr);
+});
+
 test("runPinnedChild emits canonical JSON-safe boundaries and bounded stderr", async () => {
   const fake = scriptedLauncher({ exitCode: 0, stderr: "abcdefgh" });
   const result = await runPinnedChild({
