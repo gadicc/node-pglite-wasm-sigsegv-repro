@@ -222,7 +222,7 @@ function validateRun(run, index) {
   const startUnixMs = run?.startUnixMs;
   const endUnixMs = run?.endUnixMs;
   if (run?.ordinal !== index + 1 || !Number.isSafeInteger(run?.cpu) || run.cpu < 0 ||
-      (run?.outcome !== "pass" && run?.outcome !== "sigsegv") ||
+      !["pass", "sigsegv", "other-workload-failure"].includes(run?.outcome) ||
       start === null || end === null || end < start ||
       !Number.isSafeInteger(startUnixMs) || !Number.isSafeInteger(endUnixMs) ||
       startUnixMs < 0 || endUnixMs < startUnixMs) return null;

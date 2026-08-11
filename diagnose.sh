@@ -3726,7 +3726,7 @@ compute_individual_targets() {
   return 0
 }
 
-phase_individual_v5() {
+phase_individual_v6() {
   local tsv="$OUT_DIR/results/individual.tsv"
   local meta="$OUT_DIR/results/individual.meta"
   local plan="$OUT_DIR/results/individual.plan.tsv"
@@ -3748,13 +3748,13 @@ phase_individual_v5() {
   if [[ -e "$meta" || -L "$meta" ]]; then
     individual_meta_read "$meta" ||
       diag_die "existing schema-2 individual metadata is invalid; preserve it and use --redo individual"
-    [[ "$INDIVIDUAL_META_VERSION" == 5 && "$INDIVIDUAL_META_SKIPPED" == 0 &&
+    [[ "$INDIVIDUAL_META_VERSION" == 6 && "$INDIVIDUAL_META_SKIPPED" == 0 &&
       "$INDIVIDUAL_META_TARGET_CPUS" == "$INDIVIDUAL_TARGET_CPUS" &&
       "$INDIVIDUAL_META_RUNS" == "$INDIVIDUAL_RUNS" &&
       "$INDIVIDUAL_META_TARGET_POLICY" == all-usable-cpus &&
       "$INDIVIDUAL_META_GROUP_PLAN_DIGEST" == "$INDIVIDUAL_GROUP_PLAN_DIGEST" &&
       "$INDIVIDUAL_META_GROUP_GENERATION" == "$INDIVIDUAL_GROUP_GENERATION" &&
-      "$INDIVIDUAL_META_PROTOCOL" == isolated-interleaved-v1 &&
+      "$INDIVIDUAL_META_PROTOCOL" == isolated-outcomes-v2 &&
       "$INDIVIDUAL_META_SCHEDULE_SEED" == "$PROTOCOL_SEED" &&
       "$INDIVIDUAL_META_SCHEDULE_ALGORITHM" == balanced-cyclic-v1 ]] ||
       diag_die "existing schema-2 individual metadata does not match this resumable protocol"
@@ -3771,7 +3771,7 @@ phase_individual_v5() {
     bundle_owned_real_dir "$attempt_state" && bundle_owned_single_regular "$plan" &&
       bundle_owned_single_regular "$tsv" && bundle_owned_single_regular "$boundaries" ||
       diag_die "schema-2 individual resume artifacts are missing or unsafe"
-    individual_v5_binding_read "$plan" "$tsv" "$boundaries" \
+    individual_v6_binding_read "$plan" "$tsv" "$boundaries" \
       "$INDIVIDUAL_TARGET_CPUS" "$INDIVIDUAL_RUNS" \
       "$([[ "$INDIVIDUAL_META_COMPLETED" == 1 ]] && printf 1 || printf 0)" ||
       diag_die "schema-2 individual artifacts are not an exact plan-bound prefix"
@@ -3819,6 +3819,9 @@ phase_individual_v5() {
     bundle_create_empty_exclusive "$tsv" 0600 &&
       bundle_create_empty_exclusive "$boundaries" 0600 ||
       diag_die "cannot create isolated result sidecars exclusively"
+    printf 'ordinal\tround\tposition\tcpu\toutcome\texit_code\tsignal\telapsed_sec\tstderr_sha256\tstderr_bytes\n' \
+      > "$tsv" || diag_die "cannot initialize the V6 isolated results header"
+    sync -f "$tsv" || diag_die "cannot synchronize the V6 isolated results header"
     diag_log_cmd node diagnose-lib/pinned-protocol.mjs plan-isolated \
       --cpus "$INDIVIDUAL_TARGET_CPUS" --rounds "$INDIVIDUAL_RUNS" \
       --seed "$PROTOCOL_SEED" --plan-output "$plan"
@@ -3830,17 +3833,17 @@ phase_individual_v5() {
     INDIVIDUAL_META_GENERATION="$("$DIAG_INDIVIDUAL_NODE_BIN" -e \
       'process.stdout.write(require("node:crypto").randomBytes(16).toString("hex"))')" ||
       diag_die "cannot generate isolated evidence generation"
-    INDIVIDUAL_META_PROTOCOL=isolated-interleaved-v1
+    INDIVIDUAL_META_PROTOCOL=isolated-outcomes-v2
     INDIVIDUAL_META_SCHEDULE_SEED="$PROTOCOL_SEED"
     INDIVIDUAL_META_SCHEDULE_ALGORITHM=balanced-cyclic-v1
-    individual_v5_binding_read "$plan" "$tsv" "$boundaries" \
+    individual_v6_binding_read "$plan" "$tsv" "$boundaries" \
       "$INDIVIDUAL_TARGET_CPUS" "$INDIVIDUAL_RUNS" 0 ||
       diag_die "cannot validate the fresh isolated protocol plan"
     individual_meta_write "$INDIVIDUAL_TARGET_CPUS" "$INDIVIDUAL_RUNS" 0 0 ""
   fi
 
   total=$(( $(diag_cpulist_count "$INDIVIDUAL_TARGET_CPUS") * INDIVIDUAL_RUNS ))
-  progress="$(node "$LIB/pinned-protocol.mjs" next-isolated \
+  progress="$(node "$LIB/pinned-protocol.mjs" next-isolated-v2 \
     --cpus "$INDIVIDUAL_TARGET_CPUS" --rounds "$INDIVIDUAL_RUNS" \
     --seed "$PROTOCOL_SEED" --generation "$INDIVIDUAL_META_GENERATION" \
     --state-dir "$attempt_state")" ||
@@ -3867,7 +3870,7 @@ phase_individual_v5() {
   while [[ "$complete" == false ]]; do
     protocol_rc=0
     run_pinned_protocol_logged "$output" "$protocol_log" \
-      "$DIAG_INDIVIDUAL_NODE_BIN" "$LIB/pinned-protocol.mjs" attempt-isolated \
+      "$DIAG_INDIVIDUAL_NODE_BIN" "$LIB/pinned-protocol.mjs" attempt-isolated-v2 \
       --cpus "$INDIVIDUAL_TARGET_CPUS" --rounds "$INDIVIDUAL_RUNS" \
       --seed "$PROTOCOL_SEED" --generation "$INDIVIDUAL_META_GENERATION" \
       --state-dir "$attempt_state" --command "$DIAG_INDIVIDUAL_NODE_BIN" \
@@ -3875,7 +3878,7 @@ phase_individual_v5() {
       --no-turbo-path "$no_turbo_path" || protocol_rc=$?
     result="$(<"$output")"
     [[ "$protocol_rc" == 0 && "$result" =~ \"committed\":true ]] ||
-      diag_die "isolated attempt was not a valid clean/SIGSEGV observation (executor rc=$protocol_rc); phase remains resumable"
+      diag_die "isolated attempt was operational-invalid (executor rc=$protocol_rc); phase remains resumable and the executor summary is $output"
     committed=$((committed + 1))
     ((committed <= total)) || diag_die "isolated executor committed beyond its immutable plan"
     if ((committed == total || committed % 25 == 0)); then
@@ -3897,13 +3900,13 @@ phase_individual_v5() {
     diag_die "cannot prepare isolated finalization staging directory"
   staged_tsv="$stage/individual.tsv"
   staged_boundaries="$stage/individual.boundaries.ndjson"
-  node "$LIB/pinned-protocol.mjs" finalize-isolated \
+  node "$LIB/pinned-protocol.mjs" finalize-isolated-v2 \
     --cpus "$INDIVIDUAL_TARGET_CPUS" --rounds "$INDIVIDUAL_RUNS" \
     --seed "$PROTOCOL_SEED" --generation "$INDIVIDUAL_META_GENERATION" \
     --state-dir "$attempt_state" --results-output "$staged_tsv" \
     --boundaries-output "$staged_boundaries" > /dev/null ||
     diag_die "isolated state is not complete enough to finalize"
-  individual_v5_binding_read "$plan" "$staged_tsv" "$staged_boundaries" \
+  individual_v6_binding_read "$plan" "$staged_tsv" "$staged_boundaries" \
     "$INDIVIDUAL_TARGET_CPUS" "$INDIVIDUAL_RUNS" 1 ||
     diag_die "isolated finalization did not reproduce the exact immutable plan"
   bundle_owned_single_regular "$tsv" && bundle_owned_single_regular "$boundaries" ||
@@ -3914,10 +3917,10 @@ phase_individual_v5() {
     diag_die "cannot close isolated finalization staging directory"
   sync -f "$tsv" && sync -f "$boundaries" && sync -f "$OUT_DIR/results" ||
     diag_die "cannot synchronize finalized isolated evidence"
-  individual_v5_binding_read "$plan" "$tsv" "$boundaries" \
+  individual_v6_binding_read "$plan" "$tsv" "$boundaries" \
     "$INDIVIDUAL_TARGET_CPUS" "$INDIVIDUAL_RUNS" 1 ||
     diag_die "published isolated evidence failed its terminal binding"
-  INDIVIDUAL_META_PROTOCOL=isolated-interleaved-v1
+  INDIVIDUAL_META_PROTOCOL=isolated-outcomes-v2
   INDIVIDUAL_META_SCHEDULE_SEED="$PROTOCOL_SEED"
   INDIVIDUAL_META_SCHEDULE_ALGORITHM=balanced-cyclic-v1
   individual_meta_write "$INDIVIDUAL_TARGET_CPUS" "$INDIVIDUAL_RUNS" 0 1 ""
@@ -4152,7 +4155,7 @@ individual_meta_read() {
     -n "${seen[VERSION]:-}" && -n "${seen[TARGET_CPUS]:-}" &&
     -n "${seen[RUNS_PER_CPU]:-}" && -n "${seen[SKIPPED]:-}" &&
     -n "${seen[COMPLETED]:-}" && -n "${seen[SKIP_REASON_PRESENT]:-}" ]] || return 1
-  if [[ "$INDIVIDUAL_META_VERSION" == 5 ]]; then
+  if [[ "$INDIVIDUAL_META_VERSION" == 5 || "$INDIVIDUAL_META_VERSION" == 6 ]]; then
     [[ ${#seen[@]} == 22 && -n "${seen[PROTOCOL]:-}" &&
       -n "${seen[SCHEDULE_SEED]:-}" && -n "${seen[SCHEDULE_ALGORITHM]:-}" &&
       -n "${seen[PLAN_SHA256]:-}" && -n "${seen[PLAN_BYTES]:-}" &&
@@ -4187,7 +4190,7 @@ individual_meta_write() {
   fi
   if [[ "$RUN_SCHEMA_VERSION" == 2 ]]; then
     [[ "$skipped" == 0 && "$INDIVIDUAL_TARGET_POLICY" == all-usable-cpus &&
-      "$INDIVIDUAL_META_PROTOCOL" == isolated-interleaved-v1 &&
+      "$INDIVIDUAL_META_PROTOCOL" == isolated-outcomes-v2 &&
       "$INDIVIDUAL_META_SCHEDULE_SEED" == "$PROTOCOL_SEED" &&
       "$INDIVIDUAL_META_SCHEDULE_ALGORITHM" == balanced-cyclic-v1 &&
       "$INDIVIDUAL_META_PLAN_SHA256" =~ ^[a-f0-9]{64}$ ]] &&
@@ -4204,7 +4207,7 @@ individual_meta_write() {
   tmp="$(mktemp "$OUT_DIR/results/.individual.meta.XXXXXX")" || diag_die "cannot create individual metadata"
   {
     printf 'VERSION=%s\nGENERATION=%s\nTARGET_CPUS=%s\nRUNS_PER_CPU=%s\n' \
-      "$([[ "$RUN_SCHEMA_VERSION" == 2 ]] && printf 5 || printf 4)" \
+      "$([[ "$RUN_SCHEMA_VERSION" == 2 ]] && printf 6 || printf 4)" \
       "$INDIVIDUAL_META_GENERATION" "$targets" "$runs"
     printf 'TARGET_POLICY=%s\nGROUP_PLAN_DIGEST=%s\nGROUP_GENERATION=%s\n' \
       "$INDIVIDUAL_TARGET_POLICY" "$INDIVIDUAL_GROUP_PLAN_DIGEST" "$INDIVIDUAL_GROUP_GENERATION"
@@ -4260,12 +4263,12 @@ individual_rows_binding_read() {
     { [[ "$INDIVIDUAL_META_ROW_COUNT" == 0 ]] || diag_is_safe_positive_uint "$INDIVIDUAL_META_ROW_COUNT"; }
 }
 
-individual_v5_binding_read() {
+individual_v6_binding_read() {
   local plan="$1" tsv="$2" boundaries="$3" targets="$4" runs="$5" require_complete="$6"
   local output line key value expected_fields=6
   local -A seen=()
   [[ "$require_complete" =~ ^[01]$ ]] || return 1
-  output="$("$DIAG_INDIVIDUAL_NODE_BIN" "$LIB/individual-evidence.mjs" v5-binding \
+  output="$("$DIAG_INDIVIDUAL_NODE_BIN" "$LIB/individual-evidence.mjs" v6-binding \
     "$plan" "$tsv" "$boundaries" "$targets" "$runs" "$PROTOCOL_SEED" \
     "$require_complete")" || return 1
   INDIVIDUAL_META_PLAN_SHA256=""
@@ -4339,7 +4342,7 @@ individual_empty_rows_binding_read() {
 individual_phase_matches_expected_targets() {
   local should_run="$1"
   local expected_version=4
-  [[ "$RUN_SCHEMA_VERSION" == 2 ]] && expected_version=5
+  [[ "$RUN_SCHEMA_VERSION" == 2 ]] && expected_version=6
   [[ "$should_run" =~ ^[01]$ ]] || return 1
   individual_evidence_read || return 1
   [[ "$INDIVIDUAL_META_VERSION" == "$expected_version" &&
@@ -4347,8 +4350,8 @@ individual_phase_matches_expected_targets() {
     "$INDIVIDUAL_META_TARGET_POLICY" == "$INDIVIDUAL_TARGET_POLICY" &&
     "$INDIVIDUAL_META_GROUP_PLAN_DIGEST" == "$INDIVIDUAL_GROUP_PLAN_DIGEST" &&
     "$INDIVIDUAL_META_GROUP_GENERATION" == "$INDIVIDUAL_GROUP_GENERATION" ]] || return 1
-  if [[ "$expected_version" == 5 ]]; then
-    [[ "$INDIVIDUAL_META_PROTOCOL" == isolated-interleaved-v1 &&
+  if [[ "$expected_version" == 6 ]]; then
+    [[ "$INDIVIDUAL_META_PROTOCOL" == isolated-outcomes-v2 &&
       "$INDIVIDUAL_META_SCHEDULE_SEED" == "$PROTOCOL_SEED" &&
       "$INDIVIDUAL_META_SCHEDULE_ALGORITHM" == balanced-cyclic-v1 ]] || return 1
   fi
@@ -4420,6 +4423,9 @@ individual_evidence_read() {
   if [[ "$INDIVIDUAL_META_VERSION" == 5 ]]; then
     [[ ${#seen[@]} == 24 && "$INDIVIDUAL_META_PROTOCOL" == isolated-interleaved-v1 &&
       "$INDIVIDUAL_META_SCHEDULE_ALGORITHM" == balanced-cyclic-v1 ]]
+  elif [[ "$INDIVIDUAL_META_VERSION" == 6 ]]; then
+    [[ ${#seen[@]} == 24 && "$INDIVIDUAL_META_PROTOCOL" == isolated-outcomes-v2 &&
+      "$INDIVIDUAL_META_SCHEDULE_ALGORITHM" == balanced-cyclic-v1 ]]
   else
     [[ ${#seen[@]} == 15 ]]
   fi
@@ -4427,7 +4433,7 @@ individual_evidence_read() {
 
 individual_phase_result_is_complete() {
   local expected_version=4
-  [[ "$RUN_SCHEMA_VERSION" == 2 ]] && expected_version=5
+  [[ "$RUN_SCHEMA_VERSION" == 2 ]] && expected_version=6
   individual_evidence_read &&
     [[ "$INDIVIDUAL_META_VERSION" == "$expected_version" && "$INDIVIDUAL_META_COMPLETED" == 1 &&
       ("$INDIVIDUAL_EVIDENCE_STATUS" == complete || "$INDIVIDUAL_EVIDENCE_STATUS" == skipped) ]]
@@ -4436,7 +4442,7 @@ individual_phase_result_is_complete() {
 individual_phase_is_complete_and_matches_expected() {
   local should_run="$1"
   local expected_version=4
-  [[ "$RUN_SCHEMA_VERSION" == 2 ]] && expected_version=5
+  [[ "$RUN_SCHEMA_VERSION" == 2 ]] && expected_version=6
   [[ "$should_run" =~ ^[01]$ ]] || return 1
   individual_evidence_read || return 1
   [[ "$INDIVIDUAL_META_VERSION" == "$expected_version" && "$INDIVIDUAL_META_COMPLETED" == 1 &&
@@ -4445,8 +4451,8 @@ individual_phase_is_complete_and_matches_expected() {
     "$INDIVIDUAL_META_TARGET_POLICY" == "$INDIVIDUAL_TARGET_POLICY" &&
     "$INDIVIDUAL_META_GROUP_PLAN_DIGEST" == "$INDIVIDUAL_GROUP_PLAN_DIGEST" &&
     "$INDIVIDUAL_META_GROUP_GENERATION" == "$INDIVIDUAL_GROUP_GENERATION" ]] || return 1
-  if [[ "$expected_version" == 5 ]]; then
-    [[ "$INDIVIDUAL_META_PROTOCOL" == isolated-interleaved-v1 &&
+  if [[ "$expected_version" == 6 ]]; then
+    [[ "$INDIVIDUAL_META_PROTOCOL" == isolated-outcomes-v2 &&
       "$INDIVIDUAL_META_SCHEDULE_SEED" == "$PROTOCOL_SEED" &&
       "$INDIVIDUAL_META_SCHEDULE_ALGORITHM" == balanced-cyclic-v1 ]] || return 1
   fi
@@ -4869,7 +4875,7 @@ phase_pinned_concurrent() {
 # by the phase-4 gate, so it intentionally skips that comparison.
 worst_cpu() {
   local expected_version=4
-  [[ "$RUN_SCHEMA_VERSION" == 2 ]] && expected_version=5
+  [[ "$RUN_SCHEMA_VERSION" == 2 ]] && expected_version=6
   individual_evidence_read || return 0
   [[ "$INDIVIDUAL_META_VERSION" == "$expected_version" &&
     "$INDIVIDUAL_EVIDENCE_STATUS" == complete ]] || return 0
@@ -6449,7 +6455,7 @@ main() {
     if ((individual_should_run == 1)); then
       diag_log "phase 4/$phase_total: individual CPU isolation (cpus $INDIVIDUAL_TARGET_CPUS, $INDIVIDUAL_RUNS runs each)"
       if [[ "$RUN_SCHEMA_VERSION" == 2 ]]; then
-        phase_individual_v5
+        phase_individual_v6
       else
         phase_individual
       fi

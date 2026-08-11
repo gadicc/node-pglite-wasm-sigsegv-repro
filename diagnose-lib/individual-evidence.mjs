@@ -9,6 +9,7 @@ import {
   openSync,
   readSync,
 } from "node:fs";
+import { constants as osConstants } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
@@ -20,10 +21,13 @@ import {
 export const INDIVIDUAL_META_MAX_BYTES = 1024 * 1024;
 export const INDIVIDUAL_TSV_FALLBACK_MAX_BYTES = 1024 * 1024;
 export const INDIVIDUAL_ROW_MAX_BYTES = 44n;
+export const INDIVIDUAL_V6_ROW_MAX_BYTES = 256n;
 export const INDIVIDUAL_PLAN_FALLBACK_MAX_BYTES = 1024 * 1024;
 export const INDIVIDUAL_PLAN_ROW_MAX_BYTES = 64n;
 export const INDIVIDUAL_BOUNDARIES_FALLBACK_MAX_BYTES = 1024 * 1024;
 export const INDIVIDUAL_BOUNDARY_ROW_MAX_BYTES = 512n;
+export const INDIVIDUAL_V6_BOUNDARY_ROW_MAX_BYTES = 32n * 1024n;
+export const INDIVIDUAL_V6_STDERR_EXCERPT_MAX_BYTES = 16 * 1024;
 // Preserve the first 65,536 exact failed-run details across an ordinary
 // practical bundle without allowing an all-SIGSEGV input to turn collector
 // output back into an O(row count) allocation. Per-CPU counts remain exact
@@ -46,8 +50,13 @@ const V5_ONLY_META_KEYS = [
   "BOUNDARIES_SHA256", "BOUNDARIES_BYTES", "BOUNDARY_ROW_COUNT",
 ];
 const PLAN_HEADER = "ordinal\tround\tposition\tcpu";
+const V6_RESULTS_HEADER =
+  "ordinal\tround\tposition\tcpu\toutcome\texit_code\tsignal\telapsed_sec\tstderr_sha256\tstderr_bytes";
 const V5_PROTOCOL = "isolated-interleaved-v1";
+const V6_PROTOCOL = "isolated-outcomes-v2";
 const V5_SCHEDULE_ALGORITHM = "balanced-cyclic-v1";
+const V6_OUTCOMES = new Set(["pass", "sigsegv", "other-workload-failure"]);
+const KNOWN_SIGNALS = new Set(Object.keys(osConstants.signals));
 
 function sameIdentity(left, right) {
   return left.dev === right.dev && left.ino === right.ino;
@@ -488,6 +497,141 @@ function createRowAccumulator(targets, expected, batch = null, options = {}) {
   return { acceptFields, reject, finish };
 }
 
+function validateV6OutcomeStatus(outcome, exitCode, signal) {
+  if (!V6_OUTCOMES.has(outcome)) return false;
+  if (exitCode !== null && (!Number.isSafeInteger(exitCode) || exitCode < 0 || exitCode > 255)) return false;
+  if (signal !== null && (typeof signal !== "string" || !KNOWN_SIGNALS.has(signal))) return false;
+  if ((exitCode === null) === (signal === null)) return false;
+  if (outcome === "pass") return exitCode === 0 && signal === null;
+  if (outcome === "sigsegv") return exitCode === null && signal === "SIGSEGV";
+  return exitCode !== 0 && signal !== "SIGSEGV";
+}
+
+function createV6RowAccumulator(schedule, options = {}) {
+  const counts = new Map([...schedule.targets].map((cpu) => [cpu, 0]));
+  const byCpu = new Map();
+  const boundaries = options.boundaries ?? [];
+  const authorityRowLimit = options.authorityRowLimit ?? 0;
+  const onAcceptedRow = typeof options.onAcceptedRow === "function" ? options.onAcceptedRow : null;
+  let invalidRows = false;
+  let retainedFailureDetails = 0;
+  let validatedPlanPrefixRows = 0;
+
+  const acceptLine = (line, ordinal, errors) => {
+    const fields = line.split("\t");
+    if (fields.length !== 10 || schedule.orders === null) {
+      invalidRows = true;
+      errors.push("individual V6 results contain a malformed row");
+      return;
+    }
+    const [ordinalText, roundText, positionText, cpuText, outcome,
+      exitCodeText, signalText, elapsedText, stderrSha256, stderrBytes] = fields;
+    const rowOrdinal = canonicalUint(ordinalText);
+    const round = canonicalUint(roundText);
+    const position = canonicalUint(positionText);
+    const cpu = canonicalUint(cpuText);
+    const elapsedSec = canonicalUint(elapsedText);
+    const exitCode = exitCodeText === "-" ? null : canonicalUint(exitCodeText);
+    const signal = signalText === "-" ? null : signalText;
+    const cpuCount = schedule.orders[0].length;
+    const expectedRound = Math.floor((ordinal - 1) / cpuCount) + 1;
+    const expectedPosition = ((ordinal - 1) % cpuCount) + 1;
+    const expectedCpu = schedule.orders[expectedRound - 1]?.[expectedPosition - 1];
+    if (rowOrdinal !== ordinal || round !== expectedRound || position !== expectedPosition || cpu !== expectedCpu ||
+        elapsedSec === null || !validateV6OutcomeStatus(outcome, exitCode, signal) ||
+        !/^[a-f0-9]{64}$/.test(stderrSha256) || canonicalDecimalBigInt(stderrBytes) === null) {
+      invalidRows = true;
+      errors.push("individual V6 results contain a malformed or out-of-order row");
+      return;
+    }
+    const next = (counts.get(cpu) ?? 0) + 1;
+    if (next !== round) {
+      invalidRows = true;
+      errors.push("individual V6 results contain a non-contiguous per-CPU round");
+      return;
+    }
+    counts.set(cpu, next);
+    validatedPlanPrefixRows += 1;
+    if (ordinal > authorityRowLimit) return;
+    const boundary = boundaries[ordinal - 1];
+    if (boundary === undefined || boundary.ordinal !== ordinal || boundary.cpu !== cpu ||
+        boundary.outcome !== outcome || boundary.exitCode !== exitCode || boundary.signal !== signal ||
+        boundary.stderrSha256 !== stderrSha256 || boundary.stderrBytes !== stderrBytes ||
+        BigInt(boundary.durationNs) / 1_000_000_000n !== BigInt(elapsedSec)) {
+      invalidRows = true;
+      errors.push("individual V6 result does not reconcile with its exact boundary");
+      return;
+    }
+    onAcceptedRow?.({
+      ordinal, round, position, cpu, outcome, exitCode, signal, elapsedSec, stderrSha256, stderrBytes,
+    });
+    let record = byCpu.get(cpu);
+    if (!record) {
+      record = {
+        ...newCpuSummary(cpu),
+        observations: 0,
+        passes: 0,
+        otherWorkloadFailures: 0,
+        otherWorkloadFailureDetails: [],
+      };
+      byCpu.set(cpu, record);
+    }
+    record.observations += 1;
+    if (outcome === "pass") {
+      record.runs += 1;
+      record.passes += 1;
+    } else if (outcome === "sigsegv") {
+      record.runs += 1;
+      record.failures += 1;
+      record.sigsegv += 1;
+      if (retainedFailureDetails < INDIVIDUAL_FAILED_RUN_DETAIL_LIMIT) {
+        record.failedRuns.push({
+          run: round, position, outcome, exitCode, signal: signal ?? "SIGSEGV", elapsedSec,
+          stderrSha256, stderrBytes,
+        });
+        retainedFailureDetails += 1;
+      }
+    } else {
+      record.otherFailures += 1;
+      record.otherWorkloadFailures += 1;
+      if (retainedFailureDetails < INDIVIDUAL_FAILED_RUN_DETAIL_LIMIT) {
+        record.otherWorkloadFailureDetails.push({
+          run: round, position, outcome, exitCode, signal, elapsedSec, stderrSha256, stderrBytes,
+        });
+        retainedFailureDetails += 1;
+      }
+    }
+  };
+  const finish = () => {
+    const summaries = [...byCpu.values()].sort((left, right) => left.cpu - right.cpu).map((record) => {
+      const retained = record.failedRuns.length + record.otherWorkloadFailureDetails.length;
+      const totalFailures = record.sigsegv + record.otherWorkloadFailures;
+      return retained < totalFailures
+        ? { ...record, failedRunsOmitted: totalFailures - retained }
+        : record;
+    });
+    const omittedDetails = summaries.reduce(
+      (total, record) => total + BigInt(record.failedRunsOmitted ?? 0),
+      0n,
+    );
+    return {
+      counts,
+      sigsegv: new Map(summaries.map((record) => [record.cpu, record.sigsegv])),
+      summaries,
+      ambiguousCpus: new Set(),
+      invalidRows,
+      batchRows: 0,
+      batchSigsegv: 0,
+      validatedPlanPrefixRows,
+      failedRunDetailsOmitted: omittedDetails <= BigInt(Number.MAX_SAFE_INTEGER)
+        ? Number(omittedDetails)
+        : omittedDetails.toString(),
+      failedRunDetailsOmittedIsDecimalString: omittedDetails > BigInt(Number.MAX_SAFE_INTEGER),
+    };
+  };
+  return { acceptLine, finish };
+}
+
 // Stream an individual.tsv through a fixed read buffer and a single bounded
 // line buffer. Valid files are hashed byte-for-byte as they are read. Once a
 // line exceeds the grammar ceiling or expectedRows + 1 is observed, there is
@@ -741,6 +885,24 @@ function inspectOpenedLineArtifact(opened, options) {
   return base;
 }
 
+function inspectOpenedV6Rows(opened, schedule, options = {}) {
+  const accumulator = createV6RowAccumulator(schedule, options);
+  const state = inspectOpenedLineArtifact(opened, {
+    label: "individual V6 results",
+    header: V6_RESULTS_HEADER,
+    maxLineBytes: Number(INDIVIDUAL_V6_ROW_MAX_BYTES),
+    maximumRows: schedule.expectedRows ?? 0,
+    acceptLine: accumulator.acceptLine,
+  });
+  state.summary = accumulator.finish();
+  if (state.rowCount !== schedule.expectedRows && options.requireComplete === true) {
+    state.errors.push("individual V6 results do not contain every expected row");
+  }
+  if (state.summary.invalidRows) state.sha256 = null;
+  state.errors = [...new Set(state.errors)];
+  return state;
+}
+
 function inspectOpenedPlan(opened, schedule) {
   const expectedRows = schedule.expectedRows ?? 0;
   const state = inspectOpenedLineArtifact(opened, {
@@ -820,6 +982,73 @@ function normalizeBoundaryRecord(value, ordinal, schedule) {
   };
 }
 
+function normalizeBoundaryRecordV6(value, ordinal, schedule) {
+  if (value === null || typeof value !== "object" || Array.isArray(value) || schedule.orders === null) return null;
+  const cpuCount = schedule.orders[0].length;
+  const round = Math.floor((ordinal - 1) / cpuCount) + 1;
+  const position = ((ordinal - 1) % cpuCount) + 1;
+  const cpu = schedule.orders[round - 1]?.[position - 1];
+  if (value.ordinal !== ordinal || value.round !== round || value.position !== position || value.cpu !== cpu ||
+      !validateV6OutcomeStatus(value.outcome, value.exitCode, value.signal) ||
+      typeof value.stderrSha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.stderrSha256) ||
+      canonicalDecimalBigInt(value.stderrBytes) === null ||
+      typeof value.stderrExcerptBase64 !== "string" ||
+      !Number.isSafeInteger(value.stderrExcerptBytes) || value.stderrExcerptBytes < 0 ||
+      value.stderrExcerptBytes > INDIVIDUAL_V6_STDERR_EXCERPT_MAX_BYTES ||
+      typeof value.stderrTruncated !== "boolean" ||
+      !Number.isSafeInteger(value.startUnixMs) || value.startUnixMs < 0 ||
+      !Number.isSafeInteger(value.endUnixMs) || value.endUnixMs < value.startUnixMs) return null;
+  let excerpt;
+  try {
+    excerpt = Buffer.from(value.stderrExcerptBase64, "base64");
+  } catch {
+    return null;
+  }
+  const stderrBytes = canonicalDecimalBigInt(value.stderrBytes);
+  if (excerpt.toString("base64") !== value.stderrExcerptBase64 ||
+      excerpt.length !== value.stderrExcerptBytes || stderrBytes < BigInt(excerpt.length) ||
+      value.stderrTruncated !== (stderrBytes > BigInt(excerpt.length)) ||
+      (!value.stderrTruncated && createHash("sha256").update(excerpt).digest("hex") !== value.stderrSha256)) {
+    return null;
+  }
+  const startMonotonicNs = canonicalDecimalBigInt(value.startMonotonicNs);
+  const endMonotonicNs = canonicalDecimalBigInt(value.endMonotonicNs);
+  const durationNs = canonicalDecimalBigInt(value.durationNs);
+  if (startMonotonicNs === null || endMonotonicNs === null || durationNs === null ||
+      endMonotonicNs < startMonotonicNs || durationNs !== endMonotonicNs - startMonotonicNs ||
+      durationNs > BigInt(Number.MAX_SAFE_INTEGER) || !Number.isFinite(value.durationMs) ||
+      value.durationMs < 0 || value.durationMs !== Number(durationNs) / 1_000_000) return null;
+  const noTurboStart = normalizeBoundaryNoTurbo(value.noTurboStart);
+  const noTurboEnd = normalizeBoundaryNoTurbo(value.noTurboEnd);
+  // Unlike V5, V6 commits only operationally valid attempts. A missing or
+  // malformed no_turbo read is therefore not merely descriptive boundary
+  // data: it proves this row could not have been emitted by the V2 protocol.
+  if ((noTurboStart !== 0 && noTurboStart !== 1) ||
+      (noTurboEnd !== 0 && noTurboEnd !== 1)) return null;
+  return {
+    ordinal,
+    round,
+    position,
+    cpu,
+    outcome: value.outcome,
+    exitCode: value.exitCode,
+    signal: value.signal,
+    stderrSha256: value.stderrSha256,
+    stderrBytes: value.stderrBytes,
+    stderrExcerptBase64: value.stderrExcerptBase64,
+    stderrExcerptBytes: value.stderrExcerptBytes,
+    stderrTruncated: value.stderrTruncated,
+    startUnixMs: value.startUnixMs,
+    endUnixMs: value.endUnixMs,
+    startMonotonicNs: value.startMonotonicNs,
+    endMonotonicNs: value.endMonotonicNs,
+    durationNs: value.durationNs,
+    durationMs: value.durationMs,
+    noTurboStart,
+    noTurboEnd,
+  };
+}
+
 function inspectOpenedBoundaries(opened, schedule, options = {}) {
   return inspectOpenedLineArtifact(opened, {
     label: "individual boundaries",
@@ -844,6 +1073,30 @@ function inspectOpenedBoundaries(opened, schedule, options = {}) {
   });
 }
 
+function inspectOpenedBoundariesV6(opened, schedule, options = {}) {
+  return inspectOpenedLineArtifact(opened, {
+    label: "individual V6 boundaries",
+    header: null,
+    maxLineBytes: Number(INDIVIDUAL_V6_BOUNDARY_ROW_MAX_BYTES),
+    maximumRows: schedule.expectedRows ?? 0,
+    acceptLine(line, ordinal, errors) {
+      let parsed;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        errors.push("individual V6 boundaries contain malformed or noncanonical JSON");
+        return;
+      }
+      const normalized = normalizeBoundaryRecordV6(parsed, ordinal, schedule);
+      if (normalized === null || JSON.stringify(normalized) !== line) {
+        errors.push("individual V6 boundaries contain malformed or noncanonical JSON");
+        return;
+      }
+      options.onAcceptedBoundary?.(normalized);
+    },
+  });
+}
+
 export function assessIndividual(rows, meta, phaseDone, metaState = {}) {
   const present = metaState.present ?? Object.keys(meta).length > 0;
   const reasons = [...(metaState.errors ?? [])];
@@ -859,18 +1112,21 @@ export function assessIndividual(rows, meta, phaseDone, metaState = {}) {
     invalid = true;
   }
   if (meta.VERSION !== "1" && meta.VERSION !== "2" && meta.VERSION !== "3" &&
-      meta.VERSION !== "4" && meta.VERSION !== "5") {
+      meta.VERSION !== "4" && meta.VERSION !== "5" && meta.VERSION !== "6") {
     reasons.push("individual metadata version is missing or unsupported");
     invalid = true;
   }
   const isV5 = meta.VERSION === "5";
-  const provenanceRequired = meta.VERSION === "2" || meta.VERSION === "3" || meta.VERSION === "4" || isV5;
+  const isV6 = meta.VERSION === "6";
+  const isInterleaved = isV5 || isV6;
+  const provenanceRequired = meta.VERSION === "2" || meta.VERSION === "3" || meta.VERSION === "4" ||
+    isInterleaved;
   if (provenanceRequired) {
     if (!Object.hasOwn(meta, "TARGET_POLICY") || !Object.hasOwn(meta, "GROUP_PLAN_DIGEST")) {
       reasons.push("individual metadata is missing target provenance fields");
       invalid = true;
     }
-    const validPolicy = isV5
+    const validPolicy = isInterleaved
       ? meta.TARGET_POLICY === "all-usable-cpus"
       : ["failed-groups", "all-group-cpus", "quick-skip"].includes(meta.TARGET_POLICY);
     if (!validPolicy ||
@@ -941,17 +1197,18 @@ export function assessIndividual(rows, meta, phaseDone, metaState = {}) {
       }
     }
   }
-  if (!isV5 && V5_ONLY_META_KEYS.some((key) => Object.hasOwn(meta, key))) {
+  if (!isInterleaved && V5_ONLY_META_KEYS.some((key) => Object.hasOwn(meta, key))) {
     reasons.push("pre-V5 individual metadata contains unsupported interleaved protocol fields");
     invalid = true;
   }
-  if (isV5) {
+  if (isInterleaved) {
+    const versionLabel = isV6 ? "version 6" : "version 5";
     const requiredV5 = [
       "GENERATION", "GROUP_GENERATION", "PROTOCOL", "SCHEDULE_SEED", "SCHEDULE_ALGORITHM",
       "PLAN_SHA256", "PLAN_BYTES", "PLAN_ROW_COUNT",
     ];
     if (requiredV5.some((key) => !Object.hasOwn(meta, key))) {
-      reasons.push("version 5 individual metadata is missing required protocol or plan fields");
+      reasons.push(`${versionLabel} individual metadata is missing required protocol or plan fields`);
       invalid = true;
     }
     if (!/^[a-f0-9]{32}$/.test(meta.GENERATION ?? "")) {
@@ -963,9 +1220,10 @@ export function assessIndividual(rows, meta, phaseDone, metaState = {}) {
       invalid = true;
     }
     const schedule = v5Schedule(meta);
-    if (meta.PROTOCOL !== V5_PROTOCOL || meta.SCHEDULE_ALGORITHM !== V5_SCHEDULE_ALGORITHM ||
+    const expectedProtocol = isV6 ? V6_PROTOCOL : V5_PROTOCOL;
+    if (meta.PROTOCOL !== expectedProtocol || meta.SCHEDULE_ALGORITHM !== V5_SCHEDULE_ALGORITHM ||
         schedule.orders === null) {
-      reasons.push("version 5 individual schedule metadata is malformed or unsupported");
+      reasons.push(`${versionLabel} individual schedule metadata is malformed or unsupported`);
       invalid = true;
     }
     const planBytes = canonicalUint(meta.PLAN_BYTES);
@@ -988,15 +1246,15 @@ export function assessIndividual(rows, meta, phaseDone, metaState = {}) {
     const anyTerminalBinding = [...rowBindingKeys, ...boundaryBindingKeys]
       .some((key) => Object.hasOwn(meta, key));
     if (completed === true && (!rowBindingPresent || !boundaryBindingPresent)) {
-      reasons.push("completed version 5 metadata is missing terminal row or boundary bindings");
+      reasons.push(`completed ${versionLabel} metadata is missing terminal row or boundary bindings`);
       invalid = true;
     }
     if (completed === false && anyTerminalBinding) {
-      reasons.push("incomplete version 5 metadata contains terminal row or boundary bindings");
+      reasons.push(`incomplete ${versionLabel} metadata contains terminal row or boundary bindings`);
       invalid = true;
     }
     if (anyTerminalBinding && (!rowBindingPresent || !boundaryBindingPresent)) {
-      reasons.push("version 5 terminal bindings are only partially present");
+      reasons.push(`${versionLabel} terminal bindings are only partially present`);
       invalid = true;
     }
     if (rowBindingPresent) {
@@ -1105,25 +1363,25 @@ export function assessIndividual(rows, meta, phaseDone, metaState = {}) {
     if (missing) reasons.push("individual results do not contain every expected per-CPU run");
   }
   const observedBoundaryCount = metaState.boundaryRowCount ?? 0;
-  const commonPrefixRowCount = isV5
+  const commonPrefixRowCount = isInterleaved
     ? Math.min(streamedRows?.validatedPlanPrefixRows ?? observedRowCount, observedBoundaryCount)
     : null;
-  if (isV5 && metaState.metadataOnly !== true) {
+  if (isInterleaved && metaState.metadataOnly !== true) {
     const expectedV5Rows = v5Schedule(meta).expectedRows;
     if (observedRowCount !== observedBoundaryCount) {
       reasons.push("individual results and boundaries have different validated prefix lengths");
     }
     if (completed === true && expectedV5Rows !== null &&
         (observedRowCount !== expectedV5Rows || observedBoundaryCount !== expectedV5Rows)) {
-      reasons.push("completed version 5 evidence does not contain every planned result and boundary");
+      reasons.push(`completed version ${meta.VERSION} evidence does not contain every planned result and boundary`);
       invalid = true;
     }
     if (completed === true && !phaseDone) {
-      reasons.push("completed version 5 evidence is missing its completion marker");
+      reasons.push(`completed version ${meta.VERSION} evidence is missing its completion marker`);
       invalid = true;
     }
     if (completed === false && phaseDone) {
-      reasons.push("incomplete version 5 evidence has a completion marker");
+      reasons.push(`incomplete version ${meta.VERSION} evidence has a completion marker`);
       invalid = true;
     }
   }
@@ -1149,7 +1407,7 @@ export function assessIndividual(rows, meta, phaseDone, metaState = {}) {
     groupPlanDigest: meta.GROUP_PLAN_DIGEST ?? null,
     groupGeneration: meta.GROUP_GENERATION ?? null,
   };
-  if (isV5) Object.assign(result, {
+  if (isInterleaved) Object.assign(result, {
     protocol: meta.PROTOCOL ?? null,
     scheduleSeed: canonicalUint(meta.SCHEDULE_SEED),
     scheduleAlgorithm: meta.SCHEDULE_ALGORITHM ?? null,
@@ -1157,6 +1415,14 @@ export function assessIndividual(rows, meta, phaseDone, metaState = {}) {
     boundaryRowCount: observedBoundaryCount,
     planRowCount: metaState.planRowCount ?? null,
   });
+  if (isV6) {
+    const summaries = streamedRows?.summaries ?? [];
+    result.otherWorkloadFailures = summaries.reduce(
+      (total, record) => total + (record.otherWorkloadFailures ?? 0),
+      0,
+    );
+    result.primaryEligibleRuns = summaries.reduce((total, record) => total + (record.runs ?? 0), 0);
+  }
   const omittedDetails = streamedRows?.failedRunDetailsOmitted ?? 0;
   if (omittedDetails !== 0 && omittedDetails !== "0") {
     result.failedRunDetailsTruncated = true;
@@ -1232,6 +1498,8 @@ export function inspectIndividualEvidence(outDir, options = {}) {
   let metaState;
   let expectedRows = null;
   let isV5 = false;
+  let isV6 = false;
+  const v6Boundaries = [];
   try {
     markerBytes = readOpenedPath(markerOpened, 0);
     metaBytes = readOpenedPath(metaOpened, INDIVIDUAL_META_MAX_BYTES);
@@ -1241,11 +1509,13 @@ export function inspectIndividualEvidence(outDir, options = {}) {
       errors: metaOpened.errors,
     });
     isV5 = metaState.values.VERSION === "5";
-    const schedule = isV5 ? v5Schedule(metaState.values) : null;
-    const v5RequiredOwner = isV5
+    isV6 = metaState.values.VERSION === "6";
+    const isInterleaved = isV5 || isV6;
+    const schedule = isInterleaved ? v5Schedule(metaState.values) : null;
+    const v5RequiredOwner = isInterleaved
       ? (requiredOwner ?? process.geteuid?.() ?? process.getuid())
       : requiredOwner;
-    if (isV5 && v5RequiredOwner !== null) {
+    if (isInterleaved && v5RequiredOwner !== null) {
       for (const opened of [metaOpened, markerOpened]) {
         if (opened.present && opened.stat !== undefined && opened.stat.uid !== BigInt(v5RequiredOwner)) {
           opened.errors.push(`${opened.label} must be owned by the current user`);
@@ -1259,20 +1529,20 @@ export function inspectIndividualEvidence(outDir, options = {}) {
     } else if (metaState.values.SKIPPED === "0" && targets && runs !== null && runs > 0) {
       expectedRows = BigInt(targets.size) * BigInt(runs);
     }
-    if (isV5 && schedule.expectedRows !== null) expectedRows = BigInt(schedule.expectedRows);
+    if (isInterleaved && schedule.expectedRows !== null) expectedRows = BigInt(schedule.expectedRows);
     const rowMaxBytes = expectedRows === null
       ? BigInt(INDIVIDUAL_TSV_FALLBACK_MAX_BYTES)
-      : expectedRows * INDIVIDUAL_ROW_MAX_BYTES;
+      : expectedRows * (isV6 ? INDIVIDUAL_V6_ROW_MAX_BYTES : INDIVIDUAL_ROW_MAX_BYTES);
     rowsOpened = resultsSafe
       ? openStablePath(anchoredRows, rowMaxBytes, "individual results", v5RequiredOwner)
       : unavailable(path.join(publicResultsDir, "individual.tsv"), "individual results", "individual results cannot be trusted through an unsafe results directory");
-    if (isV5) {
+    if (isInterleaved) {
       const planMaxBytes = expectedRows === null
         ? BigInt(INDIVIDUAL_PLAN_FALLBACK_MAX_BYTES)
         : BigInt(Buffer.byteLength(`${PLAN_HEADER}\n`)) + expectedRows * INDIVIDUAL_PLAN_ROW_MAX_BYTES;
       const boundariesMaxBytes = expectedRows === null
         ? BigInt(INDIVIDUAL_BOUNDARIES_FALLBACK_MAX_BYTES)
-        : expectedRows * INDIVIDUAL_BOUNDARY_ROW_MAX_BYTES;
+        : expectedRows * (isV6 ? INDIVIDUAL_V6_BOUNDARY_ROW_MAX_BYTES : INDIVIDUAL_BOUNDARY_ROW_MAX_BYTES);
       planOpened = resultsSafe
         ? openStablePath(anchoredPlan, planMaxBytes, "individual plan", v5RequiredOwner)
         : unavailable(path.join(publicResultsDir, "individual.plan.tsv"), "individual plan", "individual plan cannot be trusted through an unsafe results directory");
@@ -1280,23 +1550,37 @@ export function inspectIndividualEvidence(outDir, options = {}) {
         ? openStablePath(anchoredBoundaries, boundariesMaxBytes, "individual boundaries", v5RequiredOwner)
         : unavailable(path.join(publicResultsDir, "individual.boundaries.ndjson"), "individual boundaries", "individual boundaries cannot be trusted through an unsafe results directory");
       planState = inspectOpenedPlan(planOpened, schedule);
-      boundariesState = inspectOpenedBoundaries(boundariesOpened, schedule, {
-        onAcceptedBoundary: typeof options.onV5Boundary === "function"
-          ? options.onV5Boundary
-          : undefined,
-      });
+      boundariesState = isV6
+        ? inspectOpenedBoundariesV6(boundariesOpened, schedule, {
+          onAcceptedBoundary: (row) => {
+            v6Boundaries.push(row);
+            options.onV6Boundary?.(row);
+          },
+        })
+        : inspectOpenedBoundaries(boundariesOpened, schedule, {
+          onAcceptedBoundary: typeof options.onV5Boundary === "function"
+            ? options.onV5Boundary
+            : undefined,
+        });
     }
-    rowsState = inspectOpenedRows(rowsOpened, expectedRows, targets, runs, isV5 ? {
-      planOrders: schedule.orders,
-      authorityRowLimit: boundariesState?.rowCount ?? 0,
-      onAcceptedRow: typeof options.onV5Result === "function"
-        ? options.onV5Result
-        : undefined,
-    } : {});
-    if (isV5 && !rowsState.present) rowsState.errors.push("individual results are missing");
+    rowsState = isV6
+      ? inspectOpenedV6Rows(rowsOpened, schedule, {
+        boundaries: v6Boundaries,
+        authorityRowLimit: boundariesState?.rowCount ?? 0,
+        requireComplete: metaState.values.COMPLETED === "1",
+        onAcceptedRow: typeof options.onV6Result === "function" ? options.onV6Result : undefined,
+      })
+      : inspectOpenedRows(rowsOpened, expectedRows, targets, runs, isV5 ? {
+        planOrders: schedule.orders,
+        authorityRowLimit: boundariesState?.rowCount ?? 0,
+        onAcceptedRow: typeof options.onV5Result === "function"
+          ? options.onV5Result
+          : undefined,
+      } : {});
+    if (isInterleaved && !rowsState.present) rowsState.errors.push("individual results are missing");
     options.beforeFinalVerify?.();
     verifyOpenedPath(rowsOpened, rowsState.inspectedBytes, rowsState.completeRead);
-    if (isV5) {
+    if (isInterleaved) {
       verifyOpenedPath(planOpened, planState.inspectedBytes, planState.completeRead);
       verifyOpenedPath(boundariesOpened, boundariesState.inspectedBytes, boundariesState.completeRead);
     }
@@ -1350,7 +1634,7 @@ export function inspectIndividualEvidence(outDir, options = {}) {
   metaState.rowsBytes = rowsState.bytes;
   metaState.rowCount = rowsState.rowCount;
   metaState.rowSummary = rowsState.summary;
-  if (isV5) Object.assign(metaState, {
+  if (isV5 || isV6) Object.assign(metaState, {
     planSha256: planState?.sha256 ?? null,
     planBytes: planState?.bytes ?? null,
     planRowCount: planState?.rowCount ?? null,
@@ -1364,7 +1648,7 @@ export function inspectIndividualEvidence(outDir, options = {}) {
     metaState,
     phaseDone: markerOpened.present && markerErrors.length === 0,
   };
-  if (isV5) Object.assign(evidence, { planState, boundariesState });
+  if (isV5 || isV6) Object.assign(evidence, { planState, boundariesState });
   return evidence;
 }
 
@@ -1465,6 +1749,95 @@ export function inspectIndividualV5Artifacts(options) {
   };
 }
 
+export function inspectIndividualV6Artifacts(options) {
+  if (options === null || typeof options !== "object" || Array.isArray(options)) {
+    throw new TypeError("V6 artifact options must be an object");
+  }
+  const targets = parseCanonicalCpuList(options.targetCpus);
+  const rounds = canonicalUint(options.runsPerCpu);
+  const seed = canonicalUint(options.scheduleSeed);
+  const requireComplete = options.requireComplete === true
+    ? true
+    : options.requireComplete === false
+      ? false
+      : null;
+  const errors = [];
+  if (!targets || rounds === null || rounds < 1 || seed === null || seed > MAX_SEED ||
+      requireComplete === null ||
+      BigInt(targets?.size ?? 0) * BigInt(rounds ?? 0) > BigInt(MAX_SCHEDULE_ENTRIES)) {
+    return { valid: false, errors: ["version 6 artifact bounds are invalid"] };
+  }
+  const schedule = v5Schedule({
+    TARGET_CPUS: options.targetCpus,
+    RUNS_PER_CPU: options.runsPerCpu,
+    SCHEDULE_SEED: options.scheduleSeed,
+  });
+  if (schedule.orders === null) return { valid: false, errors: ["version 6 artifact schedule is invalid"] };
+  const owner = options.requiredOwner ?? process.geteuid?.() ?? process.getuid();
+  const expectedRows = BigInt(schedule.expectedRows);
+  const planOpened = openStablePath(
+    options.planFile,
+    BigInt(Buffer.byteLength(`${PLAN_HEADER}\n`)) + expectedRows * INDIVIDUAL_PLAN_ROW_MAX_BYTES,
+    "individual plan",
+    owner,
+  );
+  const boundariesOpened = openStablePath(
+    options.boundariesFile,
+    expectedRows * INDIVIDUAL_V6_BOUNDARY_ROW_MAX_BYTES,
+    "individual V6 boundaries",
+    owner,
+  );
+  const rowsOpened = openStablePath(
+    options.rowsFile,
+    expectedRows * INDIVIDUAL_V6_ROW_MAX_BYTES,
+    "individual V6 results",
+    owner,
+  );
+  let planState;
+  let boundariesState;
+  let rowsState;
+  const boundaries = [];
+  try {
+    planState = inspectOpenedPlan(planOpened, schedule);
+    boundariesState = inspectOpenedBoundariesV6(boundariesOpened, schedule, {
+      onAcceptedBoundary: (row) => boundaries.push(row),
+    });
+    rowsState = inspectOpenedV6Rows(rowsOpened, schedule, {
+      boundaries,
+      authorityRowLimit: boundariesState.rowCount,
+      requireComplete,
+    });
+    if (!rowsState.present) rowsState.errors.push("individual results are missing");
+    verifyOpenedPath(planOpened, planState.inspectedBytes, planState.completeRead);
+    verifyOpenedPath(boundariesOpened, boundariesState.inspectedBytes, boundariesState.completeRead);
+    verifyOpenedPath(rowsOpened, rowsState.inspectedBytes, rowsState.completeRead);
+  } finally {
+    closeQuietly(planOpened.fd);
+    closeQuietly(boundariesOpened.fd);
+    closeQuietly(rowsOpened.fd);
+  }
+  planState.errors = [...new Set([...planState.errors, ...planOpened.errors])];
+  boundariesState.errors = [...new Set([...boundariesState.errors, ...boundariesOpened.errors])];
+  rowsState.errors = [...new Set([...rowsState.errors, ...rowsOpened.errors])];
+  errors.push(...planState.errors, ...boundariesState.errors, ...rowsState.errors);
+  if (requireComplete &&
+      (rowsState.rowCount !== schedule.expectedRows || boundariesState.rowCount !== schedule.expectedRows)) {
+    errors.push("version 6 artifacts are not complete");
+  }
+  return {
+    valid: errors.length === 0,
+    errors: [...new Set(errors)],
+    expectedRowCount: schedule.expectedRows,
+    commonPrefixRowCount: Math.min(
+      rowsState.summary.validatedPlanPrefixRows ?? rowsState.rowCount,
+      boundariesState.rowCount,
+    ),
+    planState,
+    rowsState,
+    boundariesState,
+  };
+}
+
 function validateRowsPrefix(state, targetsText, expectedText, requireCompleteText) {
   const targets = parseCanonicalCpuList(targetsText);
   const expected = canonicalUint(expectedText);
@@ -1516,7 +1889,7 @@ function printShellMeta(values) {
     "TARGET_POLICY", "GROUP_PLAN_DIGEST", "GROUP_GENERATION", "GENERATION",
     "ROWS_SHA256", "ROWS_BYTES", "ROW_COUNT",
   ];
-  if (values.VERSION === "5") keys.push(
+  if (values.VERSION === "5" || values.VERSION === "6") keys.push(
     "PROTOCOL", "SCHEDULE_SEED", "SCHEDULE_ALGORITHM",
     "PLAN_SHA256", "PLAN_BYTES", "PLAN_ROW_COUNT",
     "BOUNDARIES_SHA256", "BOUNDARIES_BYTES", "BOUNDARY_ROW_COUNT",
@@ -1554,7 +1927,7 @@ function worstCpuFromSummaries(summaries) {
 }
 
 function usage() {
-  console.error("usage: individual-evidence.mjs <meta|rows|binding|empty-binding|count|batch|bundle|v5-plan|v5-binding|v5-bundle> ...");
+  console.error("usage: individual-evidence.mjs <meta|rows|binding|empty-binding|count|batch|bundle|v5-plan|v5-binding|v5-bundle|v6-binding|v6-bundle> ...");
   process.exitCode = 2;
 }
 
@@ -1606,6 +1979,37 @@ function main(argv) {
     }
     return;
   }
+  if (command === "v6-binding" && args.length === 7) {
+    const requireComplete = args[6] === "1" ? true : args[6] === "0" ? false : null;
+    const inspected = inspectIndividualV6Artifacts({
+      planFile: args[0],
+      rowsFile: args[1],
+      boundariesFile: args[2],
+      targetCpus: args[3],
+      runsPerCpu: args[4],
+      scheduleSeed: args[5],
+      requireComplete,
+    });
+    if (!inspected.valid) {
+      process.exitCode = 1;
+    } else {
+      console.log(`PLAN_SHA256=${inspected.planState.sha256}`);
+      console.log(`PLAN_BYTES=${inspected.planState.bytes}`);
+      console.log(`PLAN_ROW_COUNT=${inspected.planState.rowCount}`);
+      console.log(`RESULT_PREFIX_ROW_COUNT=${inspected.rowsState.rowCount}`);
+      console.log(`BOUNDARY_PREFIX_ROW_COUNT=${inspected.boundariesState.rowCount}`);
+      console.log(`COMMON_PREFIX_ROW_COUNT=${inspected.commonPrefixRowCount}`);
+      if (requireComplete) {
+        console.log(`ROWS_SHA256=${inspected.rowsState.sha256}`);
+        console.log(`ROWS_BYTES=${inspected.rowsState.bytes}`);
+        console.log(`ROW_COUNT=${inspected.rowsState.rowCount}`);
+        console.log(`BOUNDARIES_SHA256=${inspected.boundariesState.sha256}`);
+        console.log(`BOUNDARIES_BYTES=${inspected.boundariesState.bytes}`);
+        console.log(`BOUNDARY_ROW_COUNT=${inspected.boundariesState.rowCount}`);
+      }
+    }
+    return;
+  }
   if (command === "v5-bundle" && args.length === 1) {
     const { evidence, assessment } = assessIndividualEvidence(args[0], {
       requiredOwner: process.geteuid?.() ?? process.getuid(),
@@ -1614,6 +2018,16 @@ function main(argv) {
     printShellMeta(evidence.metaState.values);
     console.log(`COMMON_PREFIX_ROW_COUNT=${assessment.commonPrefixRowCount ?? ""}`);
     if (assessment.metadataVersion !== "5" || assessment.status === "invalid") process.exitCode = 1;
+    return;
+  }
+  if (command === "v6-bundle" && args.length === 1) {
+    const { evidence, assessment } = assessIndividualEvidence(args[0], {
+      requiredOwner: process.geteuid?.() ?? process.getuid(),
+    });
+    console.log(`STATUS=${assessment.status}`);
+    printShellMeta(evidence.metaState.values);
+    console.log(`COMMON_PREFIX_ROW_COUNT=${assessment.commonPrefixRowCount ?? ""}`);
+    if (assessment.metadataVersion !== "6" || assessment.status === "invalid") process.exitCode = 1;
     return;
   }
   if (command === "meta" && args.length === 1) {

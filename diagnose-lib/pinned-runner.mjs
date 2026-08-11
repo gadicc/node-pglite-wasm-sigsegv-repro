@@ -1,7 +1,11 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { constants as osConstants } from "node:os";
+import { fileURLToPath } from "node:url";
 
 export const PINNED_RUNNER_VERSION = 1;
+export const PINNED_RUNNER_V2_VERSION = 2;
 export const MAX_CPU_ID = 65_535;
 export const MAX_COUNT = 1_000_000;
 export const MAX_SCHEDULE_ENTRIES = 1_000_000;
@@ -17,6 +21,9 @@ const DOMAIN_ISOLATED = 0x4953_4f4c;
 const DOMAIN_GROUPS = 0x4752_4f55;
 const DOMAIN_CONCURRENT = 0x434f_4e43;
 const MAX_ERROR_TEXT = 4_096;
+const MAX_LAUNCH_PROTOCOL_BYTES = 64 * 1024;
+const KNOWN_SIGNALS = new Set(Object.keys(osConstants.signals));
+const PINNED_LAUNCH_WORKER = fileURLToPath(new URL("./pinned-launch-worker.mjs", import.meta.url));
 
 const SYSTEM_CLOCK = Object.freeze({
   epochMilliseconds: () => Date.now(),
@@ -307,6 +314,43 @@ export function classifyChildOutcome({ exitCode, signal, launchError = null, can
   return { outcome: "invalid", validOutcome: false, invalidReason: "missing-exit-status" };
 }
 
+export function classifyIndividualChildOutcomeV2({
+  exitCode,
+  signal,
+  launchError = null,
+  canceled = false,
+  secureLaunch = false,
+}) {
+  if (canceled) {
+    return { outcome: "operational-invalid", validOutcome: false, invalidReason: "canceled" };
+  }
+  if (launchError !== null || secureLaunch !== true) {
+    return {
+      outcome: "operational-invalid",
+      validOutcome: false,
+      invalidReason: launchError !== null ? "launch-error" : "unverified-launch",
+    };
+  }
+  const canonicalCode = exitCode === null ||
+    (Number.isSafeInteger(exitCode) && exitCode >= 0 && exitCode <= 255);
+  const canonicalSignal = signal === null ||
+    (typeof signal === "string" && KNOWN_SIGNALS.has(signal));
+  if (!canonicalCode || !canonicalSignal || (exitCode !== null && signal !== null) ||
+      (exitCode === null && signal === null)) {
+    return { outcome: "operational-invalid", validOutcome: false, invalidReason: "malformed-exit-status" };
+  }
+  if (exitCode === 0 && signal === null) {
+    return { outcome: "pass", validOutcome: true, invalidReason: null };
+  }
+  // The V2 worker launches the workload directly, so Node preserves a fatal
+  // signal as `signal` with a null exit code. A literal exit(139) is exact
+  // nonzero-exit evidence, not proof of SIGSEGV.
+  if (exitCode === null && signal === "SIGSEGV") {
+    return { outcome: "sigsegv", validOutcome: true, invalidReason: null };
+  }
+  return { outcome: "other-workload-failure", validOutcome: true, invalidReason: null };
+}
+
 function signalDirectChild(child, signal, killProcess) {
   if (!Number.isSafeInteger(child.pid) || child.pid <= 0) return false;
   try {
@@ -357,6 +401,51 @@ export function defaultPinnedLauncher({
   });
   return {
     child,
+    cancel(signal) {
+      return signalDirectChild(child, signal, killProcess);
+    },
+  };
+}
+
+export function defaultPinnedLauncherV2({
+  cpu,
+  command,
+  args,
+  cwd,
+  env,
+  stderrBytes,
+  tasksetPath = "taskset",
+  shellPath = "/bin/bash",
+}, {
+  spawnProcess = spawn,
+  killProcess = process.kill.bind(process),
+} = {}) {
+  if (typeof spawnProcess !== "function") throw new TypeError("spawnProcess must be a function");
+  if (typeof killProcess !== "function") throw new TypeError("killProcess must be a function");
+  const child = spawnProcess(shellPath, [
+    "-c",
+    "ulimit -c 0; exec \"$@\"",
+    "pinned-runner-v2",
+    tasksetPath,
+    "-c",
+    String(cpu),
+    "--",
+    process.execPath,
+    PINNED_LAUNCH_WORKER,
+    String(cpu),
+    String(stderrBytes),
+    command,
+    ...args,
+  ], {
+    cwd,
+    env,
+    detached: false,
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  return {
+    child,
+    launchProtocol: child.stdout,
     cancel(signal) {
       return signalDirectChild(child, signal, killProcess);
     },
@@ -417,7 +506,15 @@ function validateRunOptions(options) {
     MAX_CANCEL_GRACE_MS,
   );
   const noTurboPath = validateString(options.noTurboPath ?? DEFAULT_NO_TURBO_PATH, "no_turbo path");
-  const launcher = options.launcher === undefined ? defaultPinnedLauncher : options.launcher;
+  const runnerVersion = validateInteger(
+    options.runnerVersion ?? PINNED_RUNNER_VERSION,
+    "runner version",
+    PINNED_RUNNER_VERSION,
+    PINNED_RUNNER_V2_VERSION,
+  );
+  const launcher = options.launcher === undefined
+    ? (runnerVersion === PINNED_RUNNER_V2_VERSION ? defaultPinnedLauncherV2 : defaultPinnedLauncher)
+    : options.launcher;
   if (typeof launcher !== "function") throw new TypeError("launcher must be a function");
   const noTurboReader = options.noTurboReader === undefined ? readNoTurbo : options.noTurboReader;
   if (typeof noTurboReader !== "function") throw new TypeError("noTurboReader must be a function");
@@ -447,17 +544,78 @@ function validateRunOptions(options) {
     signal: options.signal,
     tasksetPath: options.tasksetPath,
     shellPath: options.shellPath,
+    runnerVersion,
   };
 }
 
-function normalizeLaunchDescriptor(descriptor) {
+function normalizeLaunchDescriptor(descriptor, runnerVersion) {
   if (descriptor === null || typeof descriptor !== "object" ||
       descriptor.child === null || typeof descriptor.child !== "object" ||
       typeof descriptor.child.once !== "function" ||
       typeof descriptor.cancel !== "function") {
     throw new TypeError("launcher must return { child, cancel(signal) }");
   }
+  if (runnerVersion === PINNED_RUNNER_V2_VERSION && descriptor.secureLaunch !== true &&
+      (descriptor.launchProtocol === null || typeof descriptor.launchProtocol?.on !== "function")) {
+    throw new TypeError("V2 launcher must provide a launch protocol stream or secureLaunch=true");
+  }
   return descriptor;
+}
+
+function normalizeWorkerStderr(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value) ||
+      typeof value.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.sha256) ||
+      typeof value.bytes !== "string" || !/^(0|[1-9][0-9]*)$/.test(value.bytes) ||
+      typeof value.excerptBase64 !== "string" ||
+      !Number.isSafeInteger(value.excerptBytes) || value.excerptBytes < 0 ||
+      typeof value.truncated !== "boolean") return null;
+  let excerpt;
+  try {
+    excerpt = Buffer.from(value.excerptBase64, "base64");
+  } catch {
+    return null;
+  }
+  if (excerpt.toString("base64") !== value.excerptBase64 || excerpt.length !== value.excerptBytes ||
+      excerpt.length > MAX_STDERR_BYTES || BigInt(value.bytes) < BigInt(excerpt.length) ||
+      value.truncated !== (BigInt(value.bytes) > BigInt(excerpt.length)) ||
+      (!value.truncated && createHash("sha256").update(excerpt).digest("hex") !== value.sha256)) {
+    return null;
+  }
+  return {
+    sha256: value.sha256,
+    bytes: value.bytes,
+    excerptBase64: value.excerptBase64,
+    excerptBytes: value.excerptBytes,
+    truncated: value.truncated,
+  };
+}
+
+function parseLaunchProtocol(bytes, cpu) {
+  if (bytes.length === 0 || bytes.length > MAX_LAUNCH_PROTOCOL_BYTES || bytes.at(-1) !== 0x0a) return null;
+  let value;
+  try {
+    value = JSON.parse(bytes.toString("utf8", 0, -1));
+  } catch {
+    return null;
+  }
+  const keys = [
+    "version", "cpu", "launchState", "exitCode", "signal", "canceled", "launchError", "stderr",
+  ];
+  if (value === null || typeof value !== "object" || Array.isArray(value) ||
+      Object.keys(value).sort().join("\n") !== keys.sort().join("\n") || value.version !== 1 ||
+      value.cpu !== cpu || !["launched", "launch-failure", "affinity-failure"].includes(value.launchState) ||
+      (value.exitCode !== null && (!Number.isSafeInteger(value.exitCode) || value.exitCode < 0 || value.exitCode > 255)) ||
+      (value.signal !== null && (typeof value.signal !== "string" || !KNOWN_SIGNALS.has(value.signal))) ||
+      typeof value.canceled !== "boolean") return null;
+  const launchError = value.launchError === null
+    ? null
+    : launchErrorRecord(value.launchError);
+  if ((value.launchState === "launched") !== (launchError === null) ||
+      (value.launchState !== "launched" && (value.exitCode !== null || value.signal !== null)) ||
+      (value.exitCode !== null && value.signal !== null)) return null;
+  const stderr = normalizeWorkerStderr(value.stderr);
+  if (stderr === null) return null;
+  return { ...value, launchError, stderr };
 }
 
 function buildTiming(startEpochMs, startMonotonicNs, endEpochMs, endMonotonicNs) {
@@ -497,6 +655,13 @@ export async function runPinnedChild(options) {
   let endMonotonicNs = null;
   let noTurboEnd = null;
   let boundaryError = null;
+  let secureLaunch = false;
+  let launchProtocol = null;
+  let launchProtocolOverflow = false;
+  const launchProtocolChunks = [];
+  let launchProtocolBytes = 0;
+  const stderrHash = createHash("sha256");
+  let stderrTotalBytes = 0n;
 
   const captureEndBoundary = () => {
     if (endMonotonicNs !== null || boundaryError !== null) return;
@@ -538,10 +703,51 @@ export async function runPinnedChild(options) {
     captureEndBoundary();
     if (boundaryError !== null) throw boundaryError;
     const timing = buildTiming(startEpochMs, startMonotonicNs, endEpochMs, endMonotonicNs);
-    const error = launchErrorRecord(launchError);
-    const classification = classifyChildOutcome({ exitCode, signal: exitSignal, launchError: error, canceled });
-    return {
-      version: PINNED_RUNNER_VERSION,
+    let error = launchErrorRecord(launchError);
+    let stderrEvidence = {
+      sha256: stderrHash.digest("hex"),
+      bytes: stderrTotalBytes.toString(),
+      excerptBase64: Buffer.concat(stderrChunks).toString("base64"),
+      excerptBytes: stderrBytesSeen,
+      truncated: stderrTruncated,
+    };
+    if (config.runnerVersion === PINNED_RUNNER_V2_VERSION && descriptor?.launchProtocol !== undefined) {
+      const parsed = launchProtocolOverflow
+        ? null
+        : parseLaunchProtocol(Buffer.concat(launchProtocolChunks, launchProtocolBytes), config.cpu);
+      if (parsed === null) {
+        error ??= { code: "INVALID_LAUNCH_PROTOCOL", message: "secure launcher result was missing or malformed" };
+      } else {
+        launchProtocol = parsed;
+        secureLaunch = parsed.launchState === "launched";
+        exitCode = parsed.exitCode;
+        exitSignal = parsed.signal;
+        canceled ||= parsed.canceled;
+        error = parsed.launchError;
+        stderrEvidence = parsed.stderr;
+      }
+    } else if (config.runnerVersion === PINNED_RUNNER_V2_VERSION) {
+      secureLaunch = descriptor?.secureLaunch === true;
+    }
+    let classification = config.runnerVersion === PINNED_RUNNER_V2_VERSION
+      ? classifyIndividualChildOutcomeV2({
+        exitCode,
+        signal: exitSignal,
+        launchError: error,
+        canceled,
+        secureLaunch,
+      })
+      : classifyChildOutcome({ exitCode, signal: exitSignal, launchError: error, canceled });
+    if (config.runnerVersion === PINNED_RUNNER_V2_VERSION &&
+        (noTurboStart.status !== "observed" || noTurboEnd.status !== "observed")) {
+      classification = {
+        outcome: "operational-invalid",
+        validOutcome: false,
+        invalidReason: "unsafe-boundary",
+      };
+    }
+    const result = {
+      version: config.runnerVersion,
       cpu: config.cpu,
       timing,
       noTurbo: {
@@ -557,6 +763,11 @@ export async function runPinnedChild(options) {
       stderr: Buffer.concat(stderrChunks).toString("utf8"),
       stderrTruncated,
     };
+    if (config.runnerVersion === PINNED_RUNNER_V2_VERSION) {
+      result.launchState = launchProtocol?.launchState ?? (secureLaunch ? "launched" : "unverified");
+      result.stderrEvidence = stderrEvidence;
+    }
+    return result;
   };
 
   if (canceled) return finalize();
@@ -570,7 +781,10 @@ export async function runPinnedChild(options) {
       env: config.env,
       tasksetPath: config.tasksetPath,
       shellPath: config.shellPath,
-    }));
+      ...(config.runnerVersion === PINNED_RUNNER_V2_VERSION
+        ? { stderrBytes: config.stderrBytes }
+        : {}),
+    }), config.runnerVersion);
     child = descriptor.child;
   } catch (error) {
     launchError = error;
@@ -580,6 +794,8 @@ export async function runPinnedChild(options) {
   if (child.stderr !== null && child.stderr !== undefined && typeof child.stderr.on === "function") {
     child.stderr.on("data", (chunk) => {
       const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      stderrHash.update(bytes);
+      stderrTotalBytes += BigInt(bytes.length);
       const remaining = config.stderrBytes - stderrBytesSeen;
       if (remaining > 0) {
         const retained = bytes.subarray(0, remaining);
@@ -590,6 +806,21 @@ export async function runPinnedChild(options) {
     });
     // Continue draining even when the retained evidence reaches its cap.
     child.stderr.resume?.();
+  }
+
+  if (descriptor.launchProtocol !== undefined) {
+    descriptor.launchProtocol.on("data", (chunk) => {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      if (launchProtocolOverflow) return;
+      if (launchProtocolBytes + bytes.length > MAX_LAUNCH_PROTOCOL_BYTES) {
+        launchProtocolOverflow = true;
+        launchProtocolChunks.length = 0;
+        return;
+      }
+      launchProtocolChunks.push(bytes);
+      launchProtocolBytes += bytes.length;
+    });
+    descriptor.launchProtocol.resume?.();
   }
 
   return await new Promise((resolve, reject) => {

@@ -72,7 +72,7 @@ const PHASE_SPECS = Object.freeze({
     ]),
   }),
   individual: Object.freeze({
-    version: "5",
+    versions: Object.freeze(["5", "6"]),
     boundaries: true,
     files: Object.freeze([
       Object.freeze({ path: "results/individual.meta", control: "key-value" }),
@@ -494,10 +494,13 @@ export function computeTelemetryWorkloadBinding(phase, bundle, options = {}) {
       if (phase !== "baseline") {
         workloadGeneration = requireValue(values, "GENERATION", GENERATION_RE, control.path);
       }
-      if (spec.version !== undefined) {
+      if (spec.version !== undefined || spec.versions !== undefined) {
         const version = requireValue(values, "VERSION", /^(?:0|[1-9][0-9]*)$/, control.path);
-        if (version !== spec.version) {
+        if (spec.version !== undefined && version !== spec.version) {
           fail(`${control.path} VERSION must be exactly ${spec.version}`);
+        }
+        if (spec.versions !== undefined && !spec.versions.includes(version)) {
+          fail(`${control.path} VERSION must be one of ${spec.versions.join(", ")}`);
         }
       }
       if (spec.boundaries === true) {

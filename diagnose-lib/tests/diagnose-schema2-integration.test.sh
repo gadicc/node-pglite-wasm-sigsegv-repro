@@ -5,6 +5,7 @@
 # boundaries are all replaced with shell mocks. Only synthetic files below a
 # temporary directory are created.
 set -Eeuo pipefail
+export DIAG_TEST_FORBID_WORKLOAD=1
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 TMP_ROOT="$(mktemp -d)"

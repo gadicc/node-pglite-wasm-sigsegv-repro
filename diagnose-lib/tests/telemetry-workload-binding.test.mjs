@@ -277,11 +277,15 @@ test("generation fields must be unique, lowercase hex32, and correctly delimited
 });
 
 test("exact protocols require their version and unique canonical boundary identity", () => {
+  const version6 = writeFixture("individual");
+  replace(path.join(version6, "results", "individual.meta"), /VERSION=5/, "VERSION=6");
+  assert.doesNotThrow(() => computeTelemetryWorkloadBinding("individual", version6));
+
   const legacy = writeFixture("individual");
   replace(path.join(legacy, "results", "individual.meta"), /VERSION=5/, "VERSION=4");
   assert.throws(
     () => computeTelemetryWorkloadBinding("individual", legacy),
-    /VERSION must be exactly 5/,
+    /VERSION must be one of 5, 6/,
   );
 
   const duplicate = writeFixture("individual");

@@ -563,17 +563,17 @@ export function reconcileIndividualWithGroups(
       meta.TARGET_CPUS !== expected.targetCpus ||
       meta.SKIPPED !== (expected.skipped ? "1" : "0") ||
       canonicalUint(configuredRuns) === null || meta.RUNS_PER_CPU !== configuredRuns ||
-      (meta.VERSION === "5" &&
+      ((meta.VERSION === "5" || meta.VERSION === "6") &&
         (canonicalUint(String(configuredProtocolSeed ?? "")) === null ||
           meta.SCHEDULE_SEED !== String(configuredProtocolSeed)));
-    const provenanceMismatch = meta.VERSION === "5" || meta.VERSION === "4" ||
+    const provenanceMismatch = meta.VERSION === "5" || meta.VERSION === "6" || meta.VERSION === "4" ||
       meta.VERSION === "3" || meta.VERSION === "2"
       ? meta.TARGET_POLICY !== expected?.targetPolicy ||
         meta.GROUP_PLAN_DIGEST !== expected?.groupPlanDigest
       : meta.VERSION !== "1";
-    // Versions 4 and 5 bind the exact validated groups generation: a
+    // Versions 4 through 6 bind the exact validated groups generation: a
     // reproducible plan digest alone no longer authorizes redone evidence.
-    const generationMismatch = (meta.VERSION === "4" || meta.VERSION === "5") &&
+    const generationMismatch = (meta.VERSION === "4" || meta.VERSION === "5" || meta.VERSION === "6") &&
       meta.GROUP_GENERATION !== expected?.groupGeneration;
     if (commonMismatch || provenanceMismatch) {
       reasons.push("individual target policy does not match the validated group evidence generation");
@@ -1681,11 +1681,13 @@ function exactIndividualRuns(results, boundaries) {
   if (!Array.isArray(results) || !Array.isArray(boundaries) || results.length !== boundaries.length) return null;
   const runs = boundaries.map((boundary, index) => {
     const result = results[index];
-    if (result.ordinal !== boundary.ordinal || result.cpu !== boundary.cpu || result.run !== boundary.round) return null;
+    if (result.ordinal !== boundary.ordinal || result.cpu !== boundary.cpu ||
+        (result.run ?? result.round) !== boundary.round ||
+        (result.outcome !== undefined && result.outcome !== boundary.outcome)) return null;
     return {
       ...boundary,
       context: "isolated",
-      outcome: result.rc === 139 ? "sigsegv" : "pass",
+      outcome: result.outcome ?? (result.rc === 139 ? "sigsegv" : "pass"),
     };
   });
   return runs.some((run) => run === null) ? null : runs;
@@ -1932,6 +1934,8 @@ export function collect(outDir, options = {}) {
   const individualEvidence = inspectIndividualEvidence(outDir, {
     onV5Result: (row) => individualExactResults.push(row),
     onV5Boundary: (row) => individualExactBoundaries.push(row),
+    onV6Result: (row) => individualExactResults.push(row),
+    onV6Boundary: (row) => individualExactBoundaries.push(row),
   });
   const individualRows = individualEvidence.rows;
   const individualMetaState = individualEvidence.metaState;
@@ -1997,7 +2001,8 @@ export function collect(outDir, options = {}) {
   results.telemetry = telemetry.summaries;
   results.telemetryAssociations = {};
   const exactBoundaryConditions = {};
-  if (individualStatus.status === "complete" && individualStatus.metadataVersion === "5") {
+  if (individualStatus.status === "complete" &&
+      (individualStatus.metadataVersion === "5" || individualStatus.metadataVersion === "6")) {
     const exactRuns = exactIndividualRuns(individualExactResults, individualExactBoundaries);
     const binding = {
       generation: individualMetaState.values.GENERATION,

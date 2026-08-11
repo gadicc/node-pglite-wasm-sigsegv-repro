@@ -195,7 +195,23 @@ the problem. It does not identify a CPU: the controller and its children can
 migrate anywhere inside that mask. The schema-2 individual phase uses one
 direct, pinned child at a time on every usable logical CPU. Its immutable
 seeded plan interleaves CPUs in a position-balanced order, avoiding CPU-major
-batches while retaining exact CPU attribution. The separate pinned-concurrent
+batches while retaining exact CPU attribution.
+
+Individual evidence version 6 deliberately distinguishes four outcomes:
+`pass`, the prespecified `sigsegv` primary endpoint,
+`other-workload-failure` for a securely launched and affinity-verified child
+that exits nonzero or receives another signal, and `operational-invalid` for
+launch, affinity, cancellation, boundary, or protocol failures. A valid other
+workload failure commits the current immutable-plan observation and advances
+resume; an operational-invalid attempt commits nothing and retries the same
+observation. V6 retains exact exit code or signal, elapsed time, CPU,
+round/position, both `no_turbo` boundaries, and a bounded stderr excerpt plus
+its full-stream byte count and SHA-256 digest. Other workload failures are
+reported as descriptive exact-CPU evidence, never relabelled as passes or
+SIGSEGVs, and are excluded from the clean/SIGSEGV denominator. Telemetry joins
+keep all three committed outcomes in separate context/CPU/outcome strata.
+
+The separate pinned-concurrent
 phase launches one child per active logical CPU in each validated topology
 context, with the controller pinned outside the active set. This preserves
 simultaneous load while retaining exact child-to-CPU attribution. Contexts
@@ -257,7 +273,8 @@ Everything lands in a timestamped bundle, `diagnostics/<UTC timestamp>/`
   TSV-named outcome log, while exact-CPU phases also bind their per-child
   boundary sidecar.
 - `results/individual.plan.tsv`, `results/individual.boundaries.ndjson` — the
-  immutable isolated schedule and exact per-attempt time/`no_turbo` boundaries
+  immutable isolated schedule and exact committed outcome, status, bounded
+  stderr evidence, time, and `no_turbo` boundaries
 - `results/pinned-concurrent.*` — topology contexts, immutable launch plan,
   whole-wave outcomes, and exact per-child boundaries
 - `gdb/` — capture transcripts, bound by the authoritative generation-stamped
@@ -316,6 +333,15 @@ when the rediscovered topology plan is identical, so stale individual evidence
 fails closed and requires `--redo individual`. Legacy envelopes without these
 generation bindings stay descriptive and cannot authorize conclusions.
 
+V1–V5 individual envelopes remain readable with their original meanings.
+Because accepting securely launched non-SIGSEGV workload failures changes
+liveness and statistics, V6 is a new protocol rather than a reinterpretation
+of V5. A schema-2 bundle containing an incomplete V5 individual attempt must
+be restarted explicitly with `--redo individual`; the V5 plan/state and its
+individual telemetry sessions are archived together under
+`state/superseded/`, while completed baseline and group evidence remains
+current.
+
 To instead *repeat* a phase from scratch in one contiguous session (for
 example the per-CPU tests, so all runs share one turbo/load regime), use
 `--redo`. The previous data is moved to `state/superseded/`, never
@@ -354,7 +380,11 @@ A group row names an affinity mask, not the faulting CPU. Exact-CPU localization
 is still descriptive: the seeded, position-balanced isolated schedule reduces
 systematic order bias but does not remove time, temperature, warm-up, or
 workload-drift confounding, and pinned-concurrent children within one wave are
-correlated. A zero there means
+correlated. For V6 individual evidence, Wilson intervals and zero-failure
+bounds use only primary-eligible `pass + sigsegv` observations; committed
+observations and `other-workload-failure` counts are shown separately. A CPU
+with only other workload failures therefore has no primary denominator and no
+interval. A zero there means
 only that this run did not reproduce under that protocol; it does not erase a
 failure captured in an older diagnostic session. For the prespecified frequency A/B/A reversal,
 each turbo-on leg is compared separately with the turbo-off leg using a

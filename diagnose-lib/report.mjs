@@ -151,6 +151,27 @@ function validIndividualCounts(result) {
     result.failures === result.sigsegv && result.failures <= result.runs;
 }
 
+function validIndividualV6Counts(result) {
+  return Number.isSafeInteger(result?.observations) && result.observations > 0 &&
+    Number.isSafeInteger(result?.runs) && result.runs >= 0 &&
+    Number.isSafeInteger(result?.passes) && result.passes >= 0 &&
+    Number.isSafeInteger(result?.failures) && result.failures >= 0 &&
+    Number.isSafeInteger(result?.sigsegv) && result.sigsegv >= 0 &&
+    Number.isSafeInteger(result?.otherWorkloadFailures) && result.otherWorkloadFailures >= 0 &&
+    result.failures === result.sigsegv && result.runs === result.passes + result.sigsegv &&
+    result.observations === result.runs + result.otherWorkloadFailures;
+}
+
+function validIndividualCountsForStatus(status, result) {
+  return status?.metadataVersion === "6"
+    ? validIndividualV6Counts(result)
+    : validIndividualCounts(result);
+}
+
+function validIndividualPrimaryCountsForStatus(status, result) {
+  return validIndividualCountsForStatus(status, result) && result.runs > 0;
+}
+
 function validPinnedGroupCounts(result) {
   return Number.isSafeInteger(result?.waves) && result.waves > 0 &&
     Number.isSafeInteger(result?.failedWaves) && result.failedWaves >= 0 &&
@@ -231,10 +252,11 @@ function pinnedEvidenceIsAuthoritative(r) {
     r.pinnedConcurrent?.authoritative === true && validPinnedSummary(r.pinnedConcurrent);
 }
 
-function individualUsesInterleavedV5(status) {
-  return status?.status === "complete" && status?.metadataVersion === "5" &&
+function individualUsesInterleavedProtocol(status) {
+  return status?.status === "complete" &&
+    (status?.metadataVersion === "5" || status?.metadataVersion === "6") &&
     status?.targetPolicy === "all-usable-cpus" &&
-    status?.protocol === "isolated-interleaved-v1" &&
+    (status?.protocol === "isolated-interleaved-v1" || status?.protocol === "isolated-outcomes-v2") &&
     status?.scheduleAlgorithm === "balanced-cyclic-v1" &&
     Number.isSafeInteger(status?.scheduleSeed) && status.scheduleSeed >= 0;
 }
@@ -494,7 +516,7 @@ function validatedReproductionEvidence(r) {
   }
   if (r.individualStatus?.status === "complete") {
     for (const cpu of r.individual ?? []) {
-      if (validIndividualCounts(cpu) && cpu.sigsegv > 0) {
+      if (validIndividualPrimaryCountsForStatus(r.individualStatus, cpu) && cpu.sigsegv > 0) {
         evidence.push({ protocol: `isolated pinned CPU ${cpu.cpu}`, failures: cpu.sigsegv });
       }
     }
@@ -643,7 +665,8 @@ function renderExecutiveSummary(r, env) {
   }
 
   const isolated = r.individualStatus?.status === "complete"
-    ? (r.individual ?? []).filter(validIndividualCounts)
+    ? (r.individual ?? []).filter((record) =>
+      validIndividualPrimaryCountsForStatus(r.individualStatus, record))
     : [];
   const concurrent = pinnedEvidenceIsAuthoritative(r)
     ? (r.pinnedConcurrent?.perCpu ?? []).filter(validIndividualCounts)
@@ -1063,36 +1086,52 @@ export function renderReport(results) {
     L.push("`node child.mjs` process is pinned to exactly one logical CPU per attempt,");
     L.push("with no concurrent PGlite siblings. It does not retest the shared-mask");
     L.push("cluster condition above.");
-    if (individualUsesInterleavedV5(r.individualStatus)) {
-      L.push(`Schema-2/V5 used a precommitted seeded, position-balanced interleaving (${esc(r.individualStatus.scheduleAlgorithm)}, seed ${r.individualStatus.scheduleSeed}): every round visits every usable CPU once, with rotated positions rather than CPU-major batches.`);
+    if (individualUsesInterleavedProtocol(r.individualStatus)) {
+      L.push(`Schema-2/V${esc(r.individualStatus.metadataVersion)} used a precommitted seeded, position-balanced interleaving (${esc(r.individualStatus.scheduleAlgorithm)}, seed ${r.individualStatus.scheduleSeed}): every round visits every usable CPU once, with rotated positions rather than CPU-major batches.`);
       L.push("This reduces systematic position bias but does not remove time, temperature, warm-up, or workload-drift confounding; per-CPU comparisons remain descriptive.");
-    } else if (r.individualStatus?.metadataVersion && r.individualStatus.metadataVersion !== "5") {
+      if (r.individualStatus.metadataVersion === "6") {
+        L.push("V6 classifies securely launched nonzero exits and non-SIGSEGV signals as `other-workload-failure`. Those observations advance the immutable schedule but are reported separately and excluded from the pass/SIGSEGV primary denominator.");
+      }
+    } else if (r.individualStatus?.metadataVersion &&
+        r.individualStatus.metadataVersion !== "5" && r.individualStatus.metadataVersion !== "6") {
       L.push("This is a legacy CPU-major protocol whose per-CPU batches ran sequentially. CPU identity is therefore confounded with time, temperature, and workload drift; localization remains descriptive.");
     } else {
-      L.push("A complete validated V5 schedule identity is unavailable, so the report does not claim randomized or position-balanced ordering. Per-CPU localization remains descriptive.");
+      L.push("A complete validated interleaved schedule identity is unavailable, so the report does not claim randomized or position-balanced ordering. Per-CPU localization remains descriptive.");
     }
     L.push("A CPU with zero failures is **not** proven failure-free; its nominal 95% upper");
     L.push("bound quantifies the sample under an independence/stationarity working assumption. It means only");
     L.push("that this protocol did not reproduce on that CPU in this run; it does not");
     L.push("erase failures observed in prior sessions.");
     L.push("");
-    L.push("| CPU | Runs | Failures | Nominal rate / pointwise 95% interval or bound | Notes |");
-    L.push("| --- | --- | --- | --- | --- |");
+    const individualV6 = r.individualStatus?.metadataVersion === "6";
+    L.push(individualV6
+      ? "| CPU | Committed observations | Primary eligible (pass + SIGSEGV) | SIGSEGV | Other workload failures | Nominal SIGSEGV rate / pointwise 95% interval or bound | Notes |"
+      : "| CPU | Runs | Failures | Nominal rate / pointwise 95% interval or bound | Notes |");
+    L.push(individualV6
+      ? "| --- | ---: | ---: | ---: | ---: | --- | --- |"
+      : "| --- | --- | --- | --- | --- |");
     for (const c of r.individual) {
       const notes = [];
-      const countsValid = validIndividualCounts(c);
+      const countsValid = individualV6 ? validIndividualV6Counts(c) : validIndividualCounts(c);
       if (!countsValid) notes.push("inconsistent failure counts; excluded from conclusions");
-      if (countsValid && individualComplete && c.cpu === r.worstCpu && c.failures > 0) notes.push("highest observed rate");
+      if (countsValid && c.runs > 0 && individualComplete && c.cpu === r.worstCpu && c.failures > 0) notes.push("highest observed rate");
       if (c.invalidRuns?.length > 0) notes.push(`${c.invalidRuns.length} invalid run(s) excluded (non-SIGSEGV exits)`);
       if (c.failedRuns?.length) {
-        notes.push(`failed runs: ${c.failedRuns.map((f) => `#${f.run} (${f.signal})`).join(", ")}`);
+        const shown = c.failedRuns.slice(0, 20);
+        const failureLabel = individualV6 ? "SIGSEGV runs" : "failed runs";
+        notes.push(`${failureLabel}: ${shown.map((f) => `#${f.run} (${f.signal})`).join(", ")}${c.failedRuns.length > shown.length ? `; ${c.failedRuns.length - shown.length} more retained detail(s) not rendered` : ""}`);
+      }
+      if (c.otherWorkloadFailureDetails?.length) {
+        const shown = c.otherWorkloadFailureDetails.slice(0, 20);
+        notes.push(`other workload failures: ${shown.map((f) =>
+          `#${f.run} (${f.signal ?? `exit ${f.exitCode}`}, stderr ${String(f.stderrSha256).slice(0, 12)}…)`).join(", ")}${c.otherWorkloadFailureDetails.length > shown.length ? `; ${c.otherWorkloadFailureDetails.length - shown.length} more retained detail(s) not rendered` : ""}`);
       }
       if ((c.failedRunsOmitted ?? 0) > 0) {
         notes.push(`${c.failedRuns?.length ?? 0} failed-run detail(s) retained; ${c.failedRunsOmitted} omitted by the bounded collector`);
       }
-      L.push(
-        `| ${c.cpu} | ${c.runs} | ${c.failures} | ${countsValid ? protocolRateCell(c.failures, c.runs, individualComplete) : "invalid/inconsistent counts; no interval"} | ${notes.join("; ") || "—"} |`,
-      );
+      L.push(individualV6
+        ? `| ${c.cpu} | ${c.observations ?? "—"} | ${c.runs} | ${c.sigsegv} | ${c.otherWorkloadFailures ?? c.otherFailures ?? 0} | ${countsValid && c.runs > 0 ? protocolRateCell(c.failures, c.runs, individualComplete) : countsValid ? "no primary-eligible observations; no interval" : "invalid/inconsistent counts; no interval"} | ${notes.join("; ") || "—"} |`
+        : `| ${c.cpu} | ${c.runs} | ${c.failures} | ${countsValid ? protocolRateCell(c.failures, c.runs, individualComplete) : "invalid/inconsistent counts; no interval"} | ${notes.join("; ") || "—"} |`);
     }
     L.push("", POINTWISE_INTERVAL_NOTE, "");
   } else if (individualStatus === "invalid" || individualStatus === "incomplete") {
@@ -1328,13 +1367,13 @@ export function renderReport(results) {
   L.push("- Observed failure rates can drift between batches; comparisons use");
   L.push("  exact tests on paired batches where possible, but small samples");
   L.push("  remain weak evidence.");
-  if (individualUsesInterleavedV5(r.individualStatus)) {
-    L.push("- The isolated V5 schedule is seeded and position-balanced, which reduces");
+  if (individualUsesInterleavedProtocol(r.individualStatus)) {
+    L.push(`- The isolated V${esc(r.individualStatus.metadataVersion)} schedule is seeded and position-balanced, which reduces`);
     L.push("  systematic order bias. It does not remove time, temperature, warm-up,");
     L.push("  or workload-drift confounding, so localization remains descriptive and");
     L.push("  receives no exchangeability-based p-value.");
   } else {
-    L.push("- A complete validated isolated V5 schedule identity is unavailable.");
+    L.push("- A complete validated isolated interleaved schedule identity is unavailable.");
     L.push("  Legacy CPU-major batches confound CPU identity with time, temperature,");
     L.push("  and workload drift; no randomized/interleaved ordering is inferred.");
   }
@@ -1422,8 +1461,14 @@ function renderConclusions(r) {
     }
   }
   for (const c of r.individualStatus?.status === "complete" ? (r.individual ?? []) : []) {
-    if (validIndividualCounts(c)) {
-      if (!addAggregate(c.sigsegv, 0, 0, c.runs)) hasInvalidCountEvidence = true;
+    if (validIndividualCountsForStatus(r.individualStatus, c)) {
+      const v6 = r.individualStatus?.metadataVersion === "6";
+      if (!addAggregate(
+        c.sigsegv,
+        v6 ? c.otherWorkloadFailures : 0,
+        0,
+        v6 ? c.observations : c.runs,
+      )) hasInvalidCountEvidence = true;
     } else {
       hasInvalidCountEvidence = true;
     }
@@ -1452,7 +1497,10 @@ function renderConclusions(r) {
   }
   if (totalSig > 0) {
     const unresolved = totalUnclassified > 0 ? ` Another ${totalUnclassified} failure(s) were visible only in wave summaries and could not be classified.` : "";
-    C.push(`- **The problem reproduced**: ${totalSig} SIGSEGV(s) across ${totalRuns} child-process runs in this diagnostic session.${unresolved}`);
+    const other = totalOther > 0
+      ? ` Another ${totalOther} non-SIGSEGV workload failure(s) are reported separately and do not count toward that endpoint.`
+      : "";
+    C.push(`- **The problem reproduced**: ${totalSig} SIGSEGV(s) across ${totalRuns} child-process runs in this diagnostic session.${other}${unresolved}`);
   } else if (totalOther > 0 || totalUnclassified > 0) {
     C.push(`- Workload failures occurred across ${totalRuns} child-process runs, but none were confirmed as SIGSEGV (${totalOther} classified other failure(s), ${totalUnclassified} unclassified summary-only failure(s)).`);
   } else if (totalRuns > 0 && !hasIncompleteReproEvidence) {
@@ -1485,11 +1533,12 @@ function renderConclusions(r) {
     C.push("- **Unauthoritative or inconsistent pinned-concurrent summary evidence was excluded** from reproduction, rate-bound, and localization conclusions; see phase 5.");
   }
 
-  // 2. Localization to CPUs / groups. Even the V5 position-balanced schedule
+  // 2. Localization to CPUs / groups. Even the position-balanced schedule
   // does not make CPU labels exchangeable with temporal or thermal state.
   // Keep these contrasts descriptive; do not attach a localization p-value.
   const testedCpus = r.individualStatus?.status === "complete"
-    ? (r.individual ?? []).filter((c) => validIndividualCounts(c))
+    ? (r.individual ?? []).filter((c) =>
+      validIndividualPrimaryCountsForStatus(r.individualStatus, c))
     : [];
   const failingCpus = testedCpus.filter((c) => c.sigsegv > 0);
   const cleanCpus = testedCpus.filter((c) => c.sigsegv === 0);
@@ -1512,13 +1561,13 @@ function renderConclusions(r) {
       line += "; every other tested CPU also observed at least one failure";
     }
     line += testedCpus.length > 1
-      ? individualUsesInterleavedV5(r.individualStatus)
+      ? individualUsesInterleavedProtocol(r.individualStatus)
         ? ". These zeros do not supersede prior sessions or explain shared-mask group failures. The seeded position-balanced interleaving reduces order bias but does not remove temporal or thermal confounding, so localization is descriptive"
-        : ". These zeros do not supersede prior sessions or explain shared-mask group failures. The validated V5 interleaving identity is unavailable, so localization is descriptive and no order-balance claim is made"
+        : ". These zeros do not supersede prior sessions or explain shared-mask group failures. A validated interleaving identity is unavailable, so localization is descriptive and no order-balance claim is made"
       : ". Only one CPU was tested, so no cross-CPU comparison is possible";
     C.push(`${line}.`);
   } else if (testedCpus.length > 0) {
-    C.push(`- Single-process per-CPU screen (this run only): no failures observed on any tested CPU. These zeros do not supersede prior sessions or explain shared-mask group results; ${individualUsesInterleavedV5(r.individualStatus) ? "the position-balanced schedule reduces order bias but does not remove temporal or thermal confounding" : "a complete validated V5 ordering identity is unavailable"}, so per-CPU results remain descriptive.`);
+    C.push(`- Single-process per-CPU screen (this run only): no SIGSEGVs observed on any tested CPU. These zeros do not supersede prior sessions or explain shared-mask group results; ${individualUsesInterleavedProtocol(r.individualStatus) ? "the position-balanced schedule reduces order bias but does not remove temporal or thermal confounding" : "a complete validated interleaved ordering identity is unavailable"}, so per-CPU results remain descriptive.`);
   }
   const conclusionGroups = groupsEvidenceStatus === "complete" ? (r.groups ?? []) : [];
   const failingGroups = conclusionGroups.filter(

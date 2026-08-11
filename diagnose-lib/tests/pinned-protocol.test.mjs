@@ -15,6 +15,8 @@ import { after, test } from "node:test";
 
 import {
   ISOLATED_PLAN_HEADER,
+  ISOLATED_V2_RESULTS_HEADER,
+  PINNED_PROTOCOL_STATE_V2_VERSION,
   PinnedProtocolStateError,
   buildIsolatedPlan,
   buildPinnedConcurrentPlan,
@@ -117,6 +119,37 @@ function invalidChildResult(cpu) {
     outcome: "invalid",
     validOutcome: false,
     invalidReason: "unexpected-exit",
+  };
+}
+
+function childResultV2(cpu, options = {}) {
+  const base = childResult(cpu, options);
+  const exitCode = Object.hasOwn(options, "exitCode") ? options.exitCode : 0;
+  const signal = Object.hasOwn(options, "signal") ? options.signal : null;
+  const outcome = options.outcome ?? (signal === "SIGSEGV"
+    ? "sigsegv"
+    : exitCode === 0
+      ? "pass"
+      : "other-workload-failure");
+  const excerpt = Buffer.from(options.stderr ?? "", "utf8");
+  return {
+    ...base,
+    version: 2,
+    exitCode,
+    signal,
+    outcome,
+    validOutcome: options.validOutcome ?? true,
+    invalidReason: options.invalidReason ?? null,
+    canceled: options.canceled ?? false,
+    launchError: options.launchError ?? null,
+    launchState: options.launchState ?? "launched",
+    stderrEvidence: {
+      sha256: sha256ProtocolBytes(excerpt),
+      bytes: String(excerpt.length),
+      excerptBase64: excerpt.toString("base64"),
+      excerptBytes: excerpt.length,
+      truncated: false,
+    },
   };
 }
 
@@ -277,6 +310,215 @@ test("isolated executor runs exactly the next record and never commits an invali
   const progress = await readIsolatedProgress({ plan, generation: GENERATION, stateAdapter: adapter });
   assert.equal(progress.committedRecords, 1);
   assert.deepEqual(progress.nextRecord, plan.records[1]);
+});
+
+test("isolated V2 commits unexpected exits and non-SIGSEGV signals as descriptive outcomes", async () => {
+  const plan = buildIsolatedPlan({ cpus: [8, 9], rounds: 1, seed: 7 });
+  const adapter = memoryAdapter();
+  const outcomes = [
+    { exitCode: 1, signal: null, outcome: "other-workload-failure", stderr: "exit one\n" },
+    { exitCode: null, signal: "SIGILL", outcome: "other-workload-failure", stderr: "illegal\n" },
+  ];
+  let index = 0;
+  for (const configured of outcomes) {
+    const result = await runIsolatedAttempt({
+      plan,
+      generation: GENERATION,
+      stateAdapter: adapter,
+      stateVersion: PINNED_PROTOCOL_STATE_V2_VERSION,
+      runChild: async (request) => childResultV2(request.cpu, configured),
+    });
+    assert.equal(result.committed, true);
+    assert.equal(result.state.outcome, "other-workload-failure");
+    assert.equal(result.state.record.ordinal, ++index);
+  }
+  const progress = await readIsolatedProgress({
+    plan,
+    generation: GENERATION,
+    stateAdapter: adapter,
+    stateVersion: PINNED_PROTOCOL_STATE_V2_VERSION,
+  });
+  assert.equal(progress.complete, true);
+  assert.equal(progress.committedRecords, 2);
+  assert.deepEqual(progress.states.map(({ exitCode, signal }) => ({ exitCode, signal })), [
+    { exitCode: 1, signal: null },
+    { exitCode: null, signal: "SIGILL" },
+  ]);
+});
+
+test("isolated V2 operational failures remain uncommitted, bounded, and retryable", async () => {
+  const plan = buildIsolatedPlan({ cpus: [8], rounds: 1, seed: 0 });
+  const cases = [
+    childResultV2(8, {
+      exitCode: null,
+      signal: null,
+      outcome: "operational-invalid",
+      validOutcome: false,
+      invalidReason: "launch-error",
+      launchState: "failed",
+      launchError: { code: "ENOENT", message: "missing launcher" },
+    }),
+    childResultV2(8, {
+      exitCode: null,
+      signal: "SIGTERM",
+      outcome: "operational-invalid",
+      validOutcome: false,
+      invalidReason: "canceled",
+      canceled: true,
+    }),
+    childResultV2(8, { noTurboStart: unavailableNoTurbo() }),
+    { version: 2, cpu: 8, outcome: "other-workload-failure" },
+  ];
+  for (const child of cases) {
+    const adapter = memoryAdapter();
+    const rejected = await runIsolatedAttempt({
+      plan,
+      generation: GENERATION,
+      stateAdapter: adapter,
+      stateVersion: PINNED_PROTOCOL_STATE_V2_VERSION,
+      runChild: async () => child,
+    });
+    assert.equal(rejected.committed, false);
+    assert.equal(rejected.reason, "operational-invalid");
+    assert.equal(rejected.attempt.classification, "operational-invalid");
+    assert.equal(rejected.attempt.record.ordinal, 1);
+    assert.equal(adapter.files.size, 0);
+  }
+
+  const thrownAdapter = memoryAdapter();
+  const thrown = await runIsolatedAttempt({
+    plan,
+    generation: GENERATION,
+    stateAdapter: thrownAdapter,
+    stateVersion: PINNED_PROTOCOL_STATE_V2_VERSION,
+    runChild: async () => { throw Object.assign(new Error("runner broke"), { code: "EIO" }); },
+  });
+  assert.equal(thrown.committed, false);
+  assert.equal(thrown.reason, "operational-invalid");
+  assert.equal(thrown.attempt.errorCode, "EIO");
+  assert.equal(thrownAdapter.files.size, 0);
+
+  const retried = await runIsolatedAttempt({
+    plan,
+    generation: GENERATION,
+    stateAdapter: thrownAdapter,
+    stateVersion: PINNED_PROTOCOL_STATE_V2_VERSION,
+    runChild: async (request) => childResultV2(request.cpu),
+  });
+  assert.equal(retried.committed, true);
+  assert.equal(retried.state.record.ordinal, 1);
+});
+
+test("the active V5 schedule frontier advances under V2 after canonical exit 1 evidence", async () => {
+  const plan = buildIsolatedPlan({
+    cpus: Array.from({ length: 24 }, (_, cpu) => cpu),
+    rounds: 400,
+    seed: 131738620,
+  });
+  assert.deepEqual(plan.records[0], { ordinal: 1, round: 1, position: 1, cpu: 12 });
+  assert.equal(plan.records[1].cpu, 22);
+  const adapter = memoryAdapter();
+  const result = await runIsolatedAttempt({
+    plan,
+    generation: GENERATION,
+    stateAdapter: adapter,
+    stateVersion: PINNED_PROTOCOL_STATE_V2_VERSION,
+    runChild: async (request) => childResultV2(request.cpu, {
+      exitCode: 1,
+      outcome: "other-workload-failure",
+      stderr: "canonical unexpected failure\n",
+    }),
+  });
+  assert.equal(result.committed, true);
+  const resumed = await readIsolatedProgress({
+    plan,
+    generation: GENERATION,
+    stateAdapter: adapter,
+    stateVersion: PINNED_PROTOCOL_STATE_V2_VERSION,
+  });
+  assert.equal(resumed.committedRecords, 1);
+  assert.deepEqual(resumed.nextRecord, plan.records[1]);
+});
+
+test("isolated V2 resume rejects outcome, exact status, and stderr tampering", async () => {
+  const plan = buildIsolatedPlan({ cpus: [8], rounds: 1, seed: 0 });
+  const adapter = memoryAdapter();
+  await runIsolatedAttempt({
+    plan,
+    generation: GENERATION,
+    stateAdapter: adapter,
+    stateVersion: PINNED_PROTOCOL_STATE_V2_VERSION,
+    runChild: async (request) => childResultV2(request.cpu, {
+      exitCode: 1,
+      outcome: "other-workload-failure",
+      stderr: "retained stderr",
+    }),
+  });
+  const [name, bytes] = [...adapter.files][0];
+  for (const mutate of [
+    (state) => { state.outcome = "pass"; },
+    (state) => { state.signal = "SIGABRT"; },
+    (state) => { state.exitCode = null; state.signal = "SIGBANANA"; },
+    (state) => { state.stderr.bytes = "999"; },
+    (state) => {
+      state.noTurbo.start = { status: "unavailable", value: null, errorCode: "ENOENT" };
+    },
+  ]) {
+    const tampered = cloneMemoryAdapter(adapter);
+    const state = JSON.parse(bytes.toString("utf8"));
+    mutate(state);
+    tampered.files.set(name, canonicalProtocolJsonLine(state));
+    await assert.rejects(readIsolatedProgress({
+      plan,
+      generation: GENERATION,
+      stateAdapter: tampered,
+      stateVersion: PINNED_PROTOCOL_STATE_V2_VERSION,
+    }), PinnedProtocolStateError);
+  }
+});
+
+test("isolated V2 finalization preserves classifications and exact bounded evidence", async () => {
+  const plan = buildIsolatedPlan({ cpus: [8, 9, 10], rounds: 1, seed: 4 });
+  const adapter = memoryAdapter();
+  const configured = [
+    { exitCode: 0, signal: null, outcome: "pass" },
+    { exitCode: null, signal: "SIGSEGV", outcome: "sigsegv" },
+    { exitCode: null, signal: "SIGABRT", outcome: "other-workload-failure", stderr: "aborted\n" },
+  ];
+  for (const outcome of configured) {
+    await runIsolatedAttempt({
+      plan,
+      generation: GENERATION,
+      stateAdapter: adapter,
+      stateVersion: PINNED_PROTOCOL_STATE_V2_VERSION,
+      runChild: async (request) => childResultV2(request.cpu, outcome),
+    });
+  }
+  const first = await finalizeIsolatedProtocol({
+    plan,
+    generation: GENERATION,
+    stateAdapter: adapter,
+    stateVersion: PINNED_PROTOCOL_STATE_V2_VERSION,
+  });
+  const second = await finalizeIsolatedProtocol({
+    plan,
+    generation: GENERATION,
+    stateAdapter: adapter,
+    stateVersion: PINNED_PROTOCOL_STATE_V2_VERSION,
+  });
+  assert.ok(first.results.equals(second.results));
+  assert.ok(first.boundaries.equals(second.boundaries));
+  const lines = first.results.toString("utf8").trimEnd().split("\n");
+  assert.equal(lines[0], ISOLATED_V2_RESULTS_HEADER);
+  assert.deepEqual(lines.slice(1).map((line) => line.split("\t")[4]), [
+    "pass", "sigsegv", "other-workload-failure",
+  ]);
+  assert.equal(lines[3].split("\t")[6], "SIGABRT");
+  const boundary = JSON.parse(first.boundaries.toString("utf8").trimEnd().split("\n")[2]);
+  assert.equal(boundary.outcome, "other-workload-failure");
+  assert.equal(boundary.signal, "SIGABRT");
+  assert.equal(Buffer.from(boundary.stderrExcerptBase64, "base64").toString(), "aborted\n");
+  assert.equal(boundary.stderrSha256, sha256ProtocolBytes("aborted\n"));
 });
 
 test("concurrent executor shares one abort signal and commits only a complete valid wave", async () => {

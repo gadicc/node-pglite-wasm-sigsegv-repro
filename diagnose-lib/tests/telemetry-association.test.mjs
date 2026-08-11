@@ -114,6 +114,29 @@ test("outcome summaries remain stratified when pinned contexts overlap", () => {
   );
 });
 
+test("other workload failures retain their own telemetry stratum", () => {
+  const joined = associateTelemetryRuns({
+    telemetryAssessment: assessment(),
+    workloadGeneration: generation,
+    workloadBoundariesSha256: digest,
+    workloadBoundaryRowCount: 3,
+    workloadBindingReconciled: true,
+    runs: [
+      { ordinal: 1, cpu: 8, outcome: "pass", startUnixMs: 1_200, endUnixMs: 1_360, startMonotonicNs: "1200000000", endMonotonicNs: "1360000000" },
+      { ordinal: 2, cpu: 8, outcome: "other-workload-failure", startUnixMs: 1_500, endUnixMs: 1_700, startMonotonicNs: "1500000000", endMonotonicNs: "1700000000" },
+      { ordinal: 3, cpu: 8, outcome: "sigsegv", startUnixMs: 1_750, endUnixMs: 1_900, startMonotonicNs: "1750000000", endMonotonicNs: "1900000000" },
+    ],
+  });
+  assert.equal(joined.status, "complete", joined.reasons.join("; "));
+  assert.deepEqual(joined.byContextOutcome.map(({ outcome, runs }) => ({ outcome, runs })), [
+    { outcome: "pass", runs: 1 },
+    { outcome: "other-workload-failure", runs: 1 },
+    { outcome: "sigsegv", runs: 1 },
+  ]);
+  assert.equal(joined.byCpu.filter((row) => row.outcome === "other-workload-failure").length, 1);
+  assert.equal(Object.hasOwn(joined, "byOutcome"), false);
+});
+
 test("missing binding, stale pre-sweep, and no during sweep degrade telemetry only", () => {
   const joined = associateTelemetryRuns({
     telemetryAssessment: assessment(),

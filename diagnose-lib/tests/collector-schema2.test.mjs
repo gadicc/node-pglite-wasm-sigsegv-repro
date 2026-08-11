@@ -180,7 +180,7 @@ test("schema-2-only keys cannot be smuggled into a legacy configuration", () => 
   assert.match(result.configStatus.reasons.join("; "), /legacy stored run metadata unexpectedly contains PINNED_CONCURRENT_ROUNDS/);
 });
 
-test("V5 isolated evidence reconciles only with the all-usable CPU policy and stored seed", () => {
+test("V5 and V6 isolated evidence reconcile only with the all-usable CPU policy and stored seed", () => {
   const assessment = {
     status: "complete",
     reasons: [],
@@ -202,11 +202,14 @@ test("V5 isolated evidence reconciles only with the all-usable CPU policy and st
     meta: { GENERATION: GROUP_GENERATION, PLAN_DIGEST: GROUP_PLAN_DIGEST },
     entries: [{ name: "all-cpus", cpus: "0-1", parsed: { failedWaves: 0 } }],
   };
-  const reconciled = reconcileIndividualWithGroups(assessment, meta, groups, "schema2", "1", 42);
-  assert.equal(reconciled.status, "complete", reconciled.reasons.join("; "));
-  const staleSeed = reconcileIndividualWithGroups(assessment, meta, groups, "schema2", "1", 43);
-  assert.equal(staleSeed.status, "invalid");
-  assert.match(staleSeed.reasons.join("; "), /target policy does not match/);
+  for (const version of ["5", "6"]) {
+    const candidate = { ...meta, VERSION: version };
+    const reconciled = reconcileIndividualWithGroups(assessment, candidate, groups, "schema2", "1", 42);
+    assert.equal(reconciled.status, "complete", `${version}: ${reconciled.reasons.join("; ")}`);
+    const staleSeed = reconcileIndividualWithGroups(assessment, candidate, groups, "schema2", "1", 43);
+    assert.equal(staleSeed.status, "invalid");
+    assert.match(staleSeed.reasons.join("; "), /target policy does not match/);
+  }
 });
 
 test("pinned-concurrent contexts must be exact source groups or complete a/b partitions", () => {

@@ -32,6 +32,7 @@ exec "$DIAG_TEST_REAL_NODE_BIN" "$@"
 EOF
 chmod +x "$DIAG_TEST_HERMETIC_BIN/node"
 export DIAG_TEST_REAL_NODE_BIN
+export DIAG_TEST_FORBID_WORKLOAD=1
 export PATH="$DIAG_TEST_HERMETIC_BIN:$PATH"
 
 pass=0
@@ -4766,6 +4767,89 @@ redo_ok=0
   [[ -f "$redo_stash/individual/results/individual.meta" ]] &&
   grep -q '^COMPLETED_PHASES=baseline$' "$RB/results/meta.env" && redo_ok=1
 check_eq "--redo individual stashes data, clears marker" "1" "$redo_ok"
+
+# Model the live-bundle frontier: complete baseline/groups, an immutable V5
+# individual plan with no committed observations, and three telemetry
+# sessions. Redo must archive only the individual/downstream closure.
+ACTIVE_V5_REDO="$TMP/redo-active-v5-bundle"
+mkdir -p "$ACTIVE_V5_REDO"/{results,state/individual-attempts,logs/individual,telemetry/individual,state/telemetry-individual}
+printf 'baseline retained\n' > "$ACTIVE_V5_REDO/results/baseline.meta"
+printf 'groups retained\n' > "$ACTIVE_V5_REDO/results/groups.tsv"
+printf 'ordinal\tround\tposition\tcpu\n1\t1\t1\t12\n2\t1\t2\t22\n' \
+  > "$ACTIVE_V5_REDO/results/individual.plan.tsv"
+: > "$ACTIVE_V5_REDO/results/individual.tsv"
+: > "$ACTIVE_V5_REDO/results/individual.boundaries.ndjson"
+cat > "$ACTIVE_V5_REDO/results/individual.meta" << EOF
+VERSION=5
+GENERATION=623ee623ee623ee623ee623ee623ee62
+TARGET_CPUS=0-23
+RUNS_PER_CPU=400
+TARGET_POLICY=all-usable-cpus
+GROUP_PLAN_DIGEST=$(printf 'b%.0s' {1..64})
+GROUP_GENERATION=$(printf 'c%.0s' {1..32})
+PROTOCOL=isolated-interleaved-v1
+SCHEDULE_SEED=131738620
+SCHEDULE_ALGORITHM=balanced-cyclic-v1
+PLAN_SHA256=$(printf 'd%.0s' {1..64})
+PLAN_BYTES=52
+PLAN_ROW_COUNT=9600
+SKIPPED=0
+COMPLETED=0
+EOF
+for session in 1 2 3; do
+  printf 'telemetry session %s\n' "$session" \
+    > "$ACTIVE_V5_REDO/telemetry/individual/session-$session.ndjson"
+  printf 'telemetry state %s\n' "$session" \
+    > "$ACTIVE_V5_REDO/state/telemetry-individual/session-$session.boundary.json"
+done
+printf 'telemetry rows\n' > "$ACTIVE_V5_REDO/results/telemetry-individual.tsv"
+printf 'telemetry metadata\n' > "$ACTIVE_V5_REDO/results/telemetry-individual.meta"
+touch "$ACTIVE_V5_REDO/state/phase-preflight.done" \
+  "$ACTIVE_V5_REDO/state/phase-baseline.done" "$ACTIVE_V5_REDO/state/phase-groups.done"
+cat > "$ACTIVE_V5_REDO/results/meta.env" << EOF
+MODE=full
+RUN_SCHEMA_VERSION=2
+BASELINE_CHILDREN=16
+BASELINE_WAVES=100
+GROUP_WAVES=100
+INDIVIDUAL_RUNS=400
+PINNED_CONCURRENT_ROUNDS=400
+PROTOCOL_SEED=131738620
+SKIP_PINNED_CONCURRENT=0
+TELEMETRY_INTERVAL_MS=250
+GDB_MAX_RUNS=24
+SKIP_GDB=1
+CPU_TARGET=auto
+COMPLETED_PHASES=preflight,baseline,groups
+EOF
+(
+  DIAG_SOURCE_ONLY=1
+  source "$REPO_ROOT/diagnose.sh"
+  OUT_DIR="$ACTIVE_V5_REDO"
+  STATE_DIR="$ACTIVE_V5_REDO/state"
+  META_FILE="$ACTIVE_V5_REDO/results/meta.env"
+  load_stored_config "$ACTIVE_V5_REDO"
+  REDO_PHASES=individual
+  build_redo_plan
+  apply_redo_plan
+) > /dev/null 2>&1
+active_v5_redo_rc=$?
+active_v5_stash="$(find "$ACTIVE_V5_REDO/state/superseded" -mindepth 1 -maxdepth 1 -type d -name 'redo-*' -print -quit)"
+active_v5_redo_ok=0
+[[ $active_v5_redo_rc -eq 0 ]] &&
+  [[ "$(cat "$ACTIVE_V5_REDO/results/baseline.meta")" == "baseline retained" ]] &&
+  [[ "$(cat "$ACTIVE_V5_REDO/results/groups.tsv")" == "groups retained" ]] &&
+  [[ -f "$ACTIVE_V5_REDO/state/phase-baseline.done" && -f "$ACTIVE_V5_REDO/state/phase-groups.done" ]] &&
+  [[ -f "$active_v5_stash/individual/results/individual.meta" ]] &&
+  [[ -f "$active_v5_stash/individual/results/individual.plan.tsv" ]] &&
+  [[ "$(find "$active_v5_stash/individual/telemetry/individual" -type f | wc -l)" -eq 3 ]] &&
+  [[ "$(find "$active_v5_stash/individual/state/telemetry-individual" -type f | wc -l)" -eq 3 ]] &&
+  [[ -f "$active_v5_stash/individual/results/telemetry-individual.tsv" ]] &&
+  [[ ! -e "$ACTIVE_V5_REDO/results/individual.meta" && ! -e "$ACTIVE_V5_REDO/telemetry/individual" ]] &&
+  grep -q '^COMPLETED_PHASES=preflight,baseline,groups$' "$ACTIVE_V5_REDO/results/meta.env" &&
+  active_v5_redo_ok=1
+check_eq "--redo individual archives the active V5 attempt and telemetry while preserving baseline/groups" \
+  "1" "$active_v5_redo_ok"
 
 GB="$TMP/redo-gdb-bundle"
 mkdir -p "$GB"/{results,state,gdb,logs/gdb}

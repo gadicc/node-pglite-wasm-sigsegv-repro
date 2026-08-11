@@ -21,6 +21,7 @@ import {
   unlinkSync,
   writeSync,
 } from "node:fs";
+import { constants as osConstants } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -28,7 +29,9 @@ import {
   MAX_CPU_ID,
   MAX_SCHEDULE_ENTRIES,
   MAX_SEED,
+  DEFAULT_STDERR_BYTES,
   PINNED_RUNNER_VERSION,
+  PINNED_RUNNER_V2_VERSION,
   buildBalancedGroupOrders,
   buildConcurrentLaunchOrders,
   buildIsolatedOrders,
@@ -46,7 +49,10 @@ import {
 } from "./pinned-concurrent-evidence.mjs";
 
 export const PINNED_PROTOCOL_STATE_VERSION = 1;
+export const PINNED_PROTOCOL_STATE_V2_VERSION = 2;
 export const ISOLATED_PLAN_HEADER = "ordinal\tround\tposition\tcpu";
+export const ISOLATED_V2_RESULTS_HEADER =
+  "ordinal\tround\tposition\tcpu\toutcome\texit_code\tsignal\telapsed_sec\tstderr_sha256\tstderr_bytes";
 export const DEFAULT_STATE_FILE_MAX_BYTES = 256 * 1024;
 export const MAX_WAVE_STATE_FILE_BYTES = 64 * 1024 * 1024;
 export const MAX_BOUNDARIES_BYTES = 512 * 1024 * 1024;
@@ -58,6 +64,8 @@ const GROUP_RE = /^[a-z][a-z0-9_-]{0,63}$/;
 const KIND_RE = /^[a-z][a-z0-9-]{0,31}$/;
 const ERROR_CODE_RE = /^[A-Z0-9_]{1,64}$/;
 const DECIMAL_RE = /^(0|[1-9][0-9]*)$/;
+const KNOWN_SIGNALS = new Set(Object.keys(osConstants.signals));
+const ISOLATED_V2_OUTCOMES = new Set(["pass", "sigsegv", "other-workload-failure"]);
 const MAX_PATH_BYTES = 4_096;
 const MAX_STRING_BYTES = 16 * 1024;
 const MAX_CONTEXTS = 256;
@@ -775,6 +783,91 @@ function stateObservation(record, child) {
   }
 }
 
+function normalizeStderrEvidence(value, label = "child stderr evidence") {
+  exactObjectKeys(value, [
+    "sha256", "bytes", "excerptBase64", "excerptBytes", "truncated",
+  ], label);
+  if (typeof value.sha256 !== "string" || !DIGEST_RE.test(value.sha256)) {
+    throw new PinnedProtocolStateError(`${label}.sha256 is invalid`);
+  }
+  const totalBytes = validateDecimal(value.bytes, `${label}.bytes`);
+  validateStateInteger(value.excerptBytes, `${label}.excerptBytes`, 0, DEFAULT_STDERR_BYTES);
+  if (typeof value.excerptBase64 !== "string" || typeof value.truncated !== "boolean") {
+    throw new PinnedProtocolStateError(`${label} excerpt fields are invalid`);
+  }
+  let excerpt;
+  try {
+    excerpt = Buffer.from(value.excerptBase64, "base64");
+  } catch {
+    throw new PinnedProtocolStateError(`${label}.excerptBase64 is invalid`);
+  }
+  if (excerpt.toString("base64") !== value.excerptBase64 || excerpt.length !== value.excerptBytes ||
+      totalBytes < BigInt(excerpt.length) || value.truncated !== (totalBytes > BigInt(excerpt.length)) ||
+      (!value.truncated && sha256ProtocolBytes(excerpt) !== value.sha256)) {
+    throw new PinnedProtocolStateError(`${label} does not reconcile`);
+  }
+  return Object.freeze({
+    sha256: value.sha256,
+    bytes: value.bytes,
+    excerptBase64: value.excerptBase64,
+    excerptBytes: value.excerptBytes,
+    truncated: value.truncated,
+  });
+}
+
+function validateV2ExitStatus(outcome, exitCode, signal, label) {
+  const codeValid = exitCode === null ||
+    (Number.isSafeInteger(exitCode) && exitCode >= 0 && exitCode <= 255);
+  const signalValid = signal === null ||
+    (typeof signal === "string" && KNOWN_SIGNALS.has(signal));
+  if (!codeValid || !signalValid || (exitCode !== null && signal !== null) ||
+      (exitCode === null && signal === null)) {
+    throw new PinnedProtocolStateError(`${label} exit status is malformed`);
+  }
+  if (outcome === "pass" && !(exitCode === 0 && signal === null)) {
+    throw new PinnedProtocolStateError(`${label} pass status is inconsistent`);
+  }
+  if (outcome === "sigsegv" &&
+      !(exitCode === null && signal === "SIGSEGV")) {
+    throw new PinnedProtocolStateError(`${label} SIGSEGV status is inconsistent`);
+  }
+  if (outcome === "other-workload-failure" &&
+      (exitCode === 0 || signal === "SIGSEGV")) {
+    throw new PinnedProtocolStateError(`${label} other-workload-failure status is inconsistent`);
+  }
+}
+
+function stateObservationV2(record, child) {
+  try {
+    if (child === null || typeof child !== "object" || Array.isArray(child) ||
+        child.version !== PINNED_RUNNER_V2_VERSION || child.cpu !== record.cpu ||
+        child.validOutcome !== true || child.invalidReason !== null || child.canceled !== false ||
+        child.launchError !== null || child.launchState !== "launched" ||
+        !ISOLATED_V2_OUTCOMES.has(child.outcome)) {
+      return { valid: false, reason: "operational-invalid" };
+    }
+    validateV2ExitStatus(child.outcome, child.exitCode, child.signal, "child");
+    const noTurbo = normalizeNoTurbo(child.noTurbo);
+    if (noTurbo.start.status !== "observed" || noTurbo.end.status !== "observed") {
+      return { valid: false, reason: "operational-invalid" };
+    }
+    return {
+      valid: true,
+      observation: Object.freeze({
+        record,
+        outcome: child.outcome,
+        exitCode: child.exitCode,
+        signal: child.signal,
+        stderr: normalizeStderrEvidence(child.stderrEvidence),
+        timing: normalizeTiming(child.timing),
+        noTurbo,
+      }),
+    };
+  } catch {
+    return { valid: false, reason: "operational-invalid" };
+  }
+}
+
 function validateStoredObservation(value, recordValidator, label) {
   exactObjectKeys(value, ["record", "rc", "timing", "noTurbo"], label);
   recordValidator(value.record, `${label}.record`);
@@ -786,7 +879,50 @@ function validateStoredObservation(value, recordValidator, label) {
   return value;
 }
 
-function validateIsolatedState(value, expectedPlan, generation, expectedRecord, label) {
+function validateStoredObservationV2(value, recordValidator, label) {
+  exactObjectKeys(value, [
+    "record", "outcome", "exitCode", "signal", "stderr", "timing", "noTurbo",
+  ], label);
+  recordValidator(value.record, `${label}.record`);
+  if (!ISOLATED_V2_OUTCOMES.has(value.outcome)) {
+    throw new PinnedProtocolStateError(`${label}.outcome is invalid`);
+  }
+  validateV2ExitStatus(value.outcome, value.exitCode, value.signal, label);
+  normalizeStderrEvidence(value.stderr, `${label}.stderr`);
+  normalizeTiming(value.timing);
+  const noTurbo = normalizeNoTurbo(value.noTurbo);
+  if (noTurbo.start.status !== "observed" || noTurbo.end.status !== "observed") {
+    throw new PinnedProtocolStateError(`${label} has an unsafe no_turbo boundary`);
+  }
+  return value;
+}
+
+function validateIsolatedState(value, expectedPlan, generation, expectedRecord, label, stateVersion) {
+  if (stateVersion === PINNED_PROTOCOL_STATE_V2_VERSION) {
+    exactObjectKeys(value, [
+      "version", "protocol", "generation", "planSha", "record", "outcome", "exitCode",
+      "signal", "stderr", "timing", "noTurbo",
+    ], label);
+    if (value.version !== PINNED_PROTOCOL_STATE_V2_VERSION || value.protocol !== "isolated-v2") {
+      throw new PinnedProtocolStateError(`${label} has an unsupported state version or protocol`);
+    }
+    if (value.generation !== generation || value.planSha !== expectedPlan.planSha) {
+      throw new PinnedProtocolStateError(`${label} does not match its generation and plan digest`);
+    }
+    validateStoredObservationV2({
+      record: value.record,
+      outcome: value.outcome,
+      exitCode: value.exitCode,
+      signal: value.signal,
+      stderr: value.stderr,
+      timing: value.timing,
+      noTurbo: value.noTurbo,
+    }, validateIsolatedRecord, label);
+    if (!sameRecord(value.record, expectedRecord)) {
+      throw new PinnedProtocolStateError(`${label} is not the exact next isolated plan record`);
+    }
+    return value;
+  }
   exactObjectKeys(value, [
     "version", "protocol", "generation", "planSha", "record", "rc", "timing", "noTurbo",
   ], label);
@@ -806,6 +942,14 @@ function validateIsolatedState(value, expectedPlan, generation, expectedRecord, 
     throw new PinnedProtocolStateError(`${label} is not the exact next isolated plan record`);
   }
   return value;
+}
+
+function isolatedStateVersion(options) {
+  const version = options?.stateVersion ?? PINNED_PROTOCOL_STATE_VERSION;
+  if (version !== PINNED_PROTOCOL_STATE_VERSION && version !== PINNED_PROTOCOL_STATE_V2_VERSION) {
+    throw new PinnedProtocolInputError("isolated state version must be 1 or 2");
+  }
+  return version;
 }
 
 function expectedConcurrentWave(plan, cursor) {
@@ -883,6 +1027,7 @@ function relevantStateNames(names, protocol) {
 
 export async function readIsolatedProgress(options) {
   const plan = assertPlan(options?.plan, "isolated");
+  const stateVersion = isolatedStateVersion(options);
   const generation = validateGeneration(options.generation);
   const adapter = resolveStateAdapter(options);
   const names = relevantStateNames(await adapterList(adapter), "isolated");
@@ -895,12 +1040,15 @@ export async function readIsolatedProgress(options) {
     }
     const bytes = await adapterRead(adapter, names[cursor].name, DEFAULT_STATE_FILE_MAX_BYTES);
     const state = decodeCanonicalState(bytes, DEFAULT_STATE_FILE_MAX_BYTES, names[cursor].name);
-    states.push(validateIsolatedState(state, plan, generation, expected, names[cursor].name));
+    states.push(validateIsolatedState(
+      state, plan, generation, expected, names[cursor].name, stateVersion,
+    ));
   }
   return Object.freeze({
     protocol: "isolated",
     generation,
     planSha: plan.planSha,
+    stateVersion,
     states: Object.freeze(states),
     committedRecords: states.length,
     nextRecord: plan.records[states.length] ?? null,
@@ -964,12 +1112,18 @@ function validateAbortSignal(signal) {
   return signal;
 }
 
-function childOptions(options, cpu, signal) {
+function childOptions(options, cpu, signal, runnerVersion = PINNED_RUNNER_VERSION) {
   const supplied = options.childOptions ?? {};
   if (supplied === null || typeof supplied !== "object" || Array.isArray(supplied)) {
     throw new PinnedProtocolInputError("childOptions must be an object");
   }
-  return { ...supplied, cpu, signal };
+  return {
+    ...supplied,
+    cpu,
+    signal,
+    runnerVersion,
+    ...(runnerVersion === PINNED_RUNNER_V2_VERSION ? { stderrBytes: DEFAULT_STDERR_BYTES } : {}),
+  };
 }
 
 function isolatedState(generation, plan, observation) {
@@ -985,8 +1139,59 @@ function isolatedState(generation, plan, observation) {
   };
 }
 
+function isolatedStateV2(generation, plan, observation) {
+  return {
+    version: PINNED_PROTOCOL_STATE_V2_VERSION,
+    protocol: "isolated-v2",
+    generation,
+    planSha: plan.planSha,
+    record: observation.record,
+    outcome: observation.outcome,
+    exitCode: observation.exitCode,
+    signal: observation.signal,
+    stderr: observation.stderr,
+    timing: observation.timing,
+    noTurbo: observation.noTurbo,
+  };
+}
+
+function boundedOperationalAttempt(record, child, reason) {
+  const attempt = {
+    record,
+    classification: "operational-invalid",
+    reason,
+    runnerVersion: Number.isSafeInteger(child?.version) ? child.version : null,
+    outcome: typeof child?.outcome === "string" && child.outcome.length <= 64 ? child.outcome : null,
+    exitCode: Number.isSafeInteger(child?.exitCode) ? child.exitCode : null,
+    signal: typeof child?.signal === "string" && child.signal.length <= 64 ? child.signal : null,
+    canceled: child?.canceled === true,
+    launchState: typeof child?.launchState === "string" && child.launchState.length <= 64
+      ? child.launchState
+      : null,
+    invalidReason: typeof child?.invalidReason === "string" && child.invalidReason.length <= 64
+      ? child.invalidReason
+      : null,
+  };
+  try { attempt.timing = normalizeTiming(child?.timing); } catch { attempt.timing = null; }
+  try { attempt.noTurbo = normalizeNoTurbo(child?.noTurbo); } catch { attempt.noTurbo = null; }
+  try { attempt.stderr = normalizeStderrEvidence(child?.stderrEvidence); } catch { attempt.stderr = null; }
+  if (child?.launchError !== null && typeof child?.launchError === "object") {
+    const code = typeof child.launchError.code === "string" && ERROR_CODE_RE.test(child.launchError.code)
+      ? child.launchError.code
+      : "LAUNCH_ERROR";
+    const message = typeof child.launchError.message === "string"
+      ? child.launchError.message.slice(0, 4_096)
+      : "launch error";
+    attempt.launchError = { code, message };
+  } else {
+    attempt.launchError = null;
+  }
+  return Object.freeze(attempt);
+}
+
 export async function runIsolatedAttempt(options) {
   const plan = assertPlan(options?.plan, "isolated");
+  const stateVersion = isolatedStateVersion(options);
   const runner = validateRunner(options.runChild);
   validateAbortSignal(options.signal);
   const progress = await readIsolatedProgress(options);
@@ -996,24 +1201,50 @@ export async function runIsolatedAttempt(options) {
   const record = progress.nextRecord;
   let child;
   try {
-    child = await runner(childOptions(options, record.cpu, options.signal));
+    child = await runner(childOptions(
+      options,
+      record.cpu,
+      options.signal,
+      stateVersion === PINNED_PROTOCOL_STATE_V2_VERSION
+        ? PINNED_RUNNER_V2_VERSION
+        : PINNED_RUNNER_VERSION,
+    ));
   } catch (error) {
-    return Object.freeze({
+    const rejected = {
       committed: false,
-      reason: "runner-error",
+      reason: stateVersion === PINNED_PROTOCOL_STATE_V2_VERSION
+        ? "operational-invalid"
+        : "runner-error",
       errorCode: runnerErrorCode(error),
       record,
-    });
+    };
+    if (stateVersion === PINNED_PROTOCOL_STATE_V2_VERSION) {
+      rejected.attempt = Object.freeze({
+        record,
+        classification: "operational-invalid",
+        reason: "runner-error",
+        errorCode: runnerErrorCode(error),
+      });
+    }
+    return Object.freeze(rejected);
   }
-  const normalized = stateObservation(record, child);
+  const normalized = stateVersion === PINNED_PROTOCOL_STATE_V2_VERSION
+    ? stateObservationV2(record, child)
+    : stateObservation(record, child);
   if (!normalized.valid) {
-    return Object.freeze({
+    const rejected = {
       committed: false,
       reason: normalized.reason,
       record,
-    });
+    };
+    if (stateVersion === PINNED_PROTOCOL_STATE_V2_VERSION) {
+      rejected.attempt = boundedOperationalAttempt(record, child, normalized.reason);
+    }
+    return Object.freeze(rejected);
   }
-  const state = isolatedState(progress.generation, plan, normalized.observation);
+  const state = stateVersion === PINNED_PROTOCOL_STATE_V2_VERSION
+    ? isolatedStateV2(progress.generation, plan, normalized.observation)
+    : isolatedState(progress.generation, plan, normalized.observation);
   const bytes = canonicalProtocolJsonLine(state);
   if (bytes.length > DEFAULT_STATE_FILE_MAX_BYTES) {
     throw new PinnedProtocolStateError("isolated state exceeds its byte limit");
@@ -1145,6 +1376,32 @@ function isolatedBoundary(observation) {
   };
 }
 
+function isolatedBoundaryV2(observation) {
+  const { record, timing, noTurbo, stderr } = observation;
+  return {
+    ordinal: record.ordinal,
+    round: record.round,
+    position: record.position,
+    cpu: record.cpu,
+    outcome: observation.outcome,
+    exitCode: observation.exitCode,
+    signal: observation.signal,
+    stderrSha256: stderr.sha256,
+    stderrBytes: stderr.bytes,
+    stderrExcerptBase64: stderr.excerptBase64,
+    stderrExcerptBytes: stderr.excerptBytes,
+    stderrTruncated: stderr.truncated,
+    startUnixMs: timing.startEpochMs,
+    endUnixMs: timing.endEpochMs,
+    startMonotonicNs: timing.startMonotonicNs,
+    endMonotonicNs: timing.endMonotonicNs,
+    durationNs: timing.durationNs,
+    durationMs: timing.durationMs,
+    noTurboStart: boundaryNoTurbo(noTurbo.start),
+    noTurboEnd: boundaryNoTurbo(noTurbo.end),
+  };
+}
+
 function concurrentBoundary(observation) {
   const { record, timing, noTurbo } = observation;
   return {
@@ -1179,12 +1436,22 @@ function renderBoundaries(observations, mapper) {
 }
 
 function isolatedObservations(progress) {
-  return progress.states.map((state) => ({
-    record: state.record,
-    rc: state.rc,
-    timing: state.timing,
-    noTurbo: state.noTurbo,
-  }));
+  return progress.states.map((state) => progress.stateVersion === PINNED_PROTOCOL_STATE_V2_VERSION
+    ? {
+      record: state.record,
+      outcome: state.outcome,
+      exitCode: state.exitCode,
+      signal: state.signal,
+      stderr: state.stderr,
+      timing: state.timing,
+      noTurbo: state.noTurbo,
+    }
+    : {
+      record: state.record,
+      rc: state.rc,
+      timing: state.timing,
+      noTurbo: state.noTurbo,
+    });
 }
 
 function concurrentObservations(progress) {
@@ -1193,6 +1460,7 @@ function concurrentObservations(progress) {
 
 export async function finalizeIsolatedProtocol(options) {
   const plan = assertPlan(options?.plan, "isolated");
+  const stateVersion = isolatedStateVersion(options);
   const progress = await readIsolatedProgress(options);
   if (!progress.complete) {
     throw new PinnedProtocolStateError(
@@ -1200,10 +1468,26 @@ export async function finalizeIsolatedProtocol(options) {
     );
   }
   const observations = isolatedObservations(progress);
-  const results = Buffer.from(observations.map((observation) =>
-    `${observation.record.cpu}\t${observation.record.round}\t${observation.rc}\t${observation.timing.elapsedSec}\n`,
-  ).join(""), "utf8");
-  const boundaries = renderBoundaries(observations, isolatedBoundary);
+  const results = stateVersion === PINNED_PROTOCOL_STATE_V2_VERSION
+    ? Buffer.from(`${ISOLATED_V2_RESULTS_HEADER}\n${observations.map((observation) => [
+      observation.record.ordinal,
+      observation.record.round,
+      observation.record.position,
+      observation.record.cpu,
+      observation.outcome,
+      observation.exitCode ?? "-",
+      observation.signal ?? "-",
+      observation.timing.elapsedSec,
+      observation.stderr.sha256,
+      observation.stderr.bytes,
+    ].join("\t")).join("\n")}\n`, "utf8")
+    : Buffer.from(observations.map((observation) =>
+      `${observation.record.cpu}\t${observation.record.round}\t${observation.rc}\t${observation.timing.elapsedSec}\n`,
+    ).join(""), "utf8");
+  const boundaries = renderBoundaries(
+    observations,
+    stateVersion === PINNED_PROTOCOL_STATE_V2_VERSION ? isolatedBoundaryV2 : isolatedBoundary,
+  );
   const bindings = Object.freeze({
     plan: plan.binding,
     results: protocolFileBinding(results, observations.length),
@@ -1211,6 +1495,7 @@ export async function finalizeIsolatedProtocol(options) {
   });
   return Object.freeze({
     protocol: "isolated",
+    stateVersion,
     generation: progress.generation,
     planSha: plan.planSha,
     individualTsv: results,
@@ -1393,13 +1678,14 @@ function cliPlan(parsed, protocol) {
   return buildPinnedConcurrentPlan({ contexts, rounds, seed });
 }
 
-function cliExecutionOptions(parsed, plan, signal, runChild) {
+function cliExecutionOptions(parsed, plan, signal, runChild, stateVersion = PINNED_PROTOCOL_STATE_VERSION) {
   return {
     plan,
     generation: requireCliValue(parsed, "--generation"),
     stateDir: validateAbsolutePath(requireCliValue(parsed, "--state-dir"), "--state-dir"),
     signal,
     runChild,
+    stateVersion,
     childOptions: {
       command: requireCliValue(parsed, "--command"),
       args: parsed.args,
@@ -1428,6 +1714,8 @@ Pure deterministic plan commands:
 Resume-frontier validation (prints canonical JSON):
   next-isolated --cpus LIST --rounds N --seed N --generation HEX32
                 --state-dir DIR
+  next-isolated-v2 --cpus LIST --rounds N --seed N --generation HEX32
+                   --state-dir DIR
   next-concurrent --contexts-file FILE --rounds N --seed N --generation HEX32
                   --state-dir DIR
 
@@ -1435,6 +1723,9 @@ Execute exactly one commit unit:
   attempt-isolated --cpus LIST --rounds N --seed N --generation HEX32
                    --state-dir DIR --command FILE [--arg VALUE ...]
                    [--cwd DIR] [--no-turbo-path FILE]
+  attempt-isolated-v2 --cpus LIST --rounds N --seed N --generation HEX32
+                      --state-dir DIR --command FILE [--arg VALUE ...]
+                      [--cwd DIR] [--no-turbo-path FILE]
   wave-concurrent --contexts-file FILE --rounds N --seed N --generation HEX32
                   --state-dir DIR --command FILE [--arg VALUE ...]
                   [--cwd DIR] [--no-turbo-path FILE]
@@ -1443,6 +1734,9 @@ Finalize a complete immutable state prefix into caller-chosen staging files:
   finalize-isolated --cpus LIST --rounds N --seed N --generation HEX32
                     --state-dir DIR --results-output FILE
                     --boundaries-output FILE
+  finalize-isolated-v2 --cpus LIST --rounds N --seed N --generation HEX32
+                       --state-dir DIR --results-output FILE
+                       --boundaries-output FILE
   finalize-concurrent --contexts-file FILE --rounds N --seed N --generation HEX32
                       --state-dir DIR --results-output FILE
                       --boundaries-output FILE
@@ -1482,10 +1776,17 @@ export async function runPinnedProtocolCli(argv, io = {}) {
       stdout.write(`${cliUsage()}\n`);
       return 0;
     }
-    const isolated = parsed.command.endsWith("isolated");
+    const isolatedCommands = new Set([
+      "plan-isolated", "next-isolated", "attempt-isolated", "finalize-isolated",
+      "next-isolated-v2", "attempt-isolated-v2", "finalize-isolated-v2",
+    ]);
+    const isolated = isolatedCommands.has(parsed.command);
     const concurrent = parsed.command.endsWith("concurrent");
     if (!isolated && !concurrent) throw new PinnedProtocolInputError(`unknown command: ${parsed.command}`);
     const protocol = isolated ? "isolated" : "concurrent";
+    const stateVersion = parsed.command.endsWith("-isolated-v2")
+      ? PINNED_PROTOCOL_STATE_V2_VERSION
+      : PINNED_PROTOCOL_STATE_VERSION;
     const planFlags = protocol === "isolated"
       ? new Set(["--cpus", "--rounds", "--seed"])
       : new Set(["--contexts-file", "--rounds", "--seed"]);
@@ -1520,6 +1821,7 @@ export async function runPinnedProtocolCli(argv, io = {}) {
           plan,
           generation: requireCliValue(parsed, "--generation"),
           stateDir: validateAbsolutePath(requireCliValue(parsed, "--state-dir"), "--state-dir"),
+          stateVersion,
         })
         : await readConcurrentProgress({
           plan,
@@ -1545,7 +1847,8 @@ export async function runPinnedProtocolCli(argv, io = {}) {
       return 0;
     }
 
-    if (parsed.command === "attempt-isolated" || parsed.command === "wave-concurrent") {
+    if (parsed.command === "attempt-isolated" || parsed.command === "attempt-isolated-v2" ||
+        parsed.command === "wave-concurrent") {
       const allowed = new Set([
         ...stateFlags,
         "--command", "--arg", "--cwd", "--no-turbo-path",
@@ -1553,7 +1856,7 @@ export async function runPinnedProtocolCli(argv, io = {}) {
       rejectUnexpectedCliOptions(parsed, allowed);
       const plan = cliPlan(parsed, protocol);
       const result = await withCliAbort(signalSource, (signal) => {
-        const options = cliExecutionOptions(parsed, plan, signal, io.runChild);
+        const options = cliExecutionOptions(parsed, plan, signal, io.runChild, stateVersion);
         return protocol === "isolated"
           ? runIsolatedAttempt(options)
           : runConcurrentWave(options);
@@ -1570,6 +1873,7 @@ export async function runPinnedProtocolCli(argv, io = {}) {
         plan,
         generation: requireCliValue(parsed, "--generation"),
         stateDir: validateAbsolutePath(requireCliValue(parsed, "--state-dir"), "--state-dir"),
+        stateVersion,
       };
       const finalized = protocol === "isolated"
         ? await finalizeIsolatedProtocol(base)

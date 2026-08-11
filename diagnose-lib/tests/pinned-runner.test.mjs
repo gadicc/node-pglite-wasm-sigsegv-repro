@@ -14,8 +14,10 @@ import {
   buildConcurrentLaunchOrders,
   buildIsolatedOrders,
   classifyChildOutcome,
+  classifyIndividualChildOutcomeV2,
   compressCpuList,
   defaultPinnedLauncher,
+  defaultPinnedLauncherV2,
   expandCpuList,
   flattenCpuOrders,
   flattenGroupOrders,
@@ -220,6 +222,39 @@ test("default launcher stays in the outer supervisor group and signals only its 
   assert.ok(killCalls.every(([pid]) => pid > 0), "must never address a process group with a negative PID");
 });
 
+test("V2 launcher pins the verifier worker and keeps workload status on a private protocol stream", () => {
+  const child = { pid: 42_425, stdout: new PassThrough() };
+  const spawnCalls = [];
+  const descriptor = defaultPinnedLauncherV2({
+    cpu: 12,
+    command: "/mock/node",
+    args: ["/mock/child.mjs"],
+    cwd: "/mock/repo",
+    env: { DIAG_TEST_FORBID_WORKLOAD: "1" },
+    stderrBytes: 16_384,
+    tasksetPath: "/mock/taskset",
+    shellPath: "/mock/bash",
+  }, {
+    spawnProcess(file, args, options) {
+      spawnCalls.push({ file, args, options });
+      return child;
+    },
+    killProcess() {},
+  });
+  assert.equal(descriptor.launchProtocol, child.stdout);
+  assert.equal(spawnCalls[0].file, "/mock/bash");
+  assert.deepEqual(spawnCalls[0].args.slice(0, 8), [
+    "-c", "ulimit -c 0; exec \"$@\"", "pinned-runner-v2",
+    "/mock/taskset", "-c", "12", "--", process.execPath,
+  ]);
+  assert.match(spawnCalls[0].args[8], /pinned-launch-worker\.mjs$/);
+  assert.deepEqual(spawnCalls[0].args.slice(9), [
+    "12", "16384", "/mock/node", "/mock/child.mjs",
+  ]);
+  assert.deepEqual(spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe"]);
+  assert.equal(spawnCalls[0].options.detached, false);
+});
+
 test("default launcher cancellation escalates TERM to bounded direct-child KILL without spawning", async () => {
   const child = new EventEmitter();
   child.pid = 51_515;
@@ -309,11 +344,12 @@ function scriptedLauncher(script = {}) {
     if (!script.neverExit) {
       setImmediate(() => {
         if (script.launchError) child.emit("error", script.launchError);
-        finish(script.exitCode ?? 0, script.signal ?? null);
+        finish(Object.hasOwn(script, "exitCode") ? script.exitCode : 0, script.signal ?? null);
       });
     }
     return {
       child,
+      ...(script.secureLaunch ? { secureLaunch: true } : {}),
       cancel(signal) {
         cancelSignals.push(signal);
         if (script.closeOnCancel !== false) queueMicrotask(() => finish(null, signal));
@@ -368,6 +404,106 @@ test("runPinnedChild emits canonical JSON-safe boundaries and bounded stderr", a
   assert.equal(result.stderrTruncated, true);
   assert.equal(result.launchError, null);
   assert.doesNotThrow(() => JSON.stringify(result));
+});
+
+test("V2 classifies securely launched workload failures without changing V1 semantics", () => {
+  for (const status of [
+    { exitCode: 1, signal: null },
+    { exitCode: null, signal: "SIGILL" },
+    { exitCode: null, signal: "SIGABRT" },
+  ]) {
+    assert.deepEqual(classifyIndividualChildOutcomeV2({ ...status, secureLaunch: true }), {
+      outcome: "other-workload-failure", validOutcome: true, invalidReason: null,
+    });
+    assert.equal(classifyChildOutcome(status).validOutcome, false);
+  }
+  assert.deepEqual(
+    classifyIndividualChildOutcomeV2({ exitCode: 139, signal: null, secureLaunch: true }),
+    { outcome: "other-workload-failure", validOutcome: true, invalidReason: null },
+  );
+  assert.deepEqual(classifyChildOutcome({ exitCode: 139, signal: null }), {
+    outcome: "sigsegv", validOutcome: true, invalidReason: null,
+  });
+  for (const status of [
+    { exitCode: 1, signal: null, secureLaunch: false },
+    { exitCode: 1, signal: null, secureLaunch: true, canceled: true },
+    { exitCode: 0, signal: null, secureLaunch: true, launchError: new Error("launch") },
+    { exitCode: 1, signal: "SIGILL", secureLaunch: true },
+    { exitCode: null, signal: "SIGBANANA", secureLaunch: true },
+  ]) {
+    assert.equal(classifyIndividualChildOutcomeV2(status).outcome, "operational-invalid");
+    assert.equal(classifyIndividualChildOutcomeV2(status).validOutcome, false);
+  }
+});
+
+test("runPinnedChild V2 retains exact status and bounded stderr evidence", async () => {
+  for (const script of [
+    { exitCode: 1, signal: null, stderr: "exit one", expectedSignal: null },
+    { exitCode: null, signal: "SIGILL", stderr: "illegal", expectedSignal: "SIGILL" },
+    { exitCode: null, signal: "SIGABRT", stderr: "abort", expectedSignal: "SIGABRT" },
+  ]) {
+    const fake = scriptedLauncher({ ...script, secureLaunch: true });
+    const result = await runPinnedChild({
+      runnerVersion: 2,
+      cpu: 19,
+      command: "/mock/node",
+      launcher: fake.launcher,
+      clock: scriptedClock(),
+      noTurboReader: scriptedNoTurbo([0, 0]),
+      stderrBytes: 4,
+    });
+    assert.equal(result.outcome, "other-workload-failure");
+    assert.equal(result.validOutcome, true);
+    assert.equal(result.exitCode, script.exitCode);
+    assert.equal(result.signal, script.expectedSignal);
+    assert.equal(result.launchState, "launched");
+    assert.equal(result.stderrEvidence.excerptBytes, 4);
+    assert.equal(result.stderrEvidence.bytes, String(Buffer.byteLength(script.stderr)));
+    assert.equal(result.stderrEvidence.truncated, Buffer.byteLength(script.stderr) > 4);
+    assert.match(result.stderrEvidence.sha256, /^[a-f0-9]{64}$/);
+  }
+});
+
+test("runPinnedChild V2 makes unverified launch and cancellation operational-invalid", async () => {
+  const unverified = await runPinnedChild({
+    runnerVersion: 2,
+    cpu: 19,
+    command: "/mock/node",
+    launcher: scriptedLauncher({ exitCode: 1 }).launcher,
+    clock: scriptedClock(),
+    noTurboReader: scriptedNoTurbo([0, 0]),
+  });
+  assert.equal(unverified.outcome, "operational-invalid");
+  assert.equal(unverified.invalidReason, "launch-error");
+
+  const controller = new AbortController();
+  controller.abort();
+  const canceled = await runPinnedChild({
+    runnerVersion: 2,
+    cpu: 19,
+    command: "/mock/node",
+    launcher: scriptedLauncher({ secureLaunch: true }).launcher,
+    clock: scriptedClock(),
+    noTurboReader: scriptedNoTurbo([0, 0]),
+    signal: controller.signal,
+  });
+  assert.equal(canceled.outcome, "operational-invalid");
+  assert.equal(canceled.invalidReason, "canceled");
+
+  const unsafeBoundary = await runPinnedChild({
+    runnerVersion: 2,
+    cpu: 19,
+    command: "/mock/node",
+    launcher: scriptedLauncher({ secureLaunch: true }).launcher,
+    clock: scriptedClock(),
+    noTurboReader: scriptedNoTurbo([
+      { status: "unavailable", value: null, errorCode: "ENOENT" },
+      { status: "observed", value: 0, errorCode: null },
+    ]),
+  });
+  assert.equal(unsafeBoundary.outcome, "operational-invalid");
+  assert.equal(unsafeBoundary.validOutcome, false);
+  assert.equal(unsafeBoundary.invalidReason, "unsafe-boundary");
 });
 
 test("runPinnedChild keeps exit 139 valid but rejects launcher and other exits", async () => {

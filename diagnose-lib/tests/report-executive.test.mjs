@@ -136,6 +136,102 @@ test("Executive Summary retains zero-failure contexts beside a failing context",
   assert.match(report, /ecluster-64: 3\/200 = 1\.5%.*all-ecores: no failures observed \(0\/200; 95% upper < 1\.5%\)/s);
 });
 
+test("V6 reports other workload failures without counting them as pass or SIGSEGV evidence", () => {
+  const report = renderReport(base({
+    individualStatus: {
+      status: "complete",
+      reasons: [],
+      metadataVersion: "6",
+      targetPolicy: "all-usable-cpus",
+      protocol: "isolated-outcomes-v2",
+      scheduleAlgorithm: "balanced-cyclic-v1",
+      scheduleSeed: 42,
+      otherWorkloadFailures: 2,
+      primaryEligibleRuns: 1,
+    },
+    individual: [
+      {
+        cpu: 8,
+        observations: 2,
+        runs: 1,
+        passes: 1,
+        failures: 0,
+        sigsegv: 0,
+        otherFailures: 1,
+        otherWorkloadFailures: 1,
+        invalidRuns: [],
+        failedRuns: [],
+        otherWorkloadFailureDetails: [{
+          run: 1,
+          position: 1,
+          outcome: "other-workload-failure",
+          exitCode: 1,
+          signal: null,
+          elapsedSec: 0,
+          stderrSha256: "d".repeat(64),
+          stderrBytes: "9",
+        }],
+      },
+      {
+        cpu: 9,
+        observations: 1,
+        runs: 0,
+        passes: 0,
+        failures: 0,
+        sigsegv: 0,
+        otherFailures: 1,
+        otherWorkloadFailures: 1,
+        invalidRuns: [],
+        failedRuns: [],
+        otherWorkloadFailureDetails: [{
+          run: 1,
+          position: 2,
+          outcome: "other-workload-failure",
+          exitCode: null,
+          signal: "SIGABRT",
+          elapsedSec: 0,
+          stderrSha256: "e".repeat(64),
+          stderrBytes: "6",
+        }],
+      },
+    ],
+    worstCpu: null,
+    pinnedConcurrentStatus: { status: "not-run", reasons: [], authoritative: false },
+    pinnedConcurrent: undefined,
+    gdb: undefined,
+    telemetryAssociations: {
+      individual: {
+        status: "complete",
+        totalRuns: 1,
+        joinedRuns: 1,
+        recentPreRuns: 1,
+        duringCoveredRuns: 1,
+        byContextOutcome: [{
+          context: "isolated",
+          outcome: "other-workload-failure",
+          runs: 1,
+          joinedRuns: 1,
+          recentPreRuns: 1,
+          duringCoveredRuns: 1,
+          pre: {},
+          during: {},
+        }],
+        byCpu: [],
+        topology: [],
+      },
+    },
+  }));
+  assert.match(report, /no confirmed SIGSEGV appears in complete, validated workload evidence/);
+  assert.doesNotMatch(report, /Result — fault reproduced/);
+  assert.match(report, /V6 classifies securely launched nonzero exits and non-SIGSEGV signals/);
+  assert.match(report, /\| 8 \| 2 \| 1 \| 0 \| 1 \|/);
+  assert.match(report, /\| 9 \| 1 \| 0 \| 0 \| 1 \| no primary-eligible observations; no interval/);
+  assert.match(report, /exit 1, stderr d{12}…/);
+  assert.match(report, /SIGABRT, stderr e{12}…/);
+  assert.match(report, /Workload failures occurred across 3 child-process runs, but none were confirmed as SIGSEGV \(2 classified other failure/);
+  assert.doesNotMatch(report, /Invalid failure-count evidence was excluded/);
+});
+
 test("a validated GDB-only signature names its exact logical CPU", () => {
   const report = renderReport(base({
     individualStatus: { status: "not-run", reasons: [] },
