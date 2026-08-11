@@ -429,7 +429,6 @@ export function defaultPinnedLauncherV2({
     tasksetPath,
     "-c",
     String(cpu),
-    "--",
     process.execPath,
     PINNED_LAUNCH_WORKER,
     String(cpu),

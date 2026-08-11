@@ -243,12 +243,12 @@ test("V2 launcher pins the verifier worker and keeps workload status on a privat
   });
   assert.equal(descriptor.launchProtocol, child.stdout);
   assert.equal(spawnCalls[0].file, "/mock/bash");
-  assert.deepEqual(spawnCalls[0].args.slice(0, 8), [
+  assert.deepEqual(spawnCalls[0].args.slice(0, 7), [
     "-c", "ulimit -c 0; exec \"$@\"", "pinned-runner-v2",
-    "/mock/taskset", "-c", "12", "--", process.execPath,
+    "/mock/taskset", "-c", "12", process.execPath,
   ]);
-  assert.match(spawnCalls[0].args[8], /pinned-launch-worker\.mjs$/);
-  assert.deepEqual(spawnCalls[0].args.slice(9), [
+  assert.match(spawnCalls[0].args[7], /pinned-launch-worker\.mjs$/);
+  assert.deepEqual(spawnCalls[0].args.slice(8), [
     "12", "16384", "/mock/node", "/mock/child.mjs",
   ]);
   assert.deepEqual(spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe"]);
