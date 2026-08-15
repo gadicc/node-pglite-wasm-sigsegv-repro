@@ -8,6 +8,7 @@ import {
   rmSync,
   symlinkSync,
   truncateSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -649,6 +650,28 @@ test("version 6 shell commands validate final bindings and the complete bundle",
   assert.equal(bundle.status, 0, bundle.stderr.toString());
   assert.match(bundle.stdout.toString(), /^STATUS=complete$/m);
   assert.match(bundle.stdout.toString(), /^COMMON_PREFIX_ROW_COUNT=6$/m);
+
+  const completeValidation = spawnSync(process.execPath, [
+    script, "v6-validate-complete", fixture.dir,
+  ]);
+  assert.equal(completeValidation.status, 0, completeValidation.stderr.toString());
+
+  unlinkSync(path.join(fixture.dir, "state", "phase-individual.done"));
+  const publicationAssessment = assessIndividualEvidence(fixture.dir).assessment;
+  assert.equal(publicationAssessment.status, "incomplete");
+  assert.equal(publicationAssessment.publicationReady, true);
+  assert.deepEqual(publicationAssessment.reasons, ["phase completion marker is missing"]);
+
+  const publicationValidation = spawnSync(process.execPath, [
+    script, "v6-validate-complete", fixture.dir,
+  ]);
+  assert.equal(publicationValidation.status, 0, publicationValidation.stderr.toString());
+
+  const incomplete = writeV6Bundle({ completed: false });
+  const incompleteValidation = spawnSync(process.execPath, [
+    script, "v6-validate-complete", incomplete.dir,
+  ]);
+  assert.equal(incompleteValidation.status, 1);
 });
 
 test("version 6 preserves no-follow, single-link, and artifact-size protections", () => {

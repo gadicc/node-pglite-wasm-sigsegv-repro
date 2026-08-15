@@ -1376,8 +1376,8 @@ export function assessIndividual(rows, meta, phaseDone, metaState = {}) {
       reasons.push(`completed version ${meta.VERSION} evidence does not contain every planned result and boundary`);
       invalid = true;
     }
-    if (completed === true && !phaseDone) {
-      reasons.push(`completed version ${meta.VERSION} evidence is missing its completion marker`);
+    if (isV5 && completed === true && !phaseDone) {
+      reasons.push("completed version 5 evidence is missing its completion marker");
       invalid = true;
     }
     if (completed === false && phaseDone) {
@@ -1388,6 +1388,9 @@ export function assessIndividual(rows, meta, phaseDone, metaState = {}) {
   if (!phaseDone) reasons.push("phase completion marker is missing");
   if (completed === false) reasons.push("individual metadata is not marked complete");
 
+  const uniqueReasons = [...new Set(reasons)];
+  const publicationReady = isV6 && !invalid && skipped === false && completed === true &&
+    !phaseDone && uniqueReasons.length === 1 && uniqueReasons[0] === "phase completion marker is missing";
   let status = "incomplete";
   if (invalid) status = "invalid";
   else if (skipped === true && phaseDone && completed === true && observedRowCount === 0) status = "skipped";
@@ -1395,7 +1398,7 @@ export function assessIndividual(rows, meta, phaseDone, metaState = {}) {
   const unambiguousRows = acceptedRows.filter((row) => !ambiguousCpus.has(Number(row[0])));
   const result = {
     status,
-    reasons: [...new Set(reasons)],
+    reasons: uniqueReasons,
     targetCpus: targetSet ? [...targetSet] : [],
     runsPerCpu,
     acceptedRows: unambiguousRows,
@@ -1408,6 +1411,7 @@ export function assessIndividual(rows, meta, phaseDone, metaState = {}) {
     groupGeneration: meta.GROUP_GENERATION ?? null,
   };
   if (isInterleaved) Object.assign(result, {
+    publicationReady,
     protocol: meta.PROTOCOL ?? null,
     scheduleSeed: canonicalUint(meta.SCHEDULE_SEED),
     scheduleAlgorithm: meta.SCHEDULE_ALGORITHM ?? null,
@@ -1927,7 +1931,7 @@ function worstCpuFromSummaries(summaries) {
 }
 
 function usage() {
-  console.error("usage: individual-evidence.mjs <meta|rows|binding|empty-binding|count|batch|bundle|v5-plan|v5-binding|v5-bundle|v6-binding|v6-bundle> ...");
+  console.error("usage: individual-evidence.mjs <meta|rows|binding|empty-binding|count|batch|bundle|v5-plan|v5-binding|v5-bundle|v6-binding|v6-bundle|v6-validate-complete> ...");
   process.exitCode = 2;
 }
 
@@ -2028,6 +2032,16 @@ function main(argv) {
     printShellMeta(evidence.metaState.values);
     console.log(`COMMON_PREFIX_ROW_COUNT=${assessment.commonPrefixRowCount ?? ""}`);
     if (assessment.metadataVersion !== "6" || assessment.status === "invalid") process.exitCode = 1;
+    return;
+  }
+  if (command === "v6-validate-complete" && args.length === 1) {
+    const { assessment } = assessIndividualEvidence(args[0], {
+      requiredOwner: process.geteuid?.() ?? process.getuid(),
+    });
+    if (assessment.metadataVersion !== "6" ||
+        (assessment.status !== "complete" && assessment.publicationReady !== true)) {
+      process.exitCode = 1;
+    }
     return;
   }
   if (command === "meta" && args.length === 1) {

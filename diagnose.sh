@@ -3090,6 +3090,40 @@ run_pinned_protocol_logged() {
   return "$rc"
 }
 
+# The isolated executor is deliberately a short-lived process around one
+# observation. If that process itself crashes, the observation state remains
+# the source of truth and the executor can be replaced without restarting the
+# phase. INT/TERM/HUP/QUIT remain operator controls rather than retry signals.
+isolated_executor_status_is_retryable_crash() {
+  case "${1:-}" in
+    132 | 133 | 134 | 135 | 136 | 137 | 139 | 141 | 152 | 153 | 159) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+ISOLATED_PROGRESS_COMMITTED=""
+ISOLATED_PROGRESS_COMPLETE=""
+isolated_protocol_progress_parse() {
+  # usage: isolated_protocol_progress_parse <json> <total> <minimum>
+  local progress="$1" total="$2" minimum="$3" committed complete
+  ISOLATED_PROGRESS_COMMITTED=""
+  ISOLATED_PROGRESS_COMPLETE=""
+  diag_is_uint "$total" && diag_is_uint "$minimum" && ((minimum <= total)) ||
+    return 1
+  [[ "$progress" =~ \"committedRecords\":([0-9]+) ]] || return 1
+  committed="${BASH_REMATCH[1]}"
+  [[ "$progress" =~ \"complete\":(true|false) ]] || return 1
+  complete="${BASH_REMATCH[1]}"
+  ((committed >= minimum && committed <= total)) || return 1
+  if [[ "$complete" == true ]]; then
+    ((committed == total)) || return 1
+  else
+    ((committed < total)) || return 1
+  fi
+  ISOLATED_PROGRESS_COMMITTED="$committed"
+  ISOLATED_PROGRESS_COMPLETE="$complete"
+}
+
 # The runner log is authoritative evidence: capture-fault.sh writes only its
 # canonical ATTEMPT/COUNTS records to stdout, so that stream goes directly
 # into an exclusively created private runner.log. Human progress stays on
@@ -3738,7 +3772,9 @@ phase_individual_v6() {
   local expected_generation expected_rows_sha expected_rows_bytes expected_row_count
   local expected_boundaries_sha expected_boundaries_bytes expected_boundary_rows
   local progress committed complete total output result stage staged_tsv staged_boundaries
+  local recovered_committed previous_committed retry_delay
   local protocol_rc=0 telemetry_segment="" telemetry_started=0
+  local executor_crashes=0 executor_crash_streak=0
 
   [[ "$RUN_SCHEMA_VERSION" == 2 && "$INDIVIDUAL_TARGET_POLICY" == all-usable-cpus &&
     "$INDIVIDUAL_TARGET_CPUS" == "$ONLINE_CPUS" ]] ||
@@ -3804,6 +3840,8 @@ phase_individual_v6() {
         "$TELEMETRY_RESUME_SEGMENTS_JSON" != "[]" ]]; then
         telemetry_phase_publish individual "$TELEMETRY_RESUME_SEGMENTS_JSON"
       fi
+      node "$LIB/individual-evidence.mjs" v6-validate-complete "$OUT_DIR" > /dev/null ||
+        diag_die "completed isolated evidence is not publication-ready before its marker"
       mark_done individual
       individual_evidence_read && [[ "$INDIVIDUAL_EVIDENCE_STATUS" == complete ]] ||
         diag_die "completed schema-2 individual evidence failed post-marker validation"
@@ -3848,13 +3886,13 @@ phase_individual_v6() {
     --seed "$PROTOCOL_SEED" --generation "$INDIVIDUAL_META_GENERATION" \
     --state-dir "$attempt_state")" ||
     diag_die "isolated resume state is not an exact contiguous plan prefix"
-  [[ "$progress" =~ \"committedRecords\":([0-9]+) ]] ||
-    diag_die "isolated executor returned malformed progress"
-  committed="${BASH_REMATCH[1]}"
-  [[ "$progress" =~ \"complete\":(true|false) ]] ||
-    diag_die "isolated executor omitted its completion state"
-  complete="${BASH_REMATCH[1]}"
-  ((committed <= total)) || diag_die "isolated executor state exceeds its immutable plan"
+  isolated_protocol_progress_parse "$progress" "$total" 0 ||
+    diag_die "isolated executor returned malformed or inconsistent progress"
+  committed="$ISOLATED_PROGRESS_COMMITTED"
+  complete="$ISOLATED_PROGRESS_COMPLETE"
+  if ((committed > 0)) && [[ "$complete" == false ]]; then
+    diag_log "isolated protocol: resuming from durable observation $committed/$total"
+  fi
   telemetry_resumable_prepare_descriptive individual individual-session-
   if [[ "$complete" == false && "$TELEMETRY_RESUME_AVAILABLE" == 1 ]]; then
     telemetry_segment="$TELEMETRY_RESUME_NEXT_SEGMENT"
@@ -3877,8 +3915,35 @@ phase_individual_v6() {
       --arg "$SCRIPT_DIR/child.mjs" --cwd "$SCRIPT_DIR" \
       --no-turbo-path "$no_turbo_path" || protocol_rc=$?
     result="$(<"$output")"
+    if [[ "$protocol_rc" != 0 ]] &&
+      isolated_executor_status_is_retryable_crash "$protocol_rc"; then
+      executor_crashes=$((executor_crashes + 1))
+      executor_crash_streak=$((executor_crash_streak + 1))
+      previous_committed="$committed"
+      progress="$(node "$LIB/pinned-protocol.mjs" next-isolated-v2 \
+        --cpus "$INDIVIDUAL_TARGET_CPUS" --rounds "$INDIVIDUAL_RUNS" \
+        --seed "$PROTOCOL_SEED" --generation "$INDIVIDUAL_META_GENERATION" \
+        --state-dir "$attempt_state")" ||
+        diag_die "isolated executor crashed and its durable frontier could not be validated"
+      isolated_protocol_progress_parse "$progress" "$total" "$committed" ||
+        diag_die "isolated executor crashed and its durable frontier regressed or became inconsistent"
+      recovered_committed="$ISOLATED_PROGRESS_COMMITTED"
+      complete="$ISOLATED_PROGRESS_COMPLETE"
+      if ((recovered_committed > previous_committed)); then
+        executor_crash_streak=0
+        diag_warn "isolated executor crashed after durably committing observation $recovered_committed/$total (rc=$protocol_rc); continuing from that commit"
+      else
+        retry_delay="$executor_crash_streak"
+        ((retry_delay <= 5)) || retry_delay=5
+        diag_warn "isolated executor crashed before its next commit (rc=$protocol_rc); durable frontier remains $recovered_committed/$total, restarting in ${retry_delay}s (crash $executor_crashes)"
+        sleep "$retry_delay"
+      fi
+      committed="$recovered_committed"
+      continue
+    fi
     [[ "$protocol_rc" == 0 && "$result" =~ \"committed\":true ]] ||
       diag_die "isolated attempt was operational-invalid (executor rc=$protocol_rc); phase remains resumable and the executor summary is $output"
+    executor_crash_streak=0
     committed=$((committed + 1))
     ((committed <= total)) || diag_die "isolated executor committed beyond its immutable plan"
     if ((committed == total || committed % 25 == 0)); then
@@ -3931,7 +3996,7 @@ phase_individual_v6() {
     TELEMETRY_DEGRADED=1
     diag_warn "isolated telemetry has no complete session envelope; workload evidence is retained"
   fi
-  individual_evidence_read && [[ "$INDIVIDUAL_EVIDENCE_STATUS" == incomplete ]] ||
+  node "$LIB/individual-evidence.mjs" v6-validate-complete "$OUT_DIR" > /dev/null ||
     diag_die "isolated evidence is not publication-ready before its marker"
   mark_done individual
   individual_evidence_read && [[ "$INDIVIDUAL_EVIDENCE_STATUS" == complete ]] ||

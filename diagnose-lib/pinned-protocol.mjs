@@ -504,6 +504,93 @@ function fsyncDirectory(directory) {
   }
 }
 
+const STATE_COMMIT_TEMP_RE =
+  /^\.(isolated-[0-9]{9}\.json|concurrent-[0-9]{9}-[a-z][a-z0-9_-]{0,63}\.json)\.([1-9][0-9]*)\.([a-f0-9]{16})\.(writing|ready)\.tmp$/;
+
+function processIsLive(pidText) {
+  const pid = Number(pidText);
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    throw new PinnedProtocolStateError("state commit temporary file has an invalid writer PID");
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    if (error?.code === "EPERM") return true;
+    throw new PinnedProtocolStateError("state commit writer identity could not be checked");
+  }
+}
+
+function recoverInterruptedStateCommits(directory) {
+  const names = listStableDirectory(directory);
+  const uid = typeof process.getuid === "function" ? BigInt(process.getuid()) : null;
+  const actions = [];
+  const finalNames = new Set();
+
+  for (const name of names) {
+    if (!name.startsWith(".isolated-") && !name.startsWith(".concurrent-")) continue;
+    const match = name.match(STATE_COMMIT_TEMP_RE);
+    if (match === null) continue;
+    const [, finalName, pid, , stage] = match;
+    if (finalNames.has(finalName)) {
+      throw new PinnedProtocolStateError("state contains multiple commit temporary files for one record");
+    }
+    finalNames.add(finalName);
+    if (processIsLive(pid)) {
+      throw new PinnedProtocolStateError("state contains a commit temporary file owned by a live writer");
+    }
+
+    const temporaryPath = path.join(directory, name);
+    const finalPath = path.join(directory, finalName);
+    const maximumBytes = finalName.startsWith("concurrent-")
+      ? MAX_WAVE_STATE_FILE_BYTES
+      : DEFAULT_STATE_FILE_MAX_BYTES;
+    let temporaryStat;
+    try {
+      temporaryStat = lstatSync(temporaryPath, { bigint: true });
+    } catch {
+      throw new PinnedProtocolStateError("state commit temporary file changed during recovery");
+    }
+    if (!temporaryStat.isFile() ||
+        (temporaryStat.nlink !== 1n && temporaryStat.nlink !== 2n) ||
+        temporaryStat.size > BigInt(maximumBytes) ||
+        (uid !== null && temporaryStat.uid !== uid) ||
+        (temporaryStat.mode & 0o077n) !== 0n) {
+      throw new PinnedProtocolStateError("state commit temporary file is not safe and private");
+    }
+
+    let finalStat = null;
+    try {
+      finalStat = lstatSync(finalPath, { bigint: true });
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw new PinnedProtocolStateError("state commit destination could not be inspected");
+      }
+    }
+    if (finalStat === null) {
+      if (temporaryStat.nlink !== 1n) {
+        throw new PinnedProtocolStateError("unpublished state commit temporary file has extra links");
+      }
+    } else if (stage !== "ready" || !finalStat.isFile() ||
+        temporaryStat.nlink !== 2n || finalStat.nlink !== 2n ||
+        !stableStat(temporaryStat, finalStat) ||
+        (uid !== null && finalStat.uid !== uid) ||
+        (finalStat.mode & 0o077n) !== 0n) {
+      throw new PinnedProtocolStateError("published state commit temporary file is inconsistent");
+    }
+    actions.push(temporaryPath);
+  }
+
+  if (actions.length === 0) return;
+  try {
+    for (const temporaryPath of actions) unlinkSync(temporaryPath);
+    fsyncDirectory(directory);
+  } catch {
+    throw new PinnedProtocolStateError("interrupted state commit could not be reconciled durably");
+  }
+}
+
 function commitStateFile(directory, name, content) {
   validateStateDirectory(directory);
   validateStateFileName(name);
@@ -531,8 +618,9 @@ function commitStateFile(directory, name, content) {
     renamed = true;
     // Node does not expose renameat2(RENAME_NOREPLACE). A same-directory hard
     // link gives an atomic no-clobber publication point; unlinking the private
-    // temp afterward leaves the committed file single-linked. A crash between
-    // those operations is deliberately rejected by the stable reader.
+    // temp afterward leaves the committed file single-linked. If the writer
+    // crashes in this window, the next exclusive reader verifies the exact
+    // hard-link relationship before retaining the commit and removing temp.
     linkSync(readyPath, finalPath);
     linked = true;
     unlinkSync(readyPath);
@@ -556,7 +644,10 @@ export function createFileStateAdapter(stateDirectory) {
   const directory = validateAbsolutePath(stateDirectory, "state directory");
   validateStateDirectory(directory);
   return Object.freeze({
-    list: () => listStableDirectory(directory),
+    list: () => {
+      recoverInterruptedStateCommits(directory);
+      return listStableDirectory(directory);
+    },
     read: (name, maxBytes) => readStableStateFile(directory, name, maxBytes),
     commit: (name, bytes) => commitStateFile(directory, name, bytes),
   });

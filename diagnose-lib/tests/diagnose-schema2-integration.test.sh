@@ -152,6 +152,171 @@ for phase in baseline groups; do
   done
 done
 
+echo '== isolated executor crash recovery =='
+retryable_statuses=""
+for status in 132 133 134 135 136 137 139 141 152 153 159; do
+  if isolated_executor_status_is_retryable_crash "$status"; then
+    retryable_statuses="${retryable_statuses}${retryable_statuses:+ }$status"
+  fi
+done
+check_eq 'fatal executor signals are restartable' \
+  '132 133 134 135 136 137 139 141 152 153 159' "$retryable_statuses"
+
+control_statuses_retryable=""
+for status in 0 1 3 75 129 130 131 143 255; do
+  if isolated_executor_status_is_retryable_crash "$status"; then
+    control_statuses_retryable="${control_statuses_retryable}${control_statuses_retryable:+ }$status"
+  fi
+done
+check_eq 'ordinary failures and operator signals are not hidden by restart' \
+  '' "$control_statuses_retryable"
+
+isolated_protocol_progress_parse \
+  '{"committedRecords":901,"complete":false}' 9600 900
+progress_advance_rc=$?
+check_eq 'crash recovery accepts an advanced durable frontier' 0 "$progress_advance_rc"
+check_eq 'crash recovery retains a commit made before the executor died' \
+  '901|false' "$ISOLATED_PROGRESS_COMMITTED|$ISOLATED_PROGRESS_COMPLETE"
+
+if isolated_protocol_progress_parse \
+  '{"committedRecords":899,"complete":false}' 9600 900; then
+  progress_regression_rc=0
+else
+  progress_regression_rc=$?
+fi
+check_true 'crash recovery rejects a regressed durable frontier' \
+  test "$progress_regression_rc" -ne 0
+
+if isolated_protocol_progress_parse \
+  '{"committedRecords":9600,"complete":false}' 9600 900; then
+  progress_completion_rc=0
+else
+  progress_completion_rc=$?
+fi
+check_true 'crash recovery rejects an inconsistent completion flag' \
+  test "$progress_completion_rc" -ne 0
+
+ISOLATED_LOOP_ROOT="$TMP_ROOT/isolated-executor-restart"
+mkdir -p -- "$ISOLATED_LOOP_ROOT/bundle/results" \
+  "$ISOLATED_LOOP_ROOT/bundle/state/individual-attempts" \
+  "$ISOLATED_LOOP_ROOT/bundle/logs/individual"
+for file in individual.meta individual.plan.tsv individual.tsv individual.boundaries.ndjson; do
+  : > "$ISOLATED_LOOP_ROOT/bundle/results/$file"
+  chmod 600 "$ISOLATED_LOOP_ROOT/bundle/results/$file"
+done
+isolated_loop_result="$(
+  (
+    OUT_DIR="$ISOLATED_LOOP_ROOT/bundle"
+    STATE_DIR="$OUT_DIR/state"
+    RUN_SCHEMA_VERSION=2
+    INDIVIDUAL_TARGET_POLICY=all-usable-cpus
+    INDIVIDUAL_TARGET_CPUS=0
+    ONLINE_CPUS=0
+    INDIVIDUAL_RUNS=1
+    PROTOCOL_SEED=7
+    INDIVIDUAL_GROUP_PLAN_DIGEST="$(printf 'a%.0s' {1..64})"
+    INDIVIDUAL_GROUP_GENERATION="$(printf 'b%.0s' {1..32})"
+    DIAG_INDIVIDUAL_NODE_BIN=/mock/node
+    TELEMETRY_RESUME_AVAILABLE=0
+    TELEMETRY_RESUME_SEGMENTS_JSON='[]'
+    attempts_file="$ISOLATED_LOOP_ROOT/attempts"
+    events_file="$ISOLATED_LOOP_ROOT/events"
+    : > "$attempts_file"
+    : > "$events_file"
+
+    individual_meta_read() {
+      INDIVIDUAL_META_VERSION=6
+      INDIVIDUAL_META_GENERATION=0123456789abcdef0123456789abcdef
+      INDIVIDUAL_META_TARGET_CPUS=0
+      INDIVIDUAL_META_RUNS=1
+      INDIVIDUAL_META_TARGET_POLICY=all-usable-cpus
+      INDIVIDUAL_META_GROUP_PLAN_DIGEST="$INDIVIDUAL_GROUP_PLAN_DIGEST"
+      INDIVIDUAL_META_GROUP_GENERATION="$INDIVIDUAL_GROUP_GENERATION"
+      INDIVIDUAL_META_PROTOCOL=isolated-outcomes-v2
+      INDIVIDUAL_META_SCHEDULE_SEED=7
+      INDIVIDUAL_META_SCHEDULE_ALGORITHM=balanced-cyclic-v1
+      INDIVIDUAL_META_PLAN_SHA256="$(printf 'c%.0s' {1..64})"
+      INDIVIDUAL_META_PLAN_BYTES=1
+      INDIVIDUAL_META_PLAN_ROW_COUNT=1
+      INDIVIDUAL_META_ROWS_SHA256="$(printf 'd%.0s' {1..64})"
+      INDIVIDUAL_META_ROWS_BYTES=0
+      INDIVIDUAL_META_ROW_COUNT=0
+      INDIVIDUAL_META_BOUNDARIES_SHA256="$(printf 'e%.0s' {1..64})"
+      INDIVIDUAL_META_BOUNDARIES_BYTES=0
+      INDIVIDUAL_META_BOUNDARY_ROW_COUNT=0
+      INDIVIDUAL_META_SKIPPED=0
+      INDIVIDUAL_META_COMPLETED=0
+    }
+    individual_v6_binding_read() { return 0; }
+    telemetry_resumable_prepare_descriptive() {
+      TELEMETRY_RESUME_AVAILABLE=0
+      TELEMETRY_RESUME_SEGMENTS_JSON='[]'
+    }
+    run_pinned_protocol_logged() {
+      local output="$1" attempts=0
+      [[ -s "$attempts_file" ]] && attempts="$(<"$attempts_file")"
+      attempts=$((attempts + 1))
+      printf '%s\n' "$attempts" > "$attempts_file"
+      : > "$output"
+      if ((attempts == 1)); then
+        return 139
+      fi
+      printf '{"committed":true}\n' > "$output"
+    }
+    node() {
+      if [[ "${2:-}" == next-isolated-v2 ]]; then
+        printf '{"committedRecords":0,"complete":false}\n'
+        return 0
+      fi
+      if [[ "${2:-}" == finalize-isolated-v2 ]]; then
+        local results_output="" boundaries_output=""
+        shift 2
+        while (($# > 0)); do
+          case "$1" in
+            --results-output) results_output="$2"; shift 2 ;;
+            --boundaries-output) boundaries_output="$2"; shift 2 ;;
+            *) shift ;;
+          esac
+        done
+        printf 'result\n' > "$results_output"
+        printf 'boundary\n' > "$boundaries_output"
+        chmod 600 "$results_output" "$boundaries_output"
+        return 0
+      fi
+      if [[ "${2:-}" == v6-validate-complete ]]; then
+        return 0
+      fi
+      return 97
+    }
+    sleep() { printf 'sleep:%s\n' "$1" >> "$events_file"; }
+    diag_log() { printf 'log:%s\n' "$*" >> "$events_file"; }
+    diag_warn() { printf 'warn:%s\n' "$*" >> "$events_file"; }
+    protocol_finalize_stage_prepare() { mkdir -p -- "$1"; }
+    protocol_finalize_stage_close() { rmdir -- "$1"; }
+    sync() { :; }
+    individual_meta_write() { :; }
+    individual_evidence_read() {
+      if [[ -e "$STATE_DIR/phase-individual.done" ]]; then
+        INDIVIDUAL_EVIDENCE_STATUS=complete
+      else
+        INDIVIDUAL_EVIDENCE_STATUS=incomplete
+      fi
+    }
+    mark_done() { : > "$STATE_DIR/phase-$1.done"; }
+
+    phase_individual_v6
+    attempts="$(<"$attempts_file")"
+    warned=0
+    slept=0
+    grep -Fq 'durable frontier remains 0/1' "$events_file" && warned=1
+    grep -Fxq 'sleep:1' "$events_file" && slept=1
+    printf '%s|%s|%s|%s\n' "$attempts" "$warned" "$slept" \
+      "$([[ -e "$STATE_DIR/phase-individual.done" ]] && echo complete || echo incomplete)"
+  )
+)"
+check_eq 'a crashed executor is restarted inside the same isolated phase' \
+  '2|1|1|complete' "$isolated_loop_result"
+
 echo '== fixed protocol finalization stages =='
 FINAL_ROOT="$TMP_ROOT/finalization"
 mkdir -p -- "$FINAL_ROOT/state/individual-finalize"

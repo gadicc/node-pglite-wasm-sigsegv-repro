@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import {
+  existsSync,
   linkSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -714,6 +716,60 @@ test("filesystem state adapter publishes private single-link files and never clo
     /safe bounded private state file/,
   );
   assert.equal(readFileSync(file, "utf8"), original);
+});
+
+test("filesystem state adapter reconciles interrupted private commit publications", async () => {
+  const stateDir = path.join(temporaryDirectory(), "state");
+  mkdirSync(stateDir, { mode: 0o700 });
+  const plan = buildIsolatedPlan({ cpus: [8, 9], rounds: 1, seed: 0 });
+  const result = await runIsolatedAttempt({
+    plan,
+    generation: GENERATION,
+    stateDir,
+    runChild: sequentialRunner().runChild,
+  });
+  const firstFile = path.join(stateDir, result.stateName);
+  const deadPid = "99999999";
+  const linkedReady = path.join(
+    stateDir,
+    `.${result.stateName}.${deadPid}.0123456789abcdef.ready.tmp`,
+  );
+  linkSync(firstFile, linkedReady);
+  assert.equal(statSync(firstFile).nlink, 2);
+
+  let progress = await readIsolatedProgress({
+    plan,
+    generation: GENERATION,
+    stateDir,
+  });
+  assert.equal(progress.committedRecords, 1);
+  assert.equal(statSync(firstFile).nlink, 1);
+  assert.equal(existsSync(linkedReady), false);
+
+  const orphanWriting = path.join(
+    stateDir,
+    ".isolated-000000002.json.99999998.fedcba9876543210.writing.tmp",
+  );
+  writeFileSync(orphanWriting, "incomplete commit", { mode: 0o600 });
+  progress = await readIsolatedProgress({
+    plan,
+    generation: GENERATION,
+    stateDir,
+  });
+  assert.equal(progress.committedRecords, 1);
+  assert.equal(existsSync(orphanWriting), false);
+  assert.deepEqual(progress.nextRecord, plan.records[1]);
+
+  const liveWriter = path.join(
+    stateDir,
+    `.isolated-000000002.json.${process.pid}.0011223344556677.writing.tmp`,
+  );
+  writeFileSync(liveWriter, "active commit", { mode: 0o600 });
+  await assert.rejects(
+    readIsolatedProgress({ plan, generation: GENERATION, stateDir }),
+    /live writer/,
+  );
+  assert.equal(existsSync(liveWriter), true);
 });
 
 test("CLI plan and mocked single-attempt commands are strict and workload-free", async () => {
