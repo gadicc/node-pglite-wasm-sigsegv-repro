@@ -1218,7 +1218,14 @@ function pinnedConcurrentWorkloadArtifactsPresent(outDir) {
 function pinnedConcurrentSummary(assessment, authoritative) {
   const outcomes = assessment.descriptiveOutcomes;
   if (outcomes === null || outcomes === undefined) return null;
+  const v2 = assessment.meta?.VERSION === "2";
   return {
+    ...(v2 ? {
+      metadataVersion: "2",
+      protocol: assessment.meta.PROTOCOL,
+      legacyWaveCount: assessment.legacyWaveCount ?? 0,
+      legacyRowCount: assessment.legacyRowCount ?? 0,
+    } : {}),
     generation: assessment.meta?.GENERATION ?? null,
     sourceGroupGeneration: assessment.meta?.SOURCE_GROUP_GENERATION ?? null,
     sourceGroupPlanDigest: assessment.meta?.SOURCE_GROUP_PLAN_DIGEST ?? null,
@@ -1233,6 +1240,12 @@ function pinnedConcurrentSummary(assessment, authoritative) {
       controllerCpu: group.controller_cpu,
       rounds: group.rounds,
     })),
+    ...(v2 ? {
+      observedWaves: outcomes.observedWaves,
+      otherFailureWaves: outcomes.otherFailureWaves,
+      observations: outcomes.observations,
+      otherWorkloadFailures: outcomes.otherWorkloadFailures,
+    } : {}),
     waves: outcomes.waves,
     totalWaves: assessment.totalWaveCount,
     failedWaves: outcomes.failedWaves,
@@ -1243,6 +1256,11 @@ function pinnedConcurrentSummary(assessment, authoritative) {
       context: record.group,
       group: record.group,
       cpu: record.cpu,
+      ...(v2 ? {
+        observations: record.observations,
+        passes: record.passes,
+        otherWorkloadFailures: record.otherWorkloadFailures,
+      } : {}),
       runs: record.runs,
       failures: record.sigsegv,
       sigsegv: record.sigsegv,
@@ -1499,6 +1517,7 @@ function collectPinnedConcurrent(outDir, runMetaState, groupsAssessment) {
       status,
       reasons: [...new Set(reasons)],
       authoritative,
+      ...(assessment.meta?.VERSION === "2" ? { metadataVersion: "2" } : {}),
       completedWaveCount: assessment.completedWaveCount ?? 0,
       totalWaveCount: assessment.totalWaveCount ?? 0,
       discardedTailRowCount: assessment.discardedTailRowCount ?? 0,
@@ -1700,11 +1719,12 @@ function exactPinnedConcurrentRuns(assessment) {
   const runs = boundaries.map((boundary, index) => {
     const row = rows[index];
     if (boundary.ordinal !== index + 1 || row.cpu !== boundary.cpu || row.group !== boundary.group ||
-        row.round !== boundary.round || row.launch_position !== boundary.launchPosition) return null;
+        row.round !== boundary.round || row.launch_position !== boundary.launchPosition ||
+        (row.outcome !== undefined && row.outcome !== boundary.outcome)) return null;
     return {
       ...boundary,
       context: boundary.group,
-      outcome: row.rc === 139 ? "sigsegv" : "pass",
+      outcome: row.outcome ?? (row.rc === 139 ? "sigsegv" : "pass"),
     };
   });
   return runs.some((run) => run === null) ? null : runs;

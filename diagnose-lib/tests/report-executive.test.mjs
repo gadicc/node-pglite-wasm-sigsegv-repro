@@ -102,6 +102,65 @@ test("Executive Summary is first and states only validated turbo-permitted evide
   assert.doesNotMatch(report, /\b(?:good|healthy|cleared|clean)\b/i);
 });
 
+test("pinned-concurrent V2 discloses its legacy prefix and excludes other-failure waves", () => {
+  const value = base({
+    pinnedConcurrentStatus: {
+      status: "complete",
+      reasons: [],
+      authoritative: true,
+      metadataVersion: "2",
+    },
+    pinnedConcurrent: {
+      metadataVersion: "2",
+      protocol: "concurrent-outcomes-v2",
+      legacyWaveCount: 1,
+      legacyRowCount: 2,
+      authoritative: true,
+      scheduleAlgorithm: "balanced-cyclic-v1",
+      scheduleSeed: 42,
+      groups: [
+        { group: "ctx", kind: "l2-cluster", cpus: "0-1", cluster: "l2:0-1", controllerCpu: 2, rounds: 2 },
+      ],
+      observedWaves: 2,
+      waves: 1,
+      totalWaves: 2,
+      failedWaves: 1,
+      otherFailureWaves: 1,
+      observations: 4,
+      childRuns: 3,
+      sigsegv: 1,
+      otherWorkloadFailures: 1,
+      perGroup: [{
+        group: "ctx",
+        observedWaves: 2,
+        waves: 1,
+        failedWaves: 1,
+        otherFailureWaves: 1,
+        observations: 4,
+        childRuns: 3,
+        sigsegv: 1,
+        otherWorkloadFailures: 1,
+      }],
+      perCpu: [
+        {
+          context: "ctx", group: "ctx", cpu: 0, observations: 2, runs: 1,
+          passes: 1, failures: 0, sigsegv: 0, otherWorkloadFailures: 1,
+        },
+        {
+          context: "ctx", group: "ctx", cpu: 1, observations: 2, runs: 2,
+          passes: 1, failures: 1, sigsegv: 1, otherWorkloadFailures: 0,
+        },
+      ],
+    },
+  });
+  const report = renderReport(value);
+  assert.match(report, /first 1 wave\(s\), covering 2 child observation\(s\), were migrated from the V1 checkpoint/);
+  assert.match(report, /Other-failure waves/);
+  assert.match(report, /\| ctx \| l2-cluster \/ 0-1 \| 2 \| 2 \| 1 \| 1 \|/);
+  assert.match(report, /Other workload failures/);
+  assert.match(report, /\| ctx \| 0 \| 2 \| 1 \| 0 \| 1 \|/);
+});
+
 test("Executive Summary retains zero-failure contexts beside a failing context", () => {
   const value = base();
   value.pinnedConcurrent.groups.push({

@@ -8,15 +8,20 @@
 
 import { createHash } from "node:crypto";
 import { lstatSync, writeFileSync } from "node:fs";
+import { constants as osConstants } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { readStableRegularFile } from "./individual-evidence.mjs";
 
 export const PINNED_CONCURRENT_VERSION = 1;
+export const PINNED_CONCURRENT_V2_VERSION = 2;
+export const PINNED_CONCURRENT_V2_PROTOCOL = "concurrent-outcomes-v2";
 export const PINNED_CONCURRENT_SCHEDULE_ALGORITHM = "balanced-cyclic-v1";
 export const PINNED_CONCURRENT_GROUPS_HEADER = "group\tkind\tcpus\tcluster\tcontroller_cpu\trounds";
 export const PINNED_CONCURRENT_PLAN_HEADER = "ordinal\tround\tgroup_position\tgroup\tcontroller_cpu\tlaunch_position\tcpu";
 export const PINNED_CONCURRENT_RESULTS_HEADER = "round\tgroup\tcpu\tlaunch_position\trc\telapsed_ms";
+export const PINNED_CONCURRENT_V2_RESULTS_HEADER =
+  "round\tgroup\tcpu\tlaunch_position\toutcome\texit_code\tsignal\tlegacy_rc\telapsed_ms\tstderr_sha256\tstderr_bytes";
 
 export const PINNED_CONCURRENT_META_MAX_BYTES = 256 * 1024;
 export const PINNED_CONCURRENT_GROUPS_MAX_BYTES = 256 * 1024;
@@ -27,7 +32,7 @@ export const PINNED_CONCURRENT_BOUNDARIES_MAX_BYTES = 512 * 1024 * 1024;
 export const PINNED_CONCURRENT_PLAN_MAX_ROWS = 20_000_000;
 export const PINNED_CONCURRENT_RESULTS_MAX_ROWS = 20_000_000;
 export const PINNED_CONCURRENT_BOUNDARIES_MAX_ROWS = PINNED_CONCURRENT_RESULTS_MAX_ROWS;
-export const PINNED_CONCURRENT_BOUNDARY_ROW_MAX_BYTES = 4096;
+export const PINNED_CONCURRENT_BOUNDARY_ROW_MAX_BYTES = 64 * 1024;
 export const PINNED_CONCURRENT_MARKER_MAX_BYTES = 4096;
 export const PINNED_CONCURRENT_MAX_CPU = 65_535;
 
@@ -36,6 +41,10 @@ const PLAN_FIELDS = [
   "ordinal", "round", "group_position", "group", "controller_cpu", "launch_position", "cpu",
 ];
 const RESULT_FIELDS = ["round", "group", "cpu", "launch_position", "rc", "elapsed_ms"];
+const RESULT_V2_FIELDS = [
+  "round", "group", "cpu", "launch_position", "outcome", "exit_code", "signal",
+  "legacy_rc", "elapsed_ms", "stderr_sha256", "stderr_bytes",
+];
 const BOUNDARY_FIELDS = [
   "ordinal",
   "round",
@@ -44,6 +53,32 @@ const BOUNDARY_FIELDS = [
   "controllerCpu",
   "launchPosition",
   "cpu",
+  "startUnixMs",
+  "endUnixMs",
+  "startMonotonicNs",
+  "endMonotonicNs",
+  "durationNs",
+  "durationMs",
+  "noTurboStart",
+  "noTurboEnd",
+];
+const BOUNDARY_V2_FIELDS = [
+  "ordinal",
+  "round",
+  "groupPosition",
+  "group",
+  "controllerCpu",
+  "launchPosition",
+  "cpu",
+  "outcome",
+  "exitCode",
+  "signal",
+  "legacyRc",
+  "stderrSha256",
+  "stderrBytes",
+  "stderrExcerptBase64",
+  "stderrExcerptBytes",
+  "stderrTruncated",
   "startUnixMs",
   "endUnixMs",
   "startMonotonicNs",
@@ -69,10 +104,31 @@ const BASE_META_KEYS = [
   "PLAN_ROW_COUNT",
   "COMPLETED",
 ];
+const BASE_META_V2_KEYS = [
+  "VERSION",
+  "GENERATION",
+  "SOURCE_GROUP_GENERATION",
+  "SOURCE_GROUP_PLAN_DIGEST",
+  "ROUNDS_PER_CONTEXT",
+  "SCHEDULE_SEED",
+  "SCHEDULE_ALGORITHM",
+  "PROTOCOL",
+  "LEGACY_WAVE_COUNT",
+  "LEGACY_ROW_COUNT",
+  "GROUPS_SHA256",
+  "GROUPS_BYTES",
+  "GROUPS_ROW_COUNT",
+  "PLAN_SHA256",
+  "PLAN_BYTES",
+  "PLAN_ROW_COUNT",
+  "COMPLETED",
+];
 const ROW_BINDING_KEYS = ["ROWS_SHA256", "ROWS_BYTES", "ROW_COUNT"];
 const BOUNDARY_BINDING_KEYS = ["BOUNDARIES_SHA256", "BOUNDARIES_BYTES", "BOUNDARY_ROW_COUNT"];
 const TERMINAL_BINDING_KEYS = [...ROW_BINDING_KEYS, ...BOUNDARY_BINDING_KEYS];
-const KNOWN_META_KEYS = new Set([...BASE_META_KEYS, ...TERMINAL_BINDING_KEYS]);
+const KNOWN_META_KEYS = new Set([
+  ...BASE_META_KEYS, ...BASE_META_V2_KEYS, ...TERMINAL_BINDING_KEYS,
+]);
 const DIGEST_RE = /^[a-f0-9]{64}$/;
 const GENERATION_RE = /^[a-f0-9]{32}$/;
 const GROUP_RE = /^[a-z][a-z0-9_-]{0,63}$/;
@@ -80,6 +136,8 @@ const KIND_RE = /^[a-z][a-z0-9-]{0,31}$/;
 const ERROR_CODE_RE = /^[A-Z0-9_]{1,64}$/;
 const DECIMAL_RE = /^(0|[1-9][0-9]*)$/;
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
+const V2_OUTCOMES = new Set(["pass", "sigsegv", "other-workload-failure"]);
+const KNOWN_SIGNALS = new Set(Object.keys(osConstants.signals));
 
 const TARGETS = Object.freeze({
   meta: ["results", "pinned-concurrent.meta"],
@@ -476,12 +534,69 @@ function validateResultFieldGrammar(rows) {
   return reasons;
 }
 
-export function validatePinnedConcurrentResultRows(rows, planRows = null) {
+function validateResultV2FieldGrammar(rows) {
+  const reasons = [];
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index];
+    const label = `pinned-concurrent V2 results row ${index + 1}`;
+    if (canonicalPositiveUint(row.round, PINNED_CONCURRENT_PLAN_MAX_ROWS) === null) {
+      reasons.push(`${label} has an invalid round`);
+    }
+    if (!GROUP_RE.test(row.group ?? "")) reasons.push(`${label} has an invalid group`);
+    if (canonicalUint(row.cpu, PINNED_CONCURRENT_MAX_CPU) === null) reasons.push(`${label} has an invalid CPU`);
+    if (canonicalPositiveUint(row.launch_position, PINNED_CONCURRENT_MAX_CPU + 1) === null) {
+      reasons.push(`${label} has an invalid launch position`);
+    }
+    if (!V2_OUTCOMES.has(row.outcome)) reasons.push(`${label} has an invalid outcome`);
+    if (canonicalUint(row.elapsed_ms) === null) reasons.push(`${label} has an invalid elapsed_ms`);
+    const legacy = row.legacy_rc === 0 || row.legacy_rc === 139;
+    if (legacy) {
+      const expectedOutcome = row.legacy_rc === 139 ? "sigsegv" : "pass";
+      if (row.outcome !== expectedOutcome || row.exit_code !== "-" || row.signal !== "-" ||
+          row.stderr_sha256 !== "-" || row.stderr_bytes !== "-") {
+        reasons.push(`${label} has inconsistent legacy outcome provenance`);
+      }
+      continue;
+    }
+    if (row.legacy_rc !== "-") {
+      reasons.push(`${label} has an invalid legacy_rc`);
+      continue;
+    }
+    const exitCode = canonicalUint(row.exit_code, 255);
+    const signal = typeof row.signal === "string" && KNOWN_SIGNALS.has(row.signal)
+      ? row.signal
+      : null;
+    if ((exitCode === null) === (signal === null) ||
+        (exitCode !== null && row.signal !== "-") ||
+        (signal !== null && row.exit_code !== "-")) {
+      reasons.push(`${label} has a malformed exact exit status`);
+    } else if (row.outcome === "pass" && !(exitCode === 0 && signal === null)) {
+      reasons.push(`${label} has an inconsistent pass status`);
+    } else if (row.outcome === "sigsegv" && !(exitCode === null && signal === "SIGSEGV")) {
+      reasons.push(`${label} has an inconsistent SIGSEGV status`);
+    } else if (row.outcome === "other-workload-failure" &&
+        (exitCode === 0 || signal === "SIGSEGV")) {
+      reasons.push(`${label} has an inconsistent other-workload-failure status`);
+    }
+    if (!DIGEST_RE.test(row.stderr_sha256 ?? "") || canonicalUint(row.stderr_bytes) === null) {
+      reasons.push(`${label} has invalid stderr evidence`);
+    }
+  }
+  return reasons;
+}
+
+export function validatePinnedConcurrentResultRows(rows, planRows = null, options = {}) {
   const reasons = [];
   if (!Array.isArray(rows) || rows.length > PINNED_CONCURRENT_RESULTS_MAX_ROWS) {
     return [`pinned-concurrent results exceed the ${PINNED_CONCURRENT_RESULTS_MAX_ROWS}-row limit`];
   }
-  reasons.push(...validateResultFieldGrammar(rows));
+  const version = options.version ?? PINNED_CONCURRENT_VERSION;
+  if (version !== PINNED_CONCURRENT_VERSION && version !== PINNED_CONCURRENT_V2_VERSION) {
+    return ["pinned-concurrent result version is unsupported"];
+  }
+  reasons.push(...(version === PINNED_CONCURRENT_V2_VERSION
+    ? validateResultV2FieldGrammar(rows)
+    : validateResultFieldGrammar(rows)));
   if (planRows !== null) {
     if (!Array.isArray(planRows) || rows.length > planRows.length) {
       reasons.push("pinned-concurrent results are longer than their plan");
@@ -501,32 +616,57 @@ export function validatePinnedConcurrentResultRows(rows, planRows = null) {
 }
 
 export function parsePinnedConcurrentResults(value, options = {}) {
+  const version = options.version ?? PINNED_CONCURRENT_VERSION;
+  const v2 = version === PINNED_CONCURRENT_V2_VERSION;
   const parsed = parseTsv(
     value,
-    PINNED_CONCURRENT_RESULTS_HEADER,
-    RESULT_FIELDS.length,
+    v2 ? PINNED_CONCURRENT_V2_RESULTS_HEADER : PINNED_CONCURRENT_RESULTS_HEADER,
+    v2 ? RESULT_V2_FIELDS.length : RESULT_FIELDS.length,
     PINNED_CONCURRENT_RESULTS_MAX_ROWS,
     "pinned-concurrent results",
   );
-  const rows = parsed.rows.map(([round, group, cpu, launch_position, rc, elapsed_ms]) => ({
-    round: canonicalPositiveUint(round, PINNED_CONCURRENT_PLAN_MAX_ROWS) ?? round,
-    group,
-    cpu: canonicalUint(cpu, PINNED_CONCURRENT_MAX_CPU) ?? cpu,
-    launch_position: canonicalPositiveUint(launch_position, PINNED_CONCURRENT_MAX_CPU + 1) ?? launch_position,
-    rc: canonicalUint(rc) ?? rc,
-    elapsed_ms: canonicalUint(elapsed_ms) ?? elapsed_ms,
-  }));
-  parsed.reasons.push(...validatePinnedConcurrentResultRows(rows, options.planRows ?? null));
+  const rows = v2
+    ? parsed.rows.map(([
+        round, group, cpu, launch_position, outcome, exit_code, signal, legacy_rc,
+        elapsed_ms, stderr_sha256, stderr_bytes,
+      ]) => ({
+        round: canonicalPositiveUint(round, PINNED_CONCURRENT_PLAN_MAX_ROWS) ?? round,
+        group,
+        cpu: canonicalUint(cpu, PINNED_CONCURRENT_MAX_CPU) ?? cpu,
+        launch_position: canonicalPositiveUint(launch_position, PINNED_CONCURRENT_MAX_CPU + 1) ?? launch_position,
+        outcome,
+        exit_code: canonicalUint(exit_code, 255) ?? exit_code,
+        signal,
+        legacy_rc: canonicalUint(legacy_rc, 139) ?? legacy_rc,
+        elapsed_ms: canonicalUint(elapsed_ms) ?? elapsed_ms,
+        stderr_sha256,
+        stderr_bytes: canonicalUint(stderr_bytes) ?? stderr_bytes,
+      }))
+    : parsed.rows.map(([round, group, cpu, launch_position, rc, elapsed_ms]) => ({
+        round: canonicalPositiveUint(round, PINNED_CONCURRENT_PLAN_MAX_ROWS) ?? round,
+        group,
+        cpu: canonicalUint(cpu, PINNED_CONCURRENT_MAX_CPU) ?? cpu,
+        launch_position: canonicalPositiveUint(launch_position, PINNED_CONCURRENT_MAX_CPU + 1) ?? launch_position,
+        rc: canonicalUint(rc) ?? rc,
+        elapsed_ms: canonicalUint(elapsed_ms) ?? elapsed_ms,
+      }));
+  parsed.reasons.push(...validatePinnedConcurrentResultRows(
+    rows,
+    options.planRows ?? null,
+    { version },
+  ));
   return { rows, reasons: unique(parsed.reasons) };
 }
 
-export function serializePinnedConcurrentResults(rows, planRows = null) {
+export function serializePinnedConcurrentResults(rows, planRows = null, options = {}) {
+  const version = options.version ?? PINNED_CONCURRENT_VERSION;
+  const v2 = version === PINNED_CONCURRENT_V2_VERSION;
   return serializeRows(
-    PINNED_CONCURRENT_RESULTS_HEADER,
+    v2 ? PINNED_CONCURRENT_V2_RESULTS_HEADER : PINNED_CONCURRENT_RESULTS_HEADER,
     rows,
-    RESULT_FIELDS,
+    v2 ? RESULT_V2_FIELDS : RESULT_FIELDS,
     parsePinnedConcurrentResults,
-    { planRows },
+    { planRows, version },
   );
 }
 
@@ -548,10 +688,19 @@ function normalizeBoundaryNoTurbo(value) {
   return { status: value.status, errorCode: value.errorCode };
 }
 
-function normalizePinnedConcurrentBoundaryRow(value, index, planRow, resultRow, reasons) {
+function normalizePinnedConcurrentBoundaryRow(
+  value,
+  index,
+  planRow,
+  resultRow,
+  reasons,
+  version = PINNED_CONCURRENT_VERSION,
+) {
   const rowNumber = index + 1;
+  const v2 = version === PINNED_CONCURRENT_V2_VERSION;
+  const fields = v2 ? BOUNDARY_V2_FIELDS : BOUNDARY_FIELDS;
   if (value === null || typeof value !== "object" || Array.isArray(value) ||
-      Object.keys(value).join("\n") !== BOUNDARY_FIELDS.join("\n")) {
+      Object.keys(value).join("\n") !== fields.join("\n")) {
     reasons.push(`pinned-concurrent boundary row ${rowNumber} does not contain exactly the canonical fields in order`);
     return null;
   }
@@ -579,6 +728,79 @@ function normalizePinnedConcurrentBoundaryRow(value, index, planRow, resultRow, 
     reasons.push(`pinned-concurrent boundary row ${rowNumber} is not in exact result order`);
     return null;
   }
+  let v2Evidence = null;
+  if (v2) {
+    const legacy = value.legacyRc === 0 || value.legacyRc === 139;
+    if (!V2_OUTCOMES.has(value.outcome)) {
+      reasons.push(`pinned-concurrent boundary row ${rowNumber} has an invalid outcome`);
+      return null;
+    }
+    if (legacy) {
+      const expectedOutcome = value.legacyRc === 139 ? "sigsegv" : "pass";
+      if (value.outcome !== expectedOutcome || value.exitCode !== null || value.signal !== null ||
+          value.stderrSha256 !== null || value.stderrBytes !== null ||
+          value.stderrExcerptBase64 !== null || value.stderrExcerptBytes !== null ||
+          value.stderrTruncated !== null) {
+        reasons.push(`pinned-concurrent boundary row ${rowNumber} has inconsistent legacy provenance`);
+        return null;
+      }
+    } else {
+      const exitCode = canonicalUint(value.exitCode, 255);
+      const signal = typeof value.signal === "string" && KNOWN_SIGNALS.has(value.signal)
+        ? value.signal
+        : null;
+      if (value.legacyRc !== null || (exitCode === null) === (signal === null) ||
+          (exitCode !== null && value.exitCode !== exitCode) ||
+          (value.outcome === "pass" && !(exitCode === 0 && signal === null)) ||
+          (value.outcome === "sigsegv" && !(exitCode === null && signal === "SIGSEGV")) ||
+          (value.outcome === "other-workload-failure" &&
+            (exitCode === 0 || signal === "SIGSEGV"))) {
+        reasons.push(`pinned-concurrent boundary row ${rowNumber} has an inconsistent exact exit status`);
+        return null;
+      }
+      const stderrBytes = canonicalDecimalBigInt(value.stderrBytes);
+      const stderrExcerptBytes = canonicalUint(value.stderrExcerptBytes, PINNED_CONCURRENT_BOUNDARY_ROW_MAX_BYTES);
+      let excerpt = null;
+      try {
+        excerpt = typeof value.stderrExcerptBase64 === "string"
+          ? Buffer.from(value.stderrExcerptBase64, "base64")
+          : null;
+      } catch {
+        excerpt = null;
+      }
+      if (!DIGEST_RE.test(value.stderrSha256 ?? "") || stderrBytes === null ||
+          stderrExcerptBytes === null || value.stderrExcerptBytes !== stderrExcerptBytes || excerpt === null ||
+          excerpt.toString("base64") !== value.stderrExcerptBase64 ||
+          excerpt.length !== stderrExcerptBytes || stderrBytes < BigInt(excerpt.length) ||
+          typeof value.stderrTruncated !== "boolean" ||
+          value.stderrTruncated !== (stderrBytes > BigInt(excerpt.length)) ||
+          (!value.stderrTruncated && sha256PinnedConcurrentBytes(excerpt) !== value.stderrSha256)) {
+        reasons.push(`pinned-concurrent boundary row ${rowNumber} has unreconciled stderr evidence`);
+        return null;
+      }
+    }
+    if (resultRow !== undefined &&
+        (value.outcome !== resultRow.outcome ||
+         value.exitCode !== (resultRow.exit_code === "-" ? null : resultRow.exit_code) ||
+         value.signal !== (resultRow.signal === "-" ? null : resultRow.signal) ||
+         value.legacyRc !== (resultRow.legacy_rc === "-" ? null : resultRow.legacy_rc) ||
+         value.stderrSha256 !== (resultRow.stderr_sha256 === "-" ? null : resultRow.stderr_sha256) ||
+         value.stderrBytes !== (resultRow.stderr_bytes === "-" ? null : String(resultRow.stderr_bytes)))) {
+      reasons.push(`pinned-concurrent boundary row ${rowNumber} disagrees with its exact V2 result evidence`);
+      return null;
+    }
+    v2Evidence = {
+      outcome: value.outcome,
+      exitCode: value.exitCode,
+      signal: value.signal,
+      legacyRc: value.legacyRc,
+      stderrSha256: value.stderrSha256,
+      stderrBytes: value.stderrBytes,
+      stderrExcerptBase64: value.stderrExcerptBase64,
+      stderrExcerptBytes: value.stderrExcerptBytes,
+      stderrTruncated: value.stderrTruncated,
+    };
+  }
   const startUnixMs = canonicalUint(value.startUnixMs);
   const endUnixMs = canonicalUint(value.endUnixMs);
   const startMonotonicNs = canonicalDecimalBigInt(value.startMonotonicNs);
@@ -602,7 +824,7 @@ function normalizePinnedConcurrentBoundaryRow(value, index, planRow, resultRow, 
     reasons.push(`pinned-concurrent boundary row ${rowNumber} has invalid no_turbo observations`);
     return null;
   }
-  return {
+  const schedule = {
     ordinal,
     round,
     groupPosition,
@@ -610,6 +832,10 @@ function normalizePinnedConcurrentBoundaryRow(value, index, planRow, resultRow, 
     controllerCpu,
     launchPosition,
     cpu,
+  };
+  return {
+    ...schedule,
+    ...(v2 ? v2Evidence : {}),
     startUnixMs,
     endUnixMs,
     startMonotonicNs: value.startMonotonicNs,
@@ -641,6 +867,7 @@ export function validatePinnedConcurrentBoundaryRows(rows, options = {}) {
       Array.isArray(planRows) ? planRows[index] : undefined,
       Array.isArray(resultRows) ? resultRows[index] : undefined,
       reasons,
+      options.version ?? PINNED_CONCURRENT_VERSION,
     );
   }
   return unique(reasons);
@@ -688,6 +915,7 @@ export function parsePinnedConcurrentBoundaries(value, options = {}) {
       Array.isArray(options.planRows) ? options.planRows[index] : undefined,
       Array.isArray(options.resultRows) ? options.resultRows[index] : undefined,
       reasons,
+      options.version ?? PINNED_CONCURRENT_VERSION,
     );
     if (normalized !== null) {
       rows.push(normalized);
@@ -708,6 +936,7 @@ export function serializePinnedConcurrentBoundaries(rows, options = {}) {
     Array.isArray(options.planRows) ? options.planRows[index] : undefined,
     Array.isArray(options.resultRows) ? options.resultRows[index] : undefined,
     reasons,
+    options.version ?? PINNED_CONCURRENT_VERSION,
   ));
   if (reasons.length > 0 || normalized.some((row) => row === null)) {
     throw new TypeError(unique(reasons).join("; "));
@@ -719,7 +948,10 @@ export function serializePinnedConcurrentBoundaries(rows, options = {}) {
 }
 
 function parseMetaValueGrammar(meta, reasons) {
-  if (meta.VERSION !== String(PINNED_CONCURRENT_VERSION)) reasons.push("pinned-concurrent metadata VERSION is unsupported");
+  if (meta.VERSION !== String(PINNED_CONCURRENT_VERSION) &&
+      meta.VERSION !== String(PINNED_CONCURRENT_V2_VERSION)) {
+    reasons.push("pinned-concurrent metadata VERSION is unsupported");
+  }
   if (!GENERATION_RE.test(meta.GENERATION ?? "")) reasons.push("pinned-concurrent metadata GENERATION is malformed");
   if (!GENERATION_RE.test(meta.SOURCE_GROUP_GENERATION ?? "")) {
     reasons.push("pinned-concurrent metadata SOURCE_GROUP_GENERATION is malformed");
@@ -733,6 +965,17 @@ function parseMetaValueGrammar(meta, reasons) {
   if (canonicalUint(meta.SCHEDULE_SEED) === null) reasons.push("pinned-concurrent metadata SCHEDULE_SEED is invalid");
   if (meta.SCHEDULE_ALGORITHM !== PINNED_CONCURRENT_SCHEDULE_ALGORITHM) {
     reasons.push("pinned-concurrent metadata SCHEDULE_ALGORITHM is unsupported");
+  }
+  if (meta.VERSION === String(PINNED_CONCURRENT_V2_VERSION)) {
+    if (meta.PROTOCOL !== PINNED_CONCURRENT_V2_PROTOCOL) {
+      reasons.push("pinned-concurrent metadata PROTOCOL is unsupported");
+    }
+    if (canonicalUint(meta.LEGACY_WAVE_COUNT, PINNED_CONCURRENT_PLAN_MAX_ROWS) === null) {
+      reasons.push("pinned-concurrent metadata LEGACY_WAVE_COUNT is invalid");
+    }
+    if (canonicalUint(meta.LEGACY_ROW_COUNT, PINNED_CONCURRENT_PLAN_MAX_ROWS) === null) {
+      reasons.push("pinned-concurrent metadata LEGACY_ROW_COUNT is invalid");
+    }
   }
   for (const [prefix, maxBytes, maxRows] of [
     ["GROUPS", PINNED_CONCURRENT_GROUPS_MAX_BYTES, PINNED_CONCURRENT_GROUPS_MAX_ROWS],
@@ -788,7 +1031,10 @@ export function parsePinnedConcurrentMeta(value) {
     else if (Object.hasOwn(meta, key)) reasons.push(`pinned-concurrent metadata duplicates field ${key}`);
     else meta[key] = valueText;
   }
-  const expectedKeys = meta.COMPLETED === "1" ? [...BASE_META_KEYS, ...TERMINAL_BINDING_KEYS] : BASE_META_KEYS;
+  const baseKeys = meta.VERSION === String(PINNED_CONCURRENT_V2_VERSION)
+    ? BASE_META_V2_KEYS
+    : BASE_META_KEYS;
+  const expectedKeys = meta.COMPLETED === "1" ? [...baseKeys, ...TERMINAL_BINDING_KEYS] : baseKeys;
   if (observedKeys.join("\n") !== expectedKeys.join("\n")) {
     reasons.push(`pinned-concurrent metadata must contain exactly the canonical ${expectedKeys.length} records in order`);
   }
@@ -798,9 +1044,12 @@ export function parsePinnedConcurrentMeta(value) {
 
 export function serializePinnedConcurrentMeta(meta) {
   if (meta === null || typeof meta !== "object" || Array.isArray(meta)) throw new TypeError("metadata must be an object");
-  const keys = meta.COMPLETED === "1" || meta.COMPLETED === 1
-    ? [...BASE_META_KEYS, ...TERMINAL_BINDING_KEYS]
+  const baseKeys = String(meta.VERSION) === String(PINNED_CONCURRENT_V2_VERSION)
+    ? BASE_META_V2_KEYS
     : BASE_META_KEYS;
+  const keys = meta.COMPLETED === "1" || meta.COMPLETED === 1
+    ? [...baseKeys, ...TERMINAL_BINDING_KEYS]
+    : baseKeys;
   const text = `${keys.map((key) => `${key}=${meta[key]}`).join("\n")}\n`;
   const parsed = parsePinnedConcurrentMeta(text);
   const suppliedKeys = Object.keys(meta);
@@ -815,6 +1064,7 @@ export function serializePinnedConcurrentMeta(meta) {
 }
 
 export function buildPinnedConcurrentMeta({
+  version = PINNED_CONCURRENT_VERSION,
   generation,
   sourceGroupGeneration,
   sourceGroupPlanDigest,
@@ -828,18 +1078,32 @@ export function buildPinnedConcurrentMeta({
   resultsRowCount = null,
   boundariesBytes = null,
   boundariesRowCount = null,
+  legacyWaveCount = 0,
+  legacyRowCount = 0,
   completed = false,
 }) {
+  if (version !== PINNED_CONCURRENT_VERSION && version !== PINNED_CONCURRENT_V2_VERSION) {
+    throw new TypeError("pinned-concurrent metadata version is unsupported");
+  }
   const groupsBinding = pinnedConcurrentFileBinding(groupsBytes, groupsRowCount);
   const planBinding = pinnedConcurrentFileBinding(planBytes, planRowCount);
   const meta = {
-    VERSION: String(PINNED_CONCURRENT_VERSION),
+    VERSION: String(version),
     GENERATION: generation,
     SOURCE_GROUP_GENERATION: sourceGroupGeneration,
     SOURCE_GROUP_PLAN_DIGEST: sourceGroupPlanDigest,
     ROUNDS_PER_CONTEXT: String(roundsPerContext),
     SCHEDULE_SEED: String(scheduleSeed),
     SCHEDULE_ALGORITHM: PINNED_CONCURRENT_SCHEDULE_ALGORITHM,
+  };
+  if (version === PINNED_CONCURRENT_V2_VERSION) {
+    meta.PROTOCOL = PINNED_CONCURRENT_V2_PROTOCOL;
+    meta.LEGACY_WAVE_COUNT = String(legacyWaveCount);
+    meta.LEGACY_ROW_COUNT = String(legacyRowCount);
+  } else if (legacyWaveCount !== 0 || legacyRowCount !== 0) {
+    throw new TypeError("V1 pinned-concurrent metadata cannot disclose a legacy prefix");
+  }
+  Object.assign(meta, {
     GROUPS_SHA256: groupsBinding.sha256,
     GROUPS_BYTES: String(groupsBinding.bytes),
     GROUPS_ROW_COUNT: String(groupsBinding.rowCount),
@@ -847,7 +1111,7 @@ export function buildPinnedConcurrentMeta({
     PLAN_BYTES: String(planBinding.bytes),
     PLAN_ROW_COUNT: String(planBinding.rowCount),
     COMPLETED: completed ? "1" : "0",
-  };
+  });
   if (completed) {
     if (resultsBytes === null || resultsRowCount === null ||
         boundariesBytes === null || boundariesRowCount === null) {
@@ -941,6 +1205,81 @@ function compareExpectation(meta, key, expected, reasons) {
 }
 
 function summarizeOutcomes(rows, waveBoundaries) {
+  if (rows.some((row) => Object.hasOwn(row, "outcome"))) {
+    const perCpuMap = new Map();
+    const perGroupMap = new Map();
+    let waveStart = 0;
+    let eligibleWaves = 0;
+    let failedWaves = 0;
+    let otherFailureWaves = 0;
+    for (const boundary of waveBoundaries) {
+      const waveRows = rows.slice(waveStart, boundary);
+      const otherFailure = waveRows.some(({ outcome }) => outcome === "other-workload-failure");
+      const failed = !otherFailure && waveRows.some(({ outcome }) => outcome === "sigsegv");
+      eligibleWaves += otherFailure ? 0 : 1;
+      failedWaves += failed ? 1 : 0;
+      otherFailureWaves += otherFailure ? 1 : 0;
+      const group = waveRows[0]?.group;
+      if (group !== undefined) {
+        const record = perGroupMap.get(group) ?? {
+          group,
+          observedWaves: 0,
+          waves: 0,
+          failedWaves: 0,
+          otherFailureWaves: 0,
+          observations: 0,
+          childRuns: 0,
+          sigsegv: 0,
+          otherWorkloadFailures: 0,
+        };
+        record.observedWaves += 1;
+        record.waves += otherFailure ? 0 : 1;
+        record.failedWaves += failed ? 1 : 0;
+        record.otherFailureWaves += otherFailure ? 1 : 0;
+        record.observations += waveRows.length;
+        record.childRuns += waveRows.filter(({ outcome }) => outcome !== "other-workload-failure").length;
+        record.sigsegv += waveRows.filter(({ outcome }) => outcome === "sigsegv").length;
+        record.otherWorkloadFailures += waveRows.filter(
+          ({ outcome }) => outcome === "other-workload-failure",
+        ).length;
+        perGroupMap.set(group, record);
+      }
+      for (const row of waveRows) {
+        const key = `${row.group}\0${row.cpu}`;
+        const record = perCpuMap.get(key) ?? {
+          group: row.group,
+          cpu: row.cpu,
+          observations: 0,
+          runs: 0,
+          passes: 0,
+          sigsegv: 0,
+          otherWorkloadFailures: 0,
+        };
+        record.observations += 1;
+        record.runs += row.outcome === "other-workload-failure" ? 0 : 1;
+        record.passes += row.outcome === "pass" ? 1 : 0;
+        record.sigsegv += row.outcome === "sigsegv" ? 1 : 0;
+        record.otherWorkloadFailures += row.outcome === "other-workload-failure" ? 1 : 0;
+        perCpuMap.set(key, record);
+      }
+      waveStart = boundary;
+    }
+    const otherWorkloadFailures = rows.filter(
+      ({ outcome }) => outcome === "other-workload-failure",
+    ).length;
+    return {
+      observedWaves: waveBoundaries.length,
+      waves: eligibleWaves,
+      failedWaves,
+      otherFailureWaves,
+      observations: rows.length,
+      childRuns: rows.length - otherWorkloadFailures,
+      sigsegv: rows.filter(({ outcome }) => outcome === "sigsegv").length,
+      otherWorkloadFailures,
+      perGroup: [...perGroupMap.values()].sort((left, right) => left.group.localeCompare(right.group)),
+      perCpu: [...perCpuMap.values()].sort((left, right) => left.group.localeCompare(right.group) || left.cpu - right.cpu),
+    };
+  }
   const perCpuMap = new Map();
   const perGroupMap = new Map();
   let waveStart = 0;
@@ -1117,6 +1456,9 @@ export function assessPinnedConcurrentEvidence(bundleDir, expectations = {}) {
       invalid = true;
     }
   }
+  const evidenceVersion = meta.VERSION === String(PINNED_CONCURRENT_V2_VERSION)
+    ? PINNED_CONCURRENT_V2_VERSION
+    : PINNED_CONCURRENT_VERSION;
   const roundsPerContext = canonicalPositiveUint(meta.ROUNDS_PER_CONTEXT, PINNED_CONCURRENT_PLAN_MAX_ROWS);
   let groups = [];
   if (reads.groups.state === "regular") {
@@ -1140,7 +1482,10 @@ export function assessPinnedConcurrentEvidence(bundleDir, expectations = {}) {
   }
   let rows = [];
   if (reads.results.state === "regular") {
-    const parsed = parsePinnedConcurrentResults(reads.results.bytes, { planRows: plan });
+    const parsed = parsePinnedConcurrentResults(reads.results.bytes, {
+      planRows: plan,
+      version: evidenceVersion,
+    });
     rows = parsed.rows;
     if (parsed.reasons.length > 0) {
       reasons.push(...parsed.reasons);
@@ -1153,6 +1498,7 @@ export function assessPinnedConcurrentEvidence(bundleDir, expectations = {}) {
     const parsed = parsePinnedConcurrentBoundaries(reads.boundaries.bytes, {
       planRows: plan,
       resultRows: rows,
+      version: evidenceVersion,
     });
     boundaries = parsed.rows;
     boundariesValid = parsed.reasons.length === 0;
@@ -1210,6 +1556,32 @@ export function assessPinnedConcurrentEvidence(bundleDir, expectations = {}) {
       reasons.push("expected pinned-concurrent plan is invalid");
       invalid = true;
     }
+  }
+
+  let legacyRowCount = 0;
+  let legacyWaveCount = 0;
+  if (evidenceVersion === PINNED_CONCURRENT_V2_VERSION && rows.length > 0) {
+    while (legacyRowCount < rows.length && rows[legacyRowCount].legacy_rc !== "-") {
+      legacyRowCount += 1;
+    }
+    if (rows.slice(legacyRowCount).some((row) => row.legacy_rc !== "-")) {
+      reasons.push("pinned-concurrent V2 legacy observations are not an exact contiguous prefix");
+      invalid = true;
+    }
+    legacyWaveCount = allWaveBoundaries.filter((boundary) => boundary <= legacyRowCount).length;
+    if (legacyRowCount > 0 && !allWaveBoundaries.includes(legacyRowCount)) {
+      reasons.push("pinned-concurrent V2 legacy observations end inside a group wave");
+      invalid = true;
+    }
+    if (canonicalUint(meta.LEGACY_ROW_COUNT) !== legacyRowCount ||
+        canonicalUint(meta.LEGACY_WAVE_COUNT) !== legacyWaveCount) {
+      reasons.push("pinned-concurrent V2 legacy-prefix metadata does not match the exact result prefix");
+      invalid = true;
+    }
+  } else if (evidenceVersion === PINNED_CONCURRENT_V2_VERSION &&
+      (canonicalUint(meta.LEGACY_ROW_COUNT) !== 0 || canonicalUint(meta.LEGACY_WAVE_COUNT) !== 0)) {
+    reasons.push("pinned-concurrent V2 legacy-prefix metadata is nonzero without legacy result rows");
+    invalid = true;
   }
 
   const completeBoundaries = allWaveBoundaries.filter((boundary) => boundary <= rows.length);
@@ -1270,6 +1642,7 @@ export function assessPinnedConcurrentEvidence(bundleDir, expectations = {}) {
     authoritative: complete,
     publicationReady,
     meta,
+    metadataVersion: evidenceVersion,
     groups,
     plan,
     rows,
@@ -1285,6 +1658,8 @@ export function assessPinnedConcurrentEvidence(bundleDir, expectations = {}) {
     descriptiveOutcomes: descriptiveOutcomes === null ? null : { ...descriptiveOutcomes, authoritative: complete },
     totalWaveCount: allWaveBoundaries.length,
     completedWaveCount: safePrefix ? completeBoundaries.length : 0,
+    legacyWaveCount,
+    legacyRowCount,
   };
 }
 
@@ -1326,7 +1701,7 @@ function cliUsage() {
     "  pinned-concurrent-evidence.mjs validate-complete BUNDLE [GENERATION SOURCE_GROUP_GENERATION SOURCE_DIGEST ROUNDS SEED]",
     "  pinned-concurrent-evidence.mjs build-meta --generation HEX32 --source-group-generation HEX32",
     "    --source-group-plan-digest HEX64 --rounds N --seed N --groups FILE --plan FILE",
-    "    --completed 0|1 [--results FILE --boundaries FILE] [--output FILE]",
+    "    --completed 0|1 [--version 1|2] [--results FILE --boundaries FILE] [--output FILE]",
   ].join("\n");
 }
 
@@ -1372,6 +1747,7 @@ function validateBeforeForCli(assessment) {
 function parseBuildMetaCliOptions(args) {
   const allowed = new Set([
     "--generation",
+    "--version",
     "--source-group-generation",
     "--source-group-plan-digest",
     "--rounds",
@@ -1426,8 +1802,14 @@ function buildMetaForCli(args) {
   const scheduleSeed = canonicalUint(options.get("--seed"));
   const completedText = options.get("--completed");
   const completed = completedText === "1" ? true : completedText === "0" ? false : null;
-  if (roundsPerContext === null || scheduleSeed === null || completed === null) {
-    throw new TypeError("build-meta rounds, seed, or completed value is invalid");
+  const versionText = options.get("--version") ?? String(PINNED_CONCURRENT_VERSION);
+  const version = versionText === String(PINNED_CONCURRENT_VERSION)
+    ? PINNED_CONCURRENT_VERSION
+    : versionText === String(PINNED_CONCURRENT_V2_VERSION)
+      ? PINNED_CONCURRENT_V2_VERSION
+      : null;
+  if (roundsPerContext === null || scheduleSeed === null || completed === null || version === null) {
+    throw new TypeError("build-meta rounds, seed, completed, or version value is invalid");
   }
   const groupsBytes = readCliEvidenceFile(
     options.get("--groups"),
@@ -1455,7 +1837,7 @@ function buildMetaForCli(args) {
       PINNED_CONCURRENT_RESULTS_MAX_BYTES,
       "pinned-concurrent results",
     );
-    const parsed = parsePinnedConcurrentResults(resultsBytes, { planRows: planParsed.rows });
+    const parsed = parsePinnedConcurrentResults(resultsBytes, { planRows: planParsed.rows, version });
     if (parsed.reasons.length > 0) throw new TypeError(parsed.reasons.join("; "));
     resultsRows = parsed.rows;
   }
@@ -1470,6 +1852,7 @@ function buildMetaForCli(args) {
     const parsed = parsePinnedConcurrentBoundaries(boundariesBytes, {
       planRows: planParsed.rows,
       resultRows: resultsRows,
+      version,
     });
     if (parsed.reasons.length > 0) throw new TypeError(parsed.reasons.join("; "));
     boundaryRows = parsed.rows;
@@ -1481,7 +1864,22 @@ function buildMetaForCli(args) {
   if (!completed && options.has("--boundaries")) {
     throw new TypeError("incomplete build-meta forbids a terminal boundary file");
   }
+  let legacyRowCount = 0;
+  let legacyWaveCount = 0;
+  if (version === PINNED_CONCURRENT_V2_VERSION) {
+    while (legacyRowCount < resultsRows.length && resultsRows[legacyRowCount].legacy_rc !== "-") {
+      legacyRowCount += 1;
+    }
+    if (resultsRows.slice(legacyRowCount).some((row) => row.legacy_rc !== "-") ||
+        (legacyRowCount > 0 && !planParsed.waveBoundaries.includes(legacyRowCount))) {
+      throw new TypeError("V2 legacy results must be an exact contiguous whole-wave prefix");
+    }
+    legacyWaveCount = planParsed.waveBoundaries.filter(
+      (boundary) => boundary <= legacyRowCount,
+    ).length;
+  }
   const meta = buildPinnedConcurrentMeta({
+    version,
     generation: options.get("--generation"),
     sourceGroupGeneration: options.get("--source-group-generation"),
     sourceGroupPlanDigest: options.get("--source-group-plan-digest"),
@@ -1495,6 +1893,8 @@ function buildMetaForCli(args) {
     resultsRowCount: completed ? resultsRows.length : null,
     boundariesBytes: completed ? boundariesBytes : null,
     boundariesRowCount: completed ? boundaryRows.length : null,
+    legacyWaveCount,
+    legacyRowCount,
     completed,
   });
   const text = serializePinnedConcurrentMeta(meta);

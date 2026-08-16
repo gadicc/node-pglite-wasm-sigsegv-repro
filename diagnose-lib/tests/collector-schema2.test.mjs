@@ -22,12 +22,14 @@ import {
   validatePinnedConcurrentContexts,
 } from "../collect.mjs";
 import {
+  PINNED_CONCURRENT_V2_VERSION,
   buildPinnedConcurrentMeta,
   serializePinnedConcurrentBoundaries,
   serializePinnedConcurrentGroups,
   serializePinnedConcurrentMeta,
   serializePinnedConcurrentPlan,
   serializePinnedConcurrentResults,
+  sha256PinnedConcurrentBytes,
 } from "../pinned-concurrent-evidence.mjs";
 import {
   buildTelemetryEnvelope,
@@ -104,6 +106,36 @@ function writeCompleteSourceGroups(root) {
     "VERSION=2",
     `GENERATION=${GROUP_GENERATION}`,
     "EXPECTED_ROWS=1",
+    "GROUP_WAVES=5",
+    `PLAN_DIGEST=${digest}`,
+    "COMPLETED=1",
+    "",
+  ].join("\n"));
+  writeFileSync(path.join(root, "state", "phase-groups.done"), "");
+  return digest;
+}
+
+function writeCompleteSourceGroupsWithController(root) {
+  const sourcePlan = [
+    ["pcores", "pcore", "0-3", "-", "4", "5", "logs/groups/pcores.log", "group-pcores"],
+    ["ecores", "ecore", "4-7", "-", "4", "5", "logs/groups/ecores.log", "group-ecores"],
+  ];
+  const digest = groupsPlanDigest(sourcePlan);
+  mkdirSync(path.join(root, "logs", "groups"), { recursive: true });
+  for (const row of sourcePlan) {
+    copyFileSync(
+      path.join(fixtures, "repro-clean-4x5.log"),
+      path.join(root, row[6]),
+    );
+  }
+  writeFileSync(
+    path.join(root, "results", "groups.tsv"),
+    `${sourcePlan.map((row) => [...row, "0"].join("\t")).join("\n")}\n`,
+  );
+  writeFileSync(path.join(root, "results", "groups.meta"), [
+    "VERSION=2",
+    `GENERATION=${GROUP_GENERATION}`,
+    "EXPECTED_ROWS=2",
     "GROUP_WAVES=5",
     `PLAN_DIGEST=${digest}`,
     "COMPLETED=1",
@@ -371,6 +403,40 @@ function buildConcurrentBoundaries(planRows, resultRows) {
   });
 }
 
+function buildConcurrentV2Boundaries(planRows, resultRows) {
+  return buildConcurrentBoundaries(planRows, resultRows).map((boundary, index) => {
+    const result = resultRows[index];
+    const legacy = result.legacy_rc !== "-";
+    const stderr = Buffer.from(index === 4 ? "exit one\n" : "");
+    return {
+      ordinal: boundary.ordinal,
+      round: boundary.round,
+      groupPosition: boundary.groupPosition,
+      group: boundary.group,
+      controllerCpu: boundary.controllerCpu,
+      launchPosition: boundary.launchPosition,
+      cpu: boundary.cpu,
+      outcome: result.outcome,
+      exitCode: legacy || result.exit_code === "-" ? null : result.exit_code,
+      signal: legacy || result.signal === "-" ? null : result.signal,
+      legacyRc: legacy ? result.legacy_rc : null,
+      stderrSha256: legacy ? null : result.stderr_sha256,
+      stderrBytes: legacy ? null : String(result.stderr_bytes),
+      stderrExcerptBase64: legacy ? null : stderr.toString("base64"),
+      stderrExcerptBytes: legacy ? null : stderr.length,
+      stderrTruncated: legacy ? null : false,
+      startUnixMs: boundary.startUnixMs,
+      endUnixMs: boundary.endUnixMs,
+      startMonotonicNs: boundary.startMonotonicNs,
+      endMonotonicNs: boundary.endMonotonicNs,
+      durationNs: boundary.durationNs,
+      durationMs: boundary.durationMs,
+      noTurboStart: boundary.noTurboStart,
+      noTurboEnd: boundary.noTurboEnd,
+    };
+  });
+}
+
 test("collector exposes only whole-wave concurrent summaries and withholds authority without source groups", () => {
   const root = bundle();
   const groups = [
@@ -482,6 +548,99 @@ test("collector exposes only whole-wave concurrent summaries and withholds autho
   assert.equal(alternate.pinnedConcurrentStatus.status, "invalid");
   assert.match(alternate.pinnedConcurrentStatus.reasons.join("; "), /expected seeded schedule/);
   assert.equal(alternate.pinnedConcurrent, undefined);
+});
+
+test("collector authorizes V2 mixed-prefix outcomes and separates other failures", () => {
+  const root = bundle();
+  const sourceDigest = writeCompleteSourceGroupsWithController(root);
+  const groups = [
+    { group: "pcores", kind: "pcore", cpus: "0-3", cluster: "-", controller_cpu: 4, rounds: 2 },
+    { group: "ecores", kind: "ecore", cpus: "4-7", cluster: "-", controller_cpu: 0, rounds: 2 },
+  ];
+  const plan = buildExpectedPinnedConcurrentPlanRows(groups, 2, 42);
+  const rows = plan.map(({ round, group, cpu, launch_position }, index) => {
+    const legacy = index < 4;
+    const outcome = index === 1 ? "sigsegv" : index === 4 ? "other-workload-failure" : "pass";
+    const stderr = Buffer.from(index === 4 ? "exit one\n" : "");
+    return {
+      round,
+      group,
+      cpu,
+      launch_position,
+      outcome,
+      exit_code: legacy || outcome === "sigsegv" ? "-" : outcome === "other-workload-failure" ? 1 : 0,
+      signal: legacy ? "-" : outcome === "sigsegv" ? "SIGSEGV" : "-",
+      legacy_rc: legacy ? (outcome === "sigsegv" ? 139 : 0) : "-",
+      elapsed_ms: 900 + index,
+      stderr_sha256: legacy ? "-" : sha256PinnedConcurrentBytes(stderr),
+      stderr_bytes: legacy ? "-" : stderr.length,
+    };
+  });
+  const groupsText = serializePinnedConcurrentGroups(groups, { roundsPerContext: 2 });
+  const planText = serializePinnedConcurrentPlan(plan, groups, { roundsPerContext: 2 });
+  const rowsText = serializePinnedConcurrentResults(rows, plan, { version: PINNED_CONCURRENT_V2_VERSION });
+  const boundaries = buildConcurrentV2Boundaries(plan, rows);
+  const boundariesText = serializePinnedConcurrentBoundaries(boundaries, {
+    planRows: plan,
+    resultRows: rows,
+    version: PINNED_CONCURRENT_V2_VERSION,
+  });
+  const meta = buildPinnedConcurrentMeta({
+    version: PINNED_CONCURRENT_V2_VERSION,
+    generation: TELEMETRY_GENERATION,
+    sourceGroupGeneration: GROUP_GENERATION,
+    sourceGroupPlanDigest: sourceDigest,
+    roundsPerContext: 2,
+    scheduleSeed: 42,
+    groupsBytes: groupsText,
+    groupsRowCount: groups.length,
+    planBytes: planText,
+    planRowCount: plan.length,
+    resultsBytes: rowsText,
+    resultsRowCount: rows.length,
+    boundariesBytes: boundariesText,
+    boundariesRowCount: boundaries.length,
+    legacyWaveCount: 1,
+    legacyRowCount: 4,
+    completed: true,
+  });
+  for (const [name, value] of [
+    ["pinned-concurrent.groups.tsv", groupsText],
+    ["pinned-concurrent.plan.tsv", planText],
+    ["pinned-concurrent.tsv", rowsText],
+    ["pinned-concurrent.boundaries.ndjson", boundariesText],
+    ["pinned-concurrent.meta", serializePinnedConcurrentMeta(meta)],
+  ]) writeFileSync(path.join(root, "results", name), value);
+  writeFileSync(path.join(root, "state", "phase-pinned-concurrent.done"), "");
+
+  const result = collect(root);
+  assert.equal(result.pinnedConcurrentStatus.status, "complete", result.pinnedConcurrentStatus.reasons.join("\n"));
+  assert.equal(result.pinnedConcurrentStatus.authoritative, true);
+  assert.deepEqual({
+    metadataVersion: result.pinnedConcurrent.metadataVersion,
+    legacyWaveCount: result.pinnedConcurrent.legacyWaveCount,
+    legacyRowCount: result.pinnedConcurrent.legacyRowCount,
+    observedWaves: result.pinnedConcurrent.observedWaves,
+    waves: result.pinnedConcurrent.waves,
+    failedWaves: result.pinnedConcurrent.failedWaves,
+    otherFailureWaves: result.pinnedConcurrent.otherFailureWaves,
+    observations: result.pinnedConcurrent.observations,
+    childRuns: result.pinnedConcurrent.childRuns,
+    sigsegv: result.pinnedConcurrent.sigsegv,
+    otherWorkloadFailures: result.pinnedConcurrent.otherWorkloadFailures,
+  }, {
+    metadataVersion: "2",
+    legacyWaveCount: 1,
+    legacyRowCount: 4,
+    observedWaves: 4,
+    waves: 3,
+    failedWaves: 1,
+    otherFailureWaves: 1,
+    observations: 16,
+    childRuns: 15,
+    sigsegv: 1,
+    otherWorkloadFailures: 1,
+  });
 });
 
 function writeAttribute(file, value) {

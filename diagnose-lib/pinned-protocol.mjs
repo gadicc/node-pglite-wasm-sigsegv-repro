@@ -42,6 +42,7 @@ import {
 import {
   PINNED_CONCURRENT_PLAN_HEADER,
   PINNED_CONCURRENT_RESULTS_HEADER,
+  PINNED_CONCURRENT_V2_RESULTS_HEADER,
   pinnedConcurrentFileBinding,
   serializePinnedConcurrentGroups,
   serializePinnedConcurrentPlan,
@@ -1093,6 +1094,39 @@ function validateConcurrentState(value, expectedPlan, generation, expectedRows, 
   return value;
 }
 
+function validateConcurrentStateV2(value, expectedPlan, generation, expectedRows, label) {
+  exactObjectKeys(value, [
+    "version", "protocol", "generation", "planSha", "wave", "observations",
+  ], label);
+  if (value.version !== PINNED_PROTOCOL_STATE_V2_VERSION || value.protocol !== "concurrent-v2") {
+    throw new PinnedProtocolStateError(`${label} has an unsupported state version or protocol`);
+  }
+  if (value.generation !== generation || value.planSha !== expectedPlan.planSha) {
+    throw new PinnedProtocolStateError(`${label} does not match its generation and plan digest`);
+  }
+  exactObjectKeys(value.wave, ["round", "group", "groupPosition", "controllerCpu"], `${label}.wave`);
+  const first = expectedRows[0];
+  if (value.wave.round !== first.round || value.wave.group !== first.group ||
+      value.wave.groupPosition !== first.groupPosition ||
+      value.wave.controllerCpu !== first.controllerCpu) {
+    throw new PinnedProtocolStateError(`${label} wave identity does not match the plan`);
+  }
+  if (!Array.isArray(value.observations) || value.observations.length !== expectedRows.length) {
+    throw new PinnedProtocolStateError(`${label} does not contain the whole planned wave`);
+  }
+  for (let index = 0; index < value.observations.length; index += 1) {
+    const observation = validateStoredObservationV2(
+      value.observations[index],
+      validateConcurrentRecord,
+      `${label}.observations[${index}]`,
+    );
+    if (!sameRecord(observation.record, expectedRows[index])) {
+      throw new PinnedProtocolStateError(`${label} observation ${index + 1} is not the exact plan record`);
+    }
+  }
+  return value;
+}
+
 function relevantStateNames(names, protocol) {
   const prefix = protocol === "isolated" ? "isolated-" : "concurrent-";
   const partialPrefix = `.${prefix}`;
@@ -1150,11 +1184,15 @@ export async function readIsolatedProgress(options) {
 
 export async function readConcurrentProgress(options) {
   const plan = assertPlan(options?.plan, "concurrent");
+  const stateVersion = isolatedStateVersion(options);
   const generation = validateGeneration(options.generation);
   const adapter = resolveStateAdapter(options);
   const names = relevantStateNames(await adapterList(adapter), "concurrent");
   const states = [];
   let cursor = 0;
+  let legacyWaves = 0;
+  let legacyRecords = 0;
+  let observedV2 = false;
   for (const entry of names) {
     const expectedRows = expectedConcurrentWave(plan, cursor);
     const first = expectedRows[0];
@@ -1164,16 +1202,31 @@ export async function readConcurrentProgress(options) {
     }
     const bytes = await adapterRead(adapter, entry.name, MAX_WAVE_STATE_FILE_BYTES);
     const state = decodeCanonicalState(bytes, MAX_WAVE_STATE_FILE_BYTES, entry.name);
-    states.push(validateConcurrentState(state, plan, generation, expectedRows, entry.name));
+    if (stateVersion === PINNED_PROTOCOL_STATE_VERSION) {
+      states.push(validateConcurrentState(state, plan, generation, expectedRows, entry.name));
+    } else if (state.version === PINNED_PROTOCOL_STATE_VERSION) {
+      if (observedV2) {
+        throw new PinnedProtocolStateError("concurrent V1 state may appear only as a contiguous legacy prefix");
+      }
+      states.push(validateConcurrentState(state, plan, generation, expectedRows, entry.name));
+      legacyWaves += 1;
+      legacyRecords += expectedRows.length;
+    } else {
+      observedV2 = true;
+      states.push(validateConcurrentStateV2(state, plan, generation, expectedRows, entry.name));
+    }
     cursor += expectedRows.length;
   }
   return Object.freeze({
     protocol: "concurrent",
     generation,
     planSha: plan.planSha,
+    stateVersion,
     states: Object.freeze(states),
     committedWaves: states.length,
     committedRecords: cursor,
+    legacyWaves,
+    legacyRecords,
     nextWave: Object.freeze(expectedConcurrentWave(plan, cursor)),
     complete: cursor === plan.records.length,
     _adapter: adapter,
@@ -1265,7 +1318,17 @@ function boundedOperationalAttempt(record, child, reason) {
   };
   try { attempt.timing = normalizeTiming(child?.timing); } catch { attempt.timing = null; }
   try { attempt.noTurbo = normalizeNoTurbo(child?.noTurbo); } catch { attempt.noTurbo = null; }
-  try { attempt.stderr = normalizeStderrEvidence(child?.stderrEvidence); } catch { attempt.stderr = null; }
+  try {
+    const stderr = normalizeStderrEvidence(child?.stderrEvidence);
+    attempt.stderr = {
+      sha256: stderr.sha256,
+      bytes: stderr.bytes,
+      excerptBytes: stderr.excerptBytes,
+      truncated: stderr.truncated,
+    };
+  } catch {
+    attempt.stderr = null;
+  }
   if (child?.launchError !== null && typeof child?.launchError === "object") {
     const code = typeof child.launchError.code === "string" && ERROR_CODE_RE.test(child.launchError.code)
       ? child.launchError.code
@@ -1368,8 +1431,26 @@ function concurrentState(generation, plan, observations) {
   };
 }
 
+function concurrentStateV2(generation, plan, observations) {
+  const first = observations[0].record;
+  return {
+    version: PINNED_PROTOCOL_STATE_V2_VERSION,
+    protocol: "concurrent-v2",
+    generation,
+    planSha: plan.planSha,
+    wave: {
+      round: first.round,
+      group: first.group,
+      groupPosition: first.groupPosition,
+      controllerCpu: first.controllerCpu,
+    },
+    observations,
+  };
+}
+
 export async function runConcurrentWave(options) {
   const plan = assertPlan(options?.plan, "concurrent");
+  const stateVersion = isolatedStateVersion(options);
   const runner = validateRunner(options.runChild);
   const progress = await readConcurrentProgress(options);
   if (progress.complete) {
@@ -1397,13 +1478,39 @@ export async function runConcurrentWave(options) {
     // peers, while Promise.all retains plan order for whole-wave validation.
     outcomes = await Promise.all(rows.map(async (record) => {
       try {
-        const child = await runner(childOptions(options, record.cpu, controller.signal));
-        const normalized = stateObservation(record, child);
+        const child = await runner(childOptions(
+          options,
+          record.cpu,
+          controller.signal,
+          stateVersion === PINNED_PROTOCOL_STATE_V2_VERSION
+            ? PINNED_RUNNER_V2_VERSION
+            : PINNED_RUNNER_VERSION,
+        ));
+        const normalized = stateVersion === PINNED_PROTOCOL_STATE_V2_VERSION
+          ? stateObservationV2(record, child)
+          : stateObservation(record, child);
         if (!normalized.valid) controller.abort();
-        return normalized;
+        return normalized.valid || stateVersion === PINNED_PROTOCOL_STATE_VERSION
+          ? normalized
+          : { ...normalized, attempt: boundedOperationalAttempt(record, child, normalized.reason) };
       } catch (error) {
         controller.abort();
-        return { valid: false, reason: "runner-error", errorCode: runnerErrorCode(error) };
+        const rejected = {
+          valid: false,
+          reason: stateVersion === PINNED_PROTOCOL_STATE_V2_VERSION
+            ? "operational-invalid"
+            : "runner-error",
+          errorCode: runnerErrorCode(error),
+        };
+        if (stateVersion === PINNED_PROTOCOL_STATE_V2_VERSION) {
+          rejected.attempt = Object.freeze({
+            record,
+            classification: "operational-invalid",
+            reason: "runner-error",
+            errorCode: runnerErrorCode(error),
+          });
+        }
+        return rejected;
       }
     }));
   } finally {
@@ -1411,7 +1518,7 @@ export async function runConcurrentWave(options) {
   }
   const invalid = outcomes.find((outcome) => !outcome.valid);
   if (invalid !== undefined) {
-    return Object.freeze({
+    const rejected = {
       committed: false,
       reason: invalid.reason,
       errorCode: invalid.errorCode ?? null,
@@ -1421,10 +1528,18 @@ export async function runConcurrentWave(options) {
         groupPosition: first.groupPosition,
         controllerCpu: first.controllerCpu,
       }),
-    });
+    };
+    if (stateVersion === PINNED_PROTOCOL_STATE_V2_VERSION) {
+      rejected.attempts = Object.freeze(outcomes
+        .filter((outcome) => !outcome.valid && outcome.attempt !== undefined)
+        .map((outcome) => outcome.attempt));
+    }
+    return Object.freeze(rejected);
   }
   const observations = outcomes.map((outcome) => outcome.observation);
-  const state = concurrentState(progress.generation, plan, observations);
+  const state = stateVersion === PINNED_PROTOCOL_STATE_V2_VERSION
+    ? concurrentStateV2(progress.generation, plan, observations)
+    : concurrentState(progress.generation, plan, observations);
   const bytes = canonicalProtocolJsonLine(state);
   if (bytes.length > MAX_WAVE_STATE_FILE_BYTES) {
     throw new PinnedProtocolStateError("concurrent wave state exceeds its byte limit");
@@ -1514,6 +1629,37 @@ function concurrentBoundary(observation) {
   };
 }
 
+function concurrentBoundaryV2(observation) {
+  const { record, timing, noTurbo, stderr } = observation;
+  const legacy = observation.legacyRc !== null;
+  return {
+    ordinal: record.ordinal,
+    round: record.round,
+    groupPosition: record.groupPosition,
+    group: record.group,
+    controllerCpu: record.controllerCpu,
+    launchPosition: record.launchPosition,
+    cpu: record.cpu,
+    outcome: observation.outcome,
+    exitCode: observation.exitCode,
+    signal: observation.signal,
+    legacyRc: observation.legacyRc,
+    stderrSha256: legacy ? null : stderr.sha256,
+    stderrBytes: legacy ? null : stderr.bytes,
+    stderrExcerptBase64: legacy ? null : stderr.excerptBase64,
+    stderrExcerptBytes: legacy ? null : stderr.excerptBytes,
+    stderrTruncated: legacy ? null : stderr.truncated,
+    startUnixMs: timing.startEpochMs,
+    endUnixMs: timing.endEpochMs,
+    startMonotonicNs: timing.startMonotonicNs,
+    endMonotonicNs: timing.endMonotonicNs,
+    durationNs: timing.durationNs,
+    durationMs: timing.durationMs,
+    noTurboStart: boundaryNoTurbo(noTurbo.start),
+    noTurboEnd: boundaryNoTurbo(noTurbo.end),
+  };
+}
+
 function renderBoundaries(observations, mapper) {
   const buffer = Buffer.from(
     observations.map((observation) => JSON.stringify(mapper(observation))).join("\n") +
@@ -1546,7 +1692,28 @@ function isolatedObservations(progress) {
 }
 
 function concurrentObservations(progress) {
-  return progress.states.flatMap((state) => state.observations);
+  return progress.states.flatMap((state) => state.observations.map((observation) =>
+    state.version === PINNED_PROTOCOL_STATE_VERSION
+      ? {
+          record: observation.record,
+          outcome: observation.rc === 139 ? "sigsegv" : "pass",
+          exitCode: null,
+          signal: null,
+          legacyRc: observation.rc,
+          stderr: null,
+          timing: observation.timing,
+          noTurbo: observation.noTurbo,
+        }
+      : {
+          record: observation.record,
+          outcome: observation.outcome,
+          exitCode: observation.exitCode,
+          signal: observation.signal,
+          legacyRc: null,
+          stderr: observation.stderr,
+          timing: observation.timing,
+          noTurbo: observation.noTurbo,
+        }));
 }
 
 export async function finalizeIsolatedProtocol(options) {
@@ -1599,6 +1766,7 @@ export async function finalizeIsolatedProtocol(options) {
 
 export async function finalizeConcurrentProtocol(options) {
   const plan = assertPlan(options?.plan, "concurrent");
+  const stateVersion = isolatedStateVersion(options);
   const progress = await readConcurrentProgress(options);
   if (!progress.complete) {
     throw new PinnedProtocolStateError(
@@ -1606,23 +1774,44 @@ export async function finalizeConcurrentProtocol(options) {
     );
   }
   const observations = concurrentObservations(progress);
-  const resultRows = observations.map((observation) => ({
-    round: observation.record.round,
-    group: observation.record.group,
-    cpu: observation.record.cpu,
-    launch_position: observation.record.launchPosition,
-    rc: observation.rc,
-    elapsed_ms: Number(BigInt(observation.timing.durationNs) / 1_000_000n),
-  }));
+  const resultRows = observations.map((observation) => stateVersion === PINNED_PROTOCOL_STATE_V2_VERSION
+    ? {
+        round: observation.record.round,
+        group: observation.record.group,
+        cpu: observation.record.cpu,
+        launch_position: observation.record.launchPosition,
+        outcome: observation.outcome,
+        exit_code: observation.exitCode ?? "-",
+        signal: observation.signal ?? "-",
+        legacy_rc: observation.legacyRc ?? "-",
+        elapsed_ms: Number(BigInt(observation.timing.durationNs) / 1_000_000n),
+        stderr_sha256: observation.stderr?.sha256 ?? "-",
+        stderr_bytes: observation.stderr?.bytes ?? "-",
+      }
+    : {
+        round: observation.record.round,
+        group: observation.record.group,
+        cpu: observation.record.cpu,
+        launch_position: observation.record.launchPosition,
+        rc: observation.legacyRc,
+        elapsed_ms: Number(BigInt(observation.timing.durationNs) / 1_000_000n),
+      });
   const resultText = serializePinnedConcurrentResults(
     resultRows,
     concurrentEvidenceRows(plan.records),
+    { version: stateVersion },
   );
-  if (!resultText.startsWith(`${PINNED_CONCURRENT_RESULTS_HEADER}\n`)) {
+  const expectedHeader = stateVersion === PINNED_PROTOCOL_STATE_V2_VERSION
+    ? PINNED_CONCURRENT_V2_RESULTS_HEADER
+    : PINNED_CONCURRENT_RESULTS_HEADER;
+  if (!resultText.startsWith(`${expectedHeader}\n`)) {
     throw new Error("pinned-concurrent result serializer returned an unexpected header");
   }
   const results = Buffer.from(resultText, "utf8");
-  const boundaries = renderBoundaries(observations, concurrentBoundary);
+  const boundaries = renderBoundaries(
+    observations,
+    stateVersion === PINNED_PROTOCOL_STATE_V2_VERSION ? concurrentBoundaryV2 : concurrentBoundary,
+  );
   const bindings = Object.freeze({
     groups: plan.groupsBinding,
     plan: plan.binding,
@@ -1631,8 +1820,11 @@ export async function finalizeConcurrentProtocol(options) {
   });
   return Object.freeze({
     protocol: "concurrent",
+    stateVersion,
     generation: progress.generation,
     planSha: plan.planSha,
+    legacyWaveCount: progress.legacyWaves,
+    legacyRowCount: progress.legacyRecords,
     pinnedConcurrentTsv: results,
     pinnedConcurrentBoundariesNdjson: boundaries,
     results,
@@ -1809,6 +2001,8 @@ Resume-frontier validation (prints canonical JSON):
                    --state-dir DIR
   next-concurrent --contexts-file FILE --rounds N --seed N --generation HEX32
                   --state-dir DIR
+  next-concurrent-v2 --contexts-file FILE --rounds N --seed N --generation HEX32
+                     --state-dir DIR
 
 Execute exactly one commit unit:
   attempt-isolated --cpus LIST --rounds N --seed N --generation HEX32
@@ -1820,6 +2014,9 @@ Execute exactly one commit unit:
   wave-concurrent --contexts-file FILE --rounds N --seed N --generation HEX32
                   --state-dir DIR --command FILE [--arg VALUE ...]
                   [--cwd DIR] [--no-turbo-path FILE]
+  wave-concurrent-v2 --contexts-file FILE --rounds N --seed N --generation HEX32
+                     --state-dir DIR --command FILE [--arg VALUE ...]
+                     [--cwd DIR] [--no-turbo-path FILE]
 
 Finalize a complete immutable state prefix into caller-chosen staging files:
   finalize-isolated --cpus LIST --rounds N --seed N --generation HEX32
@@ -1831,6 +2028,9 @@ Finalize a complete immutable state prefix into caller-chosen staging files:
   finalize-concurrent --contexts-file FILE --rounds N --seed N --generation HEX32
                       --state-dir DIR --results-output FILE
                       --boundaries-output FILE
+  finalize-concurrent-v2 --contexts-file FILE --rounds N --seed N --generation HEX32
+                         --state-dir DIR --results-output FILE
+                         --boundaries-output FILE
 
 contexts-file is a JSON array of exact objects:
   {"group":"l2_0","kind":"l2-cluster","cpus":[8,9,10,11],
@@ -1871,11 +2071,16 @@ export async function runPinnedProtocolCli(argv, io = {}) {
       "plan-isolated", "next-isolated", "attempt-isolated", "finalize-isolated",
       "next-isolated-v2", "attempt-isolated-v2", "finalize-isolated-v2",
     ]);
+    const concurrentCommands = new Set([
+      "plan-concurrent", "next-concurrent", "wave-concurrent", "finalize-concurrent",
+      "next-concurrent-v2", "wave-concurrent-v2", "finalize-concurrent-v2",
+    ]);
     const isolated = isolatedCommands.has(parsed.command);
-    const concurrent = parsed.command.endsWith("concurrent");
+    const concurrent = concurrentCommands.has(parsed.command);
     if (!isolated && !concurrent) throw new PinnedProtocolInputError(`unknown command: ${parsed.command}`);
     const protocol = isolated ? "isolated" : "concurrent";
-    const stateVersion = parsed.command.endsWith("-isolated-v2")
+    const stateVersion = parsed.command.endsWith("-isolated-v2") ||
+        parsed.command.endsWith("-concurrent-v2")
       ? PINNED_PROTOCOL_STATE_V2_VERSION
       : PINNED_PROTOCOL_STATE_VERSION;
     const planFlags = protocol === "isolated"
@@ -1918,6 +2123,7 @@ export async function runPinnedProtocolCli(argv, io = {}) {
           plan,
           generation: requireCliValue(parsed, "--generation"),
           stateDir: validateAbsolutePath(requireCliValue(parsed, "--state-dir"), "--state-dir"),
+          stateVersion,
         });
       writeCliJson(stdout, protocol === "isolated"
         ? {
@@ -1932,6 +2138,8 @@ export async function runPinnedProtocolCli(argv, io = {}) {
           planSha: plan.planSha,
           committedRecords: progress.committedRecords,
           committedWaves: progress.committedWaves,
+          legacyRecords: progress.legacyRecords,
+          legacyWaves: progress.legacyWaves,
           complete: progress.complete,
           nextWave: progress.nextWave,
         });
@@ -1939,7 +2147,7 @@ export async function runPinnedProtocolCli(argv, io = {}) {
     }
 
     if (parsed.command === "attempt-isolated" || parsed.command === "attempt-isolated-v2" ||
-        parsed.command === "wave-concurrent") {
+        parsed.command === "wave-concurrent" || parsed.command === "wave-concurrent-v2") {
       const allowed = new Set([
         ...stateFlags,
         "--command", "--arg", "--cwd", "--no-turbo-path",

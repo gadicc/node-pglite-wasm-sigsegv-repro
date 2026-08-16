@@ -3017,6 +3017,13 @@ protocol_destination_is_recoverable_prefix() {
   protocol_file_is_exact_prefix "$destination" "$complete"
 }
 
+pinned_concurrent_v2_destination_is_recoverable() {
+  local destination="$1" complete="$2"
+  protocol_file_is_exact_prefix "$destination" "$complete" && return 0
+  bundle_owned_single_regular "$destination" || return 1
+  cmp -s -- "$destination" <(printf 'round\tgroup\tcpu\tlaunch_position\trc\telapsed_ms\n')
+}
+
 # Run repro.mjs with epoch-prefixed output. Always returns 0; REPRO_RC holds
 # the repro exit code (1 = failed waves, an expected outcome).
 REPRO_RC=0
@@ -3085,6 +3092,12 @@ run_pinned_protocol_logged() {
     rc="$DIAG_OPERATIONAL_ERROR_RC"
   else
     diag_process_group_wait || rc=$?
+  fi
+  if ((rc != 0)) && [[ -s "$output" ]]; then
+    printf '[executor rc=%s] %s\n' "$rc" "$(<"$output")" >&"$log_fd" || {
+      exec {log_fd}>&- || true
+      return "$DIAG_OPERATIONAL_ERROR_RC"
+    }
   fi
   exec {log_fd}>&- || return "$DIAG_OPERATIONAL_ERROR_RC"
   return "$rc"
@@ -4691,12 +4704,13 @@ pinned_concurrent_final_stage_prepare() {
   protocol_finalize_stage_prepare "$stage" \
     pinned-concurrent.tsv pinned-concurrent.boundaries.ndjson \
     pinned-concurrent.meta pinned-concurrent.incomplete.meta || return 1
-  node "$LIB/pinned-protocol.mjs" finalize-concurrent \
+  node "$LIB/pinned-protocol.mjs" finalize-concurrent-v2 \
     --contexts-file "$PINNED_CONTEXTS_TEMP" --rounds "$PINNED_CONCURRENT_ROUNDS" \
     --seed "$PROTOCOL_SEED" --generation "$generation" --state-dir "$wave_state" \
     --results-output "$staged_tsv" --boundaries-output "$staged_boundaries" \
     > /dev/null || return 1
   node "$LIB/pinned-concurrent-evidence.mjs" build-meta \
+    --version 2 \
     --generation "$generation" --source-group-generation "$INDIVIDUAL_GROUP_GENERATION" \
     --source-group-plan-digest "$INDIVIDUAL_GROUP_PLAN_DIGEST" \
     --rounds "$PINNED_CONCURRENT_ROUNDS" --seed "$PROTOCOL_SEED" \
@@ -4710,7 +4724,7 @@ pinned_concurrent_final_stage_prepare() {
     --output "$staged_incomplete_meta" || return 1
   bundle_owned_single_regular "$meta" &&
     cmp -s -- "$meta" "$staged_incomplete_meta" || return 1
-  protocol_destination_is_recoverable_prefix "$tsv" "$staged_tsv" 0 || return 1
+  pinned_concurrent_v2_destination_is_recoverable "$tsv" "$staged_tsv" || return 1
   protocol_destination_is_recoverable_prefix \
     "$boundaries" "$staged_boundaries" 1 || return 1
   rm -f -- "$staged_incomplete_meta" || return 1
@@ -4834,7 +4848,7 @@ phase_pinned_concurrent() {
       diag_die "fresh pinned-concurrent evidence failed its resumable validation"
   fi
 
-  progress="$(node "$LIB/pinned-protocol.mjs" next-concurrent \
+  progress="$(node "$LIB/pinned-protocol.mjs" next-concurrent-v2 \
     --contexts-file "$PINNED_CONTEXTS_TEMP" --rounds "$PINNED_CONCURRENT_ROUNDS" \
     --seed "$PROTOCOL_SEED" --generation "$generation" --state-dir "$wave_state")" ||
     diag_die "pinned-concurrent state is not an exact whole-wave plan prefix"
@@ -4875,20 +4889,25 @@ phase_pinned_concurrent() {
       diag_die "pinned-concurrent controller CPU $controller is not usable"
     protocol_rc=0
     run_pinned_protocol_logged "$output" "$protocol_log" taskset -c "$controller" \
-      "$DIAG_INDIVIDUAL_NODE_BIN" "$LIB/pinned-protocol.mjs" wave-concurrent \
+      "$DIAG_INDIVIDUAL_NODE_BIN" "$LIB/pinned-protocol.mjs" wave-concurrent-v2 \
       --contexts-file "$PINNED_CONTEXTS_TEMP" --rounds "$PINNED_CONCURRENT_ROUNDS" \
       --seed "$PROTOCOL_SEED" --generation "$generation" --state-dir "$wave_state" \
       --command "$DIAG_INDIVIDUAL_NODE_BIN" --arg "$SCRIPT_DIR/child.mjs" \
       --cwd "$SCRIPT_DIR" --no-turbo-path /sys/devices/system/cpu/intel_pstate/no_turbo \
       || protocol_rc=$?
     result="$(<"$output")"
-    [[ "$protocol_rc" == 0 && "$result" =~ \"committed\":true ]] ||
-      diag_die "pinned-concurrent wave was not a complete clean/SIGSEGV observation set (executor rc=$protocol_rc); phase remains resumable"
+    if [[ "$protocol_rc" != 0 || ! "$result" =~ \"committed\":true ]]; then
+      local failure_reason=unknown
+      if [[ "$result" =~ \"reason\":\"([a-z-]+)\" ]]; then
+        failure_reason="${BASH_REMATCH[1]}"
+      fi
+      diag_die "pinned-concurrent wave did not produce a complete securely launched outcome set (reason=$failure_reason, executor rc=$protocol_rc); phase remains resumable; exact executor detail was appended to $protocol_log"
+    fi
     committed_waves=$((committed_waves + 1))
     if ((committed_waves == total_waves || committed_waves % 10 == 0)); then
       diag_log "pinned-concurrent protocol: committed $committed_waves/$total_waves waves"
     fi
-    progress="$(node "$LIB/pinned-protocol.mjs" next-concurrent \
+    progress="$(node "$LIB/pinned-protocol.mjs" next-concurrent-v2 \
       --contexts-file "$PINNED_CONTEXTS_TEMP" --rounds "$PINNED_CONCURRENT_ROUNDS" \
       --seed "$PROTOCOL_SEED" --generation "$generation" --state-dir "$wave_state")" ||
       diag_die "pinned-concurrent state became invalid after a wave commit"

@@ -37,6 +37,7 @@ import {
 import {
   PINNED_CONCURRENT_PLAN_HEADER,
   PINNED_CONCURRENT_RESULTS_HEADER,
+  PINNED_CONCURRENT_V2_RESULTS_HEADER,
 } from "../pinned-concurrent-evidence.mjs";
 
 const temporaryDirectories = [];
@@ -575,6 +576,141 @@ test("concurrent executor shares one abort signal and commits only a complete va
   assert.equal(invalidAdapter.files.size, 0);
   assert.equal(invalidRunner.calls.length, firstWave.length);
   assert.equal(new Set(invalidRunner.calls.map((call) => call.signal)).size, 1);
+});
+
+test("concurrent V2 resumes a V1 wave prefix and commits exact other workload outcomes", async () => {
+  const plan = buildPinnedConcurrentPlan({ contexts: CONTEXTS.slice(0, 2), rounds: 1, seed: 3 });
+  const adapter = memoryAdapter();
+  const firstWave = plan.records.filter((record) => record.group === plan.records[0].group);
+  const legacy = await runConcurrentWave({
+    plan,
+    generation: GENERATION,
+    stateAdapter: adapter,
+    runChild: sequentialRunner(firstWave.map((_, index) => ({ sigsegv: index === 1 }))).runChild,
+  });
+  assert.equal(legacy.committed, true);
+
+  const migrated = await readConcurrentProgress({
+    plan,
+    generation: GENERATION,
+    stateAdapter: adapter,
+    stateVersion: PINNED_PROTOCOL_STATE_V2_VERSION,
+  });
+  assert.equal(migrated.legacyWaves, 1);
+  assert.equal(migrated.legacyRecords, firstWave.length);
+  assert.equal(migrated.committedWaves, 1);
+
+  let childIndex = 0;
+  const exact = await runConcurrentWave({
+    plan,
+    generation: GENERATION,
+    stateAdapter: adapter,
+    stateVersion: PINNED_PROTOCOL_STATE_V2_VERSION,
+    runChild: async (request) => {
+      const index = childIndex++;
+      return childResultV2(request.cpu, index === 0
+        ? { exitCode: 1, outcome: "other-workload-failure", stderr: "exit one\n" }
+        : { exitCode: 0, outcome: "pass" });
+    },
+  });
+  assert.equal(exact.committed, true);
+  assert.equal(exact.state.version, PINNED_PROTOCOL_STATE_V2_VERSION);
+  assert.equal(exact.state.observations[0].outcome, "other-workload-failure");
+  assert.equal(exact.state.observations[0].exitCode, 1);
+
+  const finalized = await finalizeConcurrentProtocol({
+    plan,
+    generation: GENERATION,
+    stateAdapter: adapter,
+    stateVersion: PINNED_PROTOCOL_STATE_V2_VERSION,
+  });
+  assert.equal(finalized.legacyWaveCount, 1);
+  assert.equal(finalized.legacyRowCount, firstWave.length);
+  const rows = finalized.results.toString("utf8").trimEnd().split("\n");
+  assert.equal(rows[0], PINNED_CONCURRENT_V2_RESULTS_HEADER);
+  assert.equal(rows[1].split("\t")[7], "0");
+  assert.equal(rows[firstWave.length + 1].split("\t")[4], "other-workload-failure");
+  assert.equal(rows[firstWave.length + 1].split("\t")[5], "1");
+  assert.equal(rows[firstWave.length + 1].split("\t")[7], "-");
+  const boundaries = finalized.boundaries.toString("utf8").trimEnd().split("\n").map(JSON.parse);
+  assert.equal(boundaries[0].legacyRc, 0);
+  assert.equal(boundaries[0].stderrSha256, null);
+  assert.equal(boundaries[firstWave.length].outcome, "other-workload-failure");
+  assert.equal(Buffer.from(boundaries[firstWave.length].stderrExcerptBase64, "base64").toString(), "exit one\n");
+
+  const [v2Name, v2Bytes] = [...adapter.files].find(([, bytes]) =>
+    JSON.parse(bytes.toString("utf8")).version === PINNED_PROTOCOL_STATE_V2_VERSION);
+  const tampered = cloneMemoryAdapter(adapter);
+  const state = JSON.parse(v2Bytes.toString("utf8"));
+  state.observations[0].stderr.bytes = "999";
+  tampered.files.set(v2Name, canonicalProtocolJsonLine(state));
+  await assert.rejects(readConcurrentProgress({
+    plan,
+    generation: GENERATION,
+    stateAdapter: tampered,
+    stateVersion: PINNED_PROTOCOL_STATE_V2_VERSION,
+  }), PinnedProtocolStateError);
+});
+
+test("concurrent V2 operational failures remain whole-wave uncommitted", async () => {
+  const plan = buildPinnedConcurrentPlan({ contexts: CONTEXTS.slice(0, 1), rounds: 1, seed: 3 });
+  const adapter = memoryAdapter();
+  const rejected = await runConcurrentWave({
+    plan,
+    generation: GENERATION,
+    stateAdapter: adapter,
+    stateVersion: PINNED_PROTOCOL_STATE_V2_VERSION,
+    runChild: async (request) => childResultV2(request.cpu, {
+      exitCode: null,
+      signal: null,
+      outcome: "operational-invalid",
+      validOutcome: false,
+      invalidReason: "launch-error",
+      launchState: "failed",
+      launchError: { code: "ENOENT", message: "missing launcher" },
+    }),
+  });
+  assert.equal(rejected.committed, false);
+  assert.equal(rejected.reason, "operational-invalid");
+  assert.ok(rejected.attempts.length > 0);
+  assert.equal(adapter.files.size, 0);
+});
+
+test("next-concurrent-v2 CLI exposes the migrated legacy frontier", async () => {
+  const root = temporaryDirectory();
+  const stateDir = path.join(root, "state");
+  const contextsFile = path.join(root, "contexts.json");
+  mkdirSync(stateDir, { mode: 0o700 });
+  writeFileSync(contextsFile, `${JSON.stringify(CONTEXTS.slice(0, 2))}\n`, { mode: 0o600 });
+  const plan = buildPinnedConcurrentPlan({ contexts: CONTEXTS.slice(0, 2), rounds: 1, seed: 3 });
+  const firstWave = plan.records.filter((record) => record.group === plan.records[0].group);
+  await runConcurrentWave({
+    plan,
+    generation: GENERATION,
+    stateDir,
+    runChild: sequentialRunner(firstWave.map(() => ({}))).runChild,
+  });
+  let stdoutText = "";
+  let stderrText = "";
+  const stdout = new Writable({
+    write(chunk, _encoding, callback) { stdoutText += chunk.toString(); callback(); },
+  });
+  const stderr = new Writable({
+    write(chunk, _encoding, callback) { stderrText += chunk.toString(); callback(); },
+  });
+  const code = await runPinnedProtocolCli([
+    "next-concurrent-v2",
+    "--contexts-file", contextsFile,
+    "--rounds", "1",
+    "--seed", "3",
+    "--generation", GENERATION,
+    "--state-dir", stateDir,
+  ], { stdout, stderr, signalSource: new EventEmitter() });
+  assert.equal(code, 0, stderrText);
+  const progress = JSON.parse(stdoutText);
+  assert.equal(progress.legacyWaves, 1);
+  assert.equal(progress.legacyRecords, firstWave.length);
+  assert.equal(progress.committedWaves, 1);
 });
 
 test("resume accepts an interrupted prefix but rejects gaps, partials, duplicates, and tampering", async () => {

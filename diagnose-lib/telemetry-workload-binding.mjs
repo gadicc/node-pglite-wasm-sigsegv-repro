@@ -79,7 +79,7 @@ const PHASE_SPECS = Object.freeze({
     ]),
   }),
   "pinned-concurrent": Object.freeze({
-    version: "1",
+    versions: Object.freeze(["1", "2"]),
     boundaries: true,
     files: Object.freeze([
       Object.freeze({ path: "results/pinned-concurrent.meta", control: "key-value" }),

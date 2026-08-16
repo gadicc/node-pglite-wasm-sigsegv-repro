@@ -182,6 +182,21 @@ function validPinnedGroupCounts(result) {
     (result.sigsegv === 0) === (result.failedWaves === 0);
 }
 
+function validPinnedV2GroupCounts(result) {
+  return Number.isSafeInteger(result?.observedWaves) && result.observedWaves > 0 &&
+    Number.isSafeInteger(result?.waves) && result.waves >= 0 &&
+    Number.isSafeInteger(result?.failedWaves) && result.failedWaves >= 0 &&
+    Number.isSafeInteger(result?.otherFailureWaves) && result.otherFailureWaves >= 0 &&
+    result.failedWaves <= result.waves &&
+    result.waves + result.otherFailureWaves === result.observedWaves &&
+    Number.isSafeInteger(result?.observations) && result.observations >= result.observedWaves &&
+    Number.isSafeInteger(result?.childRuns) && result.childRuns >= 0 &&
+    Number.isSafeInteger(result?.sigsegv) && result.sigsegv >= 0 &&
+    Number.isSafeInteger(result?.otherWorkloadFailures) && result.otherWorkloadFailures >= 0 &&
+    result.childRuns + result.otherWorkloadFailures === result.observations &&
+    result.sigsegv <= result.childRuns && result.sigsegv >= result.failedWaves;
+}
+
 function safeCountSum(rows, field) {
   let total = 0;
   for (const row of rows) {
@@ -196,18 +211,20 @@ function validPinnedSummary(summary) {
   const perGroup = Array.isArray(summary?.perGroup) ? summary.perGroup : [];
   const perCpu = Array.isArray(summary?.perCpu) ? summary.perCpu : [];
   const groups = Array.isArray(summary?.groups) ? summary.groups : [];
+  const v2 = summary?.metadataVersion === "2";
   if (perGroup.length === 0 || perCpu.length === 0 ||
       groups.length !== perGroup.length ||
-      !perGroup.every(validPinnedGroupCounts) || !perCpu.every(validIndividualCounts)) return false;
+      !perGroup.every(v2 ? validPinnedV2GroupCounts : validPinnedGroupCounts) ||
+      !perCpu.every(v2 ? validIndividualV6Counts : validIndividualCounts)) return false;
   if (!Number.isSafeInteger(summary?.totalWaves) || summary.totalWaves <= 0 ||
-      summary.waves !== summary.totalWaves) return false;
+      (v2 ? summary.observedWaves : summary.waves) !== summary.totalWaves) return false;
   const groupNames = new Set(groups.map((group) => group?.group));
   if (groupNames.size !== groups.length ||
       perGroup.some((record) => !groupNames.has(record.group))) return false;
   for (const group of groups) {
     const outcomes = perGroup.find((record) => record.group === group.group);
     if (!Number.isSafeInteger(group?.rounds) || group.rounds <= 0 ||
-        outcomes?.waves !== group.rounds) return false;
+        (v2 ? outcomes?.observedWaves : outcomes?.waves) !== group.rounds) return false;
   }
   const totals = {
     waves: safeCountSum(perGroup, "waves"),
@@ -217,10 +234,32 @@ function validPinnedSummary(summary) {
     cpuRuns: safeCountSum(perCpu, "runs"),
     cpuSigsegv: safeCountSum(perCpu, "sigsegv"),
   };
-  return Object.values(totals).every((value) => value !== null) &&
-    totals.waves === summary.waves && totals.failedWaves === summary.failedWaves &&
-    totals.groupChildRuns === summary.childRuns && totals.cpuRuns === summary.childRuns &&
-    totals.groupSigsegv === summary.sigsegv && totals.cpuSigsegv === summary.sigsegv;
+  if (!Object.values(totals).every((value) => value !== null) ||
+      totals.waves !== summary.waves || totals.failedWaves !== summary.failedWaves ||
+      totals.groupChildRuns !== summary.childRuns || totals.cpuRuns !== summary.childRuns ||
+      totals.groupSigsegv !== summary.sigsegv || totals.cpuSigsegv !== summary.sigsegv) return false;
+  if (!v2) return true;
+  const v2Totals = {
+    observedWaves: safeCountSum(perGroup, "observedWaves"),
+    otherFailureWaves: safeCountSum(perGroup, "otherFailureWaves"),
+    groupObservations: safeCountSum(perGroup, "observations"),
+    groupOther: safeCountSum(perGroup, "otherWorkloadFailures"),
+    cpuObservations: safeCountSum(perCpu, "observations"),
+    cpuOther: safeCountSum(perCpu, "otherWorkloadFailures"),
+  };
+  return Object.values(v2Totals).every((value) => value !== null) &&
+    v2Totals.observedWaves === summary.observedWaves &&
+    v2Totals.otherFailureWaves === summary.otherFailureWaves &&
+    v2Totals.groupObservations === summary.observations &&
+    v2Totals.cpuObservations === summary.observations &&
+    v2Totals.groupOther === summary.otherWorkloadFailures &&
+    v2Totals.cpuOther === summary.otherWorkloadFailures;
+}
+
+function validPinnedCpuCounts(summary, record) {
+  return summary?.metadataVersion === "2"
+    ? validIndividualV6Counts(record)
+    : validIndividualCounts(record);
 }
 
 function validCapturedGdb(result) {
@@ -523,7 +562,7 @@ function validatedReproductionEvidence(r) {
   }
   if (pinnedEvidenceIsAuthoritative(r)) {
     for (const cpu of r.pinnedConcurrent?.perCpu ?? []) {
-      if (validIndividualCounts(cpu) && cpu.sigsegv > 0) {
+      if (validPinnedCpuCounts(r.pinnedConcurrent, cpu) && cpu.sigsegv > 0) {
         evidence.push({ protocol: `pinned-concurrent CPU ${cpu.cpu}`, failures: cpu.sigsegv });
       }
     }
@@ -669,7 +708,8 @@ function renderExecutiveSummary(r, env) {
       validIndividualPrimaryCountsForStatus(r.individualStatus, record))
     : [];
   const concurrent = pinnedEvidenceIsAuthoritative(r)
-    ? (r.pinnedConcurrent?.perCpu ?? []).filter(validIndividualCounts)
+    ? (r.pinnedConcurrent?.perCpu ?? []).filter((record) =>
+      validPinnedCpuCounts(r.pinnedConcurrent, record))
     : [];
   const gdbKnownCpu = r.gdb?.status === "captured" && Number.isSafeInteger(r.gdb?.cpu) &&
     (r.gdb.captures ?? []).some((capture) => capture.classification === "known-signature")
@@ -1172,6 +1212,13 @@ export function renderReport(results) {
     }
     L.push("Each context launches one child pinned to each active logical CPU at the same time, while the controller is pinned outside that active set. Unlike the shared-mask group phase, every child has an exact CPU identity.");
     L.push("Wave outcomes and child outcomes are reported separately: a wave is one correlated concurrent trial; child counts identify which pinned process faulted but do not form independent concurrent trials.");
+    const pinnedV2 = pinned.metadataVersion === "2";
+    if (pinnedV2) {
+      L.push("Securely launched exits and signals outside pass/SIGSEGV are retained as other workload failures. A wave containing one is excluded from the SIGSEGV-positive wave denominator, while its exact child outcomes remain descriptive.");
+      if (Number.isSafeInteger(pinned.legacyWaveCount) && pinned.legacyWaveCount > 0) {
+        L.push(`The first ${pinned.legacyWaveCount} wave(s), covering ${pinned.legacyRowCount} child observation(s), were migrated from the V1 checkpoint. Their stored 0/139 classifications are retained as legacy status provenance; subsequent observations carry exact exit/signal and stderr evidence.`);
+      }
+    }
     if (pinned.scheduleAlgorithm || Number.isSafeInteger(pinned.scheduleSeed)) {
       L.push(`The stored launch/context schedule is ${esc(pinned.scheduleAlgorithm)}${Number.isSafeInteger(pinned.scheduleSeed) ? ` with seed ${pinned.scheduleSeed}` : ""}. Contexts are separate strata and are never pooled.`);
     }
@@ -1180,28 +1227,45 @@ export function renderReport(results) {
     const groupByName = new Map((pinned.groups ?? []).map((group) => [group.group, group]));
     if (Array.isArray(pinned.perGroup) && pinned.perGroup.length > 0) {
       L.push("### Per-context wave outcomes", "");
-      L.push("| Context | Kind / active CPUs | Controller CPU | Completed waves | SIGSEGV-positive waves / nominal pointwise interval | Child runs | Pinned-child SIGSEGVs / measured rate |", "| --- | --- | ---: | ---: | --- | ---: | --- |");
+      L.push(pinnedV2
+        ? "| Context | Kind / active CPUs | Controller CPU | Observed waves | Eligible pass/SIGSEGV waves | Other-failure waves | SIGSEGV-positive waves / nominal pointwise interval | Classified child runs | Pinned-child SIGSEGVs / measured rate | Other workload failures |"
+        : "| Context | Kind / active CPUs | Controller CPU | Completed waves | SIGSEGV-positive waves / nominal pointwise interval | Child runs | Pinned-child SIGSEGVs / measured rate |",
+      pinnedV2
+        ? "| --- | --- | ---: | ---: | ---: | ---: | --- | ---: | --- | ---: |"
+        : "| --- | --- | ---: | ---: | --- | ---: | --- |");
       for (const group of pinned.perGroup) {
         const topology = groupByName.get(group.group) ?? {};
-        const valid = validPinnedGroupCounts(group);
-        const waveRate = valid
+        const valid = pinnedV2 ? validPinnedV2GroupCounts(group) : validPinnedGroupCounts(group);
+        const waveRate = valid && group.waves > 0
           ? protocolRateCell(group.failedWaves, group.waves, pinnedComplete)
-          : "invalid/inconsistent counts; no interval";
+          : valid ? "no eligible pass/SIGSEGV waves" : "invalid/inconsistent counts; no interval";
         const childRate = validBinomialCounts(group.sigsegv, group.childRuns)
           ? `${descriptiveRateCell(group.sigsegv, group.childRuns)} (descriptive; correlated children, no child-level interval)`
           : "invalid/inconsistent counts";
-        L.push(`| ${esc(group.group)} | ${esc(topology.kind)} / ${esc(topology.cpus)} | ${esc(topology.controllerCpu)} | ${esc(group.waves)} | ${waveRate} | ${esc(group.childRuns)} | ${childRate} |`);
+        L.push(pinnedV2
+          ? `| ${esc(group.group)} | ${esc(topology.kind)} / ${esc(topology.cpus)} | ${esc(topology.controllerCpu)} | ${esc(group.observedWaves)} | ${esc(group.waves)} | ${esc(group.otherFailureWaves)} | ${waveRate} | ${esc(group.childRuns)} | ${childRate} | ${esc(group.otherWorkloadFailures)} |`
+          : `| ${esc(group.group)} | ${esc(topology.kind)} / ${esc(topology.cpus)} | ${esc(topology.controllerCpu)} | ${esc(group.waves)} | ${waveRate} | ${esc(group.childRuns)} | ${childRate} |`);
       }
       L.push("");
     }
 
     if (Array.isArray(pinned.perCpu) && pinned.perCpu.length > 0) {
       L.push("### Exact pinned-child outcomes by context and CPU", "");
-      L.push("| Context | CPU | Concurrent attempts | SIGSEGVs | Nominal per-attempt rate / pointwise 95% interval or bound |", "| --- | ---: | ---: | ---: | --- |");
+      L.push(pinnedV2
+        ? "| Context | CPU | Observations | Classified pass/SIGSEGV runs | SIGSEGVs | Other workload failures | Nominal per-classified-run rate / pointwise 95% interval or bound |"
+        : "| Context | CPU | Concurrent attempts | SIGSEGVs | Nominal per-attempt rate / pointwise 95% interval or bound |",
+      pinnedV2
+        ? "| --- | ---: | ---: | ---: | ---: | ---: | --- |"
+        : "| --- | ---: | ---: | ---: | --- |");
       for (const cpu of pinned.perCpu) {
         const context = cpu.context ?? cpu.group;
-        const valid = validIndividualCounts(cpu);
-        L.push(`| ${esc(context)} | ${esc(cpu.cpu)} | ${esc(cpu.runs)} | ${esc(cpu.sigsegv)} | ${valid ? protocolRateCell(cpu.sigsegv, cpu.runs, pinnedComplete) : "invalid/inconsistent counts; no interval"} |`);
+        const valid = pinnedV2 ? validIndividualV6Counts(cpu) : validIndividualCounts(cpu);
+        const rate = valid && cpu.runs > 0
+          ? protocolRateCell(cpu.sigsegv, cpu.runs, pinnedComplete)
+          : valid ? "no classified pass/SIGSEGV runs" : "invalid/inconsistent counts; no interval";
+        L.push(pinnedV2
+          ? `| ${esc(context)} | ${esc(cpu.cpu)} | ${esc(cpu.observations)} | ${esc(cpu.runs)} | ${esc(cpu.sigsegv)} | ${esc(cpu.otherWorkloadFailures)} | ${rate} |`
+          : `| ${esc(context)} | ${esc(cpu.cpu)} | ${esc(cpu.runs)} | ${esc(cpu.sigsegv)} | ${rate} |`);
       }
       L.push("");
       L.push("A logical CPU can appear in more than one topology context. Its rows remain context-specific because sibling load, active-set size, and thermal history differ; no cross-context rate is calculated.", POINTWISE_INTERVAL_NOTE, "");
@@ -1478,7 +1542,13 @@ function renderConclusions(r) {
   }
   if (pinnedEvidenceIsAuthoritative(r)) {
     for (const c of r.pinnedConcurrent.perCpu) {
-      if (!addAggregate(c.sigsegv, 0, 0, c.runs)) hasInvalidCountEvidence = true;
+      const v2 = r.pinnedConcurrent.metadataVersion === "2";
+      if (!addAggregate(
+        c.sigsegv,
+        v2 ? c.otherWorkloadFailures : 0,
+        0,
+        v2 ? c.observations : c.runs,
+      )) hasInvalidCountEvidence = true;
     }
   } else if (pinnedEvidenceStatus === "complete") {
     if (!validPinnedSummary(r.pinnedConcurrent)) hasInvalidCountEvidence = true;

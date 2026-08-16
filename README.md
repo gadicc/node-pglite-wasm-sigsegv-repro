@@ -216,6 +216,15 @@ phase launches one child per active logical CPU in each validated topology
 context, with the controller pinned outside the active set. This preserves
 simultaneous load while retaining exact child-to-CPU attribution. Contexts
 remain separate strata because sibling load and active-set size differ.
+Pinned-concurrent evidence version 2 uses the same four-way outcome model as
+individual V6: securely launched non-SIGSEGV failures commit as descriptive
+outcomes, while operational failures leave the whole wave uncommitted and
+retryable. A resumed V1 checkpoint remains usable as a disclosed contiguous
+legacy prefix: its stored 0/139 classifications are preserved without
+inventing exact signal or stderr provenance, and all later V2 rows retain the
+exact exit/signal and bounded stderr evidence. Waves containing another
+workload failure are excluded from the primary SIGSEGV-positive wave
+denominator.
 
 `targeted-cpu-test.mjs` remains available for exploratory follow-ups outside
 the authoritative diagnostic bundle. It leaves all frequency settings

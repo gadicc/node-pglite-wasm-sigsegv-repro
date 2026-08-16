@@ -281,6 +281,17 @@ test("exact protocols require their version and unique canonical boundary identi
   replace(path.join(version6, "results", "individual.meta"), /VERSION=5/, "VERSION=6");
   assert.doesNotThrow(() => computeTelemetryWorkloadBinding("individual", version6));
 
+  const pinnedV2 = writeFixture("pinned-concurrent");
+  replace(path.join(pinnedV2, "results", "pinned-concurrent.meta"), /VERSION=1/, "VERSION=2");
+  assert.doesNotThrow(() => computeTelemetryWorkloadBinding("pinned-concurrent", pinnedV2));
+
+  const unsupportedPinned = writeFixture("pinned-concurrent");
+  replace(path.join(unsupportedPinned, "results", "pinned-concurrent.meta"), /VERSION=1/, "VERSION=3");
+  assert.throws(
+    () => computeTelemetryWorkloadBinding("pinned-concurrent", unsupportedPinned),
+    /VERSION must be one of 1, 2/,
+  );
+
   const legacy = writeFixture("individual");
   replace(path.join(legacy, "results", "individual.meta"), /VERSION=5/, "VERSION=4");
   assert.throws(

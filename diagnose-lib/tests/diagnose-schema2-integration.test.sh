@@ -935,8 +935,8 @@ if (
         record_fresh_meta validate-before
         ((metadata_file_synced == 1 && metadata_dir_synced == 1))
         ;;
-      next-concurrent)
-        record_fresh_meta next-concurrent
+      next-concurrent-v2)
+        record_fresh_meta next-concurrent-v2
         ((metadata_file_synced == 1 && metadata_dir_synced == 1)) || return 97
         printf '{"committedWaves":0,"complete":false,"controllerCpu":1}\n'
         ;;
@@ -995,7 +995,7 @@ check_true 'fresh phase stops at the mocked pre-workload telemetry boundary' \
   test "$fresh_meta_phase_rc" -ne 0
 fresh_meta_events="$(cat -- "$FRESH_META_EVENTS")"
 check_eq 'fresh incomplete metadata is durable before validation, progress, and telemetry' \
-  $'meta-write\nsync-meta\nsync-results-dir\nvalidate-before\nnext-concurrent\ntelemetry-prepare\ntelemetry-start' \
+  $'meta-write\nsync-meta\nsync-results-dir\nvalidate-before\nnext-concurrent-v2\ntelemetry-prepare\ntelemetry-start' \
   "$fresh_meta_events"
 if grep -q '^forbidden-' "$FRESH_META_EVENTS" ||
   grep -q '^unexpected-' "$FRESH_META_EVENTS"; then
@@ -1061,7 +1061,7 @@ printf 'plan\n' > "$PUBLISH_ROOT/results/pinned-concurrent.plan.tsv"
           "$OUT_DIR/results/pinned-concurrent.meta" 2>/dev/null
         ;;
       validate-before) return 0 ;;
-      next-concurrent)
+      next-concurrent-v2)
         printf '{"committedWaves":1,"complete":true}\n'
         ;;
       *)

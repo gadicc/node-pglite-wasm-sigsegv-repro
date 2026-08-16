@@ -20,6 +20,8 @@ import {
   PINNED_CONCURRENT_GROUPS_HEADER,
   PINNED_CONCURRENT_GROUPS_MAX_BYTES,
   PINNED_CONCURRENT_RESULTS_HEADER,
+  PINNED_CONCURRENT_V2_RESULTS_HEADER,
+  PINNED_CONCURRENT_V2_VERSION,
   assessPinnedConcurrentEvidence,
   buildPinnedConcurrentMeta,
   parsePinnedConcurrentCpuList,
@@ -32,6 +34,7 @@ import {
   serializePinnedConcurrentMeta,
   serializePinnedConcurrentPlan,
   serializePinnedConcurrentResults,
+  sha256PinnedConcurrentBytes,
   validateFreshPinnedConcurrentTargets,
 } from "../pinned-concurrent-evidence.mjs";
 
@@ -143,6 +146,105 @@ function createBundle({
   return { bundle, groupsText, planText, resultsText, boundariesText, meta };
 }
 
+function createV2Bundle({ mutateRows = null, mutateBoundaries = null } = {}) {
+  const bundle = temporaryDirectory("pinned-concurrent-v2-");
+  mkdirSync(path.join(bundle, "results"));
+  mkdirSync(path.join(bundle, "state"));
+  const groupsText = serializePinnedConcurrentGroups(groups, { roundsPerContext: 2 });
+  const planText = serializePinnedConcurrentPlan(plan, groups, { roundsPerContext: 2 });
+  const resultRows = plan.map(({ round, group, cpu, launch_position }, index) => {
+    if (index < 2) {
+      return {
+        round, group, cpu, launch_position, outcome: "pass", exit_code: "-", signal: "-",
+        legacy_rc: 0, elapsed_ms: results[index].elapsed_ms,
+        stderr_sha256: "-", stderr_bytes: "-",
+      };
+    }
+    const outcome = index === 3 ? "sigsegv" : index === 4 ? "other-workload-failure" : "pass";
+    const stderr = Buffer.from(index === 4 ? "exit one\n" : "");
+    return {
+      round,
+      group,
+      cpu,
+      launch_position,
+      outcome,
+      exit_code: outcome === "sigsegv" ? "-" : outcome === "other-workload-failure" ? 1 : 0,
+      signal: outcome === "sigsegv" ? "SIGSEGV" : "-",
+      legacy_rc: "-",
+      elapsed_ms: results[index].elapsed_ms,
+      stderr_sha256: sha256PinnedConcurrentBytes(stderr),
+      stderr_bytes: stderr.length,
+    };
+  });
+  mutateRows?.(resultRows);
+  const boundaryRows = boundaries.map((boundary, index) => {
+    const result = resultRows[index];
+    const legacy = result.legacy_rc !== "-";
+    const stderr = Buffer.from(index === 4 ? "exit one\n" : "");
+    return {
+      ordinal: boundary.ordinal,
+      round: boundary.round,
+      groupPosition: boundary.groupPosition,
+      group: boundary.group,
+      controllerCpu: boundary.controllerCpu,
+      launchPosition: boundary.launchPosition,
+      cpu: boundary.cpu,
+      outcome: result.outcome,
+      exitCode: legacy || result.exit_code === "-" ? null : result.exit_code,
+      signal: legacy || result.signal === "-" ? null : result.signal,
+      legacyRc: legacy ? result.legacy_rc : null,
+      stderrSha256: legacy ? null : result.stderr_sha256,
+      stderrBytes: legacy ? null : String(result.stderr_bytes),
+      stderrExcerptBase64: legacy ? null : stderr.toString("base64"),
+      stderrExcerptBytes: legacy ? null : stderr.length,
+      stderrTruncated: legacy ? null : false,
+      startUnixMs: boundary.startUnixMs,
+      endUnixMs: boundary.endUnixMs,
+      startMonotonicNs: boundary.startMonotonicNs,
+      endMonotonicNs: boundary.endMonotonicNs,
+      durationNs: boundary.durationNs,
+      durationMs: boundary.durationMs,
+      noTurboStart: boundary.noTurboStart,
+      noTurboEnd: boundary.noTurboEnd,
+    };
+  });
+  mutateBoundaries?.(boundaryRows);
+  const resultsText = serializePinnedConcurrentResults(resultRows, plan, {
+    version: PINNED_CONCURRENT_V2_VERSION,
+  });
+  const boundariesText = serializePinnedConcurrentBoundaries(boundaryRows, {
+    planRows: plan,
+    resultRows,
+    version: PINNED_CONCURRENT_V2_VERSION,
+  });
+  const meta = buildPinnedConcurrentMeta({
+    version: PINNED_CONCURRENT_V2_VERSION,
+    generation: GENERATION,
+    sourceGroupGeneration: SOURCE_GENERATION,
+    sourceGroupPlanDigest: SOURCE_PLAN_DIGEST,
+    roundsPerContext: 2,
+    scheduleSeed: 42,
+    groupsBytes: groupsText,
+    groupsRowCount: groups.length,
+    planBytes: planText,
+    planRowCount: plan.length,
+    resultsBytes: resultsText,
+    resultsRowCount: resultRows.length,
+    boundariesBytes: boundariesText,
+    boundariesRowCount: boundaryRows.length,
+    legacyWaveCount: 1,
+    legacyRowCount: 2,
+    completed: true,
+  });
+  writeFileSync(path.join(bundle, "results", "pinned-concurrent.groups.tsv"), groupsText);
+  writeFileSync(path.join(bundle, "results", "pinned-concurrent.plan.tsv"), planText);
+  writeFileSync(path.join(bundle, "results", "pinned-concurrent.tsv"), resultsText);
+  writeFileSync(path.join(bundle, "results", "pinned-concurrent.boundaries.ndjson"), boundariesText);
+  writeFileSync(path.join(bundle, "results", "pinned-concurrent.meta"), serializePinnedConcurrentMeta(meta));
+  writeFileSync(path.join(bundle, "state", "phase-pinned-concurrent.done"), "");
+  return { bundle, resultRows, boundaryRows, meta, resultsText, boundariesText };
+}
+
 function publishBoundaries(bundleRecord, text, rowCount = text.trimEnd().split("\n").length) {
   const binding = pinnedConcurrentFileBinding(text, rowCount);
   bundleRecord.meta.BOUNDARIES_SHA256 = binding.sha256;
@@ -240,6 +342,70 @@ test("a complete envelope authorizes exact child and whole-wave outcomes", () =>
   assert.equal(assessment.boundarySummary.totalDurationNs, "7228000000");
   assert.equal(assessment.boundarySummary.authoritative, true);
   assert.equal(assessment.authoritativeBoundarySummary.rowCount, 8);
+});
+
+test("V2 authorizes a legacy wave prefix and retains exact other workload failures", () => {
+  const record = createV2Bundle();
+  assert.ok(record.resultsText.startsWith(`${PINNED_CONCURRENT_V2_RESULTS_HEADER}\n`));
+  const assessment = assessPinnedConcurrentEvidence(record.bundle);
+  assert.equal(assessment.status, "complete", assessment.reasons.join("\n"));
+  assert.equal(assessment.metadataVersion, PINNED_CONCURRENT_V2_VERSION);
+  assert.equal(assessment.legacyWaveCount, 1);
+  assert.equal(assessment.legacyRowCount, 2);
+  assert.deepEqual({
+    observedWaves: assessment.descriptiveOutcomes.observedWaves,
+    waves: assessment.descriptiveOutcomes.waves,
+    failedWaves: assessment.descriptiveOutcomes.failedWaves,
+    otherFailureWaves: assessment.descriptiveOutcomes.otherFailureWaves,
+    observations: assessment.descriptiveOutcomes.observations,
+    childRuns: assessment.descriptiveOutcomes.childRuns,
+    sigsegv: assessment.descriptiveOutcomes.sigsegv,
+    otherWorkloadFailures: assessment.descriptiveOutcomes.otherWorkloadFailures,
+  }, {
+    observedWaves: 4,
+    waves: 3,
+    failedWaves: 1,
+    otherFailureWaves: 1,
+    observations: 8,
+    childRuns: 7,
+    sigsegv: 1,
+    otherWorkloadFailures: 1,
+  });
+  assert.equal(assessment.authoritativeBoundaries[0].legacyRc, 0);
+  assert.equal(assessment.authoritativeBoundaries[4].exitCode, 1);
+  assert.equal(
+    Buffer.from(assessment.authoritativeBoundaries[4].stderrExcerptBase64, "base64").toString(),
+    "exit one\n",
+  );
+});
+
+test("V2 fails closed on exact-status, legacy-prefix, and stderr tampering", () => {
+  const status = createV2Bundle();
+  publishResults(status, status.resultsText.replace("other-workload-failure\t1\t-", "pass\t1\t-"));
+  const invalidStatus = assessPinnedConcurrentEvidence(status.bundle);
+  assert.equal(invalidStatus.status, "invalid");
+  assert.match(invalidStatus.reasons.join("\n"), /inconsistent pass status|exact V2 result evidence/);
+
+  const legacy = createV2Bundle();
+  legacy.meta.LEGACY_ROW_COUNT = "3";
+  writeFileSync(
+    path.join(legacy.bundle, "results", "pinned-concurrent.meta"),
+    serializePinnedConcurrentMeta(legacy.meta),
+  );
+  const invalidLegacy = assessPinnedConcurrentEvidence(legacy.bundle);
+  assert.equal(invalidLegacy.status, "invalid");
+  assert.match(invalidLegacy.reasons.join("\n"), /legacy-prefix metadata/);
+
+  const stderr = createV2Bundle();
+  const lines = stderr.boundariesText.trimEnd().split("\n");
+  const row = JSON.parse(lines[4]);
+  row.stderrExcerptBase64 = Buffer.from("changed\n").toString("base64");
+  row.stderrExcerptBytes = Buffer.byteLength("changed\n");
+  lines[4] = JSON.stringify(row);
+  publishBoundaries(stderr, `${lines.join("\n")}\n`);
+  const invalidStderr = assessPinnedConcurrentEvidence(stderr.bundle);
+  assert.equal(invalidStderr.status, "invalid");
+  assert.match(invalidStderr.reasons.join("\n"), /stderr evidence/);
 });
 
 test("an exact partial prefix resumes only at a complete group-wave boundary", () => {
