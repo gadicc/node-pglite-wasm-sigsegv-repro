@@ -203,7 +203,6 @@ test("default launcher stays in the outer supervisor group and signals only its 
       "/mock/taskset",
       "-c",
       "19",
-      "--",
       "/mock/node",
       "/mock/child.mjs",
       "argument with spaces",

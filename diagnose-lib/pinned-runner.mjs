@@ -385,7 +385,6 @@ export function defaultPinnedLauncher({
     tasksetPath,
     "-c",
     String(cpu),
-    "--",
     command,
     ...args,
   ], {
