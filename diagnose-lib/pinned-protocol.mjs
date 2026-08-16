@@ -1557,13 +1557,17 @@ export async function runConcurrentWave(options) {
   }
   const stateName = concurrentStateName(first.ordinal, first.group);
   await adapterCommit(progress._adapter, stateName, bytes);
+  const nextOrdinal = first.ordinal + observations.length;
+  const complete = nextOrdinal > plan.records.length;
   return Object.freeze({
     committed: true,
     reason: "committed",
     stateName,
     state: Object.freeze(state),
     committedRecords: observations.length,
-    nextOrdinal: first.ordinal + observations.length,
+    nextOrdinal,
+    complete,
+    nextControllerCpu: complete ? null : plan.records[nextOrdinal - 1].controllerCpu,
   });
 }
 

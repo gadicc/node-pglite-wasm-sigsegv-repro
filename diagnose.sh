@@ -4756,6 +4756,7 @@ phase_pinned_concurrent() {
   local wave_state="$STATE_DIR/pinned-concurrent-waves"
   local protocol_log="$OUT_DIR/logs/pinned-concurrent/protocol.log"
   local generation progress result output controller complete committed_waves
+  local progress_attempt progress_rc=1
   local total_waves stage staged_tsv staged_boundaries staged_meta protocol_rc=0
   local terminal_recovery=0 stage_ready=0
   local telemetry_segment="" telemetry_started=0
@@ -4848,10 +4849,20 @@ phase_pinned_concurrent() {
       diag_die "fresh pinned-concurrent evidence failed its resumable validation"
   fi
 
-  progress="$(node "$LIB/pinned-protocol.mjs" next-concurrent-v2 \
-    --contexts-file "$PINNED_CONTEXTS_TEMP" --rounds "$PINNED_CONCURRENT_ROUNDS" \
-    --seed "$PROTOCOL_SEED" --generation "$generation" --state-dir "$wave_state")" ||
-    diag_die "pinned-concurrent state is not an exact whole-wave plan prefix"
+  # This is the run's only separate progress-reader process. It is
+  # read-only, so retry a transient Node crash without touching durable state;
+  # each successful wave response carries the next controller directly and
+  # avoids launching another unpinned administrative Node process.
+  for progress_attempt in 1 2 3; do
+    if progress="$(node "$LIB/pinned-protocol.mjs" next-concurrent-v2 \
+      --contexts-file "$PINNED_CONTEXTS_TEMP" --rounds "$PINNED_CONCURRENT_ROUNDS" \
+      --seed "$PROTOCOL_SEED" --generation "$generation" --state-dir "$wave_state")"; then
+      progress_rc=0
+      break
+    fi
+  done
+  ((progress_rc == 0)) ||
+    diag_die "pinned-concurrent state/progress reader failed after three read-only attempts"
   [[ "$progress" =~ \"committedWaves\":([0-9]+) ]] ||
     diag_die "pinned-concurrent executor returned malformed progress"
   committed_waves="${BASH_REMATCH[1]}"
@@ -4860,6 +4871,12 @@ phase_pinned_concurrent() {
   complete="${BASH_REMATCH[1]}"
   ((committed_waves <= total_waves)) ||
     diag_die "pinned-concurrent state exceeds its immutable plan"
+  controller=""
+  if [[ "$complete" == false ]]; then
+    [[ "$progress" =~ \"controllerCpu\":([0-9]+) ]] ||
+      diag_die "pinned-concurrent progress omitted its controller CPU"
+    controller="${BASH_REMATCH[1]}"
+  fi
   if ((terminal_recovery == 1)); then
     [[ "$complete" == true ]] ||
       diag_die "pinned-concurrent evidence is not a valid resumable prefix; preserve it and use --redo pinned-concurrent"
@@ -4882,9 +4899,6 @@ phase_pinned_concurrent() {
   output="$(mktemp /tmp/.diagnose-pinned-concurrent.XXXXXX)" ||
     diag_die "cannot prepare pinned-concurrent executor output"
   while [[ "$complete" == false ]]; do
-    [[ "$progress" =~ \"controllerCpu\":([0-9]+) ]] ||
-      diag_die "pinned-concurrent progress omitted its controller CPU"
-    controller="${BASH_REMATCH[1]}"
     diag_cpulist_contains "$ONLINE_CPUS" "$controller" ||
       diag_die "pinned-concurrent controller CPU $controller is not usable"
     protocol_rc=0
@@ -4907,13 +4921,14 @@ phase_pinned_concurrent() {
     if ((committed_waves == total_waves || committed_waves % 10 == 0)); then
       diag_log "pinned-concurrent protocol: committed $committed_waves/$total_waves waves"
     fi
-    progress="$(node "$LIB/pinned-protocol.mjs" next-concurrent-v2 \
-      --contexts-file "$PINNED_CONTEXTS_TEMP" --rounds "$PINNED_CONCURRENT_ROUNDS" \
-      --seed "$PROTOCOL_SEED" --generation "$generation" --state-dir "$wave_state")" ||
-      diag_die "pinned-concurrent state became invalid after a wave commit"
-    [[ "$progress" =~ \"complete\":(true|false) ]] ||
-      diag_die "pinned-concurrent executor omitted its completion state"
+    [[ "$result" =~ \"complete\":(true|false) ]] ||
+      diag_die "committed pinned-concurrent wave omitted its completion state"
     complete="${BASH_REMATCH[1]}"
+    if [[ "$complete" == false ]]; then
+      [[ "$result" =~ \"nextControllerCpu\":([0-9]+) ]] ||
+        diag_die "committed pinned-concurrent wave omitted its next controller CPU"
+      controller="${BASH_REMATCH[1]}"
+    fi
   done
   rm -f -- "$output"
   if ((telemetry_started == 1)); then

@@ -538,6 +538,8 @@ test("concurrent executor shares one abort signal and commits only a complete va
   });
   assert.equal(committed.committed, true);
   assert.equal(committed.committedRecords, firstWave.length);
+  assert.equal(committed.complete, false);
+  assert.equal(committed.nextControllerCpu, plan.records[firstWave.length].controllerCpu);
   assert.deepEqual(runner.calls.map((call) => call.cpu), firstWave.map((record) => record.cpu));
   assert.equal(new Set(runner.calls.map((call) => call.signal)).size, 1);
   assert.equal(adapter.files.size, 1);
@@ -617,6 +619,8 @@ test("concurrent V2 resumes a V1 wave prefix and commits exact other workload ou
   });
   assert.equal(exact.committed, true);
   assert.equal(exact.state.version, PINNED_PROTOCOL_STATE_V2_VERSION);
+  assert.equal(exact.complete, true);
+  assert.equal(exact.nextControllerCpu, null);
   assert.ok(exactRequests.length > 0);
   assert.ok(exactRequests.every((request) => request.witnessCpu === exact.state.wave.controllerCpu));
   assert.ok(exactRequests.every((request) => request.witnessCpu !== request.cpu));
