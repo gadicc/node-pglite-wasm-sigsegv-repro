@@ -601,12 +601,14 @@ test("concurrent V2 resumes a V1 wave prefix and commits exact other workload ou
   assert.equal(migrated.committedWaves, 1);
 
   let childIndex = 0;
+  const exactRequests = [];
   const exact = await runConcurrentWave({
     plan,
     generation: GENERATION,
     stateAdapter: adapter,
     stateVersion: PINNED_PROTOCOL_STATE_V2_VERSION,
     runChild: async (request) => {
+      exactRequests.push(request);
       const index = childIndex++;
       return childResultV2(request.cpu, index === 0
         ? { exitCode: 1, outcome: "other-workload-failure", stderr: "exit one\n" }
@@ -615,6 +617,9 @@ test("concurrent V2 resumes a V1 wave prefix and commits exact other workload ou
   });
   assert.equal(exact.committed, true);
   assert.equal(exact.state.version, PINNED_PROTOCOL_STATE_V2_VERSION);
+  assert.ok(exactRequests.length > 0);
+  assert.ok(exactRequests.every((request) => request.witnessCpu === exact.state.wave.controllerCpu));
+  assert.ok(exactRequests.every((request) => request.witnessCpu !== request.cpu));
   assert.equal(exact.state.observations[0].outcome, "other-workload-failure");
   assert.equal(exact.state.observations[0].exitCode, 1);
 

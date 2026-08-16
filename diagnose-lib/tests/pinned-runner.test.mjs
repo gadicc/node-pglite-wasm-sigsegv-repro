@@ -221,7 +221,7 @@ test("default launcher stays in the outer supervisor group and signals only its 
   assert.ok(killCalls.every(([pid]) => pid > 0), "must never address a process group with a negative PID");
 });
 
-test("V2 launcher pins the verifier worker and keeps workload status on a private protocol stream", () => {
+test("V2 isolated launcher pins the verifier worker to the target CPU", () => {
   const child = { pid: 42_425, stdout: new PassThrough() };
   const spawnCalls = [];
   const descriptor = defaultPinnedLauncherV2({
@@ -249,6 +249,41 @@ test("V2 launcher pins the verifier worker and keeps workload status on a privat
   assert.match(spawnCalls[0].args[7], /pinned-launch-worker\.mjs$/);
   assert.deepEqual(spawnCalls[0].args.slice(8), [
     "12", "16384", "/mock/node", "/mock/child.mjs",
+  ]);
+  assert.deepEqual(spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe"]);
+  assert.equal(spawnCalls[0].options.detached, false);
+});
+
+test("V2 concurrent launcher keeps its verifier on the controller CPU", () => {
+  const child = { pid: 42_426, stdout: new PassThrough() };
+  const spawnCalls = [];
+  const descriptor = defaultPinnedLauncherV2({
+    cpu: 12,
+    witnessCpu: 3,
+    command: "/mock/node",
+    args: ["/mock/child.mjs", "argument with spaces"],
+    cwd: "/mock/repo",
+    env: { MOCKED: "1" },
+    stderrBytes: 16_384,
+    tasksetPath: "/mock/taskset",
+    shellPath: "/mock/bash",
+  }, {
+    spawnProcess(file, args, options) {
+      spawnCalls.push({ file, args, options });
+      return child;
+    },
+    killProcess() {},
+  });
+  assert.equal(descriptor.launchProtocol, child.stdout);
+  assert.equal(spawnCalls[0].file, "/mock/bash");
+  assert.deepEqual(spawnCalls[0].args.slice(0, 7), [
+    "-c", "ulimit -c 0; exec \"$@\"", "pinned-runner-v2",
+    "/mock/taskset", "-c", "3", process.execPath,
+  ]);
+  assert.match(spawnCalls[0].args[7], /pinned-launch-worker\.mjs$/);
+  assert.deepEqual(spawnCalls[0].args.slice(8), [
+    "--controller", "3", "12", "16384", "/mock/taskset", "/mock/bash",
+    "/mock/node", "/mock/child.mjs", "argument with spaces",
   ]);
   assert.deepEqual(spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe"]);
   assert.equal(spawnCalls[0].options.detached, false);
@@ -381,7 +416,9 @@ test("runPinnedChild V2 accepts a canonical private worker result frame", async 
       truncated: false,
     },
   };
-  const launcher = () => {
+  let launchRequest = null;
+  const launcher = (request) => {
+    launchRequest = request;
     setImmediate(() => {
       launchProtocol.end(`${JSON.stringify(workerResult)}\n`);
       child.stderr.end();
@@ -398,6 +435,7 @@ test("runPinnedChild V2 accepts a canonical private worker result frame", async 
   const result = await runPinnedChild({
     runnerVersion: 2,
     cpu: 12,
+    witnessCpu: 3,
     command: "/mock/node",
     launcher,
     clock: scriptedClock(),
@@ -409,6 +447,7 @@ test("runPinnedChild V2 accepts a canonical private worker result frame", async 
   assert.equal(result.launchState, "launched");
   assert.equal(result.launchError, null);
   assert.deepEqual(result.stderrEvidence, workerResult.stderr);
+  assert.equal(launchRequest.witnessCpu, 3);
 });
 
 test("runPinnedChild emits canonical JSON-safe boundaries and bounded stderr", async () => {
@@ -651,6 +690,9 @@ test("runPinnedChild strictly validates execution inputs before launching", asyn
     { command: "bad\0command" },
     { args: [1] },
     { stderrBytes: -1 },
+    { runnerVersion: 2, witnessCpu: -1 },
+    { runnerVersion: 2, witnessCpu: 0 },
+    { runnerVersion: 1, witnessCpu: 1 },
     { cancelGraceMs: 60_001 },
     { launcher: null },
     { noTurboReader: null },

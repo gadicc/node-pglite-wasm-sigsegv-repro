@@ -1256,7 +1256,13 @@ function validateAbortSignal(signal) {
   return signal;
 }
 
-function childOptions(options, cpu, signal, runnerVersion = PINNED_RUNNER_VERSION) {
+function childOptions(
+  options,
+  cpu,
+  signal,
+  runnerVersion = PINNED_RUNNER_VERSION,
+  witnessCpu = undefined,
+) {
   const supplied = options.childOptions ?? {};
   if (supplied === null || typeof supplied !== "object" || Array.isArray(supplied)) {
     throw new PinnedProtocolInputError("childOptions must be an object");
@@ -1266,7 +1272,9 @@ function childOptions(options, cpu, signal, runnerVersion = PINNED_RUNNER_VERSIO
     cpu,
     signal,
     runnerVersion,
-    ...(runnerVersion === PINNED_RUNNER_V2_VERSION ? { stderrBytes: DEFAULT_STDERR_BYTES } : {}),
+    ...(runnerVersion === PINNED_RUNNER_V2_VERSION
+      ? { stderrBytes: DEFAULT_STDERR_BYTES, ...(witnessCpu === undefined ? {} : { witnessCpu }) }
+      : {}),
   };
 }
 
@@ -1485,6 +1493,9 @@ export async function runConcurrentWave(options) {
           stateVersion === PINNED_PROTOCOL_STATE_V2_VERSION
             ? PINNED_RUNNER_V2_VERSION
             : PINNED_RUNNER_VERSION,
+          stateVersion === PINNED_PROTOCOL_STATE_V2_VERSION
+            ? first.controllerCpu
+            : undefined,
         ));
         const normalized = stateVersion === PINNED_PROTOCOL_STATE_V2_VERSION
           ? stateObservationV2(record, child)

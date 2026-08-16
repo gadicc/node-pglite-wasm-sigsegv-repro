@@ -408,6 +408,7 @@ export function defaultPinnedLauncher({
 
 export function defaultPinnedLauncherV2({
   cpu,
+  witnessCpu,
   command,
   args,
   cwd,
@@ -421,19 +422,28 @@ export function defaultPinnedLauncherV2({
 } = {}) {
   if (typeof spawnProcess !== "function") throw new TypeError("spawnProcess must be a function");
   if (typeof killProcess !== "function") throw new TypeError("killProcess must be a function");
+  const workerArguments = witnessCpu === undefined
+    ? [String(cpu), String(stderrBytes), command, ...args]
+    : [
+      "--controller",
+      String(witnessCpu),
+      String(cpu),
+      String(stderrBytes),
+      tasksetPath,
+      shellPath,
+      command,
+      ...args,
+    ];
   const child = spawnProcess(shellPath, [
     "-c",
     "ulimit -c 0; exec \"$@\"",
     "pinned-runner-v2",
     tasksetPath,
     "-c",
-    String(cpu),
+    String(witnessCpu ?? cpu),
     process.execPath,
     PINNED_LAUNCH_WORKER,
-    String(cpu),
-    String(stderrBytes),
-    command,
-    ...args,
+    ...workerArguments,
   ], {
     cwd,
     env,
@@ -510,6 +520,15 @@ function validateRunOptions(options) {
     PINNED_RUNNER_VERSION,
     PINNED_RUNNER_V2_VERSION,
   );
+  const witnessCpu = options.witnessCpu === undefined
+    ? undefined
+    : validateCpu(options.witnessCpu, "witness CPU");
+  if (witnessCpu !== undefined && witnessCpu === cpu) {
+    throw new TypeError("witness CPU must differ from the workload CPU");
+  }
+  if (witnessCpu !== undefined && runnerVersion !== PINNED_RUNNER_V2_VERSION) {
+    throw new TypeError("witness CPU is supported only by runner V2");
+  }
   const launcher = options.launcher === undefined
     ? (runnerVersion === PINNED_RUNNER_V2_VERSION ? defaultPinnedLauncherV2 : defaultPinnedLauncher)
     : options.launcher;
@@ -543,6 +562,7 @@ function validateRunOptions(options) {
     tasksetPath: options.tasksetPath,
     shellPath: options.shellPath,
     runnerVersion,
+    witnessCpu,
   };
 }
 
@@ -780,7 +800,7 @@ export async function runPinnedChild(options) {
       tasksetPath: config.tasksetPath,
       shellPath: config.shellPath,
       ...(config.runnerVersion === PINNED_RUNNER_V2_VERSION
-        ? { stderrBytes: config.stderrBytes }
+        ? { stderrBytes: config.stderrBytes, witnessCpu: config.witnessCpu }
         : {}),
     }), config.runnerVersion);
     child = descriptor.child;
