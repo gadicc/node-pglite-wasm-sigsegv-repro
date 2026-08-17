@@ -1113,6 +1113,7 @@ esac
 EOF
 cat > "$PIPELINE_DIR/bin/gdb" << 'EOF'
 #!/usr/bin/env bash
+[[ -z "${FAKE_GDB_ARGS_LOG:-}" ]] || printf '%s\n' "$*" >> "$FAKE_GDB_ARGS_LOG"
 case "${FAKE_GDB_MODE:-clean}" in
   clean) printf 'Inferior 1 exited normally\n' ;;
   error) printf 'synthetic debugger error\n' ;;
@@ -1301,6 +1302,62 @@ for refusal_kind in symlink fifo hardlink regular; do
 done
 grep -q 'timeout --foreground --signal=KILL' "$REPO_ROOT/capture-fault.sh"
 check_eq "GDB timeout remains inside the tracked foreground group" "0" "$?"
+
+# The optional sixth capture-fault.sh argument selects the exact debug target.
+# The transcript helper keeps running under the PATH-resolved node; only the
+# --args target changes. Five-argument callers keep the historical default.
+EXPLICIT_TARGET_DIR="$PIPELINE_DIR/explicit-target"
+mkdir -p "$EXPLICIT_TARGET_DIR"
+cat > "$EXPLICIT_TARGET_DIR/node-a" << 'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$EXPLICIT_TARGET_DIR/node-a"
+ln -s "$EXPLICIT_TARGET_DIR/node-a" "$EXPLICIT_TARGET_DIR/node-a-link"
+
+default_target_dir="$PIPELINE_DIR/gdb-default-target"
+mkdir -p "$default_target_dir"
+default_target_rc=0
+(
+  cd "$REPO_ROOT" || exit 99
+  PATH="$PIPELINE_DIR/bin:$PATH" REAL_NODE_BIN="$REAL_NODE_BIN" FAKE_GDB_MODE=clean \
+    FAKE_GDB_ARGS_LOG="$PIPELINE_DIR/gdb-default-target.args" \
+    bash ./capture-fault.sh 0 1 1 "$default_target_dir" "$GDB_TEST_GENERATION"
+) > /dev/null 2>&1 || default_target_rc=$?
+check_eq "five-argument default still targets the PATH-resolved node" "3|1" \
+  "$default_target_rc|$([[ "$(tail -1 "$PIPELINE_DIR/gdb-default-target.args")" == *"--args $PIPELINE_DIR/bin/node child.mjs" ]] && echo 1 || echo 0)"
+
+nodebin_dir="$PIPELINE_DIR/gdb-nodebin"
+mkdir -p "$nodebin_dir"
+nodebin_rc=0
+(
+  cd "$REPO_ROOT" || exit 99
+  PATH="$PIPELINE_DIR/bin:$PATH" REAL_NODE_BIN="$REAL_NODE_BIN" FAKE_GDB_MODE=capture \
+    FAKE_GDB_ARGS_LOG="$PIPELINE_DIR/gdb-nodebin.args" \
+    bash ./capture-fault.sh 0 3 1 "$nodebin_dir" "$GDB_TEST_GENERATION" \
+    "$EXPLICIT_TARGET_DIR/node-a"
+) > "$PIPELINE_DIR/gdb-nodebin.log" 2> /dev/null || nodebin_rc=$?
+check_eq "explicit NODE_BIN run keeps canonical terminal accounting" \
+  $'0|COUNTS\tGENERATION\t0123456789abcdef0123456789abcdef\tCPU\t0\tMAX_RUNS\t3\tMAX_CAPTURES\t1\tATTEMPTED\t1\tCLEAN\t0\tCAPTURED\t1\tERRORS\t0\tEXIT_CODE\t0' \
+  "$nodebin_rc|$(tail -1 "$PIPELINE_DIR/gdb-nodebin.log")"
+check_eq "explicit NODE_BIN reaches the fake GDB invocation exactly" "1" \
+  "$([[ "$(tail -1 "$PIPELINE_DIR/gdb-nodebin.args")" == *"--args $EXPLICIT_TARGET_DIR/node-a child.mjs" ]] && echo 1 || echo 0)"
+check_eq "explicit NODE_BIN capture retains the generation-bound transcript" \
+  $'GDB_TRANSCRIPT\tVERSION\t1\tGENERATION\t0123456789abcdef0123456789abcdef\tCPU\t0\tMAX_RUNS\t3\tMAX_CAPTURES\t1\tRUN\t1\tOUTCOME\tcaptured' \
+  "$(head -1 "$nodebin_dir/cpu0-run1.txt")"
+
+nodebin_link_dir="$PIPELINE_DIR/gdb-nodebin-link"
+mkdir -p "$nodebin_link_dir"
+nodebin_link_rc=0
+(
+  cd "$REPO_ROOT" || exit 99
+  PATH="$PIPELINE_DIR/bin:$PATH" REAL_NODE_BIN="$REAL_NODE_BIN" FAKE_GDB_MODE=clean \
+    FAKE_GDB_ARGS_LOG="$PIPELINE_DIR/gdb-nodebin-link.args" \
+    bash ./capture-fault.sh 0 1 1 "$nodebin_link_dir" "$GDB_TEST_GENERATION" \
+    "$EXPLICIT_TARGET_DIR/node-a-link"
+) > /dev/null 2>&1 || nodebin_link_rc=$?
+check_eq "symlink NODE_BIN resolves to the canonical target before GDB" "3|1" \
+  "$nodebin_link_rc|$([[ "$(tail -1 "$PIPELINE_DIR/gdb-nodebin-link.args")" == *"--args $EXPLICIT_TARGET_DIR/node-a child.mjs" ]] && echo 1 || echo 0)"
 
 echo "== fail-closed settings restore =="
 RESTORE_FAIL_DIR="$TMP/restore-fail"
@@ -2804,6 +2861,17 @@ bash "$REPO_ROOT/capture-fault.sh" 0 0 1 "$TMP/out" 0123456789abcdef0123456789ab
 check_eq "capture-fault.sh rejects zero runs (rc=2)" "2" "$?"
 bash "$REPO_ROOT/capture-fault.sh" 0 1 0 "$TMP/out" 0123456789abcdef0123456789abcdef > /dev/null 2>&1
 check_eq "capture-fault.sh rejects zero captures (rc=2)" "2" "$?"
+bash "$REPO_ROOT/capture-fault.sh" 0 1 1 "$TMP/out" 0123456789abcdef0123456789abcdef node > /dev/null 2>&1
+check_eq "capture-fault.sh rejects a relative NODE_BIN (rc=2)" "2" "$?"
+bash "$REPO_ROOT/capture-fault.sh" 0 1 1 "$TMP/out" 0123456789abcdef0123456789abcdef /definitely/missing/node > /dev/null 2>&1
+check_eq "capture-fault.sh rejects a missing NODE_BIN (rc=2)" "2" "$?"
+printf 'not executable\n' > "$TMP/not-executable-node"
+bash "$REPO_ROOT/capture-fault.sh" 0 1 1 "$TMP/out" 0123456789abcdef0123456789abcdef "$TMP/not-executable-node" > /dev/null 2>&1
+check_eq "capture-fault.sh rejects a non-executable NODE_BIN (rc=2)" "2" "$?"
+bash "$REPO_ROOT/capture-fault.sh" 0 1 1 "$TMP/out" 0123456789abcdef0123456789abcdef "$TMP" > /dev/null 2>&1
+check_eq "capture-fault.sh rejects a directory NODE_BIN (rc=2)" "2" "$?"
+bash "$REPO_ROOT/capture-fault.sh" 0 1 1 "$TMP/out" 0123456789abcdef0123456789abcdef "$TMP" extra > /dev/null 2>&1
+check_eq "capture-fault.sh rejects a seventh argument (rc=2)" "2" "$?"
 # Missing dependency: a PATH containing everything except gdb.
 mkdir -p "$TMP/bin"
 for c in bash grep rm mkdir cat date head tail sort find xargs timeout taskset node tee awk sed chmod tac printf; do

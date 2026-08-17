@@ -8,7 +8,13 @@
 # and error runs keep cpu<CPU>-run<RUN>.txt, and an over-limit stream becomes
 # a truncated error transcript that is never counted as a capture.
 #
-# Usage: ./capture-fault.sh <cpu> <max-runs> <max-captures> <out-dir> <generation>
+# Usage: ./capture-fault.sh <cpu> <max-runs> <max-captures> <out-dir> <generation> [node-bin]
+#
+# The optional node-bin selects the exact executable that runs child.mjs under
+# GDB. It must be an absolute path; it is resolved to a canonical executable
+# regular file before use. Without it the debug target is the PATH-resolved
+# node, exactly as before. The transcript helper itself always runs under the
+# PATH-resolved node.
 #
 # stdout is authoritative runner evidence: exactly one
 #   ATTEMPT\tGENERATION\t<gen>\tCPU\t<cpu>\tMAX_RUNS\t<n>\tMAX_CAPTURES\t<m>\tRUN\t<r>\tOUTCOME\t<clean|captured|error>
@@ -29,8 +35,8 @@
 set -u
 ulimit -c 0
 
-if [[ $# -ne 5 ]]; then
-  echo "usage: capture-fault.sh <cpu> <max-runs> <max-captures> <out-dir> <generation>" >&2
+if [[ $# -lt 5 || $# -gt 6 ]]; then
+  echo "usage: capture-fault.sh <cpu> <max-runs> <max-captures> <out-dir> <generation> [node-bin]" >&2
   exit 2
 fi
 cpu="$1"
@@ -38,6 +44,7 @@ max_runs="$2"
 max_captures="$3"
 out_dir="$4"
 generation="$5"
+node_bin_arg="${6:-}"
 
 for v in cpu max_runs max_captures; do
   if [[ ! "${!v}" =~ ^(0|[1-9][0-9]*)$ ]]; then
@@ -78,6 +85,24 @@ node_bin="$(command -v node)" || {
   echo "error: missing dependency: node" >&2
   exit 4
 }
+# The debug target defaults to the PATH-resolved node. An explicit node-bin
+# must be absolute and is resolved once, here, so the exact target executable
+# is fixed before the first attempt and never re-derived from PATH.
+node_target="$node_bin"
+if [[ -n "$node_bin_arg" ]]; then
+  if [[ "$node_bin_arg" != /* ]]; then
+    echo "error: node-bin must be an absolute path, got '$node_bin_arg'" >&2
+    exit 2
+  fi
+  node_target="$(readlink -f -- "$node_bin_arg")" || {
+    echo "error: cannot resolve node-bin '$node_bin_arg'" >&2
+    exit 2
+  }
+  if [[ ! -f "$node_target" || ! -x "$node_target" ]]; then
+    echo "error: node-bin is not an executable regular file: '$node_bin_arg'" >&2
+    exit 2
+  fi
+fi
 if [[ ! -f child.mjs ]]; then
   echo "error: child.mjs not found in the current directory" >&2
   exit 4
@@ -118,7 +143,7 @@ for ((run = 1; run <= max_runs; run++)); do
   outcome_and_status="$(
     {
       {
-        printf '# capture-fault.sh cpu=%s run=%s started=%s\n' "$cpu" "$run" "$(date -Is)"
+        printf '# capture-fault.sh cpu=%s run=%s started=%s node=%s\n' "$cpu" "$run" "$(date -Is)" "$node_target"
         printf '# affinity: '
         taskset -pc $$ 2>/dev/null || printf 'unknown\n'
         timeout --foreground --signal=KILL 180 taskset -c "$cpu" gdb --batch \
@@ -135,7 +160,7 @@ for ((run = 1; run <= max_runs; run++)); do
           -ex "info threads" \
           -ex "info proc mappings" \
           -ex "printf \"MAPPINGS_COMPLETE=1\\n\"" \
-          --args "$node_bin" child.mjs
+          --args "$node_target" child.mjs
       } 2>&1 |
         "$node_bin" "$attempt_helper" \
           "$out_dir" "$generation" "$cpu" "$max_runs" "$max_captures" "$run"

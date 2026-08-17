@@ -48,48 +48,122 @@ The sequential control runs the same workload one child at a time:
 npm run repro:sequential
 ```
 
-### Controlled external-load A/B/A
+### Controlled-load experiments
 
-`load-state-aba.mjs` tests whether activity elsewhere on the package changes
-the failure rate of one sequential child pinned to one target CPU. It runs
-**A1** with no script-induced load, **B** with one deterministic worker pinned
-to each separately selected load CPU, then **A2** after those workers have been
-stopped and a fixed settling interval has elapsed. The controller, target, and
-load workers use disjoint affinities; the load-worker affinities are verified
-through `/proc`, and the target uses the diagnostic suite's common exact-CPU
-launcher.
+`load-state-aba.mjs` is the controlled external-load harness. The induced load
+is deliberately simple: one `/usr/bin/yes` worker per selected load CPU, each
+launched through `taskset` and verified individually through `/proc` before any
+measurement starts. All worker process groups are stopped on normal completion,
+errors, SIGINT, and SIGTERM. The harness never changes BIOS, turbo, frequency,
+affinity of unrelated processes, or any sysfs value, never requires root, and
+writes only a new directory below `diagnostics/` unless `--out-dir` is
+supplied. The default for every mode is a dry run; a live experiment requires
+`--yes`. Every target Node executable is resolved to an exact canonical path
+(and hashed) before the plan is fixed — no bare `PATH` lookup chooses a target
+once the experiment starts.
 
-The default is a dry run targeting CPU 19 with load on CPUs 0-7:
+It has three modes, all sharing the same verified load.
+
+#### Load-state A/B/A (default mode)
+
+Tests whether activity elsewhere on the package changes the failure rate of one
+sequential child pinned to one target CPU. It runs **A1** with no
+script-induced load, **B** with the induced load active, then **A2** after the
+workers have been stopped and a fixed settling interval has elapsed:
 
 ```sh
 npm run load:aba
 npm run load:aba -- --yes
-```
 
-Useful alternatives:
-
-```sh
 # Load the other CPUs in CPU 19's E-core cluster instead of the P-cores.
 npm run load:aba -- --load-cpus 16-18 --runs 30 --yes
-
-# Select the workload binary explicitly; child processes never use bare PATH
-# lookup once the experiment starts.
-npm run load:aba -- \
-  --node-bin /home/dragon/.nvm/versions/node/v25.2.1/bin/node --dry-run
 ```
 
-The live run requires `--yes`, does not require root, and writes only a new
-directory below `diagnostics/` unless `--out-dir` is supplied. It never changes
-BIOS, turbo, frequency, affinity of unrelated processes, or any sysfs value.
-Each bundle contains exact Node/load binary hashes, platform and topology
-metadata, per-child JSONL outcomes, verified load-worker phase boundaries, a
-Markdown report, and 100 ms read-only sysfs telemetry for frequency,
-temperature (when exposed), and `intel_pstate/no_turbo`.
-
 An A leg means only *no load induced by the script*: close or otherwise control
-unrelated applications before interpreting it as an idle condition. Because
-the fixed A1/B/A2 order can retain temperature and time effects, repeat the
-whole experiment rather than pooling arbitrary legs across sessions.
+unrelated applications before interpreting it as an idle condition.
+
+#### Bounded GDB capture under load (`--mode gdb`)
+
+Runs the diagnostic suite's `capture-fault.sh` against `child.mjs` on the
+target CPU *while the induced load is active*: settle, start and verify the
+workers, warm the load (default 5 s), then capture. The runner is bounded by
+`--gdb-max-runs` (default 10) and `--gdb-max-captures` (default 1) and keeps
+its existing evidence format: canonical ATTEMPT/COUNTS runner accounting,
+64 MiB-bounded generation-bound transcripts, and clean/captured/error
+classification, wrapped in the validated `gdb-evidence.mjs` manifest envelope
+(`logs/gdb/runner.log`, `gdb/cpu<N>-run<M>.txt`, `results/gdb.meta`,
+`results/gdb.manifest`).
+
+```sh
+npm run load:gdb -- \
+  --node-bin /home/dragon/.nvm/versions/node/v25.2.1/bin/node
+npm run load:gdb -- \
+  --node-bin /home/dragon/.nvm/versions/node/v25.2.1/bin/node --yes
+```
+
+A *no fault within the bound* outcome is an experimental result, not an
+operational failure: `capture-fault.sh`'s exit-code-3 convention is preserved
+inside the runner log, `gdb.meta`, and the manifest, while the harness itself
+completes successfully and reports `no-fault`. Compare any captured
+transcript's faulting instruction, `SI_ADDR`, registers, and backtrace with the
+previously published fault signature before treating the load trigger as the
+same fault.
+
+#### Node executable A/B/A under constant load (`--mode node-aba`)
+
+Changes only the Node executable while the *same* induced load stays active:
+settle, start and verify the workers once, warm the load (default 5 s), then
+**A1** with exact Node A, **B** with exact Node B, **A2** with exact Node A —
+no worker is stopped, started, or re-pinned between legs, and the load stops
+only after A2. External load, worker PIDs, affinities, target CPU, controller
+CPU, workload, dependencies, and per-leg run count stay constant. Every result
+row and phase event carries its Node label and exact path; the bundle metadata
+records both executables' resolved paths, versions, V8 versions, module
+versions, and SHA-256 hashes.
+
+```sh
+npm run load:node-aba -- \
+  --node-a /home/dragon/.nvm/versions/node/v25.2.1/bin/node \
+  --node-b /usr/bin/node
+npm run load:node-aba -- \
+  --node-a /home/dragon/.nvm/versions/node/v25.2.1/bin/node \
+  --node-b /usr/bin/node --yes
+```
+
+`--node-bin` remains supported as the Node A/default executable when `--node-a`
+is omitted. On this machine at documentation time, `/usr/bin/node` inspected as
+Node v26.7.0 (V8 14.6.202.34-node.28, modules 147, SHA-256
+`0beb7f253288ac762b8db4ededf5608ded416392da95d3bd67f24ae4db740256`) and the
+nvm Node as v25.2.1 (V8 14.1.146.11-node.14, modules 141); do not assume these
+versions — the dry-run plan prints the currently resolved identities.
+
+This mode answers a different question than the default load-state A/B/A: the
+load-state mode varies the *load state* for one fixed executable, while
+node-aba varies the *executable* under one fixed load. The legs still run in
+the fixed order A1, B, A2, so time and thermal drift remain possible
+confounders even with a constant load — prefer repeating complete sessions
+over reading a single one, and never pool legs across sessions.
+
+#### Bundle contents and recommended sequence
+
+Each bundle contains `metadata.json` (configuration, platform, topology, exact
+binary identities and hashes), `events.jsonl` (verified load-worker and phase
+boundaries), `telemetry.ndjson` (100 ms read-only frequency, temperature when
+exposed, and `intel_pstate/no_turbo` samples), and a `report.md` keeping A1, B,
+and A2 (or the capture outcome) separate. Load-state and node-aba bundles add
+`results.jsonl` with one exact child outcome per row; gdb bundles add the
+validated GDB evidence envelope instead of per-leg rows. Telemetry
+`scaling_cur_freq` is a point-in-time kernel value, not an effective-frequency
+measurement.
+
+Recommended investigation sequence:
+
+1. `--mode gdb` under the induced load to confirm the crash keeps the same
+   fault signature before attributing it to the load trigger.
+2. `--mode node-aba` under the same constant load to measure whether the
+   trigger rate depends on the Node executable.
+3. Repeat full sessions when practical; fixed-order A/B/A legs can still
+   drift in time and temperature.
 
 ## Diagnostic runner (`diagnose.sh`)
 
@@ -510,7 +584,11 @@ authorizes no conclusion and no numerical bound.
 CPU-list parsing, settings-restore-on-signal simulation, argument and
 exit-code checks, statistics and parser unit tests with fixtures, and an
 end-to-end collect+report pass on a synthetic bundle. It does not run the
-crash workload.
+crash workload. The controlled-load harness is covered through mode and
+argument validation, per-mode phase plans, stubbed orchestration (the
+constant-load node A/B/A sequence never stops or restarts load workers
+between legs), `capture-fault.sh` target-selection checks, and a fake-runner
+GDB capture that must publish a fully validated evidence envelope.
 
 ## Docker
 
