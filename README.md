@@ -1,7 +1,9 @@
-# Concurrent PGlite processes can SIGSEGV Node.js
+# CPU-localized PGlite/WebAssembly SIGSEGV reproduction for Node.js
 
-Minimal, framework-free reproduction for intermittent native Node.js crashes
-while multiple processes initialize PGlite's PostgreSQL WebAssembly module.
+Framework-free reproduction and diagnostic tooling for intermittent native
+Node.js crashes while initializing PGlite's PostgreSQL WebAssembly module on
+one affected machine. The crash was discovered under concurrent load, then
+reduced to a single process pinned to one of several susceptible logical CPUs.
 
 Each child creates an in-memory PGlite 0.5.4 client, runs `SELECT 1`, awaits
 `client.close()`, and exits. There is no Vitest, Vite, test runner, native
@@ -163,6 +165,22 @@ sampler aborts before evidence is published instead of becoming an apparent
 `avg —, max —` measurement. Older bundles with empty samples are reported as
 frequency unavailable.
 
+The workload executable must also be treated as part of the experiment. In
+particular, `sudo` plus `runuser` does not initialize an interactive NVM shell;
+a bare `node` may therefore resolve to `/usr/bin/node` instead of the binary
+used by `diagnose.sh`. Before interpreting a frequency comparison, verify the
+privileged launch path itself, for example:
+
+```sh
+sudo runuser -u "$(id -un)" -- /bin/sh -c \
+  'command -v node; node -p \
+  "process.execPath + \" \" + process.version + \" V8 \" + process.versions.v8"'
+```
+
+Record that result with the bundle. Evidence collected with a different Node
+binary remains useful for that binary's trigger rate, but it is not a
+frequency control for the runtime measured by the other phases.
+
 ### Quick and full examples
 
 ```sh
@@ -216,8 +234,8 @@ reported as descriptive exact-CPU evidence, never relabelled as passes or
 SIGSEGVs, and are excluded from the clean/SIGSEGV denominator. Telemetry joins
 keep all three committed outcomes in separate context/CPU/outcome strata.
 
-The separate pinned-concurrent
-phase launches one child per active logical CPU in each validated topology
+The separate pinned-concurrent phase launches one child per active logical CPU
+in each validated topology
 context, with the controller pinned outside the active set. This preserves
 simultaneous load while retaining exact child-to-CPU attribution. Contexts
 remain separate strata because sibling load and active-set size differ.
@@ -501,7 +519,7 @@ tiering, and WASM tier-up are enabled, with up to 128 compilation tasks. Node
 20 did reproduce when `--no-liftoff` forced the optimizing compiler, so the
 underlying crash is not established as a post-20 regression.
 
-The newest available official Node V8-canary was also tested after verifying
+The newest available official Node V8 canary was also tested after verifying
 its published SHA-256 checksum:
 
 - Node `v27.0.0-v8-canary202607066c1f8ebea4`
@@ -516,14 +534,10 @@ its published SHA-256 checksum:
 | Sequential `child_process.fork()`, one child | 50/50 waves passed |
 
 The canary results show that neither IPC nor optimized WASM compilation is
-universally required. Concurrency is the stable trigger in the measured Node
-configurations.
-
-> **Update (2026-07-31):** "Concurrency is the stable trigger" is superseded.
-> A single process pinned to one of the CPUs that failed in these tests
-> reproduces the crash with no other load; concurrency only ensured scheduler
-> exposure to those CPUs. See "Update (2026-07-31): failures localized to
-> three physical cores in these tests" below.
+universally required. The clean sequential sample initially made concurrency
+look necessary; later exact-CPU tests showed that it was instead increasing
+scheduler exposure to susceptible CPUs. A single pinned process reproduces
+with no other workload.
 
 ## Post-report flag and version sweep
 
@@ -552,21 +566,20 @@ Two consequences:
   of mitigation for this intermittent crash.
 - The crash survives `--liftoff-only`, `--no-wasm-tier-up`,
   `--no-concurrent-marking`, and `--single-threaded-gc`, so background
-  optimizing compilation and concurrent GC threads are not required. The
-  remaining shared paths are lazy Liftoff compilation and the WASM trap
-  handling on the main thread, with cross-process machine load as the
-  likely timing perturber.
+  optimizing compilation and concurrent GC threads are not required.
+- Later exact-CPU isolation showed that cross-process load is not required;
+  concurrency primarily increased scheduler exposure to the affected logical
+  CPUs in these tests.
 
-> **Update (2026-07-31):** the "likely timing perturber" framing is also
-> superseded — no cross-process load is required. See "Update (2026-07-31):
-> failures localized to three physical cores in these tests" below.
+## Platform-level fault-address investigation (2026-07-30 onward)
 
-## Root-cause investigation (2026-07-30): platform-level address corruption
-
-A full native investigation on the affected machine found that the crashes
-are not caused by Node, V8, or PGlite. The evidence points to sporadic
-single-bit corruption of faulting linear addresses in the CPU's address
-path under heavy concurrent load.
+A native investigation on the affected machine found evidence that is hard to
+reconcile with an ordinary Node, V8, or PGlite address-generation
+bug. Repeated captures point instead to sporadic single-bit corruption in the
+fault-address path while this workload executes. That is strong evidence for
+a platform-dependent execution anomaly, but it is not by itself formal proof
+of a defective CPU or proof that every software and kernel interaction has
+been excluded.
 
 ### The fault-address signature
 
@@ -584,15 +597,18 @@ equals the intended address with an extra high bit set.
 | Node 25.2.1, gdb, CPU 19 with TME disabled | `mov %rbp, 0xb0(%r13)`, `r13=0x6720080` | `0x6720130` | `0x40006720130` | yes, inside `[heap]` (rw) |
 | Node 25.2.1, strace | `mov %rbp, 0xb0(%r13)` (wasm entry) | `0x44905130` | `0x40044905130` | — |
 
-`strace -e %memory` showed the faulting address was never mapped, unmapped,
-or protected by the process at any point. The register state at each fault
-is clean and self-consistent. No x86-64 mechanism (segment bases, LAM,
-canonicalization) adds 2^42 to a plain register-relative access, and
-page-table or TLB-shootdown bugs cannot change the linear address reported
-in CR2. A software bug can only corrupt architectural state, which would be
-visible in the register dump. The varying crash sites seen earlier (Liftoff
-code emission, wasm entry, GC marking barrier) are explained by the anomaly
-striking whatever memory access is in flight.
+`strace -e %memory` showed that the reported fault address was never mapped,
+unmapped, or protected by the process. The register state at each fault is
+clean and self-consistent. No ordinary x86-64 address calculation represented
+by the captured instruction (including segment bases, LAM, or canonicalization)
+adds 2^42 to this plain register-relative access, and page-table or TLB
+translation occurs after the linear address reported in CR2 is formed. A
+conventional wrong-register or wrong-displacement compiler bug should be
+visible in the architectural register state or instruction bytes; neither is.
+The varying crash sites seen earlier are consistent with the anomaly striking
+whichever memory access is in flight. Less conventional kernel, signal,
+debugger, firmware, or CPU interactions remain part of the residual
+uncertainty.
 
 Bit 42 sits inside the PML4 index field of a 48-bit linear address, so the
 corrupted fault address names a different top-level page-table slot than
@@ -617,8 +633,9 @@ change CR2 (a linear address) at all.
   Electron/Signal V8 `int3` aborts) crashing with anomalous fault addresses
   over the same period.
 - A generic non-V8 stress test (24 threads of dense computed-address
-  stores, 10 minutes) did not reproduce. The anomaly appears to require the
-  specific concurrent V8 WASM-compilation workload, not merely memory load.
+  stores, 10 minutes) did not reproduce. The PGlite/V8 workload is therefore
+  an unusually effective trigger; generic memory load alone was insufficient
+  in this sample.
 
 ### Forensic notes
 
@@ -631,22 +648,25 @@ Trustworthy fault addresses require a live gdb stop
 ### Conclusion
 
 The affected machine (Core Ultra 9 285HX, stepping 2, microcode 0x122)
-exhibits sporadic single-high-bit corruption of faulting linear addresses
-under heavy concurrent load. In the initial TME-enabled configuration the
-CPU reported 42-bit physical addressing, so the flipped bit appeared to be
-exactly the MAXPHYADDR boundary. A controlled cold-boot test with TME disabled
-restored 46-bit physical addressing, but CPU 19 still failed 9/20 runs and a
-pristine gdb capture retained the exact `intended_address + 2^42` signature.
-TME/MKTME is therefore not required for the failure, and the earlier
+repeatedly reports sporadic single-high-bit corruption of faulting linear
+addresses while this workload executes. In the initial TME-enabled
+configuration the CPU reported 42-bit physical addressing, so the flipped bit
+appeared to be exactly the MAXPHYADDR boundary. A controlled cold-boot test
+with TME disabled restored 46-bit physical addressing, but CPU 19 still failed
+9/20 runs and a pristine gdb capture retained the exact
+`intended_address + 2^42` signature.
+TME/MKTME is therefore not required for the observed failure, and the earlier
 MAXPHYADDR correspondence was incidental. Disabling Intel System Agent
 Geyserville (SaGV) also had no effect: CPU 19 still failed 9/20 runs.
-Node+PGlite is an unusually effective trigger but not the cause. Observed
-crashes are the subset where the corrupted address is unmapped; a corrupted
-store address landing on a mapped page would silently corrupt memory. Next
-steps are firmware updates and stock BIOS settings on the affected machine
-and, if the behavior persists, an erratum report to Intel.
+Node+PGlite is an unusually effective trigger, while the captured architectural
+state argues strongly against a conventional Node/V8 address-calculation bug.
+Observed crashes are necessarily the subset where the reported address is
+unmapped; if the same kind of address corruption can land on a mapped page, it
+could in principle cause silent memory corruption. Next steps are firmware
+updates and stock BIOS settings on the affected machine and, if the behavior
+persists, a platform service case or erratum report to Intel.
 
-### Update (2026-07-31): failures localized to three physical cores in these tests
+### Initial exact-CPU localization (2026-07-31)
 
 `taskset` isolation on the affected machine localized the observed failures
 to individual CPUs in this session. CPUs 0-7 are P-cores; 8-23 are E-cores in
@@ -689,12 +709,11 @@ taskset confined every thread of the process to it.
 
 Consequences:
 
-- Concurrency is not required, superseding "concurrency is the stable
-  trigger" and "cross-process machine load as the likely timing perturber"
-  above. A single process pinned to an observed failing CPU faults while its V8
-  background threads sit idle. The earlier concurrency dependence, and the
-  unpinned rate of one crash per 40-80 child-runs, were scheduler exposure
-  to the three CPUs that failed in these tests among 24.
+- Concurrency is not required. A single process pinned to an observed failing
+  CPU faults with no other workload. The earlier apparent concurrency
+  dependence, and the unpinned rate of one crash per 40-80 child-runs, are
+  explained by greater scheduler exposure to the three CPUs that failed in
+  these tests among 24.
 - "Good core" verdicts are provisional at low rates: 50 clean single-child
   runs exclude per-run crash rates only above roughly 5%, and core 21's
   observed rate (1 in 22) sits at that boundary. Cluster 24's 400 fully
@@ -705,8 +724,9 @@ Consequences:
   runs in a single ~1.2 GiB process. This is a cheap oracle for firmware
   A/B tests and, if it comes to it, an Intel erratum report.
 
-A frequency A/B/A test on core 19 (single-child runs, back-to-back in one
-session) showed an association with the tested clock conditions:
+An earlier Node v25.2.1 frequency A/B/A test on core 19 (single-child runs,
+back-to-back in one session) showed an association with the tested clock
+conditions:
 
 | Condition | scaling_max_freq | Effective clock under load | Result |
 | --- | --- | --- | --- |
@@ -745,16 +765,35 @@ fault through either USB-C port and with the machine running on battery:
 
 The battery-only failures show that the dock, USB-C input path, external
 adapter, household mains, and unstable external supply are not required for
-the defect. The lower counts in these small batches are not evidence of an
-improvement given the previously observed rate drift. The remaining hardware
-candidates are internal platform power delivery and the CPU itself; both are
+the observed fault. The lower counts in these small batches are not evidence
+of an improvement given the previously observed rate drift. The leading
+platform candidates are internal power delivery and the CPU itself; both are
 replaced together by a system-board replacement on this model.
+
+### Full diagnostic follow-up (2026-08-11)
+
+A later full diagnostic run used seeded, position-balanced isolated trials and
+exact-CPU pinned-concurrent topology contexts. The isolated phase observed
+SIGSEGVs on CPUs 11 (24/400), 19 (146/398), 21 (71/398), and 23 (1/400), with
+0/8,000 on the other 20 CPUs in that phase. Under pinned-concurrent contexts,
+exact child attribution expanded the observed set to CPUs 9, 11, 17, 19, 21,
+22, and 23. Contexts are separate strata because sibling load differs, so
+their rates should not be pooled with the isolated rates.
+
+Three further live GDB captures on CPU 19 reproduced the same mapped intended
+address versus `intended + 2^42` signature across `addl $1,0x1c0(%r13)` and
+`mov %r10,0xa8(%r13)`. The expanded CPU set does not establish that every
+listed CPU has an intrinsic defect or that every zero-failure CPU is sound; it
+records where this workload produced exact-CPU failures under the tested
+contexts.
 
 ## Temporary workarounds
 
-These mitigate the observed trigger but are not substitutes for hardware
-replacement: the failure can potentially become silent memory corruption when
-the corrupted address happens to be mapped.
+These mitigate the observed trigger but do not resolve the underlying anomaly.
+Because an incorrectly formed address could in principle land on a mapped
+page, clean application runs are not a hardware-integrity guarantee. If the
+fault survives current firmware and a full stock-BIOS retest, platform service
+or system-board replacement remains the conservative response.
 
 The most conservative frequency workaround tested so far is to disable turbo
 globally. Core 19 passed 20/20 runs with the resulting 2.1 GHz ceiling:
@@ -766,11 +805,12 @@ echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo
 Writing `0` restores turbo. This sysfs setting is not persistent across a
 reboot.
 
-A more targeted workaround is to prevent the scheduler from using the known
-affected logical CPUs on this machine (11, 19, and 21):
+A more targeted workaround is to prevent the scheduler from using every
+logical CPU with an exact-CPU SIGSEGV in the completed protocols on this
+machine (9, 11, 17, 19, 21, 22, and 23):
 
 ```bash
-for cpu in 11 19 21; do
+for cpu in 9 11 17 19 21 22 23; do
   echo 0 | sudo tee "/sys/devices/system/cpu/cpu${cpu}/online"
 done
 ```
@@ -787,15 +827,16 @@ including its threads, on the extensively tested P-cores:
 taskset -c 0-7 node app.mjs
 ```
 
-Finally, `scaling_max_freq` can cap only CPUs 11, 19, and 21 while preserving
+Finally, `scaling_max_freq` can cap the seven observed CPUs while preserving
 turbo elsewhere. A 2.1 GHz ceiling is a conservative starting point suggested
-by the successful no-turbo test, but this exact per-CPU configuration has not
-yet been independently validated and the earlier intel_pstate/HWP cap did not
-strictly match the observed effective clock. Confirm the actual frequency
-under load and run a much longer validation before relying on it:
+only by the CPU 19 no-turbo test; this per-CPU configuration has not been
+independently validated, especially on the other six CPUs, and the earlier
+intel_pstate/HWP cap did not strictly match the observed effective clock.
+Confirm the actual frequency under load and run a much longer validation
+before relying on it:
 
 ```bash
-for cpu in 11 19 21; do
+for cpu in 9 11 17 19 21 22 23; do
   echo 2100000 | sudo tee \
     "/sys/devices/system/cpu/cpu${cpu}/cpufreq/scaling_max_freq"
 done
@@ -834,8 +875,8 @@ and explicit close:
 | Runtime | Mode | Result |
 | --- | --- | --- |
 | Bun 1.3.11 / JavaScriptCore | Node-compatible `child_process.fork()` | 50/50 waves passed |
-| Deno 2.8.0 / V8 14.9.207.2 | Native subprocess, default flags | 50/50 waves passed |
-| Deno 2.8.0 / V8 14.9.207.2 | Native subprocess, `--no-liftoff` | 50/50 waves passed |
+| Deno 2.8.0 / V8 14.9.207.2 | Native subprocess, default flags | 50/50 waves passed in this sample |
+| Deno 2.8.0 / V8 14.9.207.2 | Native subprocess, `--no-liftoff` | 50/50 waves passed in this sample |
 
 Run the Deno control with:
 
@@ -847,6 +888,12 @@ CHILD_V8_FLAGS=--no-liftoff deno run -A deno-repro.ts 16 50
 Deno's Node-compatible `child_process.fork()` could not provide an exact IPC
 control because its compatibility layer failed before spawning with
 `fd is not from BiPipe`.
+
+These Deno 2.8.0 zero-failure samples did not establish that Deno or its V8
+build was immune. A later Deno 2.9.3 run under GDB captured a related
+high-bit fault-address anomaly on the same machine. Runtime and build choices
+therefore change triggerability, but they do not provide a clean Node-versus-V8
+ownership boundary.
 
 ## PGlite debug-build control
 
@@ -866,37 +913,65 @@ Using Node 25.2.1 and the same harness:
 
 After resetting the test scope's cgroup counter, the 16-child run peaked at
 67,306,729,472 bytes (62.7 GiB). The cgroup recorded `oom=0` and `oom_kill=0`.
-The debug build therefore preserves the concurrency-dependent crash despite
-Emscripten's `--no-wasm-opt` build setting and the inclusion of source-level
-debug information. V8's runtime compilation tiers were not disabled by that
-setting. The debug build also requires much more memory than the release-build
-reproduction.
+The debug build therefore preserves the crash under concurrent scheduling
+despite Emscripten's `--no-wasm-opt` build setting and the inclusion of
+source-level debug information. Later CPU-pinned tests established that
+concurrency itself is not required. V8's runtime compilation tiers were not
+disabled by the Emscripten setting. The debug build also requires much more
+memory than the release-build reproduction.
 
-## Node versus V8 attribution
+## Node/V8 source and binary-provenance review (2026-08-17)
 
-> **Superseded (2026-07-30):** see "Root-cause investigation: platform-level
-> address corruption" above. The evidence now points to a hardware/platform
-> anomaly on the affected machine, with Node as the trigger rather than the
-> cause. This section is retained for historical context.
+The completed 2026-08-11 diagnostic bundle recorded 5,032 confirmed SIGSEGVs
+across 31,203 child-process runs. Its three live GDB captures on CPU 19 all
+reproduce the mapped intended address versus `intended + 2^42` signature
+across two ordinary memory-instruction forms. Diagnostic bundles are ignored
+by Git because they can contain machine-specific raw evidence; the durable
+findings are summarized here and in the source-history review below.
 
-The exact ownership is not yet proven.
+A subsequent comparison initially appeared to show a major Node-version
+effect: interactive NVM Node v25.2.1 reproduced 7/20 times on CPU 19, while
+`PATH=/usr/bin:/bin ./single.sh 19 20` with Node v26.7.0 passed 20/20. The
+frequency A/B/A phase had unknowingly made the same runtime switch. Because it
+was launched through `sudo` and `runuser` with a bare `node`, it resolved to
+`/usr/bin/node` v26.7.0 rather than the NVM Node v25.2.1 used by the main
+diagnostic phases. Its turbo-on legs contained one SIGSEGV among 799
+endpoint-resolved runs, but the experiment cannot answer whether disabling
+turbo suppresses the known high-rate Node v25.2.1 trigger.
 
-The results establish a Node-runtime-specific interaction under the tested
-configurations, but Node both embeds and configures V8 and supplies
-`TrapWebAssemblyOrContinue`. Deno's V8 build is clean, while a newer V8 inside
-the official Node canary still fails. Plausible locations therefore include:
+This is also not evidence that Node v26 or V8 14.6 fixed the underlying fault:
 
-- Node's WASM trap integration;
-- Node-specific V8 build flags or platform configuration;
-- a V8 defect exposed only by Node's embedding; or
-- a concurrency/resource interaction specific to Node processes executing a
-  large WASM module.
+- Official Node v26.5.1 with V8 14.6.202.34 had already reproduced.
+- An official Node 27 V8 canary with V8 15.2 reproduced.
+- The system Node v26.7.0 campaign itself contained one confirmed SIGSEGV.
 
-`d8` is V8's standalone JavaScript shell. A reproduction that loads and runs
-the relevant WASM directly in `d8`, without Node or its APIs, would establish
-that the same bug exists in V8 independently of Node. The recommended initial
-report target is Node, with maintainers routing or cross-linking it to V8 if
-appropriate.
+The two headline binaries confound source version with their production
+recipes. The NVM v25.2.1 binary is a large Clang-built, statically bundled,
+non-PGO official-style binary. Arch's `/usr/bin/node` v26.7.0 is a much smaller
+GCC-built, PGO-enabled, dynamically linked system binary. Those compiler,
+profile-guided optimization, linkage, dependency, and layout differences come
+primarily from how the official and Arch packages are built and published;
+they are not a single identifiable Node or V8 source change. Node/V8 source
+also changed between versions, so both dimensions currently vary together.
+
+The complete
+[Node/V8 source-history review](research/node-v8-25.2.1-to-26.7.0-review.md)
+screened 5,693 commits, with every disposition retained in the companion
+[audit TSV](research/node-v8-screened-commits.tsv). It found real x64/Wasm
+correctness fixes, but none matches the captured small-displacement store/add
+instructions, correct live base register, and exact `+2^42` fault address.
+Several changes could alter code layout, memory layout, spill placement, or
+timing and thereby change exposure probability. The defensible interpretation
+is therefore that runtime source and build choices materially affect
+**triggerability**, while the recurring fault signature and CPU localization
+continue to point toward a platform-dependent execution anomaly.
+
+The next high-value comparison is same-source before source-history bisection:
+interleave the official upstream Node v26.7.0 binary with Arch's
+`/usr/bin/node` v26.7.0 on CPU 19, while recording hashes and build metadata.
+That isolates packaging/build layout from the nominal Node/V8 version. Compare
+official v25.2.1 in the same randomized session, then test the major V8-roll
+boundaries only if the controlled binaries justify a source bisect.
 
 ## Related reports
 
@@ -917,4 +992,5 @@ different reports include:
   background compilation feedback-vector handling across instances/isolates.
 
 Those reports have different platforms, failure modes, or sharing models; none
-currently covers independent concurrent Node processes running this workload.
+currently matches the exact CPU localization and recurring high-bit
+fault-address signature captured here.
