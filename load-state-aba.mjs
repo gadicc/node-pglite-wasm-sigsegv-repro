@@ -269,15 +269,17 @@ export function chooseController(requested, targetCpu, loadCpus, allowed) {
 
 // The experiment as a data-only step list, so the exact ordering — including
 // the single load start/stop bracketing every node-aba leg — is testable
-// without a live machine. Steps: settle, load-start, load-warmup, leg, gdb,
-// load-stop.
+// without a live machine. Explicit load-verify steps bind worker identity and
+// affinity to both sides of each measured leg/capture.
 export function buildPhasePlan(options) {
   if (options.mode === "gdb") {
     return [
       { type: "settle", seconds: options.settleSeconds, before: "the induced load starts" },
       { type: "load-start" },
       { type: "load-warmup", seconds: options.loadWarmupSeconds },
+      { type: "load-verify", boundary: "before GDB capture" },
       { type: "gdb", description: "bounded GDB capture under the constant induced load" },
+      { type: "load-verify", boundary: "after GDB capture" },
       { type: "load-stop" },
     ];
   }
@@ -286,9 +288,13 @@ export function buildPhasePlan(options) {
       { type: "settle", seconds: options.settleSeconds, before: "the induced load starts" },
       { type: "load-start" },
       { type: "load-warmup", seconds: options.loadWarmupSeconds },
+      { type: "load-verify", boundary: "before A1" },
       { type: "leg", phase: "A1", description: NODE_ABA_PHASES[0][1], nodeLabel: "A" },
+      { type: "load-verify", boundary: "after A1" },
       { type: "leg", phase: "B", description: NODE_ABA_PHASES[1][1], nodeLabel: "B" },
+      { type: "load-verify", boundary: "after B" },
       { type: "leg", phase: "A2", description: NODE_ABA_PHASES[2][1], nodeLabel: "A" },
+      { type: "load-verify", boundary: "after A2" },
       { type: "load-stop" },
     ];
   }
@@ -297,7 +303,9 @@ export function buildPhasePlan(options) {
     { type: "leg", phase: "A1", description: "no induced load", nodeLabel: "target" },
     { type: "load-start" },
     { type: "load-warmup", seconds: options.loadWarmupSeconds },
+    { type: "load-verify", boundary: "before B" },
     { type: "leg", phase: "B", description: "induced load", nodeLabel: "target" },
+    { type: "load-verify", boundary: "after B" },
     { type: "load-stop" },
     { type: "settle", seconds: options.settleSeconds, before: "A2" },
     { type: "leg", phase: "A2", description: "no induced load after recovery", nodeLabel: "target" },
@@ -307,20 +315,23 @@ export function buildPhasePlan(options) {
 // Walk a phase plan through caller-supplied hooks. Nothing here spawns or
 // stops anything by itself; the hooks own all side effects, which keeps this
 // sequencing directly testable with fakes.
-export async function executePhasePlan(plan, hooks) {
-  const rows = [];
-  let gdbResult = null;
+export async function executePhasePlan(
+  plan,
+  hooks,
+  result = { rows: [], gdbResult: null },
+) {
   for (const step of plan) {
     if (hooks.isInterrupted?.() === true) break;
     if (step.type === "settle") await hooks.settle(step);
     else if (step.type === "load-start") await hooks.startLoad();
     else if (step.type === "load-warmup") await hooks.warmup(step);
-    else if (step.type === "leg") rows.push(...await hooks.runLeg(step));
-    else if (step.type === "gdb") gdbResult = await hooks.gdbCapture(step);
+    else if (step.type === "load-verify") await hooks.verifyLoad(step);
+    else if (step.type === "leg") result.rows.push(...await hooks.runLeg(step));
+    else if (step.type === "gdb") result.gdbResult = await hooks.gdbCapture(step);
     else if (step.type === "load-stop") await hooks.stopLoad();
     else throw new Error(`unknown phase-plan step: ${step.type}`);
   }
-  return { rows, gdbResult };
+  return result;
 }
 
 function defaultOutDir(mode) {
@@ -474,6 +485,51 @@ function installSignalHandlers() {
   }
 }
 
+// The first process exists only to re-exec the harness on the controller CPU.
+// Forward targeted signals to that controller so its installed handler can
+// stop and reap every process group before this wrapper returns.
+export function superviseController(child, signalSource = process) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      signalSource.off("SIGINT", onSigint);
+      signalSource.off("SIGTERM", onSigterm);
+      child.off("error", onError);
+      child.off("close", onClose);
+    };
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback(value);
+    };
+    const forward = (signal) => {
+      try {
+        child.kill(signal);
+      } catch (error) {
+        if (error?.code !== "ESRCH") finish(reject, error);
+      }
+    };
+    const onSigint = () => forward("SIGINT");
+    const onSigterm = () => forward("SIGTERM");
+    const onError = (error) => finish(reject, error);
+    const onClose = (exitCode, signal) => {
+      const status = signal === "SIGINT"
+        ? 130
+        : signal === "SIGTERM"
+          ? 143
+          : signal === null
+            ? (exitCode ?? 125)
+            : 125;
+      finish(resolve, status);
+    };
+    signalSource.on("SIGINT", onSigint);
+    signalSource.on("SIGTERM", onSigterm);
+    child.once("error", onError);
+    child.once("close", onClose);
+  });
+}
+
 function trackProcess(child, kind) {
   if (!Number.isSafeInteger(child.pid) || child.pid <= 1) {
     throw new Error(`failed to obtain ${kind} PID`);
@@ -488,9 +544,93 @@ function trackProcess(child, kind) {
   return closed;
 }
 
+function inspectLoadWorker(worker) {
+  const exitCode = worker.closeResult?.exitCode ?? worker.child.exitCode;
+  const signal = worker.closeResult?.signal ?? worker.child.signalCode;
+  if (worker.closeResult !== undefined || exitCode !== null || signal !== null) {
+    return {
+      alive: false,
+      exitCode,
+      signal,
+      affinity: null,
+      executable: null,
+      detail: `exited with code=${exitCode} signal=${signal}`,
+    };
+  }
+  try {
+    return {
+      alive: true,
+      exitCode: null,
+      signal: null,
+      affinity: processAffinity(worker.child.pid),
+      executable: processExe(worker.child.pid),
+      detail: null,
+    };
+  } catch (error) {
+    return {
+      alive: false,
+      exitCode,
+      signal,
+      affinity: null,
+      executable: null,
+      detail: `cannot inspect PID ${worker.child.pid}: ${error.message}`,
+    };
+  }
+}
+
+function loadWorkerProblem(worker, snapshot) {
+  if (!snapshot.alive) return snapshot.detail ?? "is not running";
+  if (snapshot.affinity !== String(worker.cpu)) {
+    return `affinity is ${snapshot.affinity}, expected ${worker.cpu}`;
+  }
+  if (snapshot.executable !== worker.expectedExecutable) {
+    return `executable is ${snapshot.executable}, expected ${worker.expectedExecutable}`;
+  }
+  return null;
+}
+
+// Bind every measured phase/capture to the original worker PIDs, executable,
+// and one-CPU affinities. Tests can provide an inspection function so this
+// behavior is exercised without starting the live workload.
+export function verifyLoadWorkers(
+  workers,
+  boundary,
+  eventsPath,
+  recorder,
+  inspect = inspectLoadWorker,
+) {
+  const snapshots = workers.map((worker) => ({
+    cpu: worker.cpu,
+    pid: worker.child.pid,
+    ...inspect(worker),
+  }));
+  const failedIndex = snapshots.findIndex((snapshot, index) => (
+    loadWorkerProblem(workers[index], snapshot) !== null
+  ));
+  if (failedIndex !== -1) {
+    const problem = loadWorkerProblem(workers[failedIndex], snapshots[failedIndex]);
+    appendJsonLine(eventsPath, {
+      type: "load_workers_check_failed",
+      boundary,
+      problem: `load worker CPU ${workers[failedIndex].cpu} ${problem}`,
+      workers: snapshots,
+      ...now(recorder),
+    });
+    throw new Error(`load worker check failed at ${boundary}: CPU ${workers[failedIndex].cpu} ${problem}`);
+  }
+  appendJsonLine(eventsPath, {
+    type: "load_workers_verified",
+    boundary,
+    workers: snapshots,
+    ...now(recorder),
+  });
+  return snapshots;
+}
+
 async function startLoadWorkers(cpus, eventsPath, recorder) {
   const workers = [];
   try {
+    const expectedExecutable = realpathSync(LOAD_PROGRAM);
     for (const cpu of cpus) {
       const child = spawn("/usr/bin/taskset", [
         "-c",
@@ -501,26 +641,28 @@ async function startLoadWorkers(cpus, eventsPath, recorder) {
         stdio: "ignore",
       });
       const closed = trackProcess(child, `load worker CPU ${cpu}`);
-      workers.push({ child, closed, cpu });
+      const worker = {
+        child,
+        closed,
+        closeResult: undefined,
+        cpu,
+        expectedExecutable,
+      };
+      closed.then((result) => { worker.closeResult = result; });
+      workers.push(worker);
     }
     await delay(250, () => interruptedBy !== null);
     if (interruptedBy) throw new Error(`interrupted by ${interruptedBy}`);
     for (const worker of workers) {
-      if (worker.child.exitCode !== null || worker.child.signalCode !== null) {
-        throw new Error(`load worker on CPU ${worker.cpu} exited during startup`);
-      }
-      const affinity = processAffinity(worker.child.pid);
-      if (affinity !== String(worker.cpu)) {
-        throw new Error(
-          `load worker PID ${worker.child.pid} affinity is ${affinity}, expected ${worker.cpu}`,
-        );
-      }
+      const snapshot = inspectLoadWorker(worker);
+      const problem = loadWorkerProblem(worker, snapshot);
+      if (problem !== null) throw new Error(`load worker on CPU ${worker.cpu} ${problem}`);
       appendJsonLine(eventsPath, {
         type: "load_worker_started",
         cpu: worker.cpu,
         pid: worker.child.pid,
-        affinity,
-        executable: processExe(worker.child.pid),
+        affinity: snapshot.affinity,
+        executable: snapshot.executable,
         ...now(recorder),
       });
     }
@@ -544,9 +686,21 @@ async function stopLoadWorkers(workers, eventsPath, recorder) {
     Promise.all(workers.map((worker) => worker.closed)),
     delay(1000),
   ]);
+  const remaining = workers.filter((worker) => activeGroups.has(worker.child.pid));
+  if (remaining.length > 0) {
+    throw new Error(
+      `load worker groups did not stop: ${remaining.map((worker) => worker.child.pid).join(",")}`,
+    );
+  }
   appendJsonLine(eventsPath, {
     type: "load_workers_stopped",
     count: workers.length,
+    workers: workers.map((worker) => ({
+      cpu: worker.cpu,
+      pid: worker.child.pid,
+      exitCode: worker.closeResult?.exitCode ?? worker.child.exitCode,
+      signal: worker.closeResult?.signal ?? worker.child.signalCode,
+    })),
     ...now(recorder),
   });
 }
@@ -666,6 +820,11 @@ export async function runGdbCapture(
     throw new Error(`GDB capture runner failed operationally with exit code ${exitCode}`);
   }
   const counts = parseRunnerCounts(runnerLogPath, generation);
+  if (counts.exitCode !== exitCode) {
+    throw new Error(
+      `GDB capture runner exit status ${exitCode} conflicts with terminal accounting ${counts.exitCode}`,
+    );
+  }
   writeFileSync(
     path.join(resultsDir, "gdb.meta"),
     `CPU=${options.targetCpu}\nMAX_RUNS=${options.gdbMaxRuns}\n` +
@@ -783,7 +942,7 @@ function runPinnedChild(options, phase, run, nodeBin, nodeLabel) {
   });
 }
 
-async function runLeg(
+export async function runLeg(
   options,
   phase,
   description,
@@ -792,6 +951,7 @@ async function runLeg(
   resultsPath,
   eventsPath,
   recorder,
+  runChild = runPinnedChild,
 ) {
   appendJsonLine(eventsPath, {
     type: "phase_started",
@@ -803,7 +963,7 @@ async function runLeg(
   });
   const rows = [];
   for (let run = 1; run <= options.runs && interruptedBy === null; run += 1) {
-    const row = await runPinnedChild(options, phase, run, nodeBin, nodeLabel);
+    const row = await runChild(options, phase, run, nodeBin, nodeLabel);
     rows.push(row);
     appendJsonLine(resultsPath, row);
     const label = nodeLabel ? ` node=${nodeLabel}` : "";
@@ -816,6 +976,8 @@ async function runLeg(
     phase,
     description,
     completedRuns: rows.length,
+    nodePath: nodeBin,
+    ...(nodeLabel ? { nodeLabel } : {}),
     ...now(recorder),
   });
   return rows;
@@ -884,17 +1046,27 @@ function renderLoadStateReport(metadata, rows) {
       `| ${item.phase} | ${item.description} | ${item.attempted} | ${item.pass} | ${percent(item.sigsegv, item.attempted)} | ${item.otherFailure} | ${item.interrupted} |`,
     );
   }
+  lines.push("", "## Interpretation boundary", "");
+  if (metadata.status === "complete") {
+    lines.push(
+      "The script controls only its own induced workers. A1 and A2 mean *no",
+      "script-induced load*, not proof that the rest of the machine was idle.",
+      "Workers in B were individually pinned away from the target CPU and their",
+      "identities and affinities were rechecked around the measured B leg. The",
+      "sequential A/B/A order can still be affected by temperature, time, and",
+      "carryover; repeat the complete experiment rather than pooling arbitrary",
+      "legs from different sessions.",
+      "",
+    );
+  } else {
+    lines.push(
+      "This experiment did not complete all load-worker checks. Retained rows",
+      "are descriptive partial output only and must not be used as an A/B/A",
+      "comparison. See `metadata.json` and `events.jsonl` for the stopping point.",
+      "",
+    );
+  }
   lines.push(
-    "",
-    "## Interpretation boundary",
-    "",
-    "The script controls only its own induced workers. A1 and A2 mean *no",
-    "script-induced load*, not proof that the rest of the machine was idle.",
-    "Workers in B were individually pinned away from the target CPU and their",
-    "affinities were verified through `/proc`. The sequential A/B/A order can",
-    "still be affected by temperature, time, and carryover; repeat the complete",
-    "experiment rather than pooling arbitrary legs from different sessions.",
-    "",
     ...telemetryNoteLines(),
     "",
     "## Files",
@@ -938,22 +1110,29 @@ function renderNodeAbaReport(metadata, rows) {
       `| ${item.phase} | ${node.node} | ${item.description} | ${item.attempted} | ${item.pass} | ${percent(item.sigsegv, item.attempted)} | ${item.otherFailure} | ${item.interrupted} |`,
     );
   }
+  lines.push("", "## Interpretation boundary", "");
+  if (metadata.status === "complete") {
+    lines.push(
+      "The induced load — one verified, pinned `/usr/bin/yes` worker per load",
+      "CPU — started once before A1 and stopped only after A2. The original",
+      "worker PIDs, executables, and affinities were rechecked around every leg,",
+      "so the intended changed variable is the Node executable alone.",
+      "",
+      "The legs still ran in the fixed order A1, B, A2, so time and thermal",
+      "drift remain possible confounders even with a constant load. Prefer",
+      "repeating complete sessions over reading a single session, and never pool",
+      "legs across different sessions or different loads.",
+      "",
+    );
+  } else {
+    lines.push(
+      "This experiment did not complete all constant-load checks. Retained rows",
+      "are descriptive partial output only and must not be used to compare Node",
+      "executables. See `metadata.json` and `events.jsonl` for the stopping point.",
+      "",
+    );
+  }
   lines.push(
-    "",
-    "## Interpretation boundary",
-    "",
-    "The induced load — one verified, pinned `/usr/bin/yes` worker per load",
-    "CPU — started once before A1 and stopped only after A2. No load worker",
-    "was stopped, started, or re-pinned between legs, so the external load,",
-    "worker PIDs, affinities, target CPU, controller CPU, workload,",
-    "dependencies, and per-leg run count stayed constant; the intended changed",
-    "variable is the Node executable alone.",
-    "",
-    "The legs still ran in the fixed order A1, B, A2, so time and thermal",
-    "drift remain possible confounders even with a constant load. Prefer",
-    "repeating complete sessions over reading a single session, and never pool",
-    "legs across different sessions or different loads.",
-    "",
     ...telemetryNoteLines(),
     "",
     "## Files",
@@ -985,7 +1164,15 @@ function renderGdbReport(metadata, gdbResult) {
     ...machineLines(metadata),
     "",
   ];
-  if (gdbResult === null || gdbResult.interrupted) {
+  if (metadata.status !== "complete") {
+    lines.push(
+      "The experiment did not complete every load-worker check. Any retained",
+      "runner output is descriptive partial material only and must not be treated",
+      "as a controlled GDB-under-load result. See `metadata.json` and",
+      "`events.jsonl` for the stopping point.",
+      "",
+    );
+  } else if (gdbResult === null || gdbResult.interrupted) {
     lines.push(
       "The capture did not complete its terminal runner accounting, so no",
       "evidence envelope was published. Partial artifacts, when present, are",
@@ -1026,14 +1213,22 @@ function renderGdbReport(metadata, gdbResult) {
       "",
     );
   }
+  lines.push("## Interpretation boundary", "");
+  if (metadata.status === "complete") {
+    lines.push(
+      "The original pinned `/usr/bin/yes` worker PIDs, executables, and",
+      "affinities were verified immediately before and after the capture window.",
+      "The script controls only its own workers, not the rest of the machine.",
+      "",
+    );
+  } else {
+    lines.push(
+      "Because the controlled-load checks did not complete, this bundle makes no",
+      "claim that the induced load remained constant across the capture window.",
+      "",
+    );
+  }
   lines.push(
-    "## Interpretation boundary",
-    "",
-    "The induced load — one verified, pinned `/usr/bin/yes` worker per load",
-    "CPU — was active for the whole capture window and its affinities were",
-    "verified through `/proc`. The script controls only its own workers, not",
-    "the rest of the machine.",
-    "",
     ...telemetryNoteLines(),
     "",
     "## Files",
@@ -1093,6 +1288,7 @@ export function planLines(options, controller, outDir, info) {
     `target Node          ${info.node.node} V8 ${info.node.v8}`,
     `target executable    ${options.nodeBin}`,
     `load program         ${LOAD_PROGRAM} (one verified pinned worker per load CPU)`,
+    "load checks          original PID/executable/affinity around every loaded phase",
     `output               ${outDir}`,
     "writes/settings      output files only; no root or sysfs writes",
   );
@@ -1237,9 +1433,8 @@ async function runExperiment(options, controller, outDir, metadata) {
     cpus: [...new Set([options.targetCpu, ...options.loadCpus, controller])],
     intervalMs: options.intervalMs,
   });
-  const rows = [];
+  const execution = { rows: [], gdbResult: null };
   let workers = [];
-  let gdbResult = null;
   let operationalError = null;
   const nodeForLabel = (label) => {
     if (label === "A") return options.nodeA;
@@ -1261,7 +1456,13 @@ async function runExperiment(options, controller, outDir, metadata) {
     startLoad: async () => {
       workers = await startLoadWorkers(options.loadCpus, eventsPath, recorder);
     },
+    verifyLoad: async (step) => {
+      verifyLoadWorkers(workers, step.boundary, eventsPath, recorder);
+    },
     stopLoad: async () => {
+      if (interruptedBy === null) {
+        verifyLoadWorkers(workers, "before planned load stop", eventsPath, recorder);
+      }
       await stopLoadWorkers(workers, eventsPath, recorder);
       workers = [];
     },
@@ -1280,9 +1481,7 @@ async function runExperiment(options, controller, outDir, metadata) {
   try {
     await recorder.start();
     appendJsonLine(eventsPath, { type: "experiment_started", ...now(recorder) });
-    const result = await executePhasePlan(buildPhasePlan(options), hooks);
-    rows.push(...result.rows);
-    gdbResult = result.gdbResult;
+    await executePhasePlan(buildPhasePlan(options), hooks, execution);
   } catch (error) {
     operationalError = error;
   } finally {
@@ -1307,17 +1506,21 @@ async function runExperiment(options, controller, outDir, metadata) {
       ? "operational failure"
       : "complete";
   metadata.finishedAt = new Date().toISOString();
-  metadata.recordCount = rows.length;
-  metadata.summary = summarize(rows, phasesForMode(options.mode));
-  if (options.mode === "gdb") metadata.gdb.result = gdbResult;
+  metadata.recordCount = execution.rows.length;
+  metadata.summary = summarize(execution.rows, phasesForMode(options.mode));
+  if (options.mode === "gdb") metadata.gdb.result = execution.gdbResult;
   metadata.machine.noTurboEnd = readText(NO_TURBO);
   if (operationalError) metadata.operationalError = operationalError.message;
   writeFileSync(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, { mode: 0o600 });
-  writeFileSync(reportPath, renderReport(metadata, rows, gdbResult), { flag: "wx", mode: 0o600 });
+  writeFileSync(
+    reportPath,
+    renderReport(metadata, execution.rows, execution.gdbResult),
+    { flag: "wx", mode: 0o600 },
+  );
   console.log(`report               ${reportPath}`);
   if (operationalError) throw operationalError;
   if (interruptedBy) return interruptedBy === "SIGINT" ? 130 : 143;
-  return rows.some((row) => row.outcome === "other_failure") ? 1 : 0;
+  return execution.rows.some((row) => row.outcome === "other_failure") ? 1 : 0;
 }
 
 export async function main(argv = process.argv.slice(2)) {
@@ -1365,28 +1568,22 @@ export async function main(argv = process.argv.slice(2)) {
       return 0;
     }
     if (process.env[CONTROLLER_ENV] !== String(controller)) {
-      return await new Promise((resolve, reject) => {
-        const child = spawn("/usr/bin/taskset", [
-          "-c",
-          String(controller),
-          process.execPath,
-          SCRIPT_PATH,
-          ...argv,
-        ], {
-          env: {
-            ...process.env,
-            [CONTROLLER_ENV]: String(controller),
-            [OUTPUT_ENV]: outDir,
-            [ALLOWED_ENV]: allowed.join(","),
-          },
-          stdio: "inherit",
-        });
-        child.once("error", reject);
-        child.once("close", (exitCode, signal) => {
-          if (signal) resolve(signal === "SIGINT" ? 130 : 125);
-          else resolve(exitCode ?? 125);
-        });
+      const child = spawn("/usr/bin/taskset", [
+        "-c",
+        String(controller),
+        process.execPath,
+        SCRIPT_PATH,
+        ...argv,
+      ], {
+        env: {
+          ...process.env,
+          [CONTROLLER_ENV]: String(controller),
+          [OUTPUT_ENV]: outDir,
+          [ALLOWED_ENV]: allowed.join(","),
+        },
+        stdio: "inherit",
       });
+      return await superviseController(child);
     }
     const currentAllowed = allowedCpus();
     if (currentAllowed.length !== 1 || currentAllowed[0] !== controller) {

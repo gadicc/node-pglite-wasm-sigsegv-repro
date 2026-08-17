@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import {
   chmodSync,
   mkdtempSync,
@@ -19,7 +20,10 @@ import {
   parseArgs,
   planLines,
   runGdbCapture,
+  runLeg,
   summarize,
+  superviseController,
+  verifyLoadWorkers,
 } from "../../load-state-aba.mjs";
 import { validateGdbEvidence } from "../gdb-evidence.mjs";
 
@@ -166,10 +170,13 @@ test("summary carries mode-specific phase descriptions", () => {
 test("phase plans match each mode's experimental design", () => {
   const loadState = buildPhasePlan(parseArgs([])).map((step) => step.type);
   assert.deepEqual(loadState, [
-    "settle", "leg", "load-start", "load-warmup", "leg", "load-stop", "settle", "leg",
+    "settle", "leg", "load-start", "load-warmup", "load-verify", "leg",
+    "load-verify", "load-stop", "settle", "leg",
   ]);
   const gdb = buildPhasePlan(parseArgs(["--mode", "gdb"])).map((step) => step.type);
-  assert.deepEqual(gdb, ["settle", "load-start", "load-warmup", "gdb", "load-stop"]);
+  assert.deepEqual(gdb, [
+    "settle", "load-start", "load-warmup", "load-verify", "gdb", "load-verify", "load-stop",
+  ]);
   const nodeAba = buildPhasePlan(
     parseArgs(["--mode", "node-aba", "--node-b", "/usr/bin/node"]),
   );
@@ -179,9 +186,13 @@ test("phase plans match each mode's experimental design", () => {
       ["settle", null, null],
       ["load-start", null, null],
       ["load-warmup", null, null],
+      ["load-verify", null, null],
       ["leg", "A1", "A"],
+      ["load-verify", null, null],
       ["leg", "B", "B"],
+      ["load-verify", null, null],
       ["leg", "A2", "A"],
+      ["load-verify", null, null],
       ["load-stop", null, null],
     ],
   );
@@ -196,6 +207,7 @@ function recordingHooks(calls, { interruptAfter = Number.POSITIVE_INFINITY } = {
     settle: async (step) => { calls.push(`settle:${step.seconds}`); },
     startLoad: async () => { calls.push("load-start"); },
     warmup: async (step) => { calls.push(`warmup:${step.seconds}`); },
+    verifyLoad: async (step) => { calls.push(`verify:${step.boundary}`); },
     runLeg: async (step) => {
       calls.push(`leg:${step.phase}:${step.nodeLabel}`);
       return [{ phase: step.phase, outcome: "pass" }];
@@ -216,7 +228,8 @@ test("load-state execution preserves the A1/load/A2 ordering", async () => {
   );
   assert.deepEqual(calls, [
     "settle:15", "leg:A1:target", "load-start", "warmup:0",
-    "leg:B:target", "load-stop", "settle:15", "leg:A2:target",
+    "verify:before B", "leg:B:target", "verify:after B", "load-stop",
+    "settle:15", "leg:A2:target",
   ]);
   assert.equal(rows.length, 3);
   assert.equal(gdbResult, null);
@@ -230,7 +243,8 @@ test("constant-load node A/B/A never stops or restarts workers between legs", as
   );
   assert.deepEqual(calls, [
     "settle:15", "load-start", "warmup:5",
-    "leg:A1:A", "leg:B:B", "leg:A2:A", "load-stop",
+    "verify:before A1", "leg:A1:A", "verify:after A1",
+    "leg:B:B", "verify:after B", "leg:A2:A", "verify:after A2", "load-stop",
   ]);
   // The load stops exactly once, strictly after the final leg.
   assert.ok(calls.indexOf("load-stop") > calls.lastIndexOf("leg:A2:A"));
@@ -246,7 +260,10 @@ test("gdb execution captures once inside the constant-load bracket", async () =>
     buildPhasePlan(parseArgs(["--mode", "gdb"])),
     recordingHooks(calls),
   );
-  assert.deepEqual(calls, ["settle:15", "load-start", "warmup:5", "gdb", "load-stop"]);
+  assert.deepEqual(calls, [
+    "settle:15", "load-start", "warmup:5", "verify:before GDB capture",
+    "gdb", "verify:after GDB capture", "load-stop",
+  ]);
   assert.equal(rows.length, 0);
   assert.deepEqual(gdbResult, { outcome: "captured" });
 });
@@ -261,6 +278,134 @@ test("an interruption skips every remaining phase", async () => {
   assert.equal(rows.length, 1);
 });
 
+test("completed leg rows survive a later load verification failure", async () => {
+  const calls = [];
+  const hooks = recordingHooks(calls);
+  hooks.verifyLoad = async (step) => {
+    calls.push(`verify:${step.boundary}`);
+    if (step.boundary === "after A1") throw new Error("simulated load worker exit");
+  };
+  const result = { rows: [], gdbResult: null };
+  await assert.rejects(
+    () => executePhasePlan(
+      buildPhasePlan(parseArgs(["--mode", "node-aba", "--node-b", "/usr/bin/node"])),
+      hooks,
+      result,
+    ),
+    /simulated load worker exit/,
+  );
+  assert.deepEqual(result.rows, [{ phase: "A1", outcome: "pass" }]);
+  assert.equal(result.gdbResult, null);
+});
+
+test("load-worker checks bind PID, executable, and affinity at each boundary", (t) => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "load-worker-check-"));
+  t.after(() => { rmSync(root, { recursive: true, force: true }); });
+  const eventsPath = path.join(root, "events.jsonl");
+  const worker = {
+    cpu: 4,
+    child: { pid: 4321 },
+    expectedExecutable: "/usr/bin/yes",
+  };
+  const snapshots = verifyLoadWorkers(
+    [worker],
+    "before A1",
+    eventsPath,
+    null,
+    () => ({
+      alive: true,
+      exitCode: null,
+      signal: null,
+      affinity: "4",
+      executable: "/usr/bin/yes",
+      detail: null,
+    }),
+  );
+  assert.deepEqual(snapshots.map(({ cpu, pid, affinity, executable }) => (
+    { cpu, pid, affinity, executable }
+  )), [{ cpu: 4, pid: 4321, affinity: "4", executable: "/usr/bin/yes" }]);
+  assert.throws(
+    () => verifyLoadWorkers(
+      [worker],
+      "after A1",
+      eventsPath,
+      null,
+      () => ({
+        alive: false,
+        exitCode: 0,
+        signal: null,
+        affinity: null,
+        executable: null,
+        detail: "exited with code=0 signal=null",
+      }),
+    ),
+    /load worker check failed at after A1/,
+  );
+  const events = readFileSync(eventsPath, "utf8").trim().split("\n")
+    .map((line) => JSON.parse(line));
+  assert.deepEqual(events.map((event) => event.type), [
+    "load_workers_verified",
+    "load_workers_check_failed",
+  ]);
+  assert.equal(events[0].workers[0].pid, 4321);
+  assert.match(events[1].problem, /CPU 4 exited/);
+});
+
+test("controller wrapper forwards SIGTERM and removes its listeners", async () => {
+  const signalSource = new EventEmitter();
+  const child = new EventEmitter();
+  const forwarded = [];
+  child.kill = (signal) => {
+    forwarded.push(signal);
+    return true;
+  };
+  const status = superviseController(child, signalSource);
+  assert.equal(signalSource.listenerCount("SIGTERM"), 1);
+  signalSource.emit("SIGTERM");
+  assert.deepEqual(forwarded, ["SIGTERM"]);
+  child.emit("close", 143, null);
+  assert.equal(await status, 143);
+  assert.equal(signalSource.listenerCount("SIGINT"), 0);
+  assert.equal(signalSource.listenerCount("SIGTERM"), 0);
+});
+
+test("both phase boundary events carry the exact Node identity", async (t) => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "load-phase-events-"));
+  t.after(() => { rmSync(root, { recursive: true, force: true }); });
+  const resultsPath = path.join(root, "results.jsonl");
+  const eventsPath = path.join(root, "events.jsonl");
+  const rows = await runLeg(
+    { runs: 1, targetCpu: 19 },
+    "B",
+    "Node B under load",
+    "/exact/node-b",
+    "B",
+    resultsPath,
+    eventsPath,
+    null,
+    async (_options, phase, run, nodePath, nodeLabel) => ({
+      type: "child_result",
+      phase,
+      run,
+      nodePath,
+      nodeLabel,
+      outcome: "pass",
+      elapsedMs: 1,
+    }),
+  );
+  assert.equal(rows.length, 1);
+  const events = readFileSync(eventsPath, "utf8").trim().split("\n")
+    .map((line) => JSON.parse(line));
+  assert.deepEqual(events.map((event) => ({
+    type: event.type,
+    nodePath: event.nodePath,
+    nodeLabel: event.nodeLabel,
+  })), [
+    { type: "phase_started", nodePath: "/exact/node-b", nodeLabel: "B" },
+    { type: "phase_ended", nodePath: "/exact/node-b", nodeLabel: "B" },
+  ]);
+});
+
 test("dry-run plan lines cover all three modes", () => {
   const node = { node: "v25.2.1", v8: "14.1.146.11-node.14" };
   const loadState = planLines(parseArgs([]), 8, "/tmp/out", { node });
@@ -269,6 +414,7 @@ test("dry-run plan lines cover all three modes", () => {
   assert.ok(loadState.includes("settle seconds       15 before A1 and A2"));
   assert.ok(loadState.includes("load warmup seconds  0"));
   assert.ok(loadState.includes("runs per leg         20"));
+  assert.ok(loadState.some((line) => line.startsWith("load checks          original PID/")));
 
   const gdb = planLines(parseArgs(["--mode", "gdb"]), 8, "/tmp/out", {
     node,
@@ -334,6 +480,17 @@ case "$mode" in
     printf 'COUNTS\\tGENERATION\\t%s\\tCPU\\t%s\\tMAX_RUNS\\t%s\\tMAX_CAPTURES\\t%s\\tATTEMPTED\\t%s\\tCLEAN\\t%s\\tCAPTURED\\t0\\tERRORS\\t0\\tEXIT_CODE\\t3\\n' \\
       "$generation" "$cpu" "$max_runs" "$max_captures" "$max_runs" "$max_runs"
     exit 3
+    ;;
+  status-mismatch)
+    run=1
+    while ((run <= max_runs)); do
+      printf 'ATTEMPT\\tGENERATION\\t%s\\tCPU\\t%s\\tMAX_RUNS\\t%s\\tMAX_CAPTURES\\t%s\\tRUN\\t%s\\tOUTCOME\\tclean\\n' \\
+        "$generation" "$cpu" "$max_runs" "$max_captures" "$run"
+      run=$((run + 1))
+    done
+    printf 'COUNTS\\tGENERATION\\t%s\\tCPU\\t%s\\tMAX_RUNS\\t%s\\tMAX_CAPTURES\\t%s\\tATTEMPTED\\t%s\\tCLEAN\\t%s\\tCAPTURED\\t0\\tERRORS\\t0\\tEXIT_CODE\\t3\\n' \\
+      "$generation" "$cpu" "$max_runs" "$max_captures" "$max_runs" "$max_runs"
+    exit 0
     ;;
   failure)
     exit 5
@@ -465,6 +622,21 @@ test("gdb runner failure is an operational failure, never a result", async (t) =
   await assert.rejects(
     () => runGdbCapture(options, outDir, eventsPath, null, script),
     /GDB capture runner failed operationally with exit code 5/,
+  );
+  assert.throws(() => statSync(path.join(outDir, "results", "gdb.manifest")), /ENOENT/);
+});
+
+test("gdb process status must match its terminal accounting", async (t) => {
+  const { script, outDir, eventsPath, argsPath, options } = gdbCaptureFixture(t);
+  process.env.FAKE_CAPTURE_ARGS = argsPath;
+  process.env.FAKE_CAPTURE_MODE = "status-mismatch";
+  t.after(() => {
+    delete process.env.FAKE_CAPTURE_ARGS;
+    delete process.env.FAKE_CAPTURE_MODE;
+  });
+  await assert.rejects(
+    () => runGdbCapture(options, outDir, eventsPath, null, script),
+    /exit status 0 conflicts with terminal accounting 3/,
   );
   assert.throws(() => statSync(path.join(outDir, "results", "gdb.manifest")), /ENOENT/);
 });

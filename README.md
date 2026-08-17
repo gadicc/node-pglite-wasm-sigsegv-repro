@@ -53,14 +53,18 @@ npm run repro:sequential
 `load-state-aba.mjs` is the controlled external-load harness. The induced load
 is deliberately simple: one `/usr/bin/yes` worker per selected load CPU, each
 launched through `taskset` and verified individually through `/proc` before any
-measurement starts. All worker process groups are stopped on normal completion,
-errors, SIGINT, and SIGTERM. The harness never changes BIOS, turbo, frequency,
-affinity of unrelated processes, or any sysfs value, never requires root, and
-writes only a new directory below `diagnostics/` unless `--out-dir` is
-supplied. The default for every mode is a dry run; a live experiment requires
-`--yes`. Every target Node executable is resolved to an exact canonical path
-(and hashed) before the plan is fixed — no bare `PATH` lookup chooses a target
-once the experiment starts.
+measurement starts. The original worker PIDs, executable paths, and affinities
+are rechecked on both sides of every measured leg or capture; a failed check
+stops the comparison and marks the bundle operationally incomplete. All worker
+process groups are stopped on normal completion, errors, SIGINT, and SIGTERM;
+the outer controller wrapper forwards targeted signals to the pinned
+controller so cleanup runs there. The harness never changes BIOS, turbo,
+frequency, affinity of unrelated processes, or any sysfs value, never requires
+root, and writes only a new directory below `diagnostics/` unless `--out-dir`
+is supplied. The default for every mode is a dry run; a live experiment
+requires `--yes`. Every target Node executable is resolved to an exact
+canonical path (and hashed) before the plan is fixed — no bare `PATH` lookup
+chooses a target once the experiment starts.
 
 It has three modes, all sharing the same verified load.
 
@@ -86,11 +90,14 @@ unrelated applications before interpreting it as an idle condition.
 
 Runs the diagnostic suite's `capture-fault.sh` against `child.mjs` on the
 target CPU *while the induced load is active*: settle, start and verify the
-workers, warm the load (default 5 s), then capture. The runner is bounded by
+workers, warm the load (default 5 s), verify again, capture, then recheck the
+same workers before stopping them. The runner is bounded by
 `--gdb-max-runs` (default 10) and `--gdb-max-captures` (default 1) and keeps
 its existing evidence format: canonical ATTEMPT/COUNTS runner accounting,
 64 MiB-bounded generation-bound transcripts, and clean/captured/error
-classification, wrapped in the validated `gdb-evidence.mjs` manifest envelope
+classification, wrapped in the validated `gdb-evidence.mjs` manifest envelope.
+The harness also requires the runner process status to agree with its terminal
+`COUNTS` status before publishing that envelope
 (`logs/gdb/runner.log`, `gdb/cpu<N>-run<M>.txt`, `results/gdb.meta`,
 `results/gdb.manifest`).
 
@@ -112,14 +119,14 @@ same fault.
 #### Node executable A/B/A under constant load (`--mode node-aba`)
 
 Changes only the Node executable while the *same* induced load stays active:
-settle, start and verify the workers once, warm the load (default 5 s), then
+settle, start and verify the workers, warm the load (default 5 s), then
 **A1** with exact Node A, **B** with exact Node B, **A2** with exact Node A —
 no worker is stopped, started, or re-pinned between legs, and the load stops
-only after A2. External load, worker PIDs, affinities, target CPU, controller
-CPU, workload, dependencies, and per-leg run count stay constant. Every result
-row and phase event carries its Node label and exact path; the bundle metadata
-records both executables' resolved paths, versions, V8 versions, module
-versions, and SHA-256 hashes.
+only after A2. The harness rechecks every original worker PID, executable, and
+affinity before A1 and after each leg; only a completed bundle establishes
+those constant-load boundaries. Every result row and phase event carries its
+Node label and exact path; the bundle metadata records both executables'
+resolved paths, versions, V8 versions, module versions, and SHA-256 hashes.
 
 ```sh
 npm run load:node-aba -- \
@@ -148,7 +155,8 @@ over reading a single one, and never pool legs across sessions.
 
 Each bundle contains `metadata.json` (configuration, platform, topology, exact
 binary identities and hashes), `events.jsonl` (verified load-worker and phase
-boundaries), `telemetry.ndjson` (100 ms read-only frequency, temperature when
+boundaries, including every repeated worker check), `telemetry.ndjson` (100 ms
+read-only frequency, temperature when
 exposed, and `intel_pstate/no_turbo` samples), and a `report.md` keeping A1, B,
 and A2 (or the capture outcome) separate. Load-state and node-aba bundles add
 `results.jsonl` with one exact child outcome per row; gdb bundles add the
@@ -587,8 +595,10 @@ end-to-end collect+report pass on a synthetic bundle. It does not run the
 crash workload. The controlled-load harness is covered through mode and
 argument validation, per-mode phase plans, stubbed orchestration (the
 constant-load node A/B/A sequence never stops or restarts load workers
-between legs), `capture-fault.sh` target-selection checks, and a fake-runner
-GDB capture that must publish a fully validated evidence envelope.
+between legs), repeated load-worker identity checks, controller signal
+forwarding, complete Node phase provenance, `capture-fault.sh` target-selection
+checks, and fake-runner GDB captures that must reconcile process/accounting
+statuses before publishing a fully validated evidence envelope.
 
 ## Docker
 
