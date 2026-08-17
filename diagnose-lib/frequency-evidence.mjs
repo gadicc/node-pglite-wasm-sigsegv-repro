@@ -130,6 +130,11 @@ function canonicalSafeInteger(value, positive = false) {
   return Number.isSafeInteger(number) ? number : null;
 }
 
+function validFrequencyOutcomeRc(value) {
+  const rc = canonicalSafeInteger(value);
+  return rc !== null && rc <= 255 && rc !== 125;
+}
+
 function requireDigest(meta, key, artifact, label, reasons) {
   if (!SHA256_RE.test(meta[key] ?? "")) {
     reasons.push(`${key} is missing or invalid`);
@@ -154,7 +159,7 @@ function validateRows(rowsState, expectedLegs, runs, label, reasons) {
     const key = `${leg}:${runText}`;
     if (
       row.length !== 4 || !Object.hasOwn(counts, leg) || run === null || run > runs ||
-      (rcText !== "0" && rcText !== "139") || elapsed === null || seen.has(key)
+      !validFrequencyOutcomeRc(rcText) || elapsed === null || seen.has(key)
     ) {
       invalid = true;
       continue;

@@ -915,7 +915,10 @@ diag_freq_sampler_stop() {
 # Run single-child workload legs on one pinned CPU, appending
 # "leg<TAB>run<TAB>rc<TAB>elapsed" rows. Optional command prefix (e.g.
 # "runuser -u user --") runs the workload as another user.
-# Callers must tolerate nonzero child exits (handled here).
+# Callers must tolerate nonzero child exits (handled here). Exit 125 is the
+# supervision sentinel and remains operational-invalid. Every other tracked
+# child status is an observed outcome: rc 0 and SIGSEGV rc 139 resolve the
+# primary endpoint, while other statuses are retained descriptively.
 diag_run_single_runs() {
   # usage: diag_run_single_runs <tsv> <leg> <cpu> <runs> [cmd-prefix...]
   local tsv="$1" leg="$2" cpu="$3" runs="$4"
@@ -934,8 +937,12 @@ diag_run_single_runs() {
     fi
     elapsed=$((SECONDS - start))
     printf '%s\t%s\t%s\t%s\n' "$leg" "$i" "$rc" "$elapsed" >> "$tsv"
-    if ((rc != 0)); then
-      diag_log "  leg $leg run $i/$runs: FAIL rc=$rc"
+    if ((rc == 139)); then
+      diag_log "  leg $leg run $i/$runs: SIGSEGV rc=$rc"
+    elif ((rc != 0 && rc != DIAG_OPERATIONAL_ERROR_RC)); then
+      diag_log "  leg $leg run $i/$runs: other non-target outcome rc=$rc"
+    elif ((rc == DIAG_OPERATIONAL_ERROR_RC)); then
+      diag_log "  leg $leg run $i/$runs: operational-invalid rc=$rc"
     elif ((i % 5 == 0)); then
       diag_log "  leg $leg run $i/$runs: ok"
     fi
@@ -964,7 +971,8 @@ diag_frequency_rows_are_complete() {
     {
       if (NF != 4 || ($1 != "A1" && $1 != "B" && $1 != "A2") ||
           $2 !~ /^[1-9][0-9]*$/ || $2 < 1 || $2 > runs ||
-          ($3 != 0 && $3 != 139) || $4 !~ /^(0|[1-9][0-9]*)$/) {
+          $3 !~ /^(0|[1-9][0-9]*)$/ || $3 > 255 || $3 == 125 ||
+          $4 !~ /^(0|[1-9][0-9]*)$/) {
         valid=0
         next
       }
@@ -987,7 +995,8 @@ diag_frequency_cap_rows_are_complete() {
     {
       if (NF != 4 || $1 != "cap" ||
           $2 !~ /^[1-9][0-9]*$/ || $2 < 1 || $2 > runs ||
-          ($3 != 0 && $3 != 139) || $4 !~ /^(0|[1-9][0-9]*)$/) {
+          $3 !~ /^(0|[1-9][0-9]*)$/ || $3 > 255 || $3 == 125 ||
+          $4 !~ /^(0|[1-9][0-9]*)$/) {
         valid=0
         next
       }

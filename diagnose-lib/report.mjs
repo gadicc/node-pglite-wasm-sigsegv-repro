@@ -503,6 +503,12 @@ function analyzeFrequencyAb(fa) {
     if (!Array.isArray(leg.invalidRuns) || leg.invalidRuns.length > 0) {
       issues.push(`${leg.leg} contains invalid or unverified runs`);
     }
+    const otherFailures = leg.otherFailures ?? 0;
+    if (!Number.isSafeInteger(otherFailures) || otherFailures < 0) {
+      issues.push(`${leg.leg} has an invalid non-target-outcome count`);
+    } else if (otherFailures > 0) {
+      issues.push(`${leg.leg} contains ${otherFailures} other non-target outcome(s)`);
+    }
   }
   if (issues.length > 0) return { valid: false, issues };
   if (!Number.isSafeInteger(a1.runs + b.runs) || !Number.isSafeInteger(a2.runs + b.runs)) {
@@ -1298,15 +1304,16 @@ export function renderReport(results) {
     L.push(`Test CPU: ${fa.cpu} (${selectionNote}). Original`);
     L.push(`settings saved first; restored after the phase: ${fa.restored ? "yes" : "**NO — check intel_pstate/no_turbo and scaling_max_freq**"}.`);
     L.push("");
-    L.push("Failures are SIGSEGV (exit 139) only; any other nonzero exit is an");
-    L.push("invalid run, excluded from the run counts below.");
+    L.push("The primary endpoint is SIGSEGV (exit 139). Other tracked child");
+    L.push("outcomes are retained descriptively, excluded from the endpoint");
+    L.push("denominator, and disable the inferential A/B/A comparison.");
     L.push("");
-    L.push("| Leg | no_turbo | scaling_max_freq | Valid runs | SIGSEGV | Rate / bound | Recorded frequency sample (avg/max) |");
-    L.push("| --- | --- | --- | --- | --- | --- | --- |");
+    L.push("| Leg | no_turbo | scaling_max_freq | Observations | Endpoint runs | SIGSEGV | Other non-target outcomes | Rate / bound | Recorded frequency sample (avg/max) |");
+    L.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
     for (const leg of fa.legs) {
       const inv = leg.invalidRuns?.length ?? 0;
       L.push(
-        `| ${leg.leg} | ${leg.noTurbo ?? "—"} | ${leg.scalingMaxKhz ? `${Math.round(leg.scalingMaxKhz / 1000)} MHz` : "—"} | ${leg.runs} | ${leg.failures}${inv > 0 ? ` (+${inv} invalid excluded)` : ""} | ${statsCell(leg.failures, leg.runs)} | ${frequencyCell(leg.frequency, " / ")} |`,
+        `| ${leg.leg} | ${leg.noTurbo ?? "—"} | ${leg.scalingMaxKhz ? `${Math.round(leg.scalingMaxKhz / 1000)} MHz` : "—"} | ${leg.observations ?? leg.runs + (leg.otherFailures ?? 0)} | ${leg.runs} | ${leg.failures}${inv > 0 ? ` (+${inv} invalid excluded)` : ""} | ${leg.otherFailures ?? 0} | ${statsCell(leg.failures, leg.runs)} | ${frequencyCell(leg.frequency, " / ")} |`,
       );
     }
     L.push("");
@@ -1352,7 +1359,8 @@ export function renderReport(results) {
     L.push(`${fc.note}.`);
     L.push("");
     for (const leg of fc.legs ?? []) {
-      L.push(`- ${leg.leg}: ${statsCell(leg.failures, leg.runs)}, frequency ${frequencyCell(leg.frequency)}`);
+      const other = leg.otherFailures ?? 0;
+      L.push(`- ${leg.leg}: ${statsCell(leg.failures, leg.runs)}${other > 0 ? `; ${other} other non-target outcome(s)` : ""}, frequency ${frequencyCell(leg.frequency)}`);
     }
     L.push("");
   } else if (r.frequencyCapStatus?.status === "incomplete") {

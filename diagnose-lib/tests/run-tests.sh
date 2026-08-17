@@ -607,6 +607,37 @@ check_eq "frequency sampler start failure prevents every workload launch" \
   "125:absent:sampler-start" \
   "$frequency_start_fail_rc:$([[ -e "$FREQUENCY_START_FAIL_TSV" ]] && echo present || echo absent):$(cat "$FREQUENCY_START_FAIL_LOG")"
 
+FREQUENCY_OTHER_TSV="$TMP/frequency-other-workload.tsv"
+(
+  DIAG_WORKLOAD_PID=""
+  DIAG_SAMPLER_PID=""
+  frequency_other_attempt=0
+  diag_freq_sampler_start() { DIAG_SAMPLER_PID=456; }
+  diag_process_group_start() { DIAG_WORKLOAD_PID=123; }
+  diag_process_group_wait() {
+    frequency_other_attempt=$((frequency_other_attempt + 1))
+    DIAG_WORKLOAD_PID=""
+    ((frequency_other_attempt == 1)) && return 1
+    return 0
+  }
+  diag_freq_sampler_stop() { DIAG_SAMPLER_PID=""; }
+  diag_run_single_runs "$FREQUENCY_OTHER_TSV" A1 0 2
+) > /dev/null 2>&1
+frequency_other_rc=$?
+check_eq "frequency legs retain non-target outcomes and continue" \
+  $'0:A1\t1\t1\t0\nA1\t2\t0\t0' \
+  "$frequency_other_rc:$(cat "$FREQUENCY_OTHER_TSV")"
+
+FREQUENCY_OTHER_COMPLETE="$TMP/frequency-other-complete.tsv"
+printf 'A1\t1\t1\t0\nB\t1\t0\t0\nA2\t1\t139\t0\n' > "$FREQUENCY_OTHER_COMPLETE"
+diag_frequency_rows_are_complete "$FREQUENCY_OTHER_COMPLETE" 1
+check_eq "frequency completeness accepts descriptive non-target outcomes" "0" "$?"
+sed -i 's/^A1\t1\t1\t/A1\t1\t125\t/' "$FREQUENCY_OTHER_COMPLETE"
+diag_frequency_rows_are_complete "$FREQUENCY_OTHER_COMPLETE" 1
+frequency_other_operational_rc=$?
+check_eq "frequency completeness rejects the operational sentinel" "1" \
+  "$([[ $frequency_other_operational_rc -ne 0 ]] && echo 1 || echo 0)"
+
 WORKLOAD_SIGNAL_DIR="$TMP/workload-signal"
 mkdir -p "$WORKLOAD_SIGNAL_DIR/bin"
 printf '0\n' > "$WORKLOAD_SIGNAL_DIR/no_turbo"

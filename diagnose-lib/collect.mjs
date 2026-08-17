@@ -513,6 +513,31 @@ function addRunOutcome(rec, runS, rcS, elapsedS) {
   }
 }
 
+// Frequency evidence retains every tracked child outcome. Only a clean exit
+// or SIGSEGV resolves the primary endpoint; other statuses remain explicit
+// descriptive observations and are never counted as clean runs.
+function addFrequencyRunOutcome(rec, runS, rcS, elapsedS) {
+  const rc = Number(rcS);
+  const detail = {
+    run: Number(runS),
+    rc,
+    signal: signalFromRc(rc) ?? `exit ${rc}`,
+    elapsedSec: num(elapsedS),
+  };
+  rec.observations += 1;
+  if (rc !== 0 && rc !== 139) {
+    rec.otherFailures += 1;
+    rec.otherWorkloadFailureDetails.push(detail);
+    return;
+  }
+  rec.runs += 1;
+  if (rc === 139) {
+    rec.failures += 1;
+    rec.sigsegv += 1;
+    rec.failedRuns.push(detail);
+  }
+}
+
 export function collectIndividual(rows) {
   const byCpu = new Map();
   for (const row of rows) {
@@ -608,8 +633,20 @@ export function collectFreqAb(outDir, rows, meta) {
   const legs = new Map();
   for (const row of rows) {
     const [leg, runS, rcS, elapsedS] = row;
-    if (!legs.has(leg)) legs.set(leg, { leg, runs: 0, failures: 0, sigsegv: 0, otherFailures: 0, invalidRuns: [], failedRuns: [] });
-    addRunOutcome(legs.get(leg), runS, rcS, elapsedS);
+    if (!legs.has(leg)) {
+      legs.set(leg, {
+        leg,
+        observations: 0,
+        runs: 0,
+        failures: 0,
+        sigsegv: 0,
+        otherFailures: 0,
+        invalidRuns: [],
+        failedRuns: [],
+        otherWorkloadFailureDetails: [],
+      });
+    }
+    addFrequencyRunOutcome(legs.get(leg), runS, rcS, elapsedS);
   }
   const cpu = num(meta.CPU);
   const result = {

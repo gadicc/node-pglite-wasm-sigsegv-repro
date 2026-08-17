@@ -139,6 +139,11 @@ partial evidence into the bundle, including after a handled interruption.
 Before replacing any frequency evidence, publication removes the previous
 frequency completion marker; `diagnose.sh --resume` revalidates the new files
 before recreating it.
+Tracked child exits other than clean (`0`) or SIGSEGV (`139`) are retained as
+descriptive non-target outcomes. They do not invalidate the completed
+schedule, but they are excluded from the clean/SIGSEGV endpoint denominator
+and disable the inferential A/B/A comparison. Exit `125` remains reserved for
+an operational supervision failure and leaves the experiment incomplete.
 The root-owned per-user state also tracks a deterministic staging location, so
 the next invocation publishes or explicitly quarantines evidence left by
 SIGKILL instead of silently orphaning an undiscoverable root-only directory.
@@ -397,11 +402,14 @@ interval. A zero there means
 only that this run did not reproduce under that protocol; it does not erase a
 failure captured in an older diagnostic session. For the prespecified frequency A/B/A reversal,
 each turbo-on leg is compared separately with the turbo-off leg using a
-one-sided Fisher exact test on confirmed SIGSEGV counts over valid runs. A
+one-sided Fisher exact test on confirmed SIGSEGV counts over endpoint-resolved
+runs. A
 replicated reduction is claimed only when both comparisons are in the
 prespecified direction and both have p < 0.05 (reported conservatively as the
 larger p-value); the legs are not pooled, and an invalid run disables that
-inference. Concurrent children in a
+inference. A tracked non-target outcome is not an invalid run, but also
+disables inference because it does not resolve the primary endpoint.
+Concurrent children in a
 wave share timing, load, and machine state, so they are correlated rather than
 independent trials: child failure totals are descriptive, while a wave is
 positive if it contains at least one confirmed SIGSEGV, negative only when all

@@ -728,7 +728,7 @@ if [[ -n "$CAP_KHZ" ]]; then
   printf 'RESTORED=%s\n' "$([[ "$now" == "$saved_smax" ]] && echo 1 || echo 0)" >> "$FREQUENCY_STAGE_DIR/results/frequency-cap.meta"
   [[ "$now" == "$saved_smax" ]] || diag_warn "scaling_max_freq restore verification FAILED"
   diag_frequency_cap_rows_are_complete "$FREQUENCY_STAGE_DIR/results/frequency-cap.tsv" "$RUNS" ||
-    diag_die "frequency-cap output is incomplete or contains non-SIGSEGV operational failures"
+    diag_die "frequency-cap output is incomplete, malformed, or contains an operational failure"
   cap_rows_sha256="$(frequency_file_sha256 "$FREQUENCY_STAGE_DIR/results/frequency-cap.tsv")" ||
     diag_die "could not hash frequency-cap rows"
   cap_samples_sha256="$(frequency_file_sha256 "$FREQUENCY_STAGE_DIR/freq/freq-ab-cap.samples")" ||
@@ -744,7 +744,7 @@ if [[ -n "$CAP_KHZ" ]]; then
 fi
 
 diag_frequency_rows_are_complete "$TSV" "$RUNS" ||
-  diag_die "frequency A/B/A output is incomplete or contains non-SIGSEGV operational failures"
+  diag_die "frequency A/B/A output is incomplete, malformed, or contains an operational failure"
 ab_rows_sha256="$(frequency_file_sha256 "$TSV")" || diag_die "could not hash frequency A/B/A rows"
 a1_samples_sha256="$(frequency_file_sha256 "$FREQUENCY_STAGE_DIR/freq/freq-ab-A1.samples")" ||
   diag_die "could not hash A1 frequency samples"

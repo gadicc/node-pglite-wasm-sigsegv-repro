@@ -1191,6 +1191,10 @@ test("renderReport: invalid counts, invalid runs, and duplicate legs disable inf
   assert.match(invalidRun, /inference is unavailable.*contains invalid/);
   assert.doesNotMatch(invalidRun, /\*\*Frequency-associated/);
 
+  const otherWorkload = renderFrequencyCase(5, 0, 5, { 0: { otherFailures: 1 } });
+  assert.match(otherWorkload, /inference is unavailable.*other non-target outcome/);
+  assert.doesNotMatch(otherWorkload, /\*\*Frequency-associated/);
+
   const duplicate = renderFrequencyCase(5, 0, 5, { 2: { leg: "A1" } });
   assert.match(duplicate, /inference is unavailable.*exactly one A1, B, and A2/);
   assert.doesNotMatch(duplicate, /\*\*Frequency-associated/);

@@ -21,7 +21,12 @@ const digest = (text) => createHash("sha256").update(text).digest("hex");
 // with version 4 individual evidence bound to its exact generation.
 const AUTO_GROUPS_GENERATION = "00112233445566778899aabbccddeeff";
 
-function writeFixture({ cap = false, generation = "0123456789abcdef0123456789abcdef" } = {}) {
+function writeFixture({
+  cap = false,
+  generation = "0123456789abcdef0123456789abcdef",
+  rows = "A1\t1\t139\t2\nB\t1\t0\t3\nA2\t1\t0\t2\n",
+  runs = 1,
+} = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "frequency-evidence-"));
   tmpDirs.push(dir);
   mkdirSync(path.join(dir, "results"));
@@ -34,7 +39,6 @@ function writeFixture({ cap = false, generation = "0123456789abcdef0123456789abc
       "INDIVIDUAL_RUNS=1\nGDB_MAX_RUNS=1\nSKIP_GDB=1\nCPU_TARGET=19\n",
   );
 
-  const rows = "A1\t1\t139\t2\nB\t1\t0\t3\nA2\t1\t0\t2\n";
   const method = "scaling_cur_freq\n";
   const samples = {
     A1: "1753950000 19 4700000\n",
@@ -49,7 +53,7 @@ function writeFixture({ cap = false, generation = "0123456789abcdef0123456789abc
   const abMeta = [
     `GENERATION=${generation}`,
     "CPU=19",
-    "RUNS_PER_LEG=1",
+    `RUNS_PER_LEG=${runs}`,
     "SAVED_NO_TURBO=0",
     `CAP_REQUESTED=${cap ? 1 : 0}`,
     `REQUESTED_CAP_KHZ=${cap ? 4200000 : "-"}`,
@@ -151,6 +155,39 @@ test("frequency envelope accepts a complete generation and marks cap not request
   const result = collect(dir);
   assert.equal(result.frequencyAb.cpu, 19);
   assert.equal(result.frequencyCap, undefined);
+});
+
+test("frequency envelope retains non-target outcomes but disables inference", () => {
+  const rows = [
+    "A1\t1\t139\t2", "A1\t2\t1\t2",
+    "B\t1\t0\t3", "B\t2\t0\t3",
+    "A2\t1\t0\t2", "A2\t2\t0\t2",
+    "",
+  ].join("\n");
+  const dir = writeFixture({ rows, runs: 2 });
+  const inspected = inspectFrequencyEvidence(dir);
+  assert.deepEqual(inspected.frequencyAbStatus, { status: "complete", reasons: [] });
+
+  const result = collect(dir);
+  assert.equal(result.frequencyAb.legs[0].observations, 2);
+  assert.equal(result.frequencyAb.legs[0].runs, 1);
+  assert.equal(result.frequencyAb.legs[0].otherFailures, 1);
+  assert.deepEqual(result.frequencyAb.legs[0].otherWorkloadFailureDetails.map((item) => item.rc), [1]);
+
+  const report = renderReport(result);
+  assert.match(report, /A1 contains 1 other non-target outcome\(s\)/);
+  assert.match(report, /leg counts are descriptive only/);
+  assert.doesNotMatch(report, /\*\*Frequency-associated/);
+});
+
+test("frequency envelope rejects the operational sentinel and out-of-range exits", () => {
+  for (const rc of ["125", "256", "01"]) {
+    const rows = `A1\t1\t${rc}\t2\nB\t1\t0\t3\nA2\t1\t0\t2\n`;
+    const dir = writeFixture({ rows });
+    const inspected = inspectFrequencyEvidence(dir);
+    assert.equal(inspected.frequencyAbStatus.status, "incomplete", rc);
+    assert.match(inspected.frequencyAbStatus.reasons.join("; "), /invalid or duplicate row/, rc);
+  }
 });
 
 test("frequency expected-CPU state distinguishes unchecked, resolved, and unavailable", () => {

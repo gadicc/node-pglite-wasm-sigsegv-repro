@@ -270,7 +270,7 @@ test("selectWorstIndividualCpu compares near-safe-integer rates exactly", () => 
   ]), 4);
 });
 
-test("collectFreqAb: legs count only clean/SIGSEGV rows as valid runs", () => {
+test("collectFreqAb: legs retain non-target outcomes outside the endpoint", () => {
   const dir = mkdtempSync(path.join(tmpdir(), "collect-test-"));
   tmpDirs.push(dir);
   const rows = [
@@ -284,13 +284,17 @@ test("collectFreqAb: legs count only clean/SIGSEGV rows as valid runs", () => {
   const res = collectFreqAb(dir, rows, { CPU: "19", LEG_A1_NO_TURBO: "0", LEG_B_NO_TURBO: "1" });
   const [a1, b] = res.legs;
   assert.equal(a1.runs, 2);
+  assert.equal(a1.observations, 4);
   assert.equal(a1.failures, 1);
   assert.equal(a1.sigsegv, 1);
-  assert.equal(a1.otherFailures, 0);
-  assert.deepEqual(a1.invalidRuns.map((f) => f.rc), [1, 126]);
+  assert.equal(a1.otherFailures, 2);
+  assert.deepEqual(a1.otherWorkloadFailureDetails.map((f) => f.rc), [1, 126]);
+  assert.deepEqual(a1.invalidRuns, []);
   assert.equal(b.runs, 1);
+  assert.equal(b.observations, 2);
   assert.equal(b.failures, 0);
-  assert.deepEqual(b.invalidRuns.map((f) => f.signal), ["SIGABRT"]);
+  assert.equal(b.otherFailures, 1);
+  assert.deepEqual(b.otherWorkloadFailureDetails.map((f) => f.signal), ["SIGABRT"]);
 });
 
 test("collect: incomplete frequency artifacts are preserved as status, not evidence", () => {
