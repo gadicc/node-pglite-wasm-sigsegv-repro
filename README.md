@@ -48,6 +48,49 @@ The sequential control runs the same workload one child at a time:
 npm run repro:sequential
 ```
 
+### Controlled external-load A/B/A
+
+`load-state-aba.mjs` tests whether activity elsewhere on the package changes
+the failure rate of one sequential child pinned to one target CPU. It runs
+**A1** with no script-induced load, **B** with one deterministic worker pinned
+to each separately selected load CPU, then **A2** after those workers have been
+stopped and a fixed settling interval has elapsed. The controller, target, and
+load workers use disjoint affinities; the load-worker affinities are verified
+through `/proc`, and the target uses the diagnostic suite's common exact-CPU
+launcher.
+
+The default is a dry run targeting CPU 19 with load on CPUs 0-7:
+
+```sh
+npm run load:aba
+npm run load:aba -- --yes
+```
+
+Useful alternatives:
+
+```sh
+# Load the other CPUs in CPU 19's E-core cluster instead of the P-cores.
+npm run load:aba -- --load-cpus 16-18 --runs 30 --yes
+
+# Select the workload binary explicitly; child processes never use bare PATH
+# lookup once the experiment starts.
+npm run load:aba -- \
+  --node-bin /home/dragon/.nvm/versions/node/v25.2.1/bin/node --dry-run
+```
+
+The live run requires `--yes`, does not require root, and writes only a new
+directory below `diagnostics/` unless `--out-dir` is supplied. It never changes
+BIOS, turbo, frequency, affinity of unrelated processes, or any sysfs value.
+Each bundle contains exact Node/load binary hashes, platform and topology
+metadata, per-child JSONL outcomes, verified load-worker phase boundaries, a
+Markdown report, and 100 ms read-only sysfs telemetry for frequency,
+temperature (when exposed), and `intel_pstate/no_turbo`.
+
+An A leg means only *no load induced by the script*: close or otherwise control
+unrelated applications before interpreting it as an idle condition. Because
+the fixed A1/B/A2 order can retain temperature and time effects, repeat the
+whole experiment rather than pooling arbitrary legs across sessions.
+
 ## Diagnostic runner (`diagnose.sh`)
 
 `diagnose.sh` automates the full investigation this repository documents:
@@ -723,6 +766,28 @@ Consequences:
   `while taskset -c 19 node child.mjs; do :; done` faults within a few
   runs in a single ~1.2 GiB process. This is a cheap oracle for firmware
   A/B tests and, if it comes to it, an Intel erratum report.
+
+On 2026-08-17, after updating to BIOS 3.3.2 and Linux
+7.1.8-1-cachyos, the controlled external-load A/B/A runner above tested a
+single sequential Node v25.2.1 child pinned to CPU 19. The controller was
+pinned to CPU 8; leg B added one verified `/usr/bin/yes` worker to each of
+CPUs 0-7, disjoint from both the controller and target:
+
+| Leg | Controlled condition | Result | Package temperature (mean / max) | CPU 19 temperature (mean / max) |
+| --- | --- | --- | --- | --- |
+| A1 | No script-induced load | 0/20 SIGSEGV | 63.6 / 89 C | 61.2 / 68 C |
+| B | Load on CPUs 0-7 | 19/20 SIGSEGV | 103.4 / 105 C | 80.3 / 90 C |
+| A2 | Load removed; 15-second settling interval | 0/20 SIGSEGV | 65.0 / 87 C | 64.2 / 72 C |
+
+The target's sampled mean `scaling_cur_freq` was 4.59, 4.34, and 4.57 GHz
+in A1, B, and A2 respectively, so this run does not support a simple claim
+that CPU 19 failed only while its sampled clock was highest. It establishes a
+strong, rapidly reversible association between activity elsewhere on the
+package and the CPU-19 failure rate. It does not distinguish package
+temperature from power/current demand, voltage regulation, firmware power
+management, or interactions among them. The fixed, non-randomized phase order
+and unrelated applications that remained open also make an independent quiet
+replication important before treating the observed rates as stationary.
 
 An earlier Node v25.2.1 frequency A/B/A test on core 19 (single-child runs,
 back-to-back in one session) showed an association with the tested clock
