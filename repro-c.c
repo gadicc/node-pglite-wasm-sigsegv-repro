@@ -413,8 +413,9 @@ static void on_segv(int sig, siginfo_t *si, void *ucv) {
 
 static void usage(const char *argv0) {
   fprintf(stderr,
-          "usage: %s [--mode clone|churn|rmw] [--cpu N] [--iters N] [--batch N] "
-          "[--span-mb N (0 disables; rmw only)] [--span-offsets N]\n",
+          "usage: %s [--mode clone|churn|churn-mem|rmw] [--cpu N] [--iters N] "
+          "[--batch N] [--span-mb N (0 disables; rmw only)] "
+          "[--span-offsets N]\n",
           argv0);
   exit(2);
 }
@@ -423,6 +424,7 @@ static int run_rmw(unsigned long total, unsigned long batch,
                    unsigned long span_mb, unsigned long offs_count);
 static int run_clone(unsigned long total, unsigned long batch);
 static int run_churn(unsigned long total, unsigned long batch);
+static int run_churn_mem(unsigned long total, unsigned long batch);
 
 static unsigned long parse_ul(const char *s, const char *flag) {
   char *end = NULL;
@@ -447,7 +449,7 @@ static uint64_t rd64(unsigned char *base, unsigned off) {
 }
 
 int main(int argc, char **argv) {
-  enum { MODE_RMW, MODE_CLONE, MODE_CHURN } mode = MODE_CLONE;
+  enum { MODE_RMW, MODE_CLONE, MODE_CHURN, MODE_CHURN_MEM } mode = MODE_CLONE;
   unsigned long total = 0; /* 0 = mode default */
   unsigned long batch = 0;
   unsigned long span_mb = 1024;
@@ -471,6 +473,8 @@ int main(int argc, char **argv) {
         mode = MODE_CLONE;
       else if (strcmp(argv[i], "churn") == 0)
         mode = MODE_CHURN;
+      else if (strcmp(argv[i], "churn-mem") == 0)
+        mode = MODE_CHURN_MEM;
       else if (strcmp(argv[i], "rmw") == 0)
         mode = MODE_RMW;
       else
@@ -501,6 +505,8 @@ int main(int argc, char **argv) {
 
   if (mode == MODE_CHURN)
     return run_churn(total ? total : 500000000ul, batch ? batch : 200000ul);
+  if (mode == MODE_CHURN_MEM)
+    return run_churn_mem(total ? total : 500000000ul, batch ? batch : 200000ul);
   if (mode == MODE_CLONE)
     return run_clone(total ? total : 2000000000ul, batch ? batch : 1000000ul);
   return run_rmw(total ? total : 500000000ul,
@@ -864,6 +870,92 @@ static int run_churn(unsigned long total, unsigned long batch) {
   pthread_mutex_unlock(&retire_mu);
   pthread_join(reaper, NULL);
   munmap(mem, UINT64_C(1) << 32);
+
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  double secs = elapsed_sec(&t0, &t1);
+  fprintf(stderr, "PASS rounds=%llu iters=%llu elapsed=%.3fs rounds/s=%.0f\n",
+          (unsigned long long)rounds, (unsigned long long)expect, secs,
+          (double)rounds / secs);
+  return 0;
+}
+
+/*
+ * churn-mem mode: the original, syscall-heaviest churn variant — per
+ * round a fresh 4 GiB guard-paged reservation plus code/instance/budget
+ * mappings, all torn down inline (4 mmap + 2 mprotect + 4 munmap per
+ * round, single-threaded). On 7.1.8-1-cachyos, ~75 loaded runs of this
+ * shape produced two kernel oopses on CPU 19 (mprotect syscall entry,
+ * CR2 = kernel stack address + 2^42) and wedged one process unkillably in
+ * exit_mmap. Retained as a separate mode because it is the only native
+ * workload so far that manifested the fault (in kernel mode) — and
+ * because it can wedge the machine. See README "Native trigger attempts".
+ */
+static int run_churn_mem(unsigned long total, unsigned long batch) {
+  size_t blob = (size_t)(clone_end - clone_begin);
+  uint64_t expect = 0;
+  uint64_t rounds = 0;
+
+  fprintf(stderr,
+          "repro-c: mode=churn-mem pid=%ld cpu=%d iters=%lu batch=%lu\n",
+          (long)getpid(), sched_getcpu(), total, batch);
+
+  struct timespec t0, t1;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+
+  while (expect < total) {
+    uint32_t n = (uint32_t)(batch < total - expect ? batch : total - expect);
+
+    void *code = mmap(NULL, 256 << 10, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    unsigned char *inst = mmap_low();
+    unsigned char *budget = mmap_low();
+    void *mem = mmap(NULL, UINT64_C(1) << 32, PROT_NONE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (code == MAP_FAILED || inst == MAP_FAILED || budget == MAP_FAILED ||
+        mem == MAP_FAILED) {
+      perror("mmap");
+      return 1;
+    }
+    memcpy(code, clone_begin, blob);
+    memcpy((char *)code + (size_t)(spin_imm - clone_begin), &rounds,
+           sizeof(uint32_t));
+    if (mprotect(code, 256 << 10, PROT_READ | PROT_EXEC) != 0) {
+      perror("mprotect code");
+      return 1;
+    }
+    memcpy(inst + 0xa0, &(uint64_t){UINT64_MAX}, sizeof(uint64_t));
+    if (mprotect(mem, 65536, PROT_READ | PROT_WRITE) != 0) {
+      perror("mprotect memory");
+      return 1;
+    }
+    memcpy(inst + 0x100 + 0x1f, &mem, sizeof mem);
+
+    g_nregions = 0;
+    region_add("instance", inst + 0x100 - 0x60, 0x200);
+    region_add("budget", budget + 0x100, 0x200);
+    region_add("memory", mem, 65536);
+    region_add("code", code, blob);
+
+    uint32_t got = clone_entry(code, inst, budget + 0x100, n);
+    expect += n;
+    rounds++;
+
+    uint32_t budget_cell = *(uint32_t *)(void *)(budget + 0x100 + 0x13);
+    uint32_t mem0 = *(uint32_t *)mem;
+    if (got != n || budget_cell != n || mem0 != n) {
+      fprintf(stderr,
+              "DATA MISMATCH round=%" PRIu64 ": n=%" PRIu32
+              " entry-ret=%" PRIu32 " budget=%" PRIu32 " mem0=%" PRIu32
+              " (silent corruption, mapped page)\n",
+              rounds, n, got, budget_cell, mem0);
+      return 43;
+    }
+
+    munmap(code, 256 << 10);
+    munmap(inst, 4096);
+    munmap(budget, 4096);
+    munmap(mem, UINT64_C(1) << 32);
+  }
 
   clock_gettime(CLOCK_MONOTONIC, &t1);
   double secs = elapsed_sec(&t0, &t1);

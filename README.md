@@ -1045,14 +1045,12 @@ three modes:
   it RX, creates fresh instance/budget pages, executes, verifies, and
   retires the mappings to a reaper thread that unmaps them asynchronously
   (the alloc/free concurrency of V8's background code-GC). The 4 GiB
-  guard-paged memory reservation is process-lifetime: the first churn
-  version reserved one per round, and a process was later found wedged
-  unkillably inside `exit_mmap` during address-space teardown (kernel
-  stack: `exit_mmap+0x13e` ← `__mmput` ← `do_exit`; survived SIGKILL for
-  over an hour on kernel 7.1.8-1-cachyos). Whether that teardown hang is a
-  kernel pathology triggered by rapid 4 GiB map/unmap cycles or another
-  manifestation of the platform fault (the exit path runs on the same
-  pinned, marginal core) is undetermined.
+  guard-paged memory reservation is process-lifetime.
+- `--mode churn-mem`: the syscall-heaviest variant — per round it also
+  makes a fresh 4 GiB reservation, and everything is torn down inline (4
+  mmap + 2 mprotect + 4 munmap per round, single-threaded). This is the
+  shape that produced the kernel oopses described below; it can wedge the
+  machine, so use it only when that is acceptable.
 
 Detection is twofold: a `SA_SIGINFO` SIGSEGV handler prints si_addr, RIP,
 the instruction bytes at RIP, and the GP registers from `ucontext`, and
@@ -1074,12 +1072,13 @@ vulnerable-shape operations in the pure-execution modes):
 | rmw | 7.1.8-1-cachyos | 0/10 | 0/10 | 0/10 |
 | rmw + 1 GiB span | 7.1.8-1-cachyos | 0/10 | 0/10 | 0/10 |
 | clone | 7.1.8-1-cachyos | 0/20 | 0/20 | 0/20 |
-| churn v1 (per-round 4 GiB reservation) | 7.1.8-1-cachyos | 0/20 | 0/20 userspace faults, but see the kernel oopses below | 0/20 |
+| churn-mem (per-round 4 GiB reservation, inline teardown) | 7.1.8-1-cachyos | 0/20 | 0/20 userspace faults; 2 kernel oopses in ~75 loaded runs (see below) | 0/20 |
+| churn-mem | 7.1.8-arch1-3 | — | 0/60, no oops (see below) | — |
 | churn (lifetime reservation, reaper thread) | 7.1.8-arch1-3 | 0/40 | 0/40 | 0/40 |
 
 ### Kernel-mode manifestation from the native churn runs
 
-The first churn version never faulted in userspace, but two of its
+The churn-mem shape never faulted in userspace, but two of its
 ~75 loaded runs ended in **kernel oopses on CPU 19** (kernel
 7.1.8-1-cachyos, 2026-08-18 10:26 and 10:42), discovered in the previous
 boot's journal after the second one wedged the process:
@@ -1105,6 +1104,15 @@ flip strikes kernel-mode address generation too — and userspace detectors
 (a SIGSEGV handler, counter verification) cannot observe a fault that
 lands in the kernel. This also means the earlier "the C repro does not
 trigger" reads were partly a detector limitation.
+
+On 7.1.8-arch1-3 the identical churn-mem shape ran 60 loaded runs with
+no userspace fault and no kernel oops in the boot journal. If the oops
+rate were the ~2.5 %/run seen on cachyos, a clean 60-run batch has about
+a 20 % chance by luck alone, so this is suggestive — not proof — that
+the stock Arch kernel build (different config/toolchain than cachyos) is
+more durable against this manifestation. The userspace SIGSEGV rate is
+unaffected by the kernel change (node child: 10/10; mini-wasm-churn:
+10/10 on both kernels).
 
 > [!CAUTION]
 > The churn modes deliberately stress syscall entry/exit and VMA
