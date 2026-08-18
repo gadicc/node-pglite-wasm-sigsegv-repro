@@ -15,13 +15,17 @@ import test from "node:test";
 
 import {
   buildPhasePlan,
+  buildNodeMatrixSchedule,
   chooseController,
+  deriveMatrixSeed,
   executePhasePlan,
   parseArgs,
   planLines,
+  renderNodeMatrixReport,
   runGdbCapture,
   runLeg,
   summarize,
+  summarizeNodeMatrix,
   superviseController,
   verifyLoadWorkers,
 } from "../../load-state-aba.mjs";
@@ -77,6 +81,23 @@ test("node-aba requires Node B and defaults Node A to --node-bin", () => {
   assert.equal(withExplicitA.nodeA, "/opt/explicit-a");
 });
 
+test("node-matrix has conservative cycle defaults and requires Node B", () => {
+  assert.throws(
+    () => parseArgs(["--mode", "node-matrix"]),
+    /--mode node-matrix requires --node-b PATH/,
+  );
+  const options = parseArgs([
+    "--mode", "node-matrix", "--node-b", "/usr/bin/node", "--matrix-seed", "42",
+  ]);
+  assert.equal(options.nodeA, process.execPath);
+  assert.equal(options.nodeB, "/usr/bin/node");
+  assert.equal(options.runs, 5);
+  assert.equal(options.settleSeconds, 60);
+  assert.deepEqual(options.matrixWarmups, [5, 60]);
+  assert.equal(options.matrixRepeats, 2);
+  assert.equal(options.matrixSeed, 42);
+});
+
 test("mode-specific options are rejected outside their mode", () => {
   assert.throws(
     () => parseArgs(["--gdb-max-runs", "3"]),
@@ -96,8 +117,30 @@ test("mode-specific options are rejected outside their mode", () => {
   );
   assert.throws(
     () => parseArgs(["--mode", "gdb", "--runs", "5"]),
-    /--runs is only valid with --mode load-state or --mode node-aba/,
+    /--runs is only valid with --mode load-state, node-aba, or node-matrix/,
   );
+  assert.throws(
+    () => parseArgs(["--matrix-repeats", "2"]),
+    /--matrix-repeats is only valid with --mode node-matrix/,
+  );
+  assert.throws(
+    () => parseArgs(["--mode", "node-matrix", "--node-b", "/usr/bin/node", "--load-warmup-seconds", "5"]),
+    /replaced by --matrix-warmups/,
+  );
+});
+
+test("node-matrix bounds and warmup pairs are validated", () => {
+  const base = ["--mode", "node-matrix", "--node-b", "/usr/bin/node"];
+  assert.deepEqual(parseArgs([...base, "--matrix-warmups", "0,3600"]).matrixWarmups, [0, 3600]);
+  for (const value of ["5", "5,5", "60,5", "05,60", "5,3601"]) {
+    assert.throws(() => parseArgs([...base, "--matrix-warmups", value]), /--matrix-warmups/);
+  }
+  for (const value of ["0", "101", "01", "x"]) {
+    assert.throws(() => parseArgs([...base, "--matrix-repeats", value]), /--matrix-repeats/);
+  }
+  for (const value of ["4294967296", "-1", "x"]) {
+    assert.throws(() => parseArgs([...base, "--matrix-seed", value]), /--matrix-seed/);
+  }
 });
 
 test("GDB bounds are canonical and limited", () => {
@@ -201,9 +244,56 @@ test("phase plans match each mode's experimental design", () => {
   assert.equal(nodeAba.filter((step) => step.type === "load-stop").length, 1);
 });
 
+test("node-matrix schedule is seeded, repeatable, and reverse-paired", () => {
+  const options = parseArgs([
+    "--mode", "node-matrix", "--node-b", "/usr/bin/node",
+    "--matrix-seed", "20260818",
+  ]);
+  const schedule = buildNodeMatrixSchedule(options);
+  assert.equal(schedule.length, 8);
+  assert.deepEqual(buildNodeMatrixSchedule(options), schedule);
+  const first = schedule.filter((cycle) => cycle.repeat === 1).map((cycle) => cycle.conditionId);
+  const second = schedule.filter((cycle) => cycle.repeat === 2).map((cycle) => cycle.conditionId);
+  assert.deepEqual(second, [...first].reverse());
+  assert.deepEqual(
+    Object.fromEntries([...new Set(schedule.map((cycle) => cycle.conditionId))].map((id) => [
+      id,
+      schedule.filter((cycle) => cycle.conditionId === id).length,
+    ])),
+    { "A-W5": 2, "A-W60": 2, "B-W5": 2, "B-W60": 2 },
+  );
+  assert.equal(new Set(schedule.map((cycle) => cycle.cycleId)).size, 8);
+  assert.equal(deriveMatrixSeed("/tmp/example-output"), deriveMatrixSeed("/tmp/example-output"));
+  assert.notEqual(deriveMatrixSeed("/tmp/example-output"), deriveMatrixSeed("/tmp/other-output"));
+});
+
+test("node-matrix gives every measured cycle its own load bracket", () => {
+  const options = parseArgs([
+    "--mode", "node-matrix", "--node-b", "/usr/bin/node",
+    "--matrix-seed", "7", "--matrix-repeats", "1",
+  ]);
+  const plan = buildPhasePlan(options);
+  assert.equal(plan.filter((step) => step.type === "cycle-start").length, 4);
+  assert.equal(plan.filter((step) => step.type === "settle").length, 4);
+  assert.equal(plan.filter((step) => step.type === "load-start").length, 4);
+  assert.equal(plan.filter((step) => step.type === "leg").length, 4);
+  assert.equal(plan.filter((step) => step.type === "load-stop").length, 4);
+  assert.equal(plan.filter((step) => step.type === "cycle-end").length, 4);
+  for (let index = 0; index < plan.length; index += 9) {
+    assert.deepEqual(plan.slice(index, index + 9).map((step) => step.type), [
+      "cycle-start", "settle", "load-start", "load-warmup", "load-verify",
+      "leg", "load-verify", "load-stop", "cycle-end",
+    ]);
+    const cycleIds = new Set(plan.slice(index, index + 9).map((step) => step.cycleId));
+    assert.equal(cycleIds.size, 1);
+  }
+});
+
 function recordingHooks(calls, { interruptAfter = Number.POSITIVE_INFINITY } = {}) {
   return {
     isInterrupted: () => calls.length >= interruptAfter,
+    beginCycle: async (step) => { calls.push(`cycle-start:${step.cycleId}`); },
+    endCycle: async (step) => { calls.push(`cycle-end:${step.cycleId}`); },
     settle: async (step) => { calls.push(`settle:${step.seconds}`); },
     startLoad: async () => { calls.push("load-start"); },
     warmup: async (step) => { calls.push(`warmup:${step.seconds}`); },
@@ -233,6 +323,91 @@ test("load-state execution preserves the A1/load/A2 ordering", async () => {
   ]);
   assert.equal(rows.length, 3);
   assert.equal(gdbResult, null);
+});
+
+test("node-matrix execution stops load before settling the next cycle", async () => {
+  const calls = [];
+  const options = parseArgs([
+    "--mode", "node-matrix", "--node-b", "/usr/bin/node",
+    "--matrix-seed", "11", "--matrix-repeats", "1",
+  ]);
+  const { rows } = await executePhasePlan(buildPhasePlan(options), recordingHooks(calls));
+  assert.equal(rows.length, 4);
+  assert.equal(calls.filter((call) => call === "load-start").length, 4);
+  assert.equal(calls.filter((call) => call === "load-stop").length, 4);
+  for (let cycle = 1; cycle <= 4; cycle += 1) {
+    const id = `C${String(cycle).padStart(2, "0")}`;
+    const begin = calls.indexOf(`cycle-start:${id}`);
+    const end = calls.indexOf(`cycle-end:${id}`);
+    assert.ok(begin >= 0 && end > begin);
+    assert.equal(calls.slice(begin, end + 1).filter((call) => call === "load-start").length, 1);
+    assert.equal(calls.slice(begin, end + 1).filter((call) => call === "load-stop").length, 1);
+  }
+});
+
+test("node-matrix summaries retain cycle-level and condition-level outcomes", () => {
+  const options = parseArgs([
+    "--mode", "node-matrix", "--node-b", "/usr/bin/node",
+    "--matrix-seed", "9", "--matrix-repeats", "1",
+  ]);
+  const schedule = buildNodeMatrixSchedule(options);
+  const rows = schedule.flatMap((cycle) => [
+    {
+      matrixCycle: cycle.cycle,
+      nodeLabel: cycle.nodeLabel,
+      warmupSeconds: cycle.warmupSeconds,
+      outcome: cycle.nodeLabel === "A" ? "sigsegv" : "pass",
+    },
+  ]);
+  const summary = summarizeNodeMatrix(rows, schedule);
+  assert.equal(summary.cycles.length, 4);
+  assert.equal(summary.conditions.length, 4);
+  assert.equal(summary.conditions.find((item) => item.conditionId === "A-W5").sigsegv, 1);
+  assert.equal(summary.conditions.find((item) => item.conditionId === "B-W60").pass, 1);
+});
+
+test("node-matrix report keeps per-cycle results ahead of descriptive totals", () => {
+  const options = parseArgs([
+    "--mode", "node-matrix", "--node-b", "/usr/bin/node",
+    "--matrix-seed", "9", "--matrix-repeats", "1",
+  ]);
+  const schedule = buildNodeMatrixSchedule(options);
+  const rows = schedule.map((cycle) => ({
+    matrixCycle: cycle.cycle,
+    nodeLabel: cycle.nodeLabel,
+    warmupSeconds: cycle.warmupSeconds,
+    outcome: "pass",
+  }));
+  const report = renderNodeMatrixReport({
+    status: "complete",
+    config: {
+      mode: "node-matrix",
+      targetCpu: 19,
+      loadCpus: [0, 1],
+      controllerCpu: 8,
+      runs: 1,
+      matrixRepeats: 1,
+      matrixWarmups: [5, 60],
+      settleSeconds: 60,
+      matrixSeed: 9,
+    },
+    nodes: {
+      A: { node: "v25", v8: "14.1", modules: "141", path: "/node-a", sha256: "a" },
+      B: { node: "v26", v8: "14.6", modules: "147", path: "/node-b", sha256: "b" },
+    },
+    machine: {
+      biosVersion: "1.0",
+      biosDate: "today",
+      kernel: "test",
+      noTurboStart: "0",
+      noTurboEnd: "0",
+    },
+    matrixSchedule: schedule,
+  }, rows);
+  assert.match(report, /# Node executable × load-warmup matrix/);
+  assert.ok(report.indexOf("## Per-cycle results") < report.indexOf("## Descriptive condition totals"));
+  assert.match(report, /A cycle, rather than an individual child run, is the experimental unit/);
+  assert.match(report, /\| C01 \|/);
 });
 
 test("constant-load node A/B/A never stops or restarts workers between legs", async () => {
@@ -392,21 +567,45 @@ test("both phase boundary events carry the exact Node identity", async (t) => {
       outcome: "pass",
       elapsedMs: 1,
     }),
+    {
+      conditionId: "B-W5",
+      matrixCycle: 2,
+      matrixCycleId: "C02",
+      matrixRepeat: 1,
+      matrixPosition: 2,
+      warmupSeconds: 5,
+    },
   );
   assert.equal(rows.length, 1);
+  assert.equal(rows[0].conditionId, "B-W5");
+  assert.equal(rows[0].matrixCycle, 2);
   const events = readFileSync(eventsPath, "utf8").trim().split("\n")
     .map((line) => JSON.parse(line));
   assert.deepEqual(events.map((event) => ({
     type: event.type,
     nodePath: event.nodePath,
     nodeLabel: event.nodeLabel,
+    conditionId: event.conditionId,
+    matrixCycleId: event.matrixCycleId,
   })), [
-    { type: "phase_started", nodePath: "/exact/node-b", nodeLabel: "B" },
-    { type: "phase_ended", nodePath: "/exact/node-b", nodeLabel: "B" },
+    {
+      type: "phase_started",
+      nodePath: "/exact/node-b",
+      nodeLabel: "B",
+      conditionId: "B-W5",
+      matrixCycleId: "C02",
+    },
+    {
+      type: "phase_ended",
+      nodePath: "/exact/node-b",
+      nodeLabel: "B",
+      conditionId: "B-W5",
+      matrixCycleId: "C02",
+    },
   ]);
 });
 
-test("dry-run plan lines cover all three modes", () => {
+test("dry-run plan lines cover all four modes", () => {
   const node = { node: "v25.2.1", v8: "14.1.146.11-node.14" };
   const loadState = planLines(parseArgs([]), 8, "/tmp/out", { node });
   assert.ok(loadState.includes("mode                 load-state"));
@@ -448,6 +647,25 @@ test("dry-run plan lines cover all three modes", () => {
   assert.ok(nodeAba.includes("node A               v25.2.1 V8 14.1 (/opt/node-a)"));
   assert.ok(nodeAba.includes("node B               v26.7.0 V8 14.6 (/opt/node-b)"));
   assert.ok(nodeAba.includes("load warmup seconds  5"));
+
+  const nodeMatrixOptions = parseArgs([
+    "--mode", "node-matrix",
+    "--node-a", "/opt/node-a",
+    "--node-b", "/opt/node-b",
+    "--matrix-seed", "123",
+  ]);
+  const nodeMatrix = planLines(nodeMatrixOptions, 8, "/tmp/out", {
+    node,
+    nodeA: { node: "v25.2.1", v8: "14.1" },
+    nodeB: { node: "v26.7.0", v8: "14.6" },
+  });
+  assert.ok(nodeMatrix.includes("mode                 node-matrix"));
+  assert.ok(nodeMatrix.includes("runs per cycle       5"));
+  assert.ok(nodeMatrix.includes("matrix repetitions   2 per Node/warmup condition"));
+  assert.ok(nodeMatrix.includes("matrix warmups       5,60 seconds"));
+  assert.ok(nodeMatrix.includes("matrix seed          123"));
+  assert.ok(nodeMatrix.some((line) => line.startsWith("cycle order          C01:")));
+  assert.ok(!nodeMatrix.some((line) => line.startsWith("load warmup seconds")));
 });
 
 const FAKE_CAPTURE_SCRIPT = `#!/usr/bin/env bash

@@ -11,6 +11,7 @@
     "load:aba": "node load-state-aba.mjs",
     "load:gdb": "node load-state-aba.mjs --mode gdb",
     "load:node-aba": "node load-state-aba.mjs --mode node-aba",
+    "load:node-matrix": "node load-state-aba.mjs --mode node-matrix",
     "check:deno": "deno check deno-repro.ts"
   },
   "dependencies": {

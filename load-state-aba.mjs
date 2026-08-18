@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 // Controlled external-load experiments for the CPU-localized PGlite SIGSEGV.
-// The target remains one sequential child pinned to one CPU. Three modes share
+// The target remains one sequential child pinned to one CPU. Four modes share
 // the same verified induced load (one worker per load CPU):
 //   load-state: A1(no induced load) -> B(induced load) -> A2(recovered)
 //   gdb:        bounded GDB capture under one constant induced load
 //   node-aba:   A1(Node A) -> B(Node B) -> A2(Node A) under one constant load
+//   node-matrix: separate recovered load cycles for Node A/B at two warmups
 
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -54,7 +55,7 @@ const CONTROLLER_ENV = "PGLITE_LOAD_ABA_CONTROLLER";
 const OUTPUT_ENV = "PGLITE_LOAD_ABA_OUT_DIR";
 const ALLOWED_ENV = "PGLITE_LOAD_ABA_ALLOWED_CPUS";
 
-const MODES = ["load-state", "gdb", "node-aba"];
+const MODES = ["load-state", "gdb", "node-aba", "node-matrix"];
 
 const PHASES = [
   ["A1", "no induced load"],
@@ -83,19 +84,28 @@ Modes:
   --mode gdb              bounded GDB capture under one constant induced load
   --mode node-aba         A1(Node A) -> B(Node B) -> A2(Node A) under one
                           constant induced load that never stops between legs
+  --mode node-matrix      separate recovered load cycles for Node A/B at two
+                          warmups, in a recorded seeded order
 
 Options:
   --target-cpu N          target logical CPU (default: 19)
   --load-cpus LIST        induced-load CPUs (default: 0-7)
   --controller-cpu N|auto controller CPU, outside target/load sets (default: auto)
-  --runs N                child runs per leg (default: 20; load-state/node-aba)
+  --runs N                child runs per leg/cycle (default: 20; node-matrix: 5)
   --node-bin PATH         exact Node binary for child.mjs (default: this Node);
-                          the Node A default in node-aba, the debug target in gdb
-  --node-a PATH           exact Node A executable (only --mode node-aba)
-  --node-b PATH           exact Node B executable (required by --mode node-aba)
+                          Node A default in comparison modes; debug target in gdb
+  --node-a PATH           exact Node A executable (node-aba/node-matrix)
+  --node-b PATH           exact Node B executable (required by node-aba/node-matrix)
+  --matrix-warmups A,B    two increasing warmups in seconds (default: 5,60;
+                          only --mode node-matrix)
+  --matrix-repeats N      cycles per Node/warmup condition (default: 2;
+                          only --mode node-matrix)
+  --matrix-seed N         uint32 ordering seed (default: derived from output path;
+                          only --mode node-matrix)
   --gdb-max-runs N        bounded GDB attempts, 1-${GDB_MAX_RUNS_LIMIT} (default: 10; only --mode gdb)
   --gdb-max-captures N    stop after this many captures, 1-${GDB_MAX_CAPTURES_LIMIT} (default: 1; only --mode gdb)
-  --settle-seconds N      settling before the first phase (default: 15)
+  --settle-seconds N      settling before the first phase/cycle (default: 15;
+                          node-matrix: 60 before every cycle)
   --load-warmup-seconds N delay after verified load starts (default: 0 for
                           load-state, 5 for gdb and node-aba)
   --interval-ms N         telemetry interval, 50-60000 (default: 100)
@@ -111,7 +121,10 @@ Examples:
     --node-bin /home/dragon/.nvm/versions/node/v25.2.1/bin/node --yes
   node load-state-aba.mjs --mode node-aba \\
     --node-a /home/dragon/.nvm/versions/node/v25.2.1/bin/node \\
-    --node-b /usr/bin/node --yes`);
+    --node-b /usr/bin/node --yes
+  node load-state-aba.mjs --mode node-matrix \\
+    --node-a /home/dragon/.nvm/versions/node/v25.2.1/bin/node \\
+    --node-b /usr/bin/node --matrix-seed 20260818 --yes`);
   return message ? 2 : 0;
 }
 
@@ -136,6 +149,9 @@ export function parseArgs(argv) {
     intervalMs: 100,
     loadCpuSpec: "0-7",
     loadWarmupSeconds: 0,
+    matrixRepeats: 2,
+    matrixSeed: null,
+    matrixWarmups: [5, 60],
     mode: "load-state",
     nodeA: null,
     nodeB: null,
@@ -156,6 +172,9 @@ export function parseArgs(argv) {
     "--node-bin",
     "--node-a",
     "--node-b",
+    "--matrix-warmups",
+    "--matrix-repeats",
+    "--matrix-seed",
     "--gdb-max-runs",
     "--gdb-max-captures",
     "--settle-seconds",
@@ -193,6 +212,25 @@ export function parseArgs(argv) {
         options.nodeA = path.resolve(value);
       } else if (arg === "--node-b") {
         options.nodeB = path.resolve(value);
+      } else if (arg === "--matrix-warmups") {
+        const fields = value.split(",");
+        if (fields.length !== 2) {
+          throw new Error("--matrix-warmups must contain exactly two comma-separated values");
+        }
+        const warmups = fields.map((field) => canonicalInteger(
+          field,
+          "--matrix-warmups",
+          0,
+          3600,
+        ));
+        if (warmups[0] >= warmups[1]) {
+          throw new Error("--matrix-warmups values must be distinct and increasing");
+        }
+        options.matrixWarmups = warmups;
+      } else if (arg === "--matrix-repeats") {
+        options.matrixRepeats = canonicalInteger(value, arg, 1, 100);
+      } else if (arg === "--matrix-seed") {
+        options.matrixSeed = canonicalInteger(value, arg, 0, 0xffff_ffff);
       } else if (arg === "--gdb-max-runs") {
         options.gdbMaxRuns = canonicalInteger(value, arg, 1, GDB_MAX_RUNS_LIMIT);
       } else if (arg === "--gdb-max-captures") {
@@ -218,22 +256,37 @@ export function parseArgs(argv) {
       if (seen.has(arg)) throw new Error(`${arg} is only valid with --mode gdb`);
     }
   }
-  if (options.mode !== "node-aba") {
+  const nodeComparisonMode = options.mode === "node-aba" || options.mode === "node-matrix";
+  if (!nodeComparisonMode) {
     for (const arg of ["--node-a", "--node-b"]) {
-      if (seen.has(arg)) throw new Error(`${arg} is only valid with --mode node-aba`);
+      if (seen.has(arg)) {
+        throw new Error(`${arg} is only valid with --mode node-aba or node-matrix`);
+      }
+    }
+  }
+  if (options.mode !== "node-matrix") {
+    for (const arg of ["--matrix-warmups", "--matrix-repeats", "--matrix-seed"]) {
+      if (seen.has(arg)) throw new Error(`${arg} is only valid with --mode node-matrix`);
     }
   }
   if (options.mode === "gdb" && seen.has("--runs")) {
-    throw new Error("--runs is only valid with --mode load-state or --mode node-aba");
+    throw new Error("--runs is only valid with --mode load-state, node-aba, or node-matrix");
   }
-  if (options.mode === "node-aba") {
+  if (nodeComparisonMode) {
     if (!seen.has("--node-b")) {
-      throw new Error("--mode node-aba requires --node-b PATH");
+      throw new Error(`--mode ${options.mode} requires --node-b PATH`);
     }
     // --node-bin remains supported as the Node A/default executable.
     options.nodeA ??= options.nodeBin;
   }
-  if (!seen.has("--load-warmup-seconds") && options.mode !== "load-state") {
+  if (options.mode === "node-matrix") {
+    if (seen.has("--load-warmup-seconds")) {
+      throw new Error("--load-warmup-seconds is replaced by --matrix-warmups in node-matrix mode");
+    }
+    if (!seen.has("--runs")) options.runs = 5;
+    if (!seen.has("--settle-seconds")) options.settleSeconds = 60;
+  }
+  if (!seen.has("--load-warmup-seconds") && ["gdb", "node-aba"].includes(options.mode)) {
     options.loadWarmupSeconds = 5;
   }
   options.loadCpus = parseCpuList(options.loadCpuSpec);
@@ -267,6 +320,67 @@ export function chooseController(requested, targetCpu, loadCpus, allowed) {
   return controller;
 }
 
+export function deriveMatrixSeed(outDir) {
+  const digest = createHash("sha256").update(path.resolve(outDir)).digest();
+  return digest.readUInt32LE(0);
+}
+
+function seededRandom(seed) {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let value = state;
+    value = Math.imul(value ^ (value >>> 15), value | 1);
+    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+    return ((value ^ (value >>> 14)) >>> 0) / 0x1_0000_0000;
+  };
+}
+
+function shuffled(values, random) {
+  const result = [...values];
+  for (let index = result.length - 1; index > 0; index -= 1) {
+    const selected = Math.floor(random() * (index + 1));
+    [result[index], result[selected]] = [result[selected], result[index]];
+  }
+  return result;
+}
+
+export function buildNodeMatrixSchedule(options) {
+  if (options.mode !== "node-matrix") return [];
+  if (!Number.isInteger(options.matrixSeed)) {
+    throw new Error("node-matrix seed must be resolved before building its schedule");
+  }
+  const conditions = ["A", "B"].flatMap((nodeLabel) => (
+    options.matrixWarmups.map((warmupSeconds) => ({
+      conditionId: `${nodeLabel}-W${warmupSeconds}`,
+      nodeLabel,
+      warmupSeconds,
+    }))
+  ));
+  const random = seededRandom(options.matrixSeed);
+  const schedule = [];
+  let pairOrder = null;
+  const totalCycles = conditions.length * options.matrixRepeats;
+  const width = Math.max(2, String(totalCycles).length);
+  for (let repeat = 1; repeat <= options.matrixRepeats; repeat += 1) {
+    if (repeat % 2 === 1) pairOrder = shuffled(conditions, random);
+    const order = repeat % 2 === 1 ? pairOrder : [...pairOrder].reverse();
+    for (let position = 1; position <= order.length; position += 1) {
+      const condition = order[position - 1];
+      const cycle = schedule.length + 1;
+      schedule.push({
+        ...condition,
+        cycle,
+        cycleId: `C${String(cycle).padStart(width, "0")}`,
+        repeat,
+        position,
+        totalCycles,
+      });
+    }
+  }
+  return schedule;
+}
+
 // The experiment as a data-only step list, so the exact ordering — including
 // the single load start/stop bracketing every node-aba leg — is testable
 // without a live machine. Explicit load-verify steps bind worker identity and
@@ -298,6 +412,40 @@ export function buildPhasePlan(options) {
       { type: "load-stop" },
     ];
   }
+  if (options.mode === "node-matrix") {
+    return buildNodeMatrixSchedule(options).flatMap((cycle) => {
+      const description = `Node ${cycle.nodeLabel} after ${cycle.warmupSeconds}s load warmup`;
+      return [
+        { type: "cycle-start", ...cycle, description },
+        {
+          type: "settle",
+          seconds: options.settleSeconds,
+          before: `${cycle.cycleId} (${cycle.conditionId})`,
+          ...cycle,
+        },
+        { type: "load-start", ...cycle },
+        { type: "load-warmup", seconds: cycle.warmupSeconds, ...cycle },
+        {
+          type: "load-verify",
+          boundary: `before ${cycle.cycleId} (${cycle.conditionId})`,
+          ...cycle,
+        },
+        {
+          type: "leg",
+          phase: cycle.cycleId,
+          description,
+          ...cycle,
+        },
+        {
+          type: "load-verify",
+          boundary: `after ${cycle.cycleId} (${cycle.conditionId})`,
+          ...cycle,
+        },
+        { type: "load-stop", ...cycle },
+        { type: "cycle-end", ...cycle, description },
+      ];
+    });
+  }
   return [
     { type: "settle", seconds: options.settleSeconds, before: "A1" },
     { type: "leg", phase: "A1", description: "no induced load", nodeLabel: "target" },
@@ -322,13 +470,15 @@ export async function executePhasePlan(
 ) {
   for (const step of plan) {
     if (hooks.isInterrupted?.() === true) break;
-    if (step.type === "settle") await hooks.settle(step);
-    else if (step.type === "load-start") await hooks.startLoad();
+    if (step.type === "cycle-start") await hooks.beginCycle(step);
+    else if (step.type === "cycle-end") await hooks.endCycle(step);
+    else if (step.type === "settle") await hooks.settle(step);
+    else if (step.type === "load-start") await hooks.startLoad(step);
     else if (step.type === "load-warmup") await hooks.warmup(step);
     else if (step.type === "load-verify") await hooks.verifyLoad(step);
     else if (step.type === "leg") result.rows.push(...await hooks.runLeg(step));
     else if (step.type === "gdb") result.gdbResult = await hooks.gdbCapture(step);
-    else if (step.type === "load-stop") await hooks.stopLoad();
+    else if (step.type === "load-stop") await hooks.stopLoad(step);
     else throw new Error(`unknown phase-plan step: ${step.type}`);
   }
   return result;
@@ -338,7 +488,13 @@ function defaultOutDir(mode) {
   const stamp = new Date().toISOString()
     .replace(/[-:]/g, "")
     .replace(/\.\d{3}Z$/, "Z");
-  const prefix = mode === "gdb" ? "load-gdb" : mode === "node-aba" ? "node-aba" : "load-aba";
+  const prefix = mode === "gdb"
+    ? "load-gdb"
+    : mode === "node-aba"
+      ? "node-aba"
+      : mode === "node-matrix"
+        ? "node-matrix"
+        : "load-aba";
   return path.join(REPO, "diagnostics", `${prefix}-${stamp}`);
 }
 
@@ -952,6 +1108,7 @@ export async function runLeg(
   eventsPath,
   recorder,
   runChild = runPinnedChild,
+  context = {},
 ) {
   appendJsonLine(eventsPath, {
     type: "phase_started",
@@ -959,11 +1116,15 @@ export async function runLeg(
     description,
     nodePath: nodeBin,
     ...(nodeLabel ? { nodeLabel } : {}),
+    ...context,
     ...now(recorder),
   });
   const rows = [];
   for (let run = 1; run <= options.runs && interruptedBy === null; run += 1) {
-    const row = await runChild(options, phase, run, nodeBin, nodeLabel);
+    const row = {
+      ...await runChild(options, phase, run, nodeBin, nodeLabel),
+      ...context,
+    };
     rows.push(row);
     appendJsonLine(resultsPath, row);
     const label = nodeLabel ? ` node=${nodeLabel}` : "";
@@ -978,6 +1139,7 @@ export async function runLeg(
     completedRuns: rows.length,
     nodePath: nodeBin,
     ...(nodeLabel ? { nodeLabel } : {}),
+    ...context,
     ...now(recorder),
   });
   return rows;
@@ -996,6 +1158,41 @@ export function summarize(rows, phases = PHASES) {
       interrupted: selected.filter((row) => row.outcome === "interrupted").length,
     };
   });
+}
+
+function outcomeSummary(selected) {
+  return {
+    attempted: selected.length,
+    pass: selected.filter((row) => row.outcome === "pass").length,
+    sigsegv: selected.filter((row) => row.outcome === "sigsegv").length,
+    otherFailure: selected.filter((row) => row.outcome === "other_failure").length,
+    interrupted: selected.filter((row) => row.outcome === "interrupted").length,
+  };
+}
+
+export function summarizeNodeMatrix(rows, schedule) {
+  const cycles = schedule.map((cycle) => ({
+    ...cycle,
+    ...outcomeSummary(rows.filter((row) => row.matrixCycle === cycle.cycle)),
+  }));
+  const conditions = [];
+  for (const nodeLabel of ["A", "B"]) {
+    for (const warmupSeconds of [...new Set(schedule.map((cycle) => cycle.warmupSeconds))].sort((a, b) => a - b)) {
+      const selected = rows.filter((row) => (
+        row.nodeLabel === nodeLabel && row.warmupSeconds === warmupSeconds
+      ));
+      conditions.push({
+        conditionId: `${nodeLabel}-W${warmupSeconds}`,
+        nodeLabel,
+        warmupSeconds,
+        cycles: cycles.filter((cycle) => (
+          cycle.nodeLabel === nodeLabel && cycle.warmupSeconds === warmupSeconds
+        )).length,
+        ...outcomeSummary(selected),
+      });
+    }
+  }
+  return { cycles, conditions };
 }
 
 function phasesForMode(mode) {
@@ -1146,6 +1343,89 @@ function renderNodeAbaReport(metadata, rows) {
   return lines.join("\n");
 }
 
+export function renderNodeMatrixReport(metadata, rows) {
+  const summary = summarizeNodeMatrix(rows, metadata.matrixSchedule);
+  const nodeOf = (label) => metadata.nodes[label];
+  const paired = metadata.config.matrixRepeats % 2 === 0;
+  const lines = [
+    "# Node executable × load-warmup matrix",
+    "",
+    `- Status: ${metadata.status}`,
+    `- Mode: ${metadata.config.mode}`,
+    `- Target: CPU ${metadata.config.targetCpu}`,
+    `- Load CPUs: ${metadata.config.loadCpus.join(", ")}`,
+    `- Controller: CPU ${metadata.config.controllerCpu}`,
+    `- Runs per cycle: ${metadata.config.runs}`,
+    `- Cycles per condition: ${metadata.config.matrixRepeats}`,
+    `- Warmups: ${metadata.config.matrixWarmups.join("s, ")}s`,
+    `- Settle before every cycle: ${metadata.config.settleSeconds}s`,
+    `- Ordering seed: ${metadata.config.matrixSeed}`,
+    `- Ordering: seeded permutation${paired ? " with every order paired to its reverse" : "; final order has no reverse partner"}`,
+    `- Node A: ${metadata.nodes.A.node}; V8 ${metadata.nodes.A.v8}; modules ${metadata.nodes.A.modules}`,
+    `- Node A executable: \`${metadata.nodes.A.path}\``,
+    `- Node A executable SHA-256: \`${metadata.nodes.A.sha256}\``,
+    `- Node B: ${metadata.nodes.B.node}; V8 ${metadata.nodes.B.v8}; modules ${metadata.nodes.B.modules}`,
+    `- Node B executable: \`${metadata.nodes.B.path}\``,
+    `- Node B executable SHA-256: \`${metadata.nodes.B.sha256}\``,
+    ...machineLines(metadata),
+    "",
+    "## Per-cycle results",
+    "",
+    "| Cycle | Repeat | Position | Node | Warmup | Attempted | Passed | SIGSEGV | Other | Interrupted |",
+    "| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+  ];
+  for (const item of summary.cycles) {
+    lines.push(
+      `| ${item.cycleId} | ${item.repeat} | ${item.position} | ${nodeOf(item.nodeLabel).node} | ${item.warmupSeconds}s | ${item.attempted} | ${item.pass} | ${percent(item.sigsegv, item.attempted)} | ${item.otherFailure} | ${item.interrupted} |`,
+    );
+  }
+  lines.push(
+    "",
+    "## Descriptive condition totals",
+    "",
+    "| Condition | Node | Warmup | Cycles | Attempted | Passed | SIGSEGV | Other | Interrupted |",
+    "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+  );
+  for (const item of summary.conditions) {
+    lines.push(
+      `| ${item.conditionId} | ${nodeOf(item.nodeLabel).node} | ${item.warmupSeconds}s | ${item.cycles} | ${item.attempted} | ${item.pass} | ${percent(item.sigsegv, item.attempted)} | ${item.otherFailure} | ${item.interrupted} |`,
+    );
+  }
+  lines.push("", "## Interpretation boundary", "");
+  if (metadata.status === "complete") {
+    lines.push(
+      "Every measured condition used its own induced-load worker set. Workers",
+      "were verified before and after the child runs, stopped and reaped, and",
+      "the configured settle elapsed before the next cycle. The exact seeded",
+      "order is recorded above and in `metadata.json`.",
+      "",
+      "A cycle, rather than an individual child run, is the experimental unit",
+      "for load-onset effects. The condition totals are descriptive; retain the",
+      "per-cycle results when assessing repeatability and order or carryover.",
+      "",
+    );
+  } else {
+    lines.push(
+      "This experiment did not complete every planned cycle and load-worker",
+      "check. Retained rows are descriptive partial output only. See",
+      "`metadata.json` and `events.jsonl` for the stopping point.",
+      "",
+    );
+  }
+  lines.push(
+    ...telemetryNoteLines(),
+    "",
+    "## Files",
+    "",
+    "- `metadata.json`: configuration, exact schedule, platform, and Node identities",
+    "- `results.jsonl`: one exact child outcome per row with cycle/condition fields",
+    "- `events.jsonl`: cycle, phase, and verified load-worker boundaries",
+    "- `telemetry.ndjson`: read-only frequency/temperature/no_turbo samples",
+    "",
+  );
+  return lines.join("\n");
+}
+
 function renderGdbReport(metadata, gdbResult) {
   const lines = [
     "# Bounded GDB capture under constant external load",
@@ -1247,6 +1527,7 @@ function renderGdbReport(metadata, gdbResult) {
 function renderReport(metadata, rows, gdbResult) {
   if (metadata.config.mode === "gdb") return renderGdbReport(metadata, gdbResult);
   if (metadata.config.mode === "node-aba") return renderNodeAbaReport(metadata, rows);
+  if (metadata.config.mode === "node-matrix") return renderNodeMatrixReport(metadata, rows);
   return renderLoadStateReport(metadata, rows);
 }
 
@@ -1267,13 +1548,28 @@ export function planLines(options, controller, outDir, info) {
       `settle seconds       ${options.settleSeconds} before starting the induced load`,
     );
   } else {
-    lines.push(`runs per leg         ${options.runs}`);
+    lines.push(`${options.mode === "node-matrix" ? "runs per cycle       " : "runs per leg         "}${options.runs}`);
     if (options.mode === "node-aba") {
       lines.push(
         "sequence             one constant load: A1(Node A) -> B(Node B) -> A2(Node A)",
         `node A               ${info.nodeA.node} V8 ${info.nodeA.v8} (${options.nodeA})`,
         `node B               ${info.nodeB.node} V8 ${info.nodeB.v8} (${options.nodeB})`,
         `settle seconds       ${options.settleSeconds} before starting the induced load`,
+      );
+    } else if (options.mode === "node-matrix") {
+      const schedule = buildNodeMatrixSchedule(options);
+      const fixedWaitSeconds = schedule.length * options.settleSeconds +
+        schedule.reduce((sum, cycle) => sum + cycle.warmupSeconds, 0);
+      lines.push(
+        `matrix repetitions   ${options.matrixRepeats} per Node/warmup condition`,
+        `matrix warmups       ${options.matrixWarmups.join(",")} seconds`,
+        `matrix seed          ${options.matrixSeed}`,
+        `matrix cycles        ${schedule.length}; separate load start/stop for every cycle`,
+        `matrix fixed waits   ${fixedWaitSeconds}s plus child runtimes and worker checks`,
+        `cycle order          ${schedule.map((cycle) => `${cycle.cycleId}:${cycle.conditionId}`).join(" -> ")}`,
+        `node A               ${info.nodeA.node} V8 ${info.nodeA.v8} (${options.nodeA})`,
+        `node B               ${info.nodeB.node} V8 ${info.nodeB.v8} (${options.nodeB})`,
+        `settle seconds       ${options.settleSeconds} before every cycle`,
       );
     } else {
       lines.push(
@@ -1283,10 +1579,14 @@ export function planLines(options, controller, outDir, info) {
     }
   }
   lines.push(
-    `load warmup seconds  ${options.loadWarmupSeconds}`,
+    ...(options.mode === "node-matrix" ? [] : [`load warmup seconds  ${options.loadWarmupSeconds}`]),
     `telemetry interval   ${options.intervalMs} ms`,
-    `target Node          ${info.node.node} V8 ${info.node.v8}`,
-    `target executable    ${options.nodeBin}`,
+    ...(options.mode === "node-matrix"
+      ? []
+      : [
+          `target Node          ${info.node.node} V8 ${info.node.v8}`,
+          `target executable    ${options.nodeBin}`,
+        ]),
     `load program         ${LOAD_PROGRAM} (one verified pinned worker per load CPU)`,
     "load checks          original PID/executable/affinity around every loaded phase",
     `output               ${outDir}`,
@@ -1301,7 +1601,7 @@ function describePlan(options, controller, outDir, info) {
 
 async function buildPlanInfo(options) {
   const info = { node: await inspectNode(options.nodeBin) };
-  if (options.mode === "node-aba") {
+  if (options.mode === "node-aba" || options.mode === "node-matrix") {
     info.nodeA = realpathSync(options.nodeA) === realpathSync(options.nodeBin)
       ? info.node
       : await inspectNode(options.nodeA);
@@ -1326,7 +1626,16 @@ async function buildMetadata(options, controller, allowed, argv) {
       loadCpus: options.loadCpus,
       controllerCpu: controller,
       settleSeconds: options.settleSeconds,
-      loadWarmupSeconds: options.loadWarmupSeconds,
+      ...(options.mode === "node-matrix"
+        ? {}
+        : { loadWarmupSeconds: options.loadWarmupSeconds }),
+      ...(options.mode === "node-matrix"
+        ? {
+            matrixRepeats: options.matrixRepeats,
+            matrixSeed: options.matrixSeed,
+            matrixWarmups: options.matrixWarmups,
+          }
+        : {}),
       telemetryIntervalMs: options.intervalMs,
       sequence: buildPhasePlan(options)
         .filter((step) => step.type === "leg" || step.type === "gdb")
@@ -1379,7 +1688,7 @@ async function buildMetadata(options, controller, allowed, argv) {
       controllerTopology: cpuTopology(controller),
     },
   };
-  if (options.mode === "node-aba") {
+  if (options.mode === "node-aba" || options.mode === "node-matrix") {
     const [infoA, infoB] = await Promise.all([
       realpathSync(options.nodeA) === realpathSync(options.nodeBin)
         ? Promise.resolve(nodeInfo)
@@ -1392,6 +1701,9 @@ async function buildMetadata(options, controller, allowed, argv) {
       A: { ...infoA, path: options.nodeA, sha256: await sha256(options.nodeA) },
       B: { ...infoB, path: options.nodeB, sha256: await sha256(options.nodeB) },
     };
+  }
+  if (options.mode === "node-matrix") {
+    metadata.matrixSchedule = buildNodeMatrixSchedule(options);
   }
   if (options.mode === "gdb") {
     // Preflight the optional debugger dependency before any load starts, and
@@ -1441,8 +1753,36 @@ async function runExperiment(options, controller, outDir, metadata) {
     if (label === "B") return options.nodeB;
     return options.nodeBin;
   };
+  const matrixContext = (step) => step.conditionId === undefined
+    ? {}
+    : {
+        conditionId: step.conditionId,
+        matrixCycle: step.cycle,
+        matrixCycleId: step.cycleId,
+        matrixRepeat: step.repeat,
+        matrixPosition: step.position,
+        warmupSeconds: step.warmupSeconds,
+      };
   const hooks = {
     isInterrupted: () => interruptedBy !== null,
+    beginCycle: async (step) => {
+      appendJsonLine(eventsPath, {
+        type: "matrix_cycle_started",
+        ...matrixContext(step),
+        nodeLabel: step.nodeLabel,
+        nodePath: nodeForLabel(step.nodeLabel),
+        ...now(recorder),
+      });
+    },
+    endCycle: async (step) => {
+      appendJsonLine(eventsPath, {
+        type: "matrix_cycle_ended",
+        ...matrixContext(step),
+        nodeLabel: step.nodeLabel,
+        nodePath: nodeForLabel(step.nodeLabel),
+        ...now(recorder),
+      });
+    },
     settle: async (step) => {
       console.log(`settling ${step.seconds}s before ${step.before}...`);
       await delay(step.seconds * 1000, () => interruptedBy !== null);
@@ -1459,9 +1799,10 @@ async function runExperiment(options, controller, outDir, metadata) {
     verifyLoad: async (step) => {
       verifyLoadWorkers(workers, step.boundary, eventsPath, recorder);
     },
-    stopLoad: async () => {
+    stopLoad: async (step = {}) => {
       if (interruptedBy === null) {
-        verifyLoadWorkers(workers, "before planned load stop", eventsPath, recorder);
+        const suffix = step.cycleId ? ` for ${step.cycleId} (${step.conditionId})` : "";
+        verifyLoadWorkers(workers, `before planned load stop${suffix}`, eventsPath, recorder);
       }
       await stopLoadWorkers(workers, eventsPath, recorder);
       workers = [];
@@ -1475,6 +1816,8 @@ async function runExperiment(options, controller, outDir, metadata) {
       resultsPath,
       eventsPath,
       recorder,
+      runPinnedChild,
+      matrixContext(step),
     ),
     gdbCapture: () => runGdbCapture(options, outDir, eventsPath, recorder),
   };
@@ -1507,7 +1850,9 @@ async function runExperiment(options, controller, outDir, metadata) {
       : "complete";
   metadata.finishedAt = new Date().toISOString();
   metadata.recordCount = execution.rows.length;
-  metadata.summary = summarize(execution.rows, phasesForMode(options.mode));
+  metadata.summary = options.mode === "node-matrix"
+    ? summarizeNodeMatrix(execution.rows, metadata.matrixSchedule)
+    : summarize(execution.rows, phasesForMode(options.mode));
   if (options.mode === "gdb") metadata.gdb.result = execution.gdbResult;
   metadata.machine.noTurboEnd = readText(NO_TURBO);
   if (operationalError) metadata.operationalError = operationalError.message;
@@ -1528,7 +1873,9 @@ export async function main(argv = process.argv.slice(2)) {
     const options = parseArgs(argv);
     if (options.help) return usage();
     const requiredFiles = [CHILD, LAUNCHER, LOAD_PROGRAM, options.nodeBin];
-    if (options.mode === "node-aba") requiredFiles.push(options.nodeA, options.nodeB);
+    if (options.mode === "node-aba" || options.mode === "node-matrix") {
+      requiredFiles.push(options.nodeA, options.nodeB);
+    }
     if (options.mode === "gdb") requiredFiles.push(CAPTURE_SCRIPT, GDB_HELPER, GDB_EVIDENCE);
     for (const required of requiredFiles) {
       if (!statSync(required).isFile()) throw new Error(`missing required file: ${required}`);
@@ -1537,7 +1884,7 @@ export async function main(argv = process.argv.slice(2)) {
     // path before the plan is fixed; no bare PATH lookup chooses a target Node.
     options.nodeBin = realpathSync(options.nodeBin);
     accessSync(options.nodeBin, constants.X_OK);
-    if (options.mode === "node-aba") {
+    if (options.mode === "node-aba" || options.mode === "node-matrix") {
       options.nodeA = realpathSync(options.nodeA);
       options.nodeB = realpathSync(options.nodeB);
       accessSync(options.nodeA, constants.X_OK);
@@ -1562,6 +1909,9 @@ export async function main(argv = process.argv.slice(2)) {
       allowed,
     );
     const outDir = process.env[OUTPUT_ENV] ?? options.outDir ?? defaultOutDir(options.mode);
+    if (options.mode === "node-matrix" && options.matrixSeed === null) {
+      options.matrixSeed = deriveMatrixSeed(outDir);
+    }
     if (!options.yes) {
       describePlan(options, controller, outDir, await buildPlanInfo(options));
       console.log("execution            dry-run (pass --yes to run)");

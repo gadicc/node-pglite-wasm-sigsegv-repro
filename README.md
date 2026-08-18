@@ -151,16 +151,60 @@ the fixed order A1, B, A2, so time and thermal drift remain possible
 confounders even with a constant load — prefer repeating complete sessions
 over reading a single one, and never pool legs across sessions.
 
+#### Node × warmup cycles (`--mode node-matrix`)
+
+Runs the four Node/warmup combinations as separate load cycles. Every cycle
+settles, starts a fresh set of pinned workers, waits for that cycle's warmup,
+verifies the workers, runs one exact Node executable on the target CPU,
+rechecks the workers, then stops and reaps them before the next settle. This
+removes the uninterrupted-load carryover inherent in `node-aba`.
+
+The defaults are five child runs per cycle, two cycles per condition, 5- and
+60-second warmups, and a 60-second settle before every cycle. A seeded
+permutation determines the first order and the second repetition uses its
+reverse. The seed is derived from the output path unless supplied explicitly;
+the resolved seed and complete order are printed and recorded. Default fixed
+waits total about 12 minutes 20 seconds, plus child runtimes and worker checks.
+
+```sh
+# Dry-run: inspect exact binaries, seed, order, and duration first.
+npm run load:node-matrix -- \
+  --node-a /home/dragon/.nvm/versions/node/v25.2.1/bin/node \
+  --node-b /usr/bin/node \
+  --matrix-seed 20260818
+
+# Initial live matrix with the defaults.
+npm run load:node-matrix -- \
+  --node-a /home/dragon/.nvm/versions/node/v25.2.1/bin/node \
+  --node-b /usr/bin/node \
+  --matrix-seed 20260818 \
+  --yes
+
+# A larger fully paired run, with an explicit replayable seed.
+npm run load:node-matrix -- \
+  --node-a /home/dragon/.nvm/versions/node/v25.2.1/bin/node \
+  --node-b /usr/bin/node \
+  --matrix-repeats 4 --runs 5 --matrix-seed 20260818 \
+  --yes
+```
+
+The cycle—not an individual child invocation—is the experimental unit for
+load-onset effects. `report.md` therefore retains a per-cycle table before its
+descriptive condition totals. Even repetition counts pair every seeded order
+with its reverse; an odd final repetition is recorded as unpaired. Do not
+treat multiple child runs from one cycle as independent load-onset sessions.
+
 #### Bundle contents and recommended sequence
 
 Each bundle contains `metadata.json` (configuration, platform, topology, exact
 binary identities and hashes), `events.jsonl` (verified load-worker and phase
-boundaries, including every repeated worker check), `telemetry.ndjson` (100 ms
-read-only frequency, temperature when
+or cycle boundaries, including every repeated worker check),
+`telemetry.ndjson` (100 ms read-only frequency, temperature when
 exposed, and `intel_pstate/no_turbo` samples), and a `report.md` keeping A1, B,
-and A2 (or the capture outcome) separate. Load-state and node-aba bundles add
-`results.jsonl` with one exact child outcome per row; gdb bundles add the
-validated GDB evidence envelope instead of per-leg rows. Telemetry
+and A2, each matrix cycle, or the capture outcome separate. Load-state,
+node-aba, and node-matrix bundles add `results.jsonl` with one exact child
+outcome per row; gdb bundles add the validated GDB evidence envelope instead
+of child rows. Telemetry
 `scaling_cur_freq` is a point-in-time kernel value, not an effective-frequency
 measurement.
 
@@ -170,8 +214,10 @@ Recommended investigation sequence:
    fault signature before attributing it to the load trigger.
 2. `--mode node-aba` under the same constant load to measure whether the
    trigger rate depends on the Node executable.
-3. Repeat full sessions when practical; fixed-order A/B/A legs can still
-   drift in time and temperature.
+3. `--mode node-matrix` when fixed-order A/B/A results show time or warmup
+   drift; assess per-cycle repeatability before condition totals.
+4. Repeat complete bundles when practical; a single bundle still samples only
+   one broader machine-history interval.
 
 ## Diagnostic runner (`diagnose.sh`)
 
