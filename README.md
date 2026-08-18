@@ -986,6 +986,143 @@ listed CPU has an intrinsic defect or that every zero-failure CPU is sound; it
 records where this workload produced exact-CPU failures under the tested
 contexts.
 
+## Native trigger attempts and minimal probes (2026-08-17 onward)
+
+Using the external-load A/B/A recipe (target CPU 19, one verified
+`/usr/bin/yes` worker per P-core 0-7, controller off-target), two minimal
+wasm probes and a native C harness were built to locate the essential
+trigger. Under the identical recipe in the same sessions, the PGlite child
+scored 9/10 SIGSEGV per ~1.2 s run (kernel 7.1.8-1-cachyos) and 10/10
+(kernel 7.1.8-arch1-3).
+
+### Minimal wasm probes: `mini-wasm.mjs` and `mini-wasm-churn.mjs`
+
+`mini-wasm.mjs` is a 40-line, dependency-free Node script: a hand-encoded
+two-function wasm module (`spin(n)` calls `bump()` n times; `bump()`
+increments `memory[0]`; Liftoff emits the same per-call budget-bump shape
+as the PGlite captures). The JS side verifies the counter every round and
+exits 43 on mismatch. In steady state its syscall profile is flat
+(`strace -c`): the trigger is pure userspace execution.
+
+`mini-wasm-churn.mjs` additionally compiles and instantiates a fresh copy
+of the module every round (a trailing custom section carrying the round
+number defeats V8's module cache), exercising the
+compile/instantiate/execute/destroy cycle continuously.
+
+Results, pinned to CPU 19 with `yes` load on CPUs 0-7:
+
+| Probe | Result |
+| --- | --- |
+| `mini-wasm.mjs`, 5 s runs | 1/10, 1/20, 0/20 SIGSEGV across three sessions |
+| `mini-wasm.mjs --liftoff-only`, 5 s runs | 0/20 |
+| `mini-wasm.mjs` under gdb (`handle SIGSEGV stop nopass`), 15 s attempts | 0/40 |
+| `mini-wasm-churn.mjs`, 8 s runs, kernel 7.1.8-1-cachyos | 15/15 SIGSEGV |
+| `mini-wasm-churn.mjs`, 8 s runs, kernel 7.1.8-arch1-3 | 10/10 SIGSEGV |
+
+So wasm module *churn* — fresh code pages, fresh instances, fresh
+guard-paged memory reservations, executed immediately — is the essential
+ingredient. It explains the rate ladder: the PGlite child spends its whole
+short life in compile/init churn (~90 % per run), steady-state mini-wasm
+gets one brief startup burst (~1-5 %), and static native loops get none.
+
+### Native harness: `repro-c.c` and `repro-c-aba.sh`
+
+`repro-c.c` is a self-contained C harness (no runtime beyond libc) with
+three modes:
+
+- `--mode rmw`: a tight loop of `addl $1, disp(%r13)` RMWs, loads, and
+  stores through long-lived base pointers with one indirect call
+  (`call *%rdx`) per iteration (`hotloop`); an optional 1 GiB
+  shuffled-page span adds one TLB-missing RMW per iteration (`hotloop2`).
+- `--mode clone`: a position-independent re-creation of mini-wasm's
+  Liftoff-generated code (same instruction shapes: instance register r13,
+  stack-check `cmp rsp,[r13-0x60]`, budget bump `addl $1, 0x13(%rax)`,
+  jump-table call), copied into a fresh RWX mapping and executed there,
+  with an instance page, a budget page, and a 4 GiB guard-paged
+  linear-memory reservation.
+- `--mode churn`: per round, sets up a fresh code mapping (RW), writes the
+  clone blob with a fresh round number patched into the code bytes, flips
+  it RX, creates fresh instance/budget pages, executes, verifies, and
+  retires the mappings to a reaper thread that unmaps them asynchronously
+  (the alloc/free concurrency of V8's background code-GC). The 4 GiB
+  guard-paged memory reservation is process-lifetime: the first churn
+  version reserved one per round, and a process was later found wedged
+  unkillably inside `exit_mmap` during address-space teardown (kernel
+  stack: `exit_mmap+0x13e` ← `__mmput` ← `do_exit`; survived SIGKILL for
+  over an hour on kernel 7.1.8-1-cachyos). Whether that teardown hang is a
+  kernel pathology triggered by rapid 4 GiB map/unmap cycles or another
+  manifestation of the platform fault (the exit path runs on the same
+  pinned, marginal core) is undetermined.
+
+Detection is twofold: a `SA_SIGINFO` SIGSEGV handler prints si_addr, RIP,
+the instruction bytes at RIP, and the GP registers from `ucontext`, and
+classifies the displacement against the registered regions (exit 42);
+batch verification of every counter catches a flip that lands on a mapped
+page (silent corruption, exit 43). `repro-c-aba.sh` runs the A/B/A load
+protocol against the binary:
+
+```sh
+cc -O2 -Wall -Wextra -pthread -o repro-c repro-c.c
+./repro-c-aba.sh 19 20 0-7 churn   # target, runs/leg, load cpus, mode
+```
+
+Results on CPU 19 (20-40 runs per leg, each run performing billions of
+vulnerable-shape operations in the pure-execution modes):
+
+| Mode | Kernel | A1 (idle) | B (loaded) | A2 (idle) |
+| --- | --- | --- | --- | --- |
+| rmw | 7.1.8-1-cachyos | 0/10 | 0/10 | 0/10 |
+| rmw + 1 GiB span | 7.1.8-1-cachyos | 0/10 | 0/10 | 0/10 |
+| clone | 7.1.8-1-cachyos | 0/20 | 0/20 | 0/20 |
+| churn v1 (per-round 4 GiB reservation) | 7.1.8-1-cachyos | 0/20 | 0/20 userspace faults, but see the kernel oopses below | 0/20 |
+| churn (lifetime reservation, reaper thread) | 7.1.8-arch1-3 | 0/40 | 0/40 | 0/40 |
+
+### Kernel-mode manifestation from the native churn runs
+
+The first churn version never faulted in userspace, but two of its
+~75 loaded runs ended in **kernel oopses on CPU 19** (kernel
+7.1.8-1-cachyos, 2026-08-18 10:26 and 10:42), discovered in the previous
+boot's journal after the second one wedged the process:
+
+- `Oops: 0002 [#1] ... CPU: 19 ... Comm: repro-c`, RIP
+  `entry_SYSCALL_64_after_hwframe+0x11` (the `push %r14` saving registers
+  on the kernel stack). Incoming registers identify the syscall as
+  `mprotect(code, 256 KiB, PROT_READ|PROT_EXEC)` (rax=10, rsi=0x40000,
+  rdx=5): the churn loop's W^X flip.
+- Oops #1 is a pristine instance of the signature: RSP was
+  `ffffd20d8b2d3f68`, so the push should have written at
+  `ffffd20d8b2d3f60`; CR2 was `ffffd60d8b2d3f60` — exactly RSP-8 with
+  **bit 42 set**, a supervisor write to a not-present page.
+- Oops #2 (same RIP, same syscall shape) left the process unkillably
+  D-stuck inside `exit_mmap` (kernel stack `exit_mmap+0x13e` ← `__mmput` ←
+  `do_exit`), surviving SIGKILL until reboot, because the oops aborted
+  syscall entry with IRQs disabled mid-teardown. The runner-visible
+  symptom was one silent non-zero exit and one hung A/B/A leg.
+
+So the anomaly does not care about privilege level: with enough
+syscall/address churn on the affected core under package load, the +2^42
+flip strikes kernel-mode address generation too — and userspace detectors
+(a SIGSEGV handler, counter verification) cannot observe a fault that
+lands in the kernel. This also means the earlier "the C repro does not
+trigger" reads were partly a detector limitation.
+
+> [!CAUTION]
+> The churn modes deliberately stress syscall entry/exit and VMA
+> teardown on the target core. On 7.1.8-1-cachyos this twice produced
+> kernel oopses on CPU 19, one of which wedged the machine (an unkillable
+> D-state process). Run them only when a hang or forced reboot is
+> acceptable.
+
+The pure-execution modes do not trigger at all, and even the churn modes
+do not reproduce the *userspace* fault reliably. The residual difference
+is therefore not the data-memory instruction stream (a byte-faithful
+replica is clean) but something in how V8 produces and maintains code:
+Liftoff's codegen CPU work writing code pages, zone allocation, and
+background-thread dynamics. The wasm-side probes remain the practical
+reduced trigger: `mini-wasm-churn.mjs` replaces PGlite with 60
+dependency-free lines at the same failure rate, and reproduces across
+kernels (15/15 on 7.1.8-1-cachyos, 10/10 on 7.1.8-arch1-3).
+
 ## Temporary workarounds
 
 These mitigate the observed trigger but do not resolve the underlying anomaly.
