@@ -81,14 +81,18 @@ The intended implementation sequence is:
 10. Adopt the Fault Affinity package, command, and repository identity.
 
 The documentation, safety-net, workload-spec, bounded attempt-runner,
-versioned attempt-record, exact-CPU phase-envelope, durable phase-store, and
-internal schema-3 bundle-owner foundations are complete. The bundle owner binds
-one workload and deterministic exact-CPU manifest, holds one exclusive lease
-across selecting, running, and committing an attempt, and derives completion
-from the exact durably published prefix. Its stable supervisor retains the
-lease through bounded cleanup if the outer owner is interrupted.
+versioned attempt-record, exact-CPU phase-envelope, durable phase-store,
+internal schema-3 bundle owner, and baseline whole-wave foundations are
+complete. The bundle owner binds one workload and deterministic exact-CPU
+manifest, holds one exclusive lease across selecting, running, and committing
+an attempt, and derives completion from the exact durably published prefix. Its
+stable supervisor retains the lease through bounded cleanup if the outer owner
+is interrupted. The baseline adapter separately binds correlated concurrent
+waves and advances only after every child has valid evidence and complete
+cleanup.
 
-Current diagnostic phases do not write the new format, and `fault-affinity` is
-not yet an executable command. The next migration step is to extend schema-3
-ownership to baseline and group screening while legacy bundle interpretation
-remains unchanged.
+Current diagnostic phases do not write the new formats, and `fault-affinity` is
+not yet an executable command. The next migration step is to introduce a new
+immutable schema-3 manifest version that binds the baseline phase, then add the
+topology and affinity-mask contract needed by group screening. Legacy bundle
+interpretation remains unchanged.

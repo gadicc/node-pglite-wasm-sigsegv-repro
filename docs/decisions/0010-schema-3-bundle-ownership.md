@@ -52,8 +52,9 @@ recovery namespace.
   temporary files without changing bundle identity.
 - Read operations also take the lease because interrupted-file reconciliation
   can mutate internal housekeeping state.
-- Baseline, group, controlled-load, debugger, and frequency phases still need
-  explicit schema-3 adapters before a public generic run can include them.
+- The baseline wave format and store exist independently, but baseline, group,
+  controlled-load, debugger, and frequency phases still need explicit schema-3
+  bundle adapters before a public generic run can include them.
 
 ## Acceptance criteria
 

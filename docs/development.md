@@ -26,6 +26,7 @@ The suite covers:
 - Versioned workload-bound attempt records and tamper rejection
 - Deterministic exact-CPU manifests, attempt envelopes, affinity witnesses, durable commits, and prefix resume
 - Immutable schema-3 bundle manifests and exclusive select-run-commit ownership
+- Workload-bound baseline manifests, correlated wave envelopes, and whole-wave resume
 - Settings restoration under simulated signals
 - Statistics and parser fixtures
 - Evidence-envelope validation
@@ -91,6 +92,7 @@ offline tests prove:
 - Singleton CPU inheritance, schedule binding, and exact-prefix resume
 - Private no-clobber state publication and bounded interrupted-write recovery
 - Reader/writer contention, manifest-only restart, and interrupted-owner lease retention
+- Baseline peer cancellation and refusal to commit partial or invalid waves
 
 They also exercise fast child exit, retained output descriptors, unavailable
 process-group observations, launch-time provenance drift, parent IPC loss, and
@@ -103,6 +105,11 @@ private store, and holds one bundle lease across selecting, running, and
 committing the next slot. Before exposing a public generic interface, extend
 that ownership contract to the remaining applicable phases without changing
 legacy bundle interpretation.
+
+The internal baseline adapter separately binds fixed concurrent waves and
+publishes only complete whole-wave envelopes. It is not yet part of the
+immutable schema-3 bundle manifest; that integration requires a new manifest
+version rather than adding fields to version 1 in place.
 
 Custom commands should be documented as trusted local workloads, not sandboxed code. They must not daemonize or escape the supervised process group.
 
