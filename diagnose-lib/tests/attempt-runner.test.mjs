@@ -47,7 +47,7 @@ afterEach(() => {
 function launcher({ missingInterpreter = false } = {}) {
   const directory = mkdtempSync(path.join(tmpdir(), "attempt-runner-"));
   directories.push(directory);
-  const executable = path.join(directory, "workload");
+  const executable = path.join(directory, "workload.mjs");
   const interpreter = missingInterpreter ? "/definitely/missing/node" : process.execPath;
   writeFileSync(executable, `#!${interpreter}\nimport ${JSON.stringify(FIXTURE)};\n`, { mode: 0o700 });
   chmodSync(executable, 0o700);

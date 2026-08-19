@@ -55,7 +55,7 @@ Use `--workload-file path/to/workload.json` to select a trusted local script or 
 
 The original child creates an in-memory PGlite 0.5.4 client, runs `SELECT 1`, closes the client, and exits. There is no application framework, test runner, native add-on, or database persistence.
 
-On Linux x64 with Node 20 or newer:
+On Linux x64 with Node 24 or newer:
 
 ```sh
 npm ci

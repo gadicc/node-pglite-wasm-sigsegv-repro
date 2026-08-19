@@ -23,6 +23,6 @@
     "@electric-sql/pglite": "0.5.4"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=24"
   }
 }

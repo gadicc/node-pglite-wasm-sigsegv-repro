@@ -75,20 +75,10 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)" || {
 }
 attempt_helper="$script_dir/diagnose-lib/gdb-attempt-io.mjs"
 
-for dep in gdb taskset timeout; do
-  if ! command -v "$dep" > /dev/null 2>&1; then
-    echo "error: missing dependency: $dep" >&2
-    exit 4
-  fi
-done
-node_bin="$(command -v node)" || {
-  echo "error: missing dependency: node" >&2
-  exit 4
-}
 # The debug target defaults to the PATH-resolved node. An explicit node-bin
 # must be absolute and is resolved once, here, so the exact target executable
 # is fixed before the first attempt and never re-derived from PATH.
-node_target="$node_bin"
+node_target=""
 if [[ -n "$node_bin_arg" ]]; then
   if [[ "$node_bin_arg" != /* ]]; then
     echo "error: node-bin must be an absolute path, got '$node_bin_arg'" >&2
@@ -103,6 +93,19 @@ if [[ -n "$node_bin_arg" ]]; then
     exit 2
   fi
 fi
+node_bin="$(command -v node)" || {
+  echo "error: missing dependency: node" >&2
+  exit 4
+}
+if [[ -z "$node_target" ]]; then
+  node_target="$node_bin"
+fi
+for dep in gdb taskset timeout; do
+  if ! command -v "$dep" > /dev/null 2>&1; then
+    echo "error: missing dependency: $dep" >&2
+    exit 4
+  fi
+done
 if [[ ! -f child.mjs ]]; then
   echo "error: child.mjs not found in the current directory" >&2
   exit 4
