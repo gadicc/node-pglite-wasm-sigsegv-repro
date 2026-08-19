@@ -17,15 +17,17 @@ or mutate schema-1 and schema-2 bundles.
 ## Decision
 
 Introduce an internal bundle-format-3 owner with one immutable canonical
-`fault-affinity-bundle.json` manifest. The manifest records bundle and run
-schema versions, a fresh bundle generation, the complete resolved workload and
-digest binding, phase capability states, and the bound exact-CPU phase
-manifest. A retry may complete initialization after the manifest was published,
+`fault-affinity-bundle.json` manifest. Manifest version 1 records bundle and
+run schema versions, a fresh bundle generation, the complete resolved workload
+and digest binding, phase capability states, and the bound exact-CPU phase
+manifest. Manifest version 2 retains those fields and also binds the baseline
+phase. A retry may complete initialization after the manifest was published,
 but it may not replace or change that manifest.
 
-Store mutable exact-CPU state below `state/exact-cpu/`. Phase completion is
-derived from the valid contiguous attempt prefix and its final no-clobber
-commit; there is no separate completion marker that could disagree.
+Store mutable exact-CPU state below `state/exact-cpu/` and, in manifest version
+2, baseline state below `state/baseline/`. Phase completion is derived from the
+valid contiguous attempt or whole-wave prefix and its final no-clobber commit;
+there is no separate completion marker that could disagree.
 
 Every operation that may reconcile or publish state holds an exclusive lease
 on an already-open canonical private bundle-directory descriptor. The lease
@@ -45,16 +47,17 @@ recovery namespace.
 
 ## Consequences
 
-- One schema-3 bundle has one immutable workload and exact-CPU schedule identity.
+- One schema-3 bundle has one immutable workload and version-specific phase identities.
 - Selection, execution, and publication form one exclusive transaction.
 - Operationally invalid attempts leave the schedule slot available.
 - Restart can recover a manifest-only initialization and known interrupted
   temporary files without changing bundle identity.
 - Read operations also take the lease because interrupted-file reconciliation
   can mutate internal housekeeping state.
-- The baseline wave format and store exist independently, but baseline, group,
-  controlled-load, debugger, and frequency phases still need explicit schema-3
-  bundle adapters before a public generic run can include them.
+- Manifest version 1 remains exact-only; version 2 binds baseline and exact-CPU
+  without reinterpreting version 1.
+- Group, controlled-load, debugger, and frequency phases still need explicit
+  schema-3 bundle adapters before a public generic run can include them.
 
 ## Acceptance criteria
 

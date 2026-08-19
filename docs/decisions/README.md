@@ -17,3 +17,4 @@ behavior and compatibility boundaries, not current runtime capabilities.
 | [ADR 0009](0009-exact-cpu-phase-envelopes.md) | Accepted | Bind valid exact-CPU attempts to one workload and deterministic resumable schedule. |
 | [ADR 0010](0010-schema-3-bundle-ownership.md) | Accepted | Own one immutable schema-3 workload and serialize each exact-CPU attempt transaction. |
 | [ADR 0011](0011-baseline-concurrent-waves.md) | Accepted | Persist baseline execution as an exact prefix of complete correlated waves. |
+| [ADR 0012](0012-schema-3-manifest-v2.md) | Accepted | Keep manifest v1 exact-only and bind baseline plus exact-CPU state in v2. |

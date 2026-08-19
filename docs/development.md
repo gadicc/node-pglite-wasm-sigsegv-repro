@@ -25,7 +25,7 @@ The suite covers:
 - Internal shell-free attempt execution, deadlines, bounded output, and process-group cleanup
 - Versioned workload-bound attempt records and tamper rejection
 - Deterministic exact-CPU manifests, attempt envelopes, affinity witnesses, durable commits, and prefix resume
-- Immutable schema-3 bundle manifests and exclusive select-run-commit ownership
+- Immutable schema-3 bundle manifest versions and exclusive phase transactions
 - Workload-bound baseline manifests, correlated wave envelopes, and whole-wave resume
 - Settings restoration under simulated signals
 - Statistics and parser fixtures
@@ -99,17 +99,18 @@ process-group observations, launch-time provenance drift, parent IPC loss, and
 TERM-to-KILL grace timing. All fixtures are harmless process-lifecycle programs.
 
 The exact-CPU adapter reuses the current balanced-cyclic isolated schedule and
-places each valid attempt record in a versioned envelope. Its internal schema-3
-owner binds one workload and phase manifest, publishes an exact prefix to a
-private store, and holds one bundle lease across selecting, running, and
-committing the next slot. Before exposing a public generic interface, extend
-that ownership contract to the remaining applicable phases without changing
-legacy bundle interpretation.
+places each valid attempt record in a versioned envelope. Schema-3 manifest
+version 1 binds only this phase. The owner publishes an exact prefix to a
+private store and holds one bundle lease across selecting, running, and
+committing the next slot.
 
 The internal baseline adapter separately binds fixed concurrent waves and
-publishes only complete whole-wave envelopes. It is not yet part of the
-immutable schema-3 bundle manifest; that integration requires a new manifest
-version rather than adding fields to version 1 in place.
+publishes only complete whole-wave envelopes. Schema-3 manifest version 2 binds
+baseline and exact-CPU state without adding fields to version 1 in place. The
+same bundle lease covers selecting, running, and committing an entire baseline
+wave. Before exposing a public generic interface, extend that versioned
+ownership contract to the remaining applicable phases without changing legacy
+bundle interpretation.
 
 Custom commands should be documented as trusted local workloads, not sandboxed code. They must not daemonize or escape the supervised process group.
 

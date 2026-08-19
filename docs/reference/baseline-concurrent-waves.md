@@ -1,7 +1,7 @@
 # Understand internal baseline concurrent waves
 
 Baseline phase version 1 is the internal bridge between the generic attempt
-runner and a future schema-3 baseline adapter. No current `diagnose.sh` phase or
+runner and schema-3 bundle manifest version 2. No current `diagnose.sh` phase or
 legacy bundle writes this format.
 
 ## Treat one wave as the schedule unit
@@ -48,9 +48,9 @@ caps a wave at 64 children, one envelope at 64 MiB, and aggregate state at
 512 MiB.
 
 The store prevents conflicting publication but does not by itself prevent two
-processes from executing the same next wave. A future schema-3 manifest version
-must bind the phase, and the bundle owner must hold its descriptor-backed lease
-across selection, execution, and commit.
+processes from executing the same next wave. Schema-3 manifest version 2 binds
+the phase, and the bundle owner holds its descriptor-backed lease across
+selection, execution, and commit. Manifest version 1 remains exact-only.
 
 See [ADR 0011](../decisions/0011-baseline-concurrent-waves.md) for the accepted
 format and migration boundary.

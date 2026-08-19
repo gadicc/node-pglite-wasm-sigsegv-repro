@@ -19,15 +19,19 @@ import {
   BundleExecutionLeaseError,
   withBundleExecutionLease,
 } from "../bundle-execution-lease.mjs";
+import { buildBaselinePhaseManifest } from "../baseline-phase.mjs";
 import { buildExactCpuPhaseManifest } from "../exact-cpu-phase.mjs";
 import { readLinuxProcessIdentity, runWorkloadAttempt } from "../attempt-runner.mjs";
 import {
   SCHEMA3_BUNDLE_FILE,
+  SCHEMA3_BASELINE_STATE_DIRECTORY,
   SCHEMA3_EXACT_CPU_STATE_DIRECTORY,
   buildSchema3BundleManifest,
+  buildSchema3BundleManifestV2,
   canonicalSchema3BundleManifestLine,
   initializeSchema3Bundle,
   readSchema3Bundle,
+  runOneSchema3BaselineWave,
   runOneSchema3ExactCpuAttempt,
 } from "../schema3-bundle.mjs";
 import { createFileStateAdapter } from "../pinned-protocol.mjs";
@@ -63,7 +67,11 @@ function allowedCpu() {
   return Number(first);
 }
 
-function workload({ args = ["-e", ""], id = "schema3-fixture" } = {}) {
+function workload({
+  args = ["-e", ""],
+  id = "schema3-fixture",
+  capabilities = { isolated: true },
+} = {}) {
   const cwd = temporaryDirectory("schema3-workload-");
   return resolveWorkloadSpec({
     version: 1,
@@ -75,8 +83,20 @@ function workload({ args = ["-e", ""], id = "schema3-fixture" } = {}) {
     environment: {},
     attempt: { mode: "exit", timeoutMs: 2_000, termGraceMs: 50, killGraceMs: 500 },
     outcomes: { targetSignals: [], mappedExits: [] },
-    capabilities: { isolated: true },
+    capabilities,
     provenance: { completeness: "complete", files: [] },
+  });
+}
+
+function baselineWorkload(options = {}) {
+  return workload({ ...options, capabilities: { baseline: true, isolated: true } });
+}
+
+function baselineManifest(resolved, { childrenPerWave = 2, waves = 1 } = {}) {
+  return buildBaselinePhaseManifest(resolved, {
+    generation: "fedcba9876543210fedcba9876543210",
+    childrenPerWave,
+    waves,
   });
 }
 
@@ -93,6 +113,14 @@ function exactCpuManifest(resolved, { rounds = 1 } = {}) {
 function bundleManifest(resolved, options = {}) {
   return buildSchema3BundleManifest(resolved, {
     bundleGeneration: "abcdef0123456789abcdef0123456789",
+    exactCpuManifest: exactCpuManifest(resolved, options),
+  });
+}
+
+function bundleManifestV2(resolved, options = {}) {
+  return buildSchema3BundleManifestV2(resolved, {
+    bundleGeneration: "abcdef0123456789abcdef0123456789",
+    baselineManifest: baselineManifest(resolved, options),
     exactCpuManifest: exactCpuManifest(resolved, options),
   });
 }
@@ -150,6 +178,9 @@ test("schema-3 initialization binds one workload and recovers a manifest-only re
     canonicalSchema3BundleManifestLine(resolved, manifest),
   );
   const initialized = await initializeSchema3Bundle({ resolved, manifest, bundleDir });
+  assert.equal(initialized.manifest.version, 1);
+  assert.equal("baseline" in initialized, false);
+  assert.equal("baseline" in initialized.manifest, false);
   assert.equal(initialized.manifest.bundleFormatVersion, 3);
   assert.equal(initialized.manifest.runSchemaVersion, 3);
   assert.equal(initialized.manifest.workloadBinding.digest, resolved.digest);
@@ -171,6 +202,65 @@ test("schema-3 initialization binds one workload and recovers a manifest-only re
   const different = workload({ args: ["-e", " "], id: "schema3-changed" });
   await assert.rejects(readSchema3Bundle({ resolved: different, bundleDir }),
     /does not match the resolved workload/);
+});
+
+test("schema-3 manifest v2 binds baseline and exact-CPU state without changing v1", {
+  timeout: 10_000,
+}, async () => {
+  const resolved = baselineWorkload();
+  const manifest = bundleManifestV2(resolved);
+  const bundleDir = bundleDirectory();
+
+  await createFileStateAdapter(bundleDir).commit(
+    SCHEMA3_BUNDLE_FILE,
+    canonicalSchema3BundleManifestLine(resolved, manifest),
+  );
+  const initialized = await initializeSchema3Bundle({ resolved, manifest, bundleDir });
+  assert.equal(initialized.manifest.version, 2);
+  assert.equal(initialized.manifest.phaseControls.baseline, "supported");
+  assert.equal(initialized.manifest.phaseControls.isolated, "supported");
+  assert.equal(initialized.baseline.progress.status, "empty");
+  assert.equal(initialized.exactCpu.progress.status, "empty");
+  assert.equal(statSync(path.join(bundleDir, SCHEMA3_BASELINE_STATE_DIRECTORY)).mode & 0o777,
+    0o700);
+  assert.equal(statSync(path.join(bundleDir, SCHEMA3_EXACT_CPU_STATE_DIRECTORY)).mode & 0o777,
+    0o700);
+
+  const reopened = await readSchema3Bundle({ resolved, bundleDir });
+  assert.deepEqual(reopened.manifest, initialized.manifest);
+  assert.deepEqual(reopened.baseline, initialized.baseline);
+  assert.deepEqual(reopened.exactCpu, initialized.exactCpu);
+  const retried = await initializeSchema3Bundle({ resolved, manifest, bundleDir });
+  assert.deepEqual(retried.manifest, initialized.manifest);
+  assert.deepEqual(retried.baseline, initialized.baseline);
+
+  const changedSchedule = bundleManifestV2(resolved, { childrenPerWave: 3 });
+  await assert.rejects(initializeSchema3Bundle({
+    resolved,
+    manifest: changedSchedule,
+    bundleDir,
+  }), /different manifest/);
+});
+
+test("schema-3 manifest v1 remains readable for a workload with baseline capability", {
+  timeout: 10_000,
+}, async () => {
+  const resolved = baselineWorkload();
+  const manifest = bundleManifest(resolved);
+  const bundleDir = bundleDirectory();
+
+  assert.equal(manifest.version, 1);
+  assert.equal(manifest.phaseControls.baseline, "unavailable");
+  assert.equal("baseline" in manifest, false);
+  const initialized = await initializeSchema3Bundle({ resolved, manifest, bundleDir });
+  assert.equal("baseline" in initialized, false);
+  assert.equal(initialized.exactCpu.progress.status, "empty");
+
+  const completed = await runOneSchema3ExactCpuAttempt({ resolved, bundleDir });
+  assert.equal(completed.result.reason, "committed");
+  assert.equal(completed.bundle.exactCpu.progress.status, "complete");
+  await assert.rejects(runOneSchema3BaselineWave({ resolved, bundleDir }),
+    /does not bind a baseline phase/);
 });
 
 test("the execution lease makes selecting, running, and committing one slot indivisible", {
@@ -223,6 +313,75 @@ test("the execution lease makes selecting, running, and committing one slot indi
   assert.equal(launches, 1);
 });
 
+test("the schema-3 v2 lease makes a complete baseline wave one transaction", {
+  timeout: 10_000,
+}, async () => {
+  const resolved = baselineWorkload();
+  const manifest = bundleManifestV2(resolved);
+  const bundleDir = bundleDirectory();
+  await initializeSchema3Bundle({ resolved, manifest, bundleDir });
+  const resultFixture = await runWorkloadAttempt(resolved);
+  const started = deferred();
+  const release = deferred();
+  let launches = 0;
+  const runAttempt = async (_resolved, options) => {
+    launches += 1;
+    assert.equal(fstatSync(options.retainedDirectory.fd, { bigint: true }).ino.toString(),
+      options.retainedDirectory.inode);
+    if (launches === 2) started.resolve();
+    await release.promise;
+    return resultFixture;
+  };
+
+  const first = runOneSchema3BaselineWave({ resolved, bundleDir, runAttempt });
+  await started.promise;
+  await assert.rejects(runOneSchema3BaselineWave({ resolved, bundleDir, runAttempt }),
+    (error) => error instanceof BundleExecutionLeaseError &&
+      error.code === "BUNDLE_EXECUTION_LEASE_BUSY");
+  await assert.rejects(runOneSchema3ExactCpuAttempt({ resolved, bundleDir }),
+    (error) => error instanceof BundleExecutionLeaseError &&
+      error.code === "BUNDLE_EXECUTION_LEASE_BUSY");
+  await assert.rejects(readSchema3Bundle({ resolved, bundleDir }),
+    (error) => error instanceof BundleExecutionLeaseError &&
+      error.code === "BUNDLE_EXECUTION_LEASE_BUSY");
+  assert.equal(launches, 2);
+  release.resolve();
+
+  const completed = await first;
+  assert.equal(completed.result.reason, "committed");
+  assert.equal(completed.bundle.baseline.progress.status, "complete");
+  assert.equal(completed.bundle.baseline.progress.committedWaves, 1);
+
+  const noOp = await runOneSchema3BaselineWave({ resolved, bundleDir, runAttempt });
+  assert.equal(noOp.result.reason, "complete");
+  assert.equal(launches, 2);
+});
+
+test("an invalid schema-3 v2 baseline wave leaves the complete wave available", {
+  timeout: 10_000,
+}, async () => {
+  const resolved = baselineWorkload();
+  const manifest = bundleManifestV2(resolved);
+  const bundleDir = bundleDirectory();
+  await initializeSchema3Bundle({ resolved, manifest, bundleDir });
+
+  const invalid = await runOneSchema3BaselineWave({
+    resolved,
+    bundleDir,
+    runAttempt: async () => {
+      throw Object.assign(new Error("fixture runner unavailable"), {
+        code: "FIXTURE_UNAVAILABLE",
+      });
+    },
+  });
+  assert.equal(invalid.result.reason, "runner-error");
+  assert.equal(invalid.bundle.baseline.progress.committedWaves, 0);
+
+  const retried = await runOneSchema3BaselineWave({ resolved, bundleDir });
+  assert.equal(retried.result.reason, "committed");
+  assert.equal(retried.bundle.baseline.progress.status, "complete");
+});
+
 test("operationally invalid execution leaves the slot available for a retained production attempt", {
   timeout: 10_000,
 }, async () => {
@@ -269,6 +428,22 @@ test("bundle readers fail closed on foreign root/state entries and live commit r
   await assert.rejects(readSchema3Bundle({ resolved, bundleDir: foreignState }),
     /state directory contains an unknown entry/);
 
+  const v2Resolved = baselineWorkload();
+  const v2Manifest = bundleManifestV2(v2Resolved);
+  const missingV2State = bundleDirectory();
+  await initializeSchema3Bundle({
+    resolved: v2Resolved,
+    manifest: v2Manifest,
+    bundleDir: missingV2State,
+  });
+  rmSync(path.join(missingV2State, SCHEMA3_BASELINE_STATE_DIRECTORY), {
+    recursive: true,
+  });
+  await assert.rejects(readSchema3Bundle({
+    resolved: v2Resolved,
+    bundleDir: missingV2State,
+  }), /phase state directory is missing/);
+
   const liveTemporary = bundleDirectory();
   const liveName =
     `.fault-affinity-bundle.json.${process.pid}.0123456789abcdef.writing.tmp`;
@@ -311,6 +486,7 @@ test("the supervisor retains bundle ownership while an interrupted owner cleans 
     bundleDir,
     cwd,
     readyFile,
+    "exact",
   ], {
     cwd: "/",
     env: {},
@@ -343,6 +519,65 @@ test("the supervisor retains bundle ownership while an interrupted owner cleans 
 
     const reopened = await readSchema3Bundle({ resolved, bundleDir });
     assert.equal(reopened.exactCpu.progress.committedAttempts, 0);
+  } finally {
+    if (owner.exitCode === null && owner.signalCode === null) owner.kill("SIGTERM");
+    if (supervisorPid !== null) {
+      const current = readLinuxProcessIdentity(supervisorPid);
+      if (current?.live && current.processGroupId === supervisorPid) {
+        try { process.kill(-supervisorPid, "SIGKILL"); } catch { /* already complete */ }
+      }
+    }
+  }
+});
+
+test("a v2 baseline supervisor retains bundle ownership during interrupted-owner cleanup", {
+  timeout: 15_000,
+}, async () => {
+  const cwd = temporaryDirectory("schema3-baseline-retention-workload-");
+  const readyFile = path.join(cwd, "ready.json");
+  const resolved = resolveWorkloadSpec(leaseRetentionWorkloadSpec({ cwd, readyFile }));
+  const manifest = bundleManifestV2(resolved);
+  const bundleDir = bundleDirectory();
+  await initializeSchema3Bundle({ resolved, manifest, bundleDir });
+
+  const owner = spawn(process.execPath, [
+    LEASE_RETENTION_OWNER,
+    bundleDir,
+    cwd,
+    readyFile,
+    "baseline",
+  ], {
+    cwd: "/",
+    env: {},
+    shell: false,
+    stdio: ["ignore", "ignore", "ignore"],
+  });
+  const ownerExit = waitForChildExit(owner);
+  let supervisorPid = null;
+  try {
+    const ready = await waitForJsonFile(readyFile);
+    assert.equal(ready.pid > 1, true);
+    assert.equal(ready.parentPid > 1, true);
+    assert.equal(ready.inheritedBundleDirectory, false);
+    supervisorPid = ready.parentPid;
+    const supervisor = readLinuxProcessIdentity(supervisorPid);
+    assert.equal(supervisor?.live, true);
+    assert.equal(supervisor.processGroupId, supervisorPid);
+
+    assert.equal(owner.kill("SIGTERM"), true);
+    const ownerStatus = await ownerExit;
+    assert.equal(ownerStatus.signal, "SIGTERM");
+
+    await assert.rejects(
+      withBundleExecutionLease({ bundleDir }, async () => "must-not-run"),
+      (error) => error instanceof BundleExecutionLeaseError &&
+        error.code === "BUNDLE_EXECUTION_LEASE_BUSY",
+    );
+    assert.equal(await withBundleExecutionLease({ bundleDir, waitMs: 3_000 },
+      async () => "recovered"), "recovered");
+
+    const reopened = await readSchema3Bundle({ resolved, bundleDir });
+    assert.equal(reopened.baseline.progress.committedWaves, 0);
   } finally {
     if (owner.exitCode === null && owner.signalCode === null) owner.kill("SIGTERM");
     if (supervisorPid !== null) {

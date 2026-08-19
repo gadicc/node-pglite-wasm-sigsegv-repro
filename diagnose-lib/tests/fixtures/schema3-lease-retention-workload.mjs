@@ -32,7 +32,7 @@ export function leaseRetentionWorkloadSpec({ cwd, readyFile }) {
       killGraceMs: 1_000,
     },
     outcomes: { targetSignals: [], mappedExits: [] },
-    capabilities: { isolated: true },
+    capabilities: { baseline: true, isolated: true },
     provenance: { completeness: "complete", files: [] },
   };
 }
@@ -40,11 +40,17 @@ export function leaseRetentionWorkloadSpec({ cwd, readyFile }) {
 // Running this file directly makes it the disposable bundle owner used by the
 // parent-interruption test. Importing it only exposes the shared workload spec.
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  const [bundleDir, cwd, readyFile] = process.argv.slice(2);
-  const [{ resolveWorkloadSpec }, { runOneSchema3ExactCpuAttempt }] = await Promise.all([
+  const [bundleDir, cwd, readyFile, mode = "exact"] = process.argv.slice(2);
+  const [{ resolveWorkloadSpec }, bundleRunner] = await Promise.all([
     import("../../workload-spec.mjs"),
     import("../../schema3-bundle.mjs"),
   ]);
   const resolved = resolveWorkloadSpec(leaseRetentionWorkloadSpec({ cwd, readyFile }));
-  await runOneSchema3ExactCpuAttempt({ resolved, bundleDir });
+  if (mode === "exact") {
+    await bundleRunner.runOneSchema3ExactCpuAttempt({ resolved, bundleDir });
+  } else if (mode === "baseline") {
+    await bundleRunner.runOneSchema3BaselineWave({ resolved, bundleDir });
+  } else {
+    throw new Error(`unsupported fixture mode: ${mode}`);
+  }
 }

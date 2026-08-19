@@ -48,8 +48,8 @@ automation nor changes the public Node/PGlite baseline.
 - Baseline rates retain their correlated wave denominator.
 - Partial or operationally invalid waves cannot reduce the planned sample count.
 - Child positions and the complete workload identity remain reviewable on resume.
-- Schema-3 manifest version 1 remains unchanged; a later manifest version must
-  bind this phase before a generic bundle can execute it.
+- Schema-3 manifest version 1 remains unchanged; manifest version 2 binds this
+  phase alongside exact-CPU state.
 - CPU-group screening can reuse the whole-wave evidence model but needs a
   separate topology and affinity-mask schedule contract.
 
