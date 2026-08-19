@@ -50,9 +50,10 @@ result, or fault-rate sample.
 No public command or current `load-state-aba.mjs` mode uses this internal path
 yet. The internal [worker-set controller](controlled-load-worker-sets.md) now
 manages complete readiness, rechecks original identities at measurement
-boundaries, and accounts for every stop. A later layer must publish only
-complete single-workload A/B/A sessions and retain the existing historical
-modes without reinterpretation.
+boundaries, and accounts for every stop. The internal
+[single-workload session adapter](controlled-load-aba-sessions.md) now publishes
+only complete A1/B/A2 envelopes. Durable phase ownership remains separate, and
+the existing historical modes retain their interpretation.
 
 See [ADR 0015](../decisions/0015-managed-auxiliary-workloads.md) for the accepted
 boundary.

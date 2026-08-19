@@ -100,8 +100,10 @@ where applicable. The controlled-load foundation now has a separate managed
 auxiliary-workload lifecycle with verified readiness, discarded output, and
 bounded cleanup. Its worker-set layer now adds complete readiness, stable
 boundary identities, peer cancellation, stop evidence, and interrupted-owner
-lease retention. It still needs complete single-workload A/B/A envelopes and
-schema-3 state. Historical Node A/B/A and Node-by-warmup modes remain
-multi-workload experiments outside the current schema. Public orchestration
-follows only after those compatibility and privilege boundaries are explicit.
-Legacy bundle interpretation remains unchanged.
+lease retention. The single-workload adapter now adds complete A1/B/A2
+envelopes, constant target affinity, and evidence-backed warm-up and recovery
+intervals. It still needs durable phase storage and schema-3 state. Historical
+Node A/B/A and Node-by-warmup modes remain multi-workload experiments outside
+the current schema. Public orchestration follows only after those compatibility
+and privilege boundaries are explicit. Legacy bundle interpretation remains
+unchanged.

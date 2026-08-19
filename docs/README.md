@@ -36,6 +36,7 @@ This index separates instructions for running the current tooling from the resul
 - [Understand internal pinned-concurrent waves](reference/pinned-concurrent-waves.md): controller placement, singleton child affinity, balanced scheduling, and whole-wave resume
 - [Understand managed auxiliary workloads](reference/managed-auxiliary-workloads.md): verified readiness, silent output, bounded cleanup, and separation from diagnostic attempts
 - [Understand controlled-load worker sets](reference/controlled-load-worker-sets.md): complete readiness, stable boundary identities, peer cancellation, and stop evidence
+- [Understand controlled-load A/B/A sessions](reference/controlled-load-aba-sessions.md): one target workload, complete B bracketing, and all-or-nothing session evidence
 - [Node/V8 source-history review](../research/node-v8-25.2.1-to-26.7.0-review.md): 5,693-commit source and provenance screen
 - [Node/V8 screened-commit audit](../research/node-v8-screened-commits.tsv): complete disposition table for the source-history review
 

@@ -271,8 +271,9 @@ export function parseControlledLoadWorkerSetStopEvidence(resolved, startValue, v
     (value.failureCode === null ||
       (typeof value.failureCode === "string" && ERROR_CODE_RE.test(value.failureCode))),
   "controlled-load stop status is invalid");
-  requireCondition(decimal(value.stoppedMonotonicNs, "controlled-load stop boundary") >=
-    decimal(start.readyMonotonicNs, "controlled-load ready boundary"),
+  const stopped = decimal(value.stoppedMonotonicNs, "controlled-load stop boundary");
+  requireCondition(stopped >= decimal(start.readyMonotonicNs,
+    "controlled-load ready boundary"),
   "controlled-load stop precedes complete readiness");
   requireCondition(Array.isArray(value.workers) && value.workers.length === start.workers.length,
     "controlled-load stop evidence must contain every worker");
@@ -309,6 +310,9 @@ export function parseControlledLoadWorkerSetStopEvidence(resolved, startValue, v
       result.cleanup.groupDrained === true && result.cleanup.outputDrained === true;
     requireCondition(validStop ? worker.errorCode === null : worker.errorCode !== null,
       "controlled-load stopped worker status disagrees with its lifecycle record");
+    requireCondition(decimal(result.boundary.cleanupFinishedMonotonicNs,
+      "controlled-load worker cleanup boundary") <= stopped,
+    "controlled-load stop precedes a worker cleanup boundary");
     return { ...worker, result };
   });
   requireCondition(value.valid

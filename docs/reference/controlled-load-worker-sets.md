@@ -54,8 +54,9 @@ the outer owner is interrupted, replacement ownership remains unavailable only
 until those supervisors finish bounded parent-loss cleanup.
 
 No public command or current controlled-load bundle writes these records yet.
-The next layer is a complete single-workload A1/B/A2 session contract; the
-historical multi-Node modes remain separate.
+The internal [single-workload A1/B/A2 adapter](controlled-load-aba-sessions.md)
+now binds them into a complete comparison. Durable phase storage and schema-3
+ownership remain future work; the historical multi-Node modes stay separate.
 
 See [ADR 0016](../decisions/0016-controlled-load-worker-sets.md) for the accepted
 worker-set boundary.

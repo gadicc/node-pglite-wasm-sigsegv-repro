@@ -25,6 +25,7 @@ The suite covers:
 - Internal shell-free attempt execution, deadlines, bounded output, and process-group cleanup
 - Managed auxiliary-workload readiness, discarded output, and bounded cancellation
 - Controlled-load worker-set readiness, boundary identity checks, peer cancellation, and stop evidence
+- Complete controlled-load A1/B/A2 ordering, target affinity, interval proof, and failure cleanup
 - Versioned workload-bound attempt records and tamper rejection
 - Deterministic exact-CPU manifests, attempt envelopes, affinity witnesses, durable commits, and prefix resume
 - Immutable schema-3 bundle manifest versions and exclusive phase transactions
@@ -116,6 +117,12 @@ CPU, reports running only after complete readiness, rechecks the same PID and
 start-ticks identities at named boundaries, and returns one complete stop
 record. Early termination or placement drift cancels the set. The current
 public controlled-load script remains unchanged.
+
+The controlled-load session adapter pins all measured attempts to one target
+CPU and publishes only a complete A1/B/A2 envelope. Its B attempts are enclosed
+by the same worker-set readiness, identity boundaries, and valid stop record;
+declared warm-up and recovery times are checked against monotonic evidence.
+The adapter has no public command or durable phase store yet.
 
 The exact-CPU adapter reuses the current balanced-cyclic isolated schedule and
 places each valid attempt record in a versioned envelope. Schema-3 manifest

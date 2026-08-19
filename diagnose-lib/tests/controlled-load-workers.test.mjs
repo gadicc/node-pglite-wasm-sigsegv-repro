@@ -153,6 +153,13 @@ test("a managed worker set verifies singleton readiness, boundaries, and complet
     handle.startEvidence,
     stopped,
   ), stopped);
+  const earlyStop = JSON.parse(JSON.stringify(stopped));
+  earlyStop.stoppedMonotonicNs = handle.startEvidence.readyMonotonicNs;
+  assert.throws(() => parseControlledLoadWorkerSetStopEvidence(
+    resolved,
+    handle.startEvidence,
+    earlyStop,
+  ), /stop precedes a worker cleanup boundary/);
   const result = stopped.workers[0].result;
   assert.equal(result.observation.terminalReason, "external-cancel");
   assert.equal(result.observation.cleanupComplete, true);

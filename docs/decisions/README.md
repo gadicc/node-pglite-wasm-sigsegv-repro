@@ -22,3 +22,4 @@ behavior and compatibility boundaries, not current runtime capabilities.
 | [ADR 0014](0014-pinned-concurrent-and-manifest-v4.md) | Accepted | Bind controller placement, per-child singleton affinity, and whole-wave state in manifest v4. |
 | [ADR 0015](0015-managed-auxiliary-workloads.md) | Accepted | Separate verified long-lived condition workers from canonical diagnostic attempt evidence. |
 | [ADR 0016](0016-controlled-load-worker-sets.md) | Accepted | Bind complete worker readiness, stable boundary identities, peer cancellation, and stop evidence. |
+| [ADR 0017](0017-controlled-load-aba-sessions.md) | Accepted | Publish only complete single-workload A1/B/A2 sessions with a verified B condition. |
