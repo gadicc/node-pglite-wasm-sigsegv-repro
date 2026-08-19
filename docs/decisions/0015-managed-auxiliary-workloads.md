@@ -58,8 +58,9 @@ command, or admit multi-workload comparisons to schema 3.
   interruption while their existing parent-loss cleanup runs.
 - Load-state A/B/A may later bind one measured workload; historical Node A/B/A
   and Node-by-warmup evidence remain on their separate multi-workload path.
-- A controlled-load phase still needs a worker-set manager, boundary witnesses,
-  whole-session envelopes, durable state, and schema-3 integration.
+- The internal controlled-load worker-set manager now adds all-or-nothing
+  readiness, boundary witnesses, and stop accounting. Whole-session envelopes,
+  durable state, and schema-3 integration remain separate.
 
 ## Acceptance criteria
 

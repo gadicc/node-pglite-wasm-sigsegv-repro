@@ -117,6 +117,9 @@ switch (mode) {
     flood(Number(args[0]));
     hold();
     break;
+  case "exit-after":
+    setTimeout(() => process.exit(Number(args[1] ?? 0)), Number(args[0]));
+    break;
   default:
     throw new Error(`unknown attempt fixture mode: ${mode}`);
 }

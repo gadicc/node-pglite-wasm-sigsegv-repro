@@ -98,8 +98,10 @@ not yet an executable command. The next migration step is to adapt the
 controlled-load, debugger, and frequency protocols to the workload-bound owner
 where applicable. The controlled-load foundation now has a separate managed
 auxiliary-workload lifecycle with verified readiness, discarded output, and
-bounded cleanup. It still needs a worker-set manager and complete
-single-workload A/B/A envelopes. Historical Node A/B/A and Node-by-warmup modes
-remain multi-workload experiments outside the current schema. Public
-orchestration follows only after those compatibility and privilege boundaries
-are explicit. Legacy bundle interpretation remains unchanged.
+bounded cleanup. Its worker-set layer now adds complete readiness, stable
+boundary identities, peer cancellation, stop evidence, and interrupted-owner
+lease retention. It still needs complete single-workload A/B/A envelopes and
+schema-3 state. Historical Node A/B/A and Node-by-warmup modes remain
+multi-workload experiments outside the current schema. Public orchestration
+follows only after those compatibility and privilege boundaries are explicit.
+Legacy bundle interpretation remains unchanged.

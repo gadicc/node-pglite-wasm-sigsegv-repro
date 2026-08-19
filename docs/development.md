@@ -24,6 +24,7 @@ The suite covers:
 - Draft workload-spec validation and typed outcome classification
 - Internal shell-free attempt execution, deadlines, bounded output, and process-group cleanup
 - Managed auxiliary-workload readiness, discarded output, and bounded cancellation
+- Controlled-load worker-set readiness, boundary identity checks, peer cancellation, and stop evidence
 - Versioned workload-bound attempt records and tamper rejection
 - Deterministic exact-CPU manifests, attempt envelopes, affinity witnesses, durable commits, and prefix resume
 - Immutable schema-3 bundle manifest versions and exclusive phase transactions
@@ -98,6 +99,7 @@ offline tests prove:
 - Baseline peer cancellation and refusal to commit partial or invalid waves
 - Pinned-concurrent controller validation, peer cancellation, and interrupted-owner lease retention
 - Separation of long-lived condition-worker lifecycle results from canonical diagnostic attempt evidence
+- Retained bundle ownership through interrupted managed worker-set cleanup
 
 They also exercise fast child exit, retained output descriptors, unavailable
 process-group observations, launch-time provenance drift, parent IPC loss, and
@@ -108,6 +110,12 @@ controlled conditions. It reports readiness only after identity and CPU-list
 validation, discards intentionally unbounded worker output, and returns a
 separate result shape that cannot be published as a diagnostic attempt record.
 No current controlled-load command uses this internal path yet.
+
+The controlled-load worker-set layer starts one managed worker per canonical
+CPU, reports running only after complete readiness, rechecks the same PID and
+start-ticks identities at named boundaries, and returns one complete stop
+record. Early termination or placement drift cancels the set. The current
+public controlled-load script remains unchanged.
 
 The exact-CPU adapter reuses the current balanced-cyclic isolated schedule and
 places each valid attempt record in a versioned envelope. Schema-3 manifest

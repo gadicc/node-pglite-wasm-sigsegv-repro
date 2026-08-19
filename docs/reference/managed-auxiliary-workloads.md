@@ -48,10 +48,11 @@ of an auxiliary worker is operational lifecycle evidence, not a pass, clean
 result, or fault-rate sample.
 
 No public command or current `load-state-aba.mjs` mode uses this internal path
-yet. The next controlled-load layer must manage a complete worker set, recheck
-the original identities at measurement boundaries, publish only complete
-single-workload A/B/A sessions, and retain the existing historical modes
-without reinterpretation.
+yet. The internal [worker-set controller](controlled-load-worker-sets.md) now
+manages complete readiness, rechecks original identities at measurement
+boundaries, and accounts for every stop. A later layer must publish only
+complete single-workload A/B/A sessions and retain the existing historical
+modes without reinterpretation.
 
 See [ADR 0015](../decisions/0015-managed-auxiliary-workloads.md) for the accepted
 boundary.

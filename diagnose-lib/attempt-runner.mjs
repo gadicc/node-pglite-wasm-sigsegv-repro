@@ -193,6 +193,24 @@ export function readLinuxProcessIdentity(pid, { strict = false } = {}) {
   }
 }
 
+export function readLinuxAllowedCpuList(pid, { strict = false } = {}) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+  try {
+    const status = readFileSync(`/proc/${pid}/status`, "utf8");
+    const match = status.match(/^Cpus_allowed_list:\s*(\S+)\s*$/m);
+    if (match === null || !/^[0-9,-]+$/.test(match[1])) {
+      if (strict) throw Object.assign(new Error("malformed /proc status"), {
+        code: "PROCESS_AFFINITY_PARSE_ERROR",
+      });
+      return null;
+    }
+    return match[1];
+  } catch (error) {
+    if (strict && error?.code !== "ENOENT" && error?.code !== "ESRCH") throw error;
+    return null;
+  }
+}
+
 export function listLiveProcessGroupMembers(processGroupId) {
   if (!Number.isSafeInteger(processGroupId) || processGroupId <= 1) return [];
   const members = [];
