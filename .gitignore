@@ -1,5 +1,6 @@
 node_modules/
 diagnostics/
+Dell-RMA/
 repro-c
 core
 core.*
