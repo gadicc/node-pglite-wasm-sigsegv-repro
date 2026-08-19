@@ -14,3 +14,4 @@ behavior and compatibility boundaries, not current runtime capabilities.
 | [ADR 0006](0006-legacy-bundle-compatibility.md) | Accepted | Keep schema-1 and schema-2 bundles on a separate Node/PGlite compatibility path. |
 | [ADR 0007](0007-phase-capabilities-and-workload-identity.md) | Accepted | Declare phase support and bind every phase to one workload identity. |
 | [ADR 0008](0008-privileged-frequency-compatibility.md) | Accepted | Retain the historical recovery namespace and defer generic privileged workloads. |
+| [ADR 0009](0009-exact-cpu-phase-envelopes.md) | Accepted | Bind valid exact-CPU attempts to one workload and deterministic resumable schedule. |

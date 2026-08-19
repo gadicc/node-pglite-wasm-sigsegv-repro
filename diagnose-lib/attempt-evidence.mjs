@@ -394,6 +394,22 @@ function validateRecord(resolved, value) {
   validateOutput(value.output, value.cleanup);
 }
 
+function validateRunnerExecution(value) {
+  exactKeys(value, ["cpuAffinity"], "attempt runner execution context");
+  if (value.cpuAffinity === null) return;
+  exactKeys(value.cpuAffinity, [
+    "requestedCpu", "supervisorAllowedCpuList", "workloadAllowedCpuList",
+  ], "attempt runner CPU-affinity context");
+  requireCondition(Number.isSafeInteger(value.cpuAffinity.requestedCpu) &&
+    value.cpuAffinity.requestedCpu >= 0 && value.cpuAffinity.requestedCpu <= 65_535,
+  "attempt runner requested CPU is invalid");
+  for (const key of ["supervisorAllowedCpuList", "workloadAllowedCpuList"]) {
+    requireCondition(value.cpuAffinity[key] === null ||
+      (typeof value.cpuAffinity[key] === "string" && /^[0-9,-]+$/.test(value.cpuAffinity[key])),
+    `attempt runner ${key} is invalid`);
+  }
+}
+
 export function parseAttemptEvidence(resolved, value) {
   validateRecord(resolved, value);
   return deepFreeze(canonicalize(value));
@@ -403,6 +419,7 @@ export function buildAttemptEvidence(resolved, result) {
   exactKeys(result, [
     "version",
     "workloadDigest",
+    "execution",
     "boundary",
     "process",
     "observation",
@@ -414,6 +431,7 @@ export function buildAttemptEvidence(resolved, result) {
     `attempt runner result version must be ${ATTEMPT_RESULT_VERSION}`);
   requireCondition(result.workloadDigest === resolved.digest,
     "attempt runner result belongs to a different workload");
+  validateRunnerExecution(result.execution);
   return parseAttemptEvidence(resolved, {
     version: ATTEMPT_EVIDENCE_VERSION,
     workload: {

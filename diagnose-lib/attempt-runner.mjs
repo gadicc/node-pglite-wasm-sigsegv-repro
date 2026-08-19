@@ -11,9 +11,9 @@ import {
   workloadLaunchProvenance,
 } from "./workload-spec.mjs";
 
-export const ATTEMPT_RESULT_VERSION = 1;
+export const ATTEMPT_RESULT_VERSION = 2;
 
-const SUPERVISOR_PROTOCOL_VERSION = 1;
+const SUPERVISOR_PROTOCOL_VERSION = 2;
 const ATTEMPT_SUPERVISOR = fileURLToPath(new URL("./attempt-supervisor.mjs", import.meta.url));
 const LIVE_STATES = new Set(["R", "S", "D", "T", "t", "I", "W"]);
 const ERROR_CODE_RE = /^[A-Z][A-Z0-9_]{0,63}$/;
@@ -22,6 +22,7 @@ const START_TICKS_RE = /^(0|[1-9][0-9]*)$/;
 const KNOWN_SIGNALS = new Set(Object.keys(osConstants.signals));
 const DEFAULT_EXCERPT_BYTES = 64 * 1024;
 const MAX_EXCERPT_BYTES = 1024 * 1024;
+const MAX_CPU_ID = 65_535;
 const GROUP_POLL_MS = 10;
 
 function fail(message) {
@@ -53,6 +54,20 @@ function excerptLimit(value, label) {
     fail(`${label} must be an integer from 0 through ${MAX_EXCERPT_BYTES}`);
   }
   return value;
+}
+
+function validateCpuAffinity(value) {
+  if (value === undefined) return null;
+  const affinity = plainObject(value, "attempt options.cpuAffinity");
+  exactKeys(affinity, ["cpu", "tasksetPath"], "attempt options.cpuAffinity");
+  if (!Number.isSafeInteger(affinity.cpu) || affinity.cpu < 0 || affinity.cpu > MAX_CPU_ID) {
+    fail(`attempt options.cpuAffinity.cpu must be an integer from 0 through ${MAX_CPU_ID}`);
+  }
+  if (typeof affinity.tasksetPath !== "string" || !affinity.tasksetPath.startsWith("/") ||
+      affinity.tasksetPath.includes("\0") || Buffer.byteLength(affinity.tasksetPath) > 16 * 1024) {
+    fail("attempt options.cpuAffinity.tasksetPath must be a bounded absolute NUL-free path");
+  }
+  return Object.freeze({ cpu: affinity.cpu, tasksetPath: affinity.tasksetPath });
 }
 
 function normalizeErrorCode(error, fallback) {
@@ -258,7 +273,17 @@ function noSignalAction() {
   };
 }
 
-function cancelledBeforeLaunch(resolved, nowNs) {
+function executionEvidence(cpuAffinity, supervisorAllowedCpuList, workloadAllowedCpuList) {
+  return {
+    cpuAffinity: cpuAffinity === null ? null : {
+      requestedCpu: cpuAffinity.cpu,
+      supervisorAllowedCpuList,
+      workloadAllowedCpuList,
+    },
+  };
+}
+
+function cancelledBeforeLaunch(resolved, nowNs, cpuAffinity) {
   const now = nowNs().toString();
   const observation = Object.freeze({
     exitCode: null,
@@ -270,6 +295,7 @@ function cancelledBeforeLaunch(resolved, nowNs) {
   return deepFreeze({
     version: ATTEMPT_RESULT_VERSION,
     workloadDigest: resolved.digest,
+    execution: executionEvidence(cpuAffinity, null, null),
     boundary: {
       attemptStartedMonotonicNs: now,
       workloadStartedMonotonicNs: null,
@@ -296,7 +322,9 @@ function cancelledBeforeLaunch(resolved, nowNs) {
 
 function validateOptions(options) {
   const value = plainObject(options, "attempt options");
-  exactKeys(value, ["signal", "stdoutExcerptBytes", "stderrExcerptBytes"], "attempt options");
+  exactKeys(value, [
+    "signal", "stdoutExcerptBytes", "stderrExcerptBytes", "cpuAffinity",
+  ], "attempt options");
   const signal = value.signal;
   if (signal !== undefined &&
       (signal === null || typeof signal !== "object" || typeof signal.aborted !== "boolean" ||
@@ -306,6 +334,7 @@ function validateOptions(options) {
   }
   return {
     signal,
+    cpuAffinity: validateCpuAffinity(value.cpuAffinity),
     stdoutExcerptBytes: excerptLimit(
       value.stdoutExcerptBytes ?? DEFAULT_EXCERPT_BYTES,
       "attempt options.stdoutExcerptBytes",
@@ -472,7 +501,9 @@ export function createAttemptRunner({
   return async function runAttempt(resolved, rawOptions = {}) {
     const options = validateOptions(rawOptions);
     const launchEnvironment = workloadLaunchEnvironment(resolved);
-    if (options.signal?.aborted) return cancelledBeforeLaunch(resolved, nowNs);
+    if (options.signal?.aborted) {
+      return cancelledBeforeLaunch(resolved, nowNs, options.cpuAffinity);
+    }
 
     verifyWorkloadProvenance(resolved);
     const launchProvenance = workloadLaunchProvenance(resolved);
@@ -499,6 +530,8 @@ export function createAttemptRunner({
     let shutdownError = null;
     let killExpected = false;
     let workloadIdentity = null;
+    let supervisorAllowedCpuList = null;
+    let workloadAllowedCpuList = null;
     let workloadStartedNs = null;
     let workloadStatus = null;
     let stdout = null;
@@ -589,7 +622,16 @@ export function createAttemptRunner({
     });
 
     try {
-      supervisor = spawnProcess(process.execPath, [supervisorPath], {
+      const supervisorExecutable = options.cpuAffinity?.tasksetPath ?? process.execPath;
+      const supervisorArguments = options.cpuAffinity === null
+        ? [supervisorPath]
+        : [
+          "-c",
+          String(options.cpuAffinity.cpu),
+          process.execPath,
+          supervisorPath,
+        ];
+      supervisor = spawnProcess(supervisorExecutable, supervisorArguments, {
         cwd: "/",
         env: {},
         detached: true,
@@ -632,12 +674,16 @@ export function createAttemptRunner({
 
         if (message.type === "supervisor-ready") {
           if (!hasExactKeys(message, [
-            "version", "type", "pid", "startTicks", "processGroupId", "sessionId", "monotonicNs",
+            "version", "type", "pid", "startTicks", "processGroupId", "sessionId",
+            "allowedCpuList", "monotonicNs",
           ]) || protocolState !== "awaiting-ready" ||
               !Number.isSafeInteger(message.pid) || message.pid <= 1 ||
               typeof message.startTicks !== "string" || !START_TICKS_RE.test(message.startTicks) ||
               message.processGroupId !== message.pid || message.sessionId !== message.pid ||
-              message.pid !== supervisor.pid) {
+              message.pid !== supervisor.pid || typeof message.allowedCpuList !== "string" ||
+              !/^[0-9,-]+$/.test(message.allowedCpuList) ||
+              (options.cpuAffinity !== null &&
+                message.allowedCpuList !== String(options.cpuAffinity.cpu))) {
             protocolViolation();
             return;
           }
@@ -657,6 +703,7 @@ export function createAttemptRunner({
             return;
           }
           supervisorIdentity = actual;
+          supervisorAllowedCpuList = message.allowedCpuList;
           protocolState = "supervisor-ready";
           if (terminal.value !== null || eventNs > executionDeadlineNs || nowNs() >= executionDeadlineNs) {
             chooseLaunchError("LAUNCH_TIMEOUT");
@@ -673,6 +720,7 @@ export function createAttemptRunner({
               cwd: resolved.command.cwd,
               environment: launchEnvironment,
               termGraceMs: resolved.attempt.termGraceMs,
+              cpuAffinity: options.cpuAffinity?.cpu ?? null,
               provenance: launchProvenance,
             }, (error) => {
               if (error) chooseLaunchError(normalizeErrorCode(error, "SUPERVISOR_SEND_ERROR"));
@@ -685,10 +733,15 @@ export function createAttemptRunner({
 
         if (message.type === "workload-started") {
           if (!hasExactKeys(message, [
-            "version", "type", "pid", "startTicks", "identityBound", "monotonicNs",
+            "version", "type", "pid", "startTicks", "identityBound", "allowedCpuList",
+            "monotonicNs",
           ]) || protocolState !== "launch-sent" ||
               !Number.isSafeInteger(message.pid) || message.pid <= 1 ||
               typeof message.identityBound !== "boolean" ||
+              typeof message.allowedCpuList !== "string" ||
+              !/^[0-9,-]+$/.test(message.allowedCpuList) ||
+              (options.cpuAffinity !== null &&
+                message.allowedCpuList !== String(options.cpuAffinity.cpu)) ||
               (message.identityBound
                 ? typeof message.startTicks !== "string" || !START_TICKS_RE.test(message.startTicks)
                 : message.startTicks !== null)) {
@@ -716,6 +769,7 @@ export function createAttemptRunner({
             return;
           }
           workloadStartedNs = eventNs;
+          workloadAllowedCpuList = message.allowedCpuList;
           protocolState = "workload-started";
           if (eventNs > executionDeadlineNs) chooseTerminalRace();
           return;
@@ -951,6 +1005,11 @@ export function createAttemptRunner({
     const result = deepFreeze({
       version: ATTEMPT_RESULT_VERSION,
       workloadDigest: resolved.digest,
+      execution: executionEvidence(
+        options.cpuAffinity,
+        supervisorAllowedCpuList,
+        workloadAllowedCpuList,
+      ),
       boundary: {
         attemptStartedMonotonicNs: attemptStartedNs.toString(),
         workloadStartedMonotonicNs: workloadStartedNs?.toString() ?? null,

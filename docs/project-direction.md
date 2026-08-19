@@ -80,10 +80,11 @@ The intended implementation sequence is:
 9. Extract built-in workloads and reorganize the source tree.
 10. Adopt the Fault Affinity package, command, and repository identity.
 
-The documentation, safety-net, workload-spec, bounded attempt-runner, and
-versioned attempt-record foundations are complete. The runner and record are
-internal: current diagnostic phases do not call them, they write no current
-bundle format, and they do not make `fault-affinity` an executable command. The
-next migration step is an internal phase envelope that binds attempt ordinals,
-schedule identity, and one existing exact-CPU path without changing legacy
-bundle interpretation.
+The documentation, safety-net, workload-spec, bounded attempt-runner,
+versioned attempt-record, and exact-CPU phase-envelope foundations are
+complete. The internal adapter reuses the existing balanced-cyclic isolated
+schedule, binds every valid attempt to an exact CPU slot, and resumes only an
+exact schedule prefix. Current diagnostic phases do not write the new format,
+and `fault-affinity` is not yet an executable command. The next migration step
+is durable phase publication and a schema-3 bundle owner, while legacy bundle
+interpretation remains unchanged.

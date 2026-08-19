@@ -11,7 +11,7 @@ import { spawn } from "node:child_process";
 
 import { verifyWorkloadLaunchProvenance } from "./workload-spec.mjs";
 
-const PROTOCOL_VERSION = 1;
+const PROTOCOL_VERSION = 2;
 const SUPERVISOR_ERROR_EXIT = 125;
 const LIVE_STATES = new Set(["R", "S", "D", "T", "t", "I", "W"]);
 const ERROR_CODE_RE = /^[A-Z][A-Z0-9_]{0,63}$/;
@@ -45,6 +45,16 @@ function readIdentity(pid) {
       startTicks,
       live: LIVE_STATES.has(fields[0]),
     };
+  } catch {
+    return null;
+  }
+}
+
+function readAllowedCpuList(pid) {
+  try {
+    const status = readFileSync(`/proc/${pid}/status`, "utf8");
+    const match = status.match(/^Cpus_allowed_list:\s*(\S+)\s*$/m);
+    return match !== null && /^[0-9,-]+$/.test(match[1]) ? match[1] : null;
   } catch {
     return null;
   }
@@ -110,6 +120,7 @@ function validateLaunch(message) {
     "cwd",
     "environment",
     "termGraceMs",
+    "cpuAffinity",
     "provenance",
   ]) ||
       message.version !== PROTOCOL_VERSION || message.type !== "launch" ||
@@ -123,7 +134,10 @@ function validateLaunch(message) {
       !Object.entries(message.environment).every(([name, value]) =>
         /^[A-Za-z_][A-Za-z0-9_]*$/.test(name) && validString(value)) ||
       !Number.isSafeInteger(message.termGraceMs) || message.termGraceMs < 0 ||
-      message.termGraceMs > 60_000 || message.provenance === null ||
+      message.termGraceMs > 60_000 ||
+      !(message.cpuAffinity === null ||
+        (Number.isSafeInteger(message.cpuAffinity) && message.cpuAffinity >= 0 &&
+          message.cpuAffinity <= 65_535)) || message.provenance === null ||
       typeof message.provenance !== "object" || Array.isArray(message.provenance) ||
       message.provenance.executable?.path !== message.executable ||
       message.provenance.cwd !== message.cwd) {
@@ -140,6 +154,12 @@ function launch(message) {
   }
   launchReceived = true;
   termGraceMs = message.termGraceMs;
+
+  if (message.cpuAffinity !== null &&
+      readAllowedCpuList(process.pid) !== String(message.cpuAffinity)) {
+    send({ type: "workload-launch-error", errorCode: "AFFINITY_MISMATCH" });
+    return;
+  }
 
   try {
     verifyWorkloadLaunchProvenance(message.provenance);
@@ -174,8 +194,16 @@ function launch(message) {
   workload.once("spawn", () => {
     workloadStarted = true;
     const identity = readIdentity(workload.pid);
+    const observedAllowedCpuList = readAllowedCpuList(workload.pid);
+    const allowedCpuList = observedAllowedCpuList ?? readAllowedCpuList(process.pid);
     if (identity !== null && identity.processGroupId !== process.pid) {
       send({ type: "fatal", errorCode: "WORKLOAD_GROUP_MISMATCH" });
+      emergencyCleanup();
+      return;
+    }
+    if (allowedCpuList === null || (message.cpuAffinity !== null &&
+        observedAllowedCpuList !== String(message.cpuAffinity))) {
+      send({ type: "fatal", errorCode: "WORKLOAD_AFFINITY_MISMATCH" });
       emergencyCleanup();
       return;
     }
@@ -184,6 +212,7 @@ function launch(message) {
       pid: workload.pid,
       startTicks: identity?.startTicks ?? null,
       identityBound: identity !== null,
+      allowedCpuList,
     });
   });
 
@@ -246,8 +275,10 @@ process.on("unhandledRejection", () => {
 });
 
 const self = readIdentity(process.pid);
+const selfAllowedCpuList = readAllowedCpuList(process.pid);
 if (typeof process.send !== "function" || self === null || !self.live ||
-    self.processGroupId !== process.pid || self.sessionId !== process.pid) {
+    self.processGroupId !== process.pid || self.sessionId !== process.pid ||
+    selfAllowedCpuList === null) {
   process.exit(SUPERVISOR_ERROR_EXIT);
 }
 
@@ -257,4 +288,5 @@ send({
   startTicks: self.startTicks,
   processGroupId: self.processGroupId,
   sessionId: self.sessionId,
+  allowedCpuList: selfAllowedCpuList,
 });

@@ -33,10 +33,11 @@ non-monotonic boundaries, malformed identities, premature TERM-to-KILL
 escalation, inconsistent cleanup summaries, non-canonical output excerpts, and
 changed full-content digests when the complete output fits in its excerpt.
 
-Canonical JSON-line bytes and their digest/length binding are available for a
-future phase manifest. The attempt record does not yet provide an attempt
-ordinal, phase generation, schedule binding, durable publication transaction,
-or bundle resume authority; those belong to the phase envelope that owns it.
+Canonical JSON-line bytes and their digest/length binding are consumed by the
+internal [exact-CPU phase envelope](exact-cpu-phase-envelopes.md). The attempt
+record itself does not provide an ordinal, phase generation, schedule binding,
+durable publication transaction, or bundle resume authority; those remain the
+responsibility of its owning phase format.
 
 See [ADR 0003](../decisions/0003-attempt-lifecycle.md),
 [ADR 0004](../decisions/0004-typed-outcome-evidence.md), and
