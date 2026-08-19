@@ -23,6 +23,7 @@ The suite covers:
 - Argument and exit-code validation
 - Draft workload-spec validation and typed outcome classification
 - Internal shell-free attempt execution, deadlines, bounded output, and process-group cleanup
+- Managed auxiliary-workload readiness, discarded output, and bounded cancellation
 - Versioned workload-bound attempt records and tamper rejection
 - Deterministic exact-CPU manifests, attempt envelopes, affinity witnesses, durable commits, and prefix resume
 - Immutable schema-3 bundle manifest versions and exclusive phase transactions
@@ -96,10 +97,17 @@ offline tests prove:
 - Reader/writer contention, manifest-only restart, and interrupted-owner lease retention
 - Baseline peer cancellation and refusal to commit partial or invalid waves
 - Pinned-concurrent controller validation, peer cancellation, and interrupted-owner lease retention
+- Separation of long-lived condition-worker lifecycle results from canonical diagnostic attempt evidence
 
 They also exercise fast child exit, retained output descriptors, unavailable
 process-group observations, launch-time provenance drift, parent IPC loss, and
 TERM-to-KILL grace timing. All fixtures are harmless process-lifecycle programs.
+
+The managed auxiliary-workload path reuses that supervisor for future
+controlled conditions. It reports readiness only after identity and CPU-list
+validation, discards intentionally unbounded worker output, and returns a
+separate result shape that cannot be published as a diagnostic attempt record.
+No current controlled-load command uses this internal path yet.
 
 The exact-CPU adapter reuses the current balanced-cyclic isolated schedule and
 places each valid attempt record in a versioned envelope. Schema-3 manifest

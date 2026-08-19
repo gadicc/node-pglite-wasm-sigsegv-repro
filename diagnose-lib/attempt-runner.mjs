@@ -12,6 +12,9 @@ import {
 } from "./workload-spec.mjs";
 
 export const ATTEMPT_RESULT_VERSION = 3;
+// Managed auxiliary processes have a deliberately separate, output-free
+// result shape so they cannot be published as diagnostic attempt evidence.
+export const MANAGED_WORKLOAD_RESULT_VERSION = 1;
 
 const SUPERVISOR_PROTOCOL_VERSION = 3;
 const ATTEMPT_SUPERVISOR = fileURLToPath(new URL("./attempt-supervisor.mjs", import.meta.url));
@@ -25,6 +28,7 @@ const DEFAULT_EXCERPT_BYTES = 64 * 1024;
 const MAX_EXCERPT_BYTES = 1024 * 1024;
 const MAX_CPU_ID = 65_535;
 const GROUP_POLL_MS = 10;
+const MANAGED_RESULT_METADATA = Symbol("managedResultMetadata");
 
 function fail(message) {
   throw new TypeError(message);
@@ -388,11 +392,12 @@ function cancelledBeforeLaunch(resolved, nowNs, cpuAffinity) {
   });
 }
 
-function validateOptions(options) {
+function validateOptions(options, managed) {
   const value = plainObject(options, "attempt options");
   exactKeys(value, [
     "signal", "stdoutExcerptBytes", "stderrExcerptBytes", "cpuAffinity",
     "retainedDirectory",
+    ...(managed ? ["onStarted"] : []),
   ], "attempt options");
   const signal = value.signal;
   if (signal !== undefined &&
@@ -401,8 +406,12 @@ function validateOptions(options) {
        typeof signal.removeEventListener !== "function")) {
     fail("attempt options.signal must be an AbortSignal");
   }
+  if (managed && typeof value.onStarted !== "function") {
+    fail("managed attempt options.onStarted must be a synchronous function");
+  }
   return {
     signal,
+    onStarted: managed ? value.onStarted : null,
     cpuAffinity: validateCpuAffinity(value.cpuAffinity),
     retainedDirectory: validateRetainedDirectory(value.retainedDirectory),
     stdoutExcerptBytes: excerptLimit(
@@ -553,14 +562,14 @@ function supervisorCompletionValid({
     supervisorStatus.exitCode === 0 && supervisorStatus.signal === null;
 }
 
-export function createAttemptRunner({
+function createRunner({
   spawnProcess = spawn,
   readIdentity = readLinuxProcessIdentity,
   listGroupMembers = listLiveProcessGroupMembers,
   killProcess = process.kill.bind(process),
   nowNs = process.hrtime.bigint.bind(process.hrtime),
   supervisorPath = ATTEMPT_SUPERVISOR,
-} = {}) {
+} = {}, { managed = false } = {}) {
   if (typeof spawnProcess !== "function" || typeof readIdentity !== "function" ||
       typeof listGroupMembers !== "function" || typeof killProcess !== "function" ||
       typeof nowNs !== "function" || typeof supervisorPath !== "string" ||
@@ -569,7 +578,7 @@ export function createAttemptRunner({
   }
 
   return async function runAttempt(resolved, rawOptions = {}) {
-    const options = validateOptions(rawOptions);
+    const options = validateOptions(rawOptions, managed);
     const launchEnvironment = workloadLaunchEnvironment(resolved);
     if (options.signal?.aborted) {
       return cancelledBeforeLaunch(resolved, nowNs, options.cpuAffinity);
@@ -591,6 +600,8 @@ export function createAttemptRunner({
     let supervisorUnexpectedExit = false;
     let supervisorFatalError = null;
     let protocolError = null;
+    let managedObserverError = null;
+    let managedReadinessReported = false;
     let identityProbeError = null;
     let protocolState = "awaiting-ready";
     let lastSupervisorEventNs = null;
@@ -617,6 +628,13 @@ export function createAttemptRunner({
     const chooseTerminalRace = () => terminal.choose({
       cause: "terminal-race",
       terminalReason: "terminal-race-unresolved",
+      exitCode: null,
+      signal: null,
+      launchErrorCode: null,
+    });
+    const chooseManagedCancel = () => terminal.choose({
+      cause: "external-cancel",
+      terminalReason: "external-cancel",
       exitCode: null,
       signal: null,
       launchErrorCode: null,
@@ -722,15 +740,18 @@ export function createAttemptRunner({
         shell: false,
         stdio: [
           "ignore",
-          "pipe",
-          "pipe",
+          // A controlled-condition worker may intentionally write without
+          // bound. Managed mode sends both streams directly to the null
+          // device; its distinct result records that policy explicitly.
+          managed ? "ignore" : "pipe",
+          managed ? "ignore" : "pipe",
           "ipc",
           ...(options.retainedDirectory === null ? [] : [options.retainedDirectory.fd]),
         ],
         windowsHide: true,
       });
-      stdout = new OutputAccumulator(supervisor.stdout, options.stdoutExcerptBytes);
-      stderr = new OutputAccumulator(supervisor.stderr, options.stderrExcerptBytes);
+      stdout = new OutputAccumulator(supervisor.stdout ?? null, options.stdoutExcerptBytes);
+      stderr = new OutputAccumulator(supervisor.stderr ?? null, options.stderrExcerptBytes);
     } catch (error) {
       supervisorSpawnErrorCode = normalizeErrorCode(error, "SUPERVISOR_SPAWN_THROW");
       chooseLaunchError(supervisorSpawnErrorCode);
@@ -868,7 +889,47 @@ export function createAttemptRunner({
           workloadStartedNs = eventNs;
           workloadAllowedCpuList = message.allowedCpuList;
           protocolState = "workload-started";
-          if (eventNs > executionDeadlineNs) chooseTerminalRace();
+          if (eventNs > executionDeadlineNs) {
+            chooseTerminalRace();
+            return;
+          }
+          if (managed) {
+            if (!message.identityBound || actual === null || boundStartTicks === null) {
+              managedObserverError = "MANAGED_WORKLOAD_IDENTITY_UNBOUND";
+              chooseManagedCancel();
+              return;
+            }
+            try {
+              const returned = options.onStarted(deepFreeze({
+                monotonicNs: message.monotonicNs,
+                supervisor: {
+                  pid: supervisorIdentity.pid,
+                  processGroupId: supervisorIdentity.processGroupId,
+                  sessionId: supervisorIdentity.sessionId,
+                  startTicks: supervisorIdentity.startTicks,
+                  allowedCpuList: supervisorAllowedCpuList,
+                },
+                workload: {
+                  pid: workloadIdentity.pid,
+                  startTicks: workloadIdentity.startTicks,
+                  allowedCpuList: workloadAllowedCpuList,
+                },
+              }));
+              if (returned !== undefined) {
+                Promise.resolve(returned).catch(() => {});
+                throw Object.assign(new Error("managed start observer must be synchronous"), {
+                  code: "MANAGED_START_OBSERVER_ASYNC",
+                });
+              }
+              managedReadinessReported = true;
+            } catch (error) {
+              managedObserverError = normalizeErrorCode(
+                error,
+                "MANAGED_START_OBSERVER_ERROR",
+              );
+              chooseManagedCancel();
+            }
+          }
           return;
         }
 
@@ -1099,7 +1160,7 @@ export function createAttemptRunner({
     const postTerminalStatus = terminalResult.cause === "natural-exit" || workloadStatus === null
       ? null
       : { exitCode: workloadStatus.exitCode, signal: workloadStatus.signal };
-    const result = deepFreeze({
+    const resultValue = {
       version: ATTEMPT_RESULT_VERSION,
       workloadDigest: resolved.digest,
       execution: executionEvidence(
@@ -1139,7 +1200,19 @@ export function createAttemptRunner({
         supervisorStatus,
       },
       output: { stdout: stdoutResult, stderr: stderrResult },
-    });
+    };
+    if (managed) {
+      Object.defineProperty(resultValue, MANAGED_RESULT_METADATA, {
+        configurable: false,
+        enumerable: false,
+        writable: false,
+        value: deepFreeze({
+          reported: managedReadinessReported,
+          errorCode: managedObserverError,
+        }),
+      });
+    }
+    const result = deepFreeze(resultValue);
 
     supervisor?.removeAllListeners("message");
     if (supervisor?.connected) supervisor.disconnect();
@@ -1147,4 +1220,31 @@ export function createAttemptRunner({
   };
 }
 
+export function createAttemptRunner(dependencies = {}) {
+  return createRunner(dependencies);
+}
+
+export function createManagedWorkloadRunner(dependencies = {}) {
+  const runAttempt = createRunner(dependencies, { managed: true });
+  return async function runManagedWorkload(resolved, options = {}) {
+    const result = await runAttempt(resolved, options);
+    return deepFreeze({
+      version: MANAGED_WORKLOAD_RESULT_VERSION,
+      workloadDigest: result.workloadDigest,
+      outputMode: "discard",
+      readiness: result[MANAGED_RESULT_METADATA] ?? {
+        reported: false,
+        errorCode: null,
+      },
+      execution: result.execution,
+      boundary: result.boundary,
+      process: result.process,
+      observation: result.observation,
+      outcome: result.outcome,
+      cleanup: result.cleanup,
+    });
+  };
+}
+
 export const runWorkloadAttempt = createAttemptRunner();
+export const runManagedWorkload = createManagedWorkloadRunner();

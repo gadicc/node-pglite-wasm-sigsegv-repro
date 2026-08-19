@@ -96,6 +96,10 @@ retain the lease through bounded cleanup if the outer owner is interrupted.
 Current diagnostic phases do not write the new formats, and `fault-affinity` is
 not yet an executable command. The next migration step is to adapt the
 controlled-load, debugger, and frequency protocols to the workload-bound owner
-where applicable, then expose orchestration only after those compatibility and
-privilege boundaries are explicit. Legacy bundle interpretation remains
-unchanged.
+where applicable. The controlled-load foundation now has a separate managed
+auxiliary-workload lifecycle with verified readiness, discarded output, and
+bounded cleanup. It still needs a worker-set manager and complete
+single-workload A/B/A envelopes. Historical Node A/B/A and Node-by-warmup modes
+remain multi-workload experiments outside the current schema. Public
+orchestration follows only after those compatibility and privilege boundaries
+are explicit. Legacy bundle interpretation remains unchanged.

@@ -10,9 +10,11 @@ import { fileURLToPath } from "node:url";
 import {
   createAttemptRunner,
   readLinuxProcessIdentity,
+  runManagedWorkload,
   runWorkloadAttempt,
   selectAttemptDeadlineCandidate,
 } from "../attempt-runner.mjs";
+import { buildAttemptEvidence } from "../attempt-evidence.mjs";
 import {
   resolveWorkloadSpec,
   workloadLaunchEnvironment,
@@ -358,6 +360,105 @@ test("external AbortSignal cancellation remains operational evidence", { timeout
   assert.equal(result.outcome.category, "operational-invalid");
   assert.equal(result.outcome.invalidReason, "external-cancel");
   assert.equal(result.cleanup.groupDrained, true);
+});
+
+test("managed workloads expose bound readiness and discard auxiliary output", {
+  timeout: 5_000,
+}, async () => {
+  const files = launcher();
+  const allowed = readFileSync("/proc/self/status", "utf8")
+    .match(/^Cpus_allowed_list:\s*(\S+)\s*$/m)?.[1];
+  assert.equal(typeof allowed, "string");
+  const cpu = expandCpuList(allowed)[0];
+  const controller = new AbortController();
+  let resolveStarted;
+  const started = new Promise((resolve) => { resolveStarted = resolve; });
+  const running = runManagedWorkload(workload(files, ["flood-hold", String(64 * 1024)], {
+    timeoutMs: 2_000,
+  }), {
+    signal: controller.signal,
+    cpuAffinity: { cpu, tasksetPath: "/usr/bin/taskset" },
+    onStarted(witness) {
+      resolveStarted(witness);
+    },
+  });
+
+  const witness = await started;
+  assert.equal(Object.isFrozen(witness), true);
+  assert.equal(witness.supervisor.allowedCpuList, String(cpu));
+  assert.equal(witness.workload.allowedCpuList, String(cpu));
+  assert.equal(witness.supervisor.processGroupId, witness.supervisor.pid);
+  assert.match(witness.supervisor.startTicks, /^[0-9]+$/);
+  assert.match(witness.workload.startTicks, /^[0-9]+$/);
+  controller.abort();
+
+  const managed = await running;
+  track(managed);
+  assert.deepEqual(Object.keys(managed).sort(), [
+    "boundary",
+    "cleanup",
+    "execution",
+    "observation",
+    "outcome",
+    "outputMode",
+    "process",
+    "readiness",
+    "version",
+    "workloadDigest",
+  ]);
+  assert.equal(managed.version, 1);
+  assert.equal(managed.outputMode, "discard");
+  assert.deepEqual(managed.readiness, { reported: true, errorCode: null });
+  assert.equal("output" in managed, false);
+  assert.equal("result" in managed, false);
+  assert.equal(managed.observation.terminalReason, "external-cancel");
+  assert.equal(managed.cleanup.groupDrained, true);
+  assert.equal(managed.cleanup.outputDrained, true);
+  assert.throws(() => buildAttemptEvidence(workload(files, ["exit", "0"]), managed),
+    /attempt runner result must contain exactly/);
+  assert.deepEqual(managed.execution.cpuAffinity, {
+    requestedCpu: cpu,
+    supervisorAllowedCpuList: String(cpu),
+    workloadAllowedCpuList: String(cpu),
+  });
+});
+
+test("managed readiness observers are synchronous and isolated from canonical attempts", {
+  timeout: 5_000,
+}, async () => {
+  const files = launcher();
+  const resolved = workload(files, ["hold"], { timeoutMs: 2_000, termGraceMs: 20 });
+  await assert.rejects(runWorkloadAttempt(resolved, {
+    onStarted() {},
+  }), /unknown field 'onStarted'/);
+  await assert.rejects(runManagedWorkload(resolved),
+    /managed attempt options\.onStarted must be a synchronous function/);
+
+  const controller = new AbortController();
+  controller.abort();
+  let starts = 0;
+  const cancelled = await runManagedWorkload(resolved, {
+    signal: controller.signal,
+    onStarted() { starts += 1; },
+  });
+  assert.equal(starts, 0);
+  assert.equal(cancelled.process.supervisor, null);
+  assert.equal(cancelled.process.workload, null);
+  assert.equal(cancelled.observation.terminalReason, "external-cancel");
+  assert.deepEqual(cancelled.readiness, { reported: false, errorCode: null });
+
+  const managed = await runManagedWorkload(resolved, {
+    onStarted: async () => {},
+  });
+  track(managed);
+  assert.equal(managed.observation.terminalReason, "external-cancel");
+  assert.equal(managed.observation.cleanupComplete, true);
+  assert.equal(managed.cleanup.failureReason, null);
+  assert.deepEqual(managed.readiness, {
+    reported: false,
+    errorCode: "MANAGED_START_OBSERVER_ASYNC",
+  });
+  assert.equal(managed.cleanup.groupDrained, true);
 });
 
 test("an unavailable group observation fails closed without claiming drain", {

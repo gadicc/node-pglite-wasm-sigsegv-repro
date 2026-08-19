@@ -113,6 +113,10 @@ switch (mode) {
   case "flood":
     flood(Number(args[0]));
     break;
+  case "flood-hold":
+    flood(Number(args[0]));
+    hold();
+    break;
   default:
     throw new Error(`unknown attempt fixture mode: ${mode}`);
 }
