@@ -122,7 +122,7 @@ test("planned termination remains cleanup evidence in a survival-window record",
 }, async () => {
   const resolved = resolvedWorkload(["-e", "setInterval(() => {}, 1000)"], {
     mode: "survive-window",
-    timeoutMs: 100,
+    timeoutMs: 1_000,
   });
   const record = buildAttemptEvidence(resolved, await runWorkloadAttempt(resolved));
 
@@ -140,7 +140,7 @@ test("operationally incomplete cleanup remains validly structured evidence", {
 }, async () => {
   const resolved = resolvedWorkload(["-e", "setInterval(() => {}, 1000)"], {
     mode: "survive-window",
-    timeoutMs: 100,
+    timeoutMs: 1_000,
     termGraceMs: 20,
     killGraceMs: 200,
   });
