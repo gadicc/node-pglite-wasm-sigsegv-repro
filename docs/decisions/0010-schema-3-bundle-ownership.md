@@ -20,14 +20,18 @@ Introduce an internal bundle-format-3 owner with one immutable canonical
 `fault-affinity-bundle.json` manifest. Manifest version 1 records bundle and
 run schema versions, a fresh bundle generation, the complete resolved workload
 and digest binding, phase capability states, and the bound exact-CPU phase
-manifest. Manifest version 2 retains those fields and also binds the baseline
-phase. A retry may complete initialization after the manifest was published,
-but it may not replace or change that manifest.
+manifest. Manifest version 2 adds baseline, version 3 adds group topology, and
+version 4 adds pinned-concurrent topology. Each version retains all preceding
+phases without changing the fields or state inventory of an earlier version. A
+retry may complete initialization after the manifest was published, but it may
+not replace or change that manifest.
 
-Store mutable exact-CPU state below `state/exact-cpu/` and, in manifest version
-2, baseline state below `state/baseline/`. Phase completion is derived from the
-valid contiguous attempt or whole-wave prefix and its final no-clobber commit;
-there is no separate completion marker that could disagree.
+Store mutable exact-CPU state below `state/exact-cpu/`, baseline state below
+`state/baseline/` from version 2, group state below `state/groups/` from version
+3, and pinned-concurrent state below `state/pinned-concurrent/` from version 4.
+Phase completion is derived from the valid contiguous attempt or whole-wave
+prefix and its final no-clobber commit; there is no separate completion marker
+that could disagree.
 
 Every operation that may reconcile or publish state holds an exclusive lease
 on an already-open canonical private bundle-directory descriptor. The lease
@@ -54,10 +58,10 @@ recovery namespace.
   temporary files without changing bundle identity.
 - Read operations also take the lease because interrupted-file reconciliation
   can mutate internal housekeeping state.
-- Manifest version 1 remains exact-only; version 2 binds baseline and exact-CPU
-  without reinterpreting version 1.
-- Group, controlled-load, debugger, and frequency phases still need explicit
-  schema-3 bundle adapters before a public generic run can include them.
+- Manifest version 1 remains exact-only; versions 2 through 4 add baseline,
+  groups, and pinned-concurrent state without reinterpreting earlier versions.
+- Controlled-load, debugger, and frequency phases still need explicit schema-3
+  bundle adapters before a public generic run can include them.
 
 ## Acceptance criteria
 
@@ -67,8 +71,10 @@ recovery namespace.
   owns the bundle.
 - A harmless production-runner fixture proves that the supervisor validates and
   retains the bundle descriptor.
-- A harmless interrupted-owner fixture proves that ownership remains active
-  through supervisor cleanup and that no uncommitted slot is consumed.
-- Exact completion is derived from the final valid prefix.
+- Harmless interrupted-owner fixtures prove that ownership remains active
+  through exact, baseline, and pinned-concurrent supervisor cleanup and that no
+  uncommitted slot is consumed.
+- Exact attempts and complete waves derive completion from their final valid
+  prefixes.
 - Schema-1, schema-2, the public CLI, and live diagnostic workloads remain
   unchanged.

@@ -32,7 +32,12 @@ export function leaseRetentionWorkloadSpec({ cwd, readyFile }) {
       killGraceMs: 1_000,
     },
     outcomes: { targetSignals: [], mappedExits: [] },
-    capabilities: { baseline: true, isolated: true },
+    capabilities: {
+      baseline: true,
+      groups: true,
+      isolated: true,
+      pinnedConcurrent: true,
+    },
     provenance: { completeness: "complete", files: [] },
   };
 }
@@ -50,6 +55,8 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     await bundleRunner.runOneSchema3ExactCpuAttempt({ resolved, bundleDir });
   } else if (mode === "baseline") {
     await bundleRunner.runOneSchema3BaselineWave({ resolved, bundleDir });
+  } else if (mode === "pinned-concurrent") {
+    await bundleRunner.runOneSchema3PinnedConcurrentWave({ resolved, bundleDir });
   } else {
     throw new Error(`unsupported fixture mode: ${mode}`);
   }

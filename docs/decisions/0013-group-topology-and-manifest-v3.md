@@ -40,8 +40,8 @@ legacy evidence, or the public command surface.
 - Mask drift in either the supervisor or direct workload invalidates the child
   and prevents whole-wave publication.
 - Manifest v3 owns `state/groups/` in addition to the v2 state inventory.
-- Pinned-concurrent contexts are the next phase needing a distinct controller
-  CPU and per-child singleton-affinity contract.
+- Manifest version 4 adds the distinct pinned-concurrent controller and
+  per-child singleton-affinity contract without changing version 3.
 
 ## Acceptance criteria
 

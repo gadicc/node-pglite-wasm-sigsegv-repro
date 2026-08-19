@@ -82,16 +82,20 @@ The intended implementation sequence is:
 
 The documentation, safety-net, workload-spec, bounded attempt-runner,
 versioned attempt-record, exact-CPU phase-envelope, durable phase-store,
-internal schema-3 bundle owner, and baseline whole-wave foundations are
-complete. Bundle manifest version 1 binds one workload and deterministic
-exact-CPU manifest. Version 2 additionally binds correlated baseline waves,
-and version 3 binds overlapping CPU-group contexts and inherited masks.
+internal schema-3 bundle owner, baseline whole-wave, CPU-group, and
+pinned-concurrent foundations are complete. Bundle manifest version 1 binds one
+workload and deterministic exact-CPU manifest. Version 2 additionally binds
+correlated baseline waves, version 3 binds overlapping CPU-group contexts and
+inherited masks, and version 4 binds a separate controller CPU plus one
+singleton-affinity child per active CPU.
 The owner holds one exclusive lease across selecting, running, and committing
-an exact attempt or complete baseline wave and derives completion from the
-durably published prefix. Its stable supervisors retain the lease through
-bounded cleanup if the outer owner is interrupted.
+an exact attempt or complete baseline, group, or pinned-concurrent wave and
+derives completion from the durably published prefix. Its stable supervisors
+retain the lease through bounded cleanup if the outer owner is interrupted.
 
 Current diagnostic phases do not write the new formats, and `fault-affinity` is
-not yet an executable command. The next migration step is the distinct
-pinned-concurrent contract: controller placement plus one singleton-affinity
-child per context CPU. Legacy bundle interpretation remains unchanged.
+not yet an executable command. The next migration step is to adapt the
+controlled-load, debugger, and frequency protocols to the workload-bound owner
+where applicable, then expose orchestration only after those compatibility and
+privilege boundaries are explicit. Legacy bundle interpretation remains
+unchanged.

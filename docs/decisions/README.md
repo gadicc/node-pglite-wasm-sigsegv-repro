@@ -19,3 +19,4 @@ behavior and compatibility boundaries, not current runtime capabilities.
 | [ADR 0011](0011-baseline-concurrent-waves.md) | Accepted | Persist baseline execution as an exact prefix of complete correlated waves. |
 | [ADR 0012](0012-schema-3-manifest-v2.md) | Accepted | Keep manifest v1 exact-only and bind baseline plus exact-CPU state in v2. |
 | [ADR 0013](0013-group-topology-and-manifest-v3.md) | Accepted | Bind overlapping group contexts, inherited CPU masks, and whole-wave state in manifest v3. |
+| [ADR 0014](0014-pinned-concurrent-and-manifest-v4.md) | Accepted | Bind controller placement, per-child singleton affinity, and whole-wave state in manifest v4. |

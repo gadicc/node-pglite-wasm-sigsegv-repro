@@ -33,6 +33,7 @@ This index separates instructions for running the current tooling from the resul
 - [Understand internal exact-CPU phase envelopes](reference/exact-cpu-phase-envelopes.md): schedule identity, attempt slots, affinity, durable publication, and exact-prefix resume
 - [Understand internal baseline concurrent waves](reference/baseline-concurrent-waves.md): correlated wave identity, child slots, all-or-nothing publication, and exact-prefix resume
 - [Understand internal CPU-group waves](reference/group-topology-waves.md): overlapping topology contexts, inherited masks, balanced scheduling, and whole-wave resume
+- [Understand internal pinned-concurrent waves](reference/pinned-concurrent-waves.md): controller placement, singleton child affinity, balanced scheduling, and whole-wave resume
 - [Node/V8 source-history review](../research/node-v8-25.2.1-to-26.7.0-review.md): 5,693-commit source and provenance screen
 - [Node/V8 screened-commit audit](../research/node-v8-screened-commits.tsv): complete disposition table for the source-history review
 

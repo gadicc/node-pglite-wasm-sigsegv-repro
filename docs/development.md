@@ -28,6 +28,7 @@ The suite covers:
 - Immutable schema-3 bundle manifest versions and exclusive phase transactions
 - Workload-bound baseline manifests, correlated wave envelopes, and whole-wave resume
 - Workload-bound group topology, inherited CPU-mask witnesses, and whole-wave resume
+- Workload-bound pinned-concurrent topology, controller witnesses, singleton child affinity, and whole-wave resume
 - Settings restoration under simulated signals
 - Statistics and parser fixtures
 - Evidence-envelope validation
@@ -94,6 +95,7 @@ offline tests prove:
 - Private no-clobber state publication and bounded interrupted-write recovery
 - Reader/writer contention, manifest-only restart, and interrupted-owner lease retention
 - Baseline peer cancellation and refusal to commit partial or invalid waves
+- Pinned-concurrent controller validation, peer cancellation, and interrupted-owner lease retention
 
 They also exercise fast child exit, retained output descriptors, unavailable
 process-group observations, launch-time provenance drift, parent IPC loss, and
@@ -116,8 +118,9 @@ bundle interpretation.
 Schema-3 manifest version 3 additionally binds CPU-group contexts. Contexts
 may overlap, their order is deterministically balanced, and every child must
 witness the scheduled inherited mask before its complete wave can advance.
-Pinned-concurrent execution remains separate because it also needs a controller
-CPU and one singleton CPU per child.
+Manifest version 4 adds pinned-concurrent contexts. The bundle owner must
+witness its scheduled controller CPU, and each child supervisor and workload
+must witness one scheduled singleton CPU before the complete wave can advance.
 
 Custom commands should be documented as trusted local workloads, not sandboxed code. They must not daemonize or escape the supervised process group.
 

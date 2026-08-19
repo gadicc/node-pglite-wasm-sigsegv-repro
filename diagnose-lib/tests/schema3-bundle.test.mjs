@@ -22,21 +22,25 @@ import {
 import { buildBaselinePhaseManifest } from "../baseline-phase.mjs";
 import { buildExactCpuPhaseManifest } from "../exact-cpu-phase.mjs";
 import { buildGroupPhaseManifest } from "../group-phase.mjs";
+import { buildPinnedConcurrentPhaseManifest } from "../pinned-concurrent-phase.mjs";
 import { readLinuxProcessIdentity, runWorkloadAttempt } from "../attempt-runner.mjs";
 import {
   SCHEMA3_BUNDLE_FILE,
   SCHEMA3_BASELINE_STATE_DIRECTORY,
   SCHEMA3_EXACT_CPU_STATE_DIRECTORY,
   SCHEMA3_GROUP_STATE_DIRECTORY,
+  SCHEMA3_PINNED_CONCURRENT_STATE_DIRECTORY,
   buildSchema3BundleManifest,
   buildSchema3BundleManifestV2,
   buildSchema3BundleManifestV3,
+  buildSchema3BundleManifestV4,
   canonicalSchema3BundleManifestLine,
   initializeSchema3Bundle,
   readSchema3Bundle,
   runOneSchema3BaselineWave,
   runOneSchema3ExactCpuAttempt,
   runOneSchema3GroupWave,
+  runOneSchema3PinnedConcurrentWave,
 } from "../schema3-bundle.mjs";
 import { createFileStateAdapter } from "../pinned-protocol.mjs";
 import { resolveWorkloadSpec } from "../workload-spec.mjs";
@@ -63,12 +67,23 @@ function temporaryDirectory(prefix) {
   return directory;
 }
 
-function allowedCpu() {
+function allowedCpus(limit = 3) {
   const status = readFileSync("/proc/self/status", "utf8");
   const match = status.match(/^Cpus_allowed_list:\s*(\S+)\s*$/m);
   assert.notEqual(match, null);
-  const first = match[1].split(",")[0].split("-")[0];
-  return Number(first);
+  const cpus = [];
+  for (const token of match[1].split(",")) {
+    const [firstText, lastText = firstText] = token.split("-");
+    for (let cpu = Number(firstText); cpu <= Number(lastText) && cpus.length < limit; cpu += 1) {
+      cpus.push(cpu);
+    }
+    if (cpus.length === limit) break;
+  }
+  return cpus;
+}
+
+function allowedCpu() {
+  return allowedCpus(1)[0];
 }
 
 function workload({
@@ -103,6 +118,18 @@ function groupWorkload(options = {}) {
   });
 }
 
+function pinnedConcurrentWorkload(options = {}) {
+  return workload({
+    ...options,
+    capabilities: {
+      baseline: true,
+      groups: true,
+      isolated: true,
+      pinnedConcurrent: true,
+    },
+  });
+}
+
 function baselineManifest(resolved, { childrenPerWave = 2, waves = 1 } = {}) {
   return buildBaselinePhaseManifest(resolved, {
     generation: "fedcba9876543210fedcba9876543210",
@@ -133,6 +160,24 @@ function groupManifest(resolved, { groupRounds = 1 } = {}) {
   });
 }
 
+function pinnedConcurrentManifest(resolved, { pinnedRounds = 1 } = {}) {
+  const cpus = allowedCpus(3);
+  assert.ok(cpus.length >= 2);
+  return buildPinnedConcurrentPhaseManifest(resolved, {
+    generation: "ffeeddccbbaa99887766554433221100",
+    contexts: [{
+      group: "active",
+      kind: "uniform",
+      cpus: cpus.slice(1),
+      cluster: "-",
+      controllerCpu: cpus[0],
+    }],
+    rounds: pinnedRounds,
+    seed: 20260819,
+    tasksetPath: "/usr/bin/taskset",
+  });
+}
+
 function bundleManifest(resolved, options = {}) {
   return buildSchema3BundleManifest(resolved, {
     bundleGeneration: "abcdef0123456789abcdef0123456789",
@@ -153,6 +198,16 @@ function bundleManifestV3(resolved, options = {}) {
     bundleGeneration: "abcdef0123456789abcdef0123456789",
     baselineManifest: baselineManifest(resolved, options),
     groupManifest: groupManifest(resolved, options),
+    exactCpuManifest: exactCpuManifest(resolved, options),
+  });
+}
+
+function bundleManifestV4(resolved, options = {}) {
+  return buildSchema3BundleManifestV4(resolved, {
+    bundleGeneration: "abcdef0123456789abcdef0123456789",
+    baselineManifest: baselineManifest(resolved, options),
+    groupManifest: groupManifest(resolved, options),
+    pinnedConcurrentManifest: pinnedConcurrentManifest(resolved, options),
     exactCpuManifest: exactCpuManifest(resolved, options),
   });
 }
@@ -323,6 +378,32 @@ test("schema-3 manifest v3 binds group topology without changing v1 or v2", {
     /different manifest/);
 });
 
+test("schema-3 manifest v4 binds pinned-concurrent state without changing v1 through v3", {
+  timeout: 10_000,
+}, async () => {
+  const resolved = pinnedConcurrentWorkload();
+  const manifest = bundleManifestV4(resolved);
+  const bundleDir = bundleDirectory();
+  await createFileStateAdapter(bundleDir).commit(
+    SCHEMA3_BUNDLE_FILE,
+    canonicalSchema3BundleManifestLine(resolved, manifest),
+  );
+  const initialized = await initializeSchema3Bundle({ resolved, manifest, bundleDir });
+  assert.equal(initialized.manifest.version, 4);
+  assert.equal(initialized.manifest.phaseControls.pinnedConcurrent, "supported");
+  assert.equal(initialized.pinnedConcurrent.progress.status, "empty");
+  assert.equal(initialized.groups.progress.status, "empty");
+  assert.equal(statSync(path.join(
+    bundleDir,
+    SCHEMA3_PINNED_CONCURRENT_STATE_DIRECTORY,
+  )).mode & 0o777, 0o700);
+  const reopened = await readSchema3Bundle({ resolved, bundleDir });
+  assert.deepEqual(reopened.pinnedConcurrent, initialized.pinnedConcurrent);
+  const changed = bundleManifestV4(resolved, { pinnedRounds: 2 });
+  await assert.rejects(initializeSchema3Bundle({ resolved, manifest: changed, bundleDir }),
+    /different manifest/);
+});
+
 test("the execution lease makes selecting, running, and committing one slot indivisible", {
   timeout: 10_000,
 }, async () => {
@@ -483,6 +564,61 @@ test("one schema-3 v3 lease owns the complete group-mask wave transaction", {
   const noOp = await runOneSchema3GroupWave({ resolved, bundleDir, runAttempt });
   assert.equal(noOp.result.reason, "complete");
   assert.equal(launches, 2);
+});
+
+test("one schema-3 v4 lease owns controller and singleton-child wave execution", {
+  timeout: 10_000,
+}, async () => {
+  const resolved = pinnedConcurrentWorkload();
+  const manifest = bundleManifestV4(resolved);
+  const bundleDir = bundleDirectory();
+  await initializeSchema3Bundle({ resolved, manifest, bundleDir });
+  const phase = manifest.pinnedConcurrent.manifest;
+  const context = phase.topology.contexts[0];
+  const fixtures = new Map();
+  for (const cpu of context.cpus) {
+    fixtures.set(cpu, await runWorkloadAttempt(resolved, {
+      cpuAffinity: { cpu, tasksetPath: phase.execution.tasksetPath },
+    }));
+  }
+  const started = deferred();
+  const release = deferred();
+  let launches = 0;
+  const runAttempt = async (_resolved, options) => {
+    launches += 1;
+    assert.equal(fstatSync(options.retainedDirectory.fd, { bigint: true }).ino.toString(),
+      options.retainedDirectory.inode);
+    if (launches === context.cpus.length) started.resolve();
+    await release.promise;
+    return fixtures.get(options.cpuAffinity.cpu);
+  };
+
+  const first = runOneSchema3PinnedConcurrentWave({
+    resolved,
+    bundleDir,
+    runAttempt,
+    readControllerCpuList: () => String(context.controllerCpu),
+  });
+  await started.promise;
+  await assert.rejects(runOneSchema3GroupWave({ resolved, bundleDir }),
+    (error) => error instanceof BundleExecutionLeaseError &&
+      error.code === "BUNDLE_EXECUTION_LEASE_BUSY");
+  await assert.rejects(readSchema3Bundle({ resolved, bundleDir }),
+    (error) => error instanceof BundleExecutionLeaseError &&
+      error.code === "BUNDLE_EXECUTION_LEASE_BUSY");
+  release.resolve();
+  const completed = await first;
+  assert.equal(completed.result.reason, "committed");
+  assert.equal(completed.bundle.pinnedConcurrent.progress.status, "complete");
+
+  const noOp = await runOneSchema3PinnedConcurrentWave({
+    resolved,
+    bundleDir,
+    runAttempt,
+    readControllerCpuList: () => String(context.controllerCpu),
+  });
+  assert.equal(noOp.result.reason, "complete");
+  assert.equal(launches, context.cpus.length);
 });
 
 test("operationally invalid execution leaves the slot available for a retained production attempt", {
@@ -681,6 +817,69 @@ test("a v2 baseline supervisor retains bundle ownership during interrupted-owner
 
     const reopened = await readSchema3Bundle({ resolved, bundleDir });
     assert.equal(reopened.baseline.progress.committedWaves, 0);
+  } finally {
+    if (owner.exitCode === null && owner.signalCode === null) owner.kill("SIGTERM");
+    if (supervisorPid !== null) {
+      const current = readLinuxProcessIdentity(supervisorPid);
+      if (current?.live && current.processGroupId === supervisorPid) {
+        try { process.kill(-supervisorPid, "SIGKILL"); } catch { /* already complete */ }
+      }
+    }
+  }
+});
+
+test("a v4 pinned-concurrent supervisor retains bundle ownership during interrupted-owner cleanup", {
+  timeout: 15_000,
+}, async () => {
+  const cwd = temporaryDirectory("schema3-pinned-concurrent-retention-workload-");
+  const readyFile = path.join(cwd, "ready.json");
+  const resolved = resolveWorkloadSpec(leaseRetentionWorkloadSpec({ cwd, readyFile }));
+  const manifest = bundleManifestV4(resolved);
+  const bundleDir = bundleDirectory();
+  await initializeSchema3Bundle({ resolved, manifest, bundleDir });
+  const controllerCpu = manifest.pinnedConcurrent.manifest.topology.contexts[0].controllerCpu;
+
+  const owner = spawn("/usr/bin/taskset", [
+    "-c",
+    String(controllerCpu),
+    process.execPath,
+    LEASE_RETENTION_OWNER,
+    bundleDir,
+    cwd,
+    readyFile,
+    "pinned-concurrent",
+  ], {
+    cwd: "/",
+    env: {},
+    shell: false,
+    stdio: ["ignore", "ignore", "ignore"],
+  });
+  const ownerExit = waitForChildExit(owner);
+  let supervisorPid = null;
+  try {
+    const ready = await waitForJsonFile(readyFile);
+    assert.equal(ready.pid > 1, true);
+    assert.equal(ready.parentPid > 1, true);
+    assert.equal(ready.inheritedBundleDirectory, false);
+    supervisorPid = ready.parentPid;
+    const supervisor = readLinuxProcessIdentity(supervisorPid);
+    assert.equal(supervisor?.live, true);
+    assert.equal(supervisor.processGroupId, supervisorPid);
+
+    assert.equal(owner.kill("SIGTERM"), true);
+    const ownerStatus = await ownerExit;
+    assert.equal(ownerStatus.signal, "SIGTERM");
+
+    await assert.rejects(
+      withBundleExecutionLease({ bundleDir }, async () => "must-not-run"),
+      (error) => error instanceof BundleExecutionLeaseError &&
+        error.code === "BUNDLE_EXECUTION_LEASE_BUSY",
+    );
+    assert.equal(await withBundleExecutionLease({ bundleDir, waitMs: 3_000 },
+      async () => "recovered"), "recovered");
+
+    const reopened = await readSchema3Bundle({ resolved, bundleDir });
+    assert.equal(reopened.pinnedConcurrent.progress.committedWaves, 0);
   } finally {
     if (owner.exitCode === null && owner.signalCode === null) owner.kill("SIGTERM");
     if (supervisorPid !== null) {
