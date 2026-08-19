@@ -1,0 +1,175 @@
+# Kernel oops excerpts: CPU 19, repro-c --mode churn-mem under load
+
+Source: systemd journal of the previous boot (`journalctl -k -b -1`),
+extracted 2026-08-18. Kernel at the time: 7.1.8-1-cachyos. The boot later
+ended in a hard system crash (no further kernel log lines recorded).
+
+## Context
+
+- Machine: Dell Pro Max 18 Plus MB18250 (0Y3CTV), BIOS 3.3.2 (08/03/2026)
+- CPU: Intel Core Ultra 9 285HX, stepping 2, microcode 0x122
+- Kernel: 7.1.8-1-cachyos (tainted G O: out-of-tree nvidia modules loaded;
+  see "Modules linked in" in the excerpts)
+- Trigger: `repro-c --mode churn-mem` (at commit 89c2bca the mode was the
+  default churn implementation; it is --mode churn-mem since 00f2e38),
+  a ~500-line native C program: per round it maps a fresh 256 KiB code
+  buffer, writes a small position-independent code blob, flips it RX with
+  mprotect, makes fresh instance/budget pages and a fresh 4 GiB
+  PROT_NONE guard-paged reservation (64 KiB committed), executes, verifies
+  counters, and unmaps everything (~2500 rounds/s per run).
+- Conditions: process pinned to CPU 19 (taskset); eight /usr/bin/yes
+  workers pinned to P-cores 0-7 (package load). No Node, V8, wasm, or
+  PGlite involved. No overclocking; laptop running a normal desktop
+  session.
+- The same machine reproduces userspace SIGSEGVs with si_addr equal to
+  the intended address plus exactly 2^42 (bit 42 set) in V8/wasm
+  workloads on the same core under the same load; see README.md
+  "Platform-level fault-address investigation".
+
+## Why these oopses matter
+
+Oops [#1] is a kernel-mode instance of the same +2^42 signature:
+
+- RIP `entry_SYSCALL_64_after_hwframe+0x11/0x7e` is the `push %r14`
+  saving user registers on the kernel stack (see the Code line: the
+  bracketed bytes `<41> 54` are that push).
+- Incoming registers identify the syscall: RAX=10 (mprotect),
+  RDI=0x7fd21deb5000, RSI=0x40000, RDX=5 (PROT_READ|PROT_EXEC) - the
+  churn loop's W^X flip of its 256 KiB code buffer.
+- RSP was `ffffd20d8b2d3f68`, so the push should have written at
+  `ffffd20d8b2d3f60`. CR2 (the faulting address) was
+  `ffffd60d8b2d3f60` = RSP-8 with **bit 42 set** and nothing else:
+  supervisor write access to a not-present page, error_code 0x0002.
+- No valid x86-64 execution of that instruction produces that address;
+  the page-table walk (PGD/P4D present, PUD 0) confirms the address was
+  corrupted before translation, matching the userspace captures where
+  the architectural register state is clean and only the fault address
+  carries the extra bit.
+
+Oops [#2] (same RIP, same syscall shape, ~16 minutes later) aborted
+syscall entry with IRQs disabled ("exited with irqs disabled",
+"preempt_count 1") and left the process unkillably D-stuck in exit_mmap.
+Its kernel stack, captured via sudo from /proc/1320017/stack while wedged:
+
+    [<0>] exit_mmap+0x13e/0x320
+    [<0>] __mmput+0x41/0x100
+    [<0>] do_exit+0x205/0x5c0
+    [<0>] make_task_dead+0x80/0x150
+    [<0>] rewind_stack_and_make_dead+0x16/0x20
+
+The wedged process survived SIGKILL for over an hour until the machine
+was rebooted.
+
+Cross-kernel note: on 7.1.8-arch1-3 (stock Arch build, same base
+version), 60 loaded churn-mem runs produced no userspace fault and no
+kernel oops. Against the ~2.5%/run oops rate implied by the cachyos
+session, a clean 60-run batch has ~20% probability by luck alone, so
+kernel-build durability is suggestive, not established. Userspace fault
+rates are identical across both kernels (10/10 under the same recipe).
+
+## Raw excerpts (verbatim, timestamps +01:00)
+
+Aug 18 10:26:27 dragon-pro18 kernel: BUG: unable to handle page fault for address: ffffd60d8b2d3f60
+Aug 18 10:26:27 dragon-pro18 kernel: #PF: supervisor write access in kernel mode
+Aug 18 10:26:27 dragon-pro18 kernel: #PF: error_code(0x0002) - not-present page
+Aug 18 10:26:27 dragon-pro18 kernel: PGD 100008067 P4D 100008067 PUD 0 
+Aug 18 10:26:27 dragon-pro18 kernel: Oops: Oops: 0002 [#1] SMP NOPTI
+Aug 18 10:26:27 dragon-pro18 kernel: CPU: 19 UID: 1000 PID: 1295831 Comm: repro-c Tainted: G           O        7.1.8-1-cachyos #1 PREEMPT(full)  b4c0ec852ba11d95ca3c3dad93b04199835241c7
+Aug 18 10:26:27 dragon-pro18 kernel: Tainted: [O]=OOT_MODULE
+Aug 18 10:26:27 dragon-pro18 kernel: Hardware name: Dell Inc. Dell Pro Max 18 Plus MB18250/0Y3CTV, BIOS 3.3.2 08/03/2026
+Aug 18 10:26:27 dragon-pro18 kernel: RIP: 0010:entry_SYSCALL_64_after_hwframe+0x11/0x7e
+Aug 18 10:26:27 dragon-pro18 kernel: Code: 0f 22 dc 65 48 8b 25 5d 2f 59 03 6a 2b 65 ff 35 60 ff 57 03 41 53 6a 33 51 50 57 56 52 51 6a da 41 50 41 51 41 52 41 53 53 55 <41> 54 41 55 41 56 41 57 31 f6 31 d2 31 c9 45 31 c0 45 31 c9 45 31
+Aug 18 10:26:27 dragon-pro18 kernel: RSP: 0018:ffffd20d8b2d3f68 EFLAGS: 00010002
+Aug 18 10:26:27 dragon-pro18 kernel: RAX: 000000000000000a RBX: 00007fd11dc00000 RCX: 00007fd21dd4aadb
+Aug 18 10:26:27 dragon-pro18 kernel: RDX: 0000000000000005 RSI: 0000000000040000 RDI: 00007fd21deb5000
+Aug 18 10:26:27 dragon-pro18 kernel: RBP: 0000000041e1f000 R08: 00000000ffffffff R09: 0000000000000000
+Aug 18 10:26:27 dragon-pro18 kernel: R10: 0000000000004022 R11: 0000000000000287 R12: 00007fd21deb5000
+Aug 18 10:26:27 dragon-pro18 kernel: R13: 0000000041eb8000 R14: 0000000000030d40 R15: 000000000791ddc0
+Aug 18 10:26:27 dragon-pro18 kernel: FS:  00007fd21def5740(0000) GS:ffff8de158945000(0000) knlGS:0000000000000000
+Aug 18 10:26:27 dragon-pro18 kernel: CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+Aug 18 10:26:27 dragon-pro18 kernel: CR2: ffffd60d8b2d3f60 CR3: 000000088f95d003 CR4: 0000000008f72ef0
+Aug 18 10:26:27 dragon-pro18 kernel: PKRU: 55555554
+Aug 18 10:26:27 dragon-pro18 kernel: Call Trace:
+Aug 18 10:26:27 dragon-pro18 kernel:  <TASK>
+Aug 18 10:26:27 dragon-pro18 kernel:  </TASK>
+Aug 18 10:26:27 dragon-pro18 kernel: Modules linked in: nft_ct wireguard libcurve25519 ip6_udp_tunnel udp_tunnel nf_conntrack_netlink xt_nat xt_tcpudp veth xt_conntrack xt_MASQUERADE bridge stp llc xfrm_user xfrm_algo xt_set ip_set nft_chain_nat nf_nat nf_conntrack nf_defrag_ipv6 nf_defrag_ipv4 xt_addrtype nft_compat x_tables nf_tables nfnetlink rfcomm snd_seq_dummy snd_hrtimer snd_seq overlay algif_hash algif_skcipher af_alg bnep typec_thunderbolt snd_soc_cs42l43 snd_soc_cs42l43_sdw pinctrl_cs42l43 spi_cs42l43 snd_soc_sof_sdw snd_sof_probes snd_soc_intel_hda_dsp_common snd_soc_cs35l56_sdw snd_soc_cs35l56 snd_soc_cs35l56_shared snd_soc_cs_amp_lib cs42l43_sdw snd_soc_wm_adsp snd_hda_codec_intelhdmi regmap_sdw cs_dsp cs42l43 snd_soc_dmic snd_sof_pci_intel_mtl snd_sof_intel_hda_generic soundwire_intel snd_sof_intel_hda_sdw_bpt hid_sensor_custom_intel_hinge snd_sof_intel_hda_common snd_soc_hdac_hda snd_sof_intel_hda snd_sof_intel_hda_mlink vfat soundwire_cadence fat intel_rapl_msr snd_sof_pci snd_sof_xtensa_dsp intel_uncore_frequency
+Aug 18 10:26:27 dragon-pro18 kernel:  intel_uncore_frequency_common snd_sof x86_pkg_temp_thermal intel_powerclamp hid_sensor_prox hid_sensor_als snd_sof_utils hid_sensor_gyro_3d snd_ctl_led dell_pc hid_sensor_trigger snd_hda_ext_core kfifo_buf snd_soc_acpi_intel_match coretemp hid_sensor_iio_common snd_soc_acpi_intel_sdca_quirks industrialio soundwire_generic_allocation hid_sensor_custom iwlmld snd_soc_sdw_utils snd_hda_codec_nvhdmi hid_sensor_hub dell_laptop btusb mac80211 snd_hda_codec_hdmi snd_soc_acpi btmtk kvm_intel soundwire_bus cdc_mbim btbcm snd_usb_audio uvcvideo btintel intel_ishtp_hid snd_hda_intel cdc_wdm libarc4 snd_soc_sdca uvc ucsi_acpi cdc_ncm mhi_wwan_mbim kvm snd_hda_codec mhi_wwan_ctrl videobuf2_vmalloc snd_usbmidi_lib btrtl iwlwifi cdc_ether typec_ucsi snd_soc_core wwan dell_wmi videobuf2_memops iTCO_wdt processor_thermal_device_pci gnss spd5118 igc intel_pmc_bxt mei_gsc_proxy roles usbnet snd_ump mei_wdt irqbypass videobuf2_v4l2 processor_thermal_device ac97_bus hid_multitouch dell_smbios snd_hda_core snd_pcm_dmaengine
+Aug 18 10:26:27 dragon-pro18 kernel:  bluetooth cfg80211 i2c_i801 rapl processor_thermal_power_floor ptp spi_nor videobuf2_common snd_compress snd_rawmidi snd_intel_dspcfg mhi_pci_generic r8152 i2c_smbus typec intel_cstate dcdbas mei_me processor_thermal_wt_hint intel_uncore pcspkr psmouse dell_smm_hwmon dell_wmi_ddv dell_wmi_sysman firmware_attributes_class videodev wmi_bmof dell_wmi_descriptor mtd snd_seq_device intel_ish_ipc processor_thermal_wt_req crc8 pps_core i2c_mux mhi i2c_hid_acpi mii snd_intel_sdw_acpi mei mousedev mc intel_ishtp rfkill processor_thermal_rfim nvidia_wmi_ec_backlight intel_pmc_core joydev snd_hwdep i2c_hid processor_thermal_mbox platform_temperature_control nvidia_drm(O) snd_pcm processor_thermal_rapl dptf_pch_fivr snd_timer intel_hid pmt_telemetry int3403_thermal intel_rapl_common nvidia_modeset(O) acpi_tad int3400_thermal pmt_discovery snd processor_thermal_soc_slider sparse_keymap intel_vpu thunderbolt pmt_class acpi_thermal_rel pinctrl_meteorpoint acpi_pad soundcore pinctrl_meteorlake intel_pmc_ssram_telemetry
+Aug 18 10:26:27 dragon-pro18 kernel:  int340x_thermal_zone mac_hid nvidia_uvm(O) nvidia(O) sg i2c_dev crypto_user ntsync zram 842_decompress 842_compress lz4hc_compress lz4_compress dm_crypt encrypted_keys trusted tee asn1_encoder xe gpu_sched drm_ttm_helper drm_gpuvm drm_exec drm_gpusvm_helper drm_suballoc_helper dm_mod i915 drm_buddy rtsx_pci_sdmmc intel_gtt ttm mmc_core nvme i2c_algo_bit aesni_intel gf128mul spi_intel_pci intel_lpss_pci drm_display_helper nvme_core aead intel_lpss spi_intel video rtsx_pci nvme_keyring intel_vsec cec idma64 nvme_auth wmi serio_raw
+Aug 18 10:26:27 dragon-pro18 kernel: CR2: ffffd60d8b2d3f60
+Aug 18 10:26:27 dragon-pro18 kernel: ---[ end trace 0000000000000000 ]---
+Aug 18 10:26:27 dragon-pro18 kernel: RIP: 0010:entry_SYSCALL_64_after_hwframe+0x11/0x7e
+Aug 18 10:26:27 dragon-pro18 kernel: Code: 0f 22 dc 65 48 8b 25 5d 2f 59 03 6a 2b 65 ff 35 60 ff 57 03 41 53 6a 33 51 50 57 56 52 51 6a da 41 50 41 51 41 52 41 53 53 55 <41> 54 41 55 41 56 41 57 31 f6 31 d2 31 c9 45 31 c0 45 31 c9 45 31
+Aug 18 10:26:27 dragon-pro18 kernel: RSP: 0018:ffffd20d8b2d3f68 EFLAGS: 00010002
+Aug 18 10:26:27 dragon-pro18 kernel: RAX: 000000000000000a RBX: 00007fd11dc00000 RCX: 00007fd21dd4aadb
+Aug 18 10:26:27 dragon-pro18 kernel: RDX: 0000000000000005 RSI: 0000000000040000 RDI: 00007fd21deb5000
+Aug 18 10:26:27 dragon-pro18 kernel: RBP: 0000000041e1f000 R08: 00000000ffffffff R09: 0000000000000000
+Aug 18 10:26:27 dragon-pro18 kernel: R10: 0000000000004022 R11: 0000000000000287 R12: 00007fd21deb5000
+Aug 18 10:26:27 dragon-pro18 kernel: R13: 0000000041eb8000 R14: 0000000000030d40 R15: 000000000791ddc0
+Aug 18 10:26:27 dragon-pro18 kernel: FS:  00007fd21def5740(0000) GS:ffff8de158945000(0000) knlGS:0000000000000000
+Aug 18 10:26:27 dragon-pro18 kernel: CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+Aug 18 10:26:27 dragon-pro18 kernel: CR2: ffffd60d8b2d3f60 CR3: 000000088f95d003 CR4: 0000000008f72ef0
+Aug 18 10:26:27 dragon-pro18 kernel: PKRU: 55555554
+Aug 18 10:26:27 dragon-pro18 kernel: note: repro-c[1295831] exited with irqs disabled
+Aug 18 10:32:33 dragon-pro18 kernel: nvidia 0000:02:00.0: Enabling HDA controller
+Aug 18 10:32:58 dragon-pro18 kernel: nvidia 0000:02:00.0: Enabling HDA controller
+Aug 18 10:33:34 dragon-pro18 kernel: nvidia 0000:02:00.0: Enabling HDA controller
+Aug 18 10:42:35 dragon-pro18 kernel: BUG: unable to handle page fault for address: ffffd60d9628bcb0
+Aug 18 10:42:35 dragon-pro18 kernel: #PF: supervisor write access in kernel mode
+Aug 18 10:42:35 dragon-pro18 kernel: #PF: error_code(0x0002) - not-present page
+Aug 18 10:42:35 dragon-pro18 kernel: PGD 100008067 P4D 100008067 PUD 0 
+Aug 18 10:42:35 dragon-pro18 kernel: Oops: Oops: 0002 [#2] SMP NOPTI
+Aug 18 10:42:35 dragon-pro18 kernel: CPU: 19 UID: 1000 PID: 1320017 Comm: repro-c Tainted: G      D    O        7.1.8-1-cachyos #1 PREEMPT(full)  b4c0ec852ba11d95ca3c3dad93b04199835241c7
+Aug 18 10:42:35 dragon-pro18 kernel: Tainted: [D]=DIE, [O]=OOT_MODULE
+Aug 18 10:42:35 dragon-pro18 kernel: Hardware name: Dell Inc. Dell Pro Max 18 Plus MB18250/0Y3CTV, BIOS 3.3.2 08/03/2026
+Aug 18 10:42:35 dragon-pro18 kernel: RIP: 0010:__rb_insert_augmented+0x8/0x1f0
+Aug 18 10:42:35 dragon-pro18 kernel: Code: 4f 58 e9 a0 ed ff ff cc cc cc cc cc cc cc cc cc cc cc 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 f3 0f 1e fa 41 57 41 56 <41> 54 53 48 89 f0 48 89 fb 48 8b 37 48 85 f6 0f 84 8f 01 00 00 48
+Aug 18 10:42:35 dragon-pro18 kernel: RSP: 0000:ffffd20d9628bcb8 EFLAGS: 00010246
+Aug 18 10:42:35 dragon-pro18 kernel: RAX: ffff8dd012c118e0 RBX: ffff8dd012c118c0 RCX: 0000000000000000
+Aug 18 10:42:35 dragon-pro18 kernel: RDX: ffffffff847785f0 RSI: ffff8dcbf83882e8 RDI: ffff8dd012c118e0
+Aug 18 10:42:35 dragon-pro18 kernel: RBP: 0000000000001255 R08: ffff8dc1c0351500 R09: 0000000000000000
+Aug 18 10:42:35 dragon-pro18 kernel: R10: 0000000000000068 R11: 0000000000000001 R12: ffff8dcbf83882a0
+Aug 18 10:42:35 dragon-pro18 kernel: R13: ffff8dcbf83882a0 R14: ffff8dc1d436f88c R15: ffff8dce4e7eb9b0
+Aug 18 10:42:35 dragon-pro18 kernel: FS:  00007f34b3b02740(0000) GS:ffff8de158945000(0000) knlGS:0000000000000000
+Aug 18 10:42:35 dragon-pro18 kernel: CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+Aug 18 10:42:35 dragon-pro18 kernel: CR2: ffffd60d9628bcb0 CR3: 0000000b8f6b0005 CR4: 0000000008f72ef0
+Aug 18 10:42:35 dragon-pro18 kernel: PKRU: 55555554
+Aug 18 10:42:35 dragon-pro18 kernel: Call Trace:
+Aug 18 10:42:35 dragon-pro18 kernel:  <TASK>
+Aug 18 10:42:35 dragon-pro18 kernel:  __anon_vma_prepare+0xd4/0x1a0
+Aug 18 10:42:35 dragon-pro18 kernel:  do_pte_missing+0x88c/0xa30
+Aug 18 10:42:35 dragon-pro18 kernel:  ? alloc_pages_noprof+0xcc/0x160
+Aug 18 10:42:35 dragon-pro18 kernel:  ? __pmd_alloc+0x13b/0x190
+Aug 18 10:42:35 dragon-pro18 kernel:  handle_mm_fault+0x670/0x740
+Aug 18 10:42:35 dragon-pro18 kernel:  do_user_addr_fault+0x25c/0x440
+Aug 18 10:42:35 dragon-pro18 kernel:  exc_page_fault+0x66/0xd0
+Aug 18 10:42:35 dragon-pro18 kernel:  asm_exc_page_fault+0x26/0x30
+Aug 18 10:42:35 dragon-pro18 kernel: RIP: 0033:0x7f34b3ac202b
+Aug 18 10:42:35 dragon-pro18 kernel: Code: 0f 1e fa 55 48 89 e5 48 83 ec 30 45 31 e4 89 45 dc 48 89 75 f0 4c 89 75 e8 49 39 65 a0 76 35 8b 45 dc 85 c0 74 20 48 8b 45 e8 <83> 40 13 01 e8 23 00 00 00 8b 45 dc b9 01 00 00 00 29 c8 89 45 dc
+Aug 18 10:42:35 dragon-pro18 kernel: RSP: 002b:00007fff337d3d60 EFLAGS: 00010202
+Aug 18 10:42:35 dragon-pro18 kernel: RAX: 0000000040a8d100 RBX: 00007f33b3800000 RCX: 0000000000030d40
+Aug 18 10:42:35 dragon-pro18 kernel: RDX: 0000000040a8d100 RSI: 00000000413f4100 RDI: 00007f34b3ac2000
+Aug 18 10:42:35 dragon-pro18 kernel: RBP: 00007fff337d3d90 R08: 00000000ffffffff R09: 0000000000000000
+Aug 18 10:42:35 dragon-pro18 kernel: R10: 0000000000004022 R11: 0000000000000246 R12: 0000000000000000
+Aug 18 10:42:35 dragon-pro18 kernel: R13: 00000000413f4100 R14: 0000000040a8d100 R15: 000000001d873440
+Aug 18 10:42:35 dragon-pro18 kernel:  </TASK>
+Aug 18 10:42:35 dragon-pro18 kernel: Modules linked in: nft_ct wireguard libcurve25519 ip6_udp_tunnel udp_tunnel nf_conntrack_netlink xt_nat xt_tcpudp veth xt_conntrack xt_MASQUERADE bridge stp llc xfrm_user xfrm_algo xt_set ip_set nft_chain_nat nf_nat nf_conntrack nf_defrag_ipv6 nf_defrag_ipv4 xt_addrtype nft_compat x_tables nf_tables nfnetlink rfcomm snd_seq_dummy snd_hrtimer snd_seq overlay algif_hash algif_skcipher af_alg bnep typec_thunderbolt snd_soc_cs42l43 snd_soc_cs42l43_sdw pinctrl_cs42l43 spi_cs42l43 snd_soc_sof_sdw snd_sof_probes snd_soc_intel_hda_dsp_common snd_soc_cs35l56_sdw snd_soc_cs35l56 snd_soc_cs35l56_shared snd_soc_cs_amp_lib cs42l43_sdw snd_soc_wm_adsp snd_hda_codec_intelhdmi regmap_sdw cs_dsp cs42l43 snd_soc_dmic snd_sof_pci_intel_mtl snd_sof_intel_hda_generic soundwire_intel snd_sof_intel_hda_sdw_bpt hid_sensor_custom_intel_hinge snd_sof_intel_hda_common snd_soc_hdac_hda snd_sof_intel_hda snd_sof_intel_hda_mlink vfat soundwire_cadence fat intel_rapl_msr snd_sof_pci snd_sof_xtensa_dsp intel_uncore_frequency
+Aug 18 10:42:35 dragon-pro18 kernel:  intel_uncore_frequency_common snd_sof x86_pkg_temp_thermal intel_powerclamp hid_sensor_prox hid_sensor_als snd_sof_utils hid_sensor_gyro_3d snd_ctl_led dell_pc hid_sensor_trigger snd_hda_ext_core kfifo_buf snd_soc_acpi_intel_match coretemp hid_sensor_iio_common snd_soc_acpi_intel_sdca_quirks industrialio soundwire_generic_allocation hid_sensor_custom iwlmld snd_soc_sdw_utils snd_hda_codec_nvhdmi hid_sensor_hub dell_laptop btusb mac80211 snd_hda_codec_hdmi snd_soc_acpi btmtk kvm_intel soundwire_bus cdc_mbim btbcm snd_usb_audio uvcvideo btintel intel_ishtp_hid snd_hda_intel cdc_wdm libarc4 snd_soc_sdca uvc ucsi_acpi cdc_ncm mhi_wwan_mbim kvm snd_hda_codec mhi_wwan_ctrl videobuf2_vmalloc snd_usbmidi_lib btrtl iwlwifi cdc_ether typec_ucsi snd_soc_core wwan dell_wmi videobuf2_memops iTCO_wdt processor_thermal_device_pci gnss spd5118 igc intel_pmc_bxt mei_gsc_proxy roles usbnet snd_ump mei_wdt irqbypass videobuf2_v4l2 processor_thermal_device ac97_bus hid_multitouch dell_smbios snd_hda_core snd_pcm_dmaengine
+Aug 18 10:42:35 dragon-pro18 kernel:  bluetooth cfg80211 i2c_i801 rapl processor_thermal_power_floor ptp spi_nor videobuf2_common snd_compress snd_rawmidi snd_intel_dspcfg mhi_pci_generic r8152 i2c_smbus typec intel_cstate dcdbas mei_me processor_thermal_wt_hint intel_uncore pcspkr psmouse dell_smm_hwmon dell_wmi_ddv dell_wmi_sysman firmware_attributes_class videodev wmi_bmof dell_wmi_descriptor mtd snd_seq_device intel_ish_ipc processor_thermal_wt_req crc8 pps_core i2c_mux mhi i2c_hid_acpi mii snd_intel_sdw_acpi mei mousedev mc intel_ishtp rfkill processor_thermal_rfim nvidia_wmi_ec_backlight intel_pmc_core joydev snd_hwdep i2c_hid processor_thermal_mbox platform_temperature_control nvidia_drm(O) snd_pcm processor_thermal_rapl dptf_pch_fivr snd_timer intel_hid pmt_telemetry int3403_thermal intel_rapl_common nvidia_modeset(O) acpi_tad int3400_thermal pmt_discovery snd processor_thermal_soc_slider sparse_keymap intel_vpu thunderbolt pmt_class acpi_thermal_rel pinctrl_meteorpoint acpi_pad soundcore pinctrl_meteorlake intel_pmc_ssram_telemetry
+Aug 18 10:42:35 dragon-pro18 kernel:  int340x_thermal_zone mac_hid nvidia_uvm(O) nvidia(O) sg i2c_dev crypto_user ntsync zram 842_decompress 842_compress lz4hc_compress lz4_compress dm_crypt encrypted_keys trusted tee asn1_encoder xe gpu_sched drm_ttm_helper drm_gpuvm drm_exec drm_gpusvm_helper drm_suballoc_helper dm_mod i915 drm_buddy rtsx_pci_sdmmc intel_gtt ttm mmc_core nvme i2c_algo_bit aesni_intel gf128mul spi_intel_pci intel_lpss_pci drm_display_helper nvme_core aead intel_lpss spi_intel video rtsx_pci nvme_keyring intel_vsec cec idma64 nvme_auth wmi serio_raw
+Aug 18 10:42:35 dragon-pro18 kernel: CR2: ffffd60d9628bcb0
+Aug 18 10:42:35 dragon-pro18 kernel: ---[ end trace 0000000000000000 ]---
+Aug 18 10:42:35 dragon-pro18 kernel: RIP: 0010:entry_SYSCALL_64_after_hwframe+0x11/0x7e
+Aug 18 10:42:35 dragon-pro18 kernel: Code: 0f 22 dc 65 48 8b 25 5d 2f 59 03 6a 2b 65 ff 35 60 ff 57 03 41 53 6a 33 51 50 57 56 52 51 6a da 41 50 41 51 41 52 41 53 53 55 <41> 54 41 55 41 56 41 57 31 f6 31 d2 31 c9 45 31 c0 45 31 c9 45 31
+Aug 18 10:42:35 dragon-pro18 kernel: RSP: 0018:ffffd20d8b2d3f68 EFLAGS: 00010002
+Aug 18 10:42:35 dragon-pro18 kernel: RAX: 000000000000000a RBX: 00007fd11dc00000 RCX: 00007fd21dd4aadb
+Aug 18 10:42:35 dragon-pro18 kernel: RDX: 0000000000000005 RSI: 0000000000040000 RDI: 00007fd21deb5000
+Aug 18 10:42:35 dragon-pro18 kernel: RBP: 0000000041e1f000 R08: 00000000ffffffff R09: 0000000000000000
+Aug 18 10:42:35 dragon-pro18 kernel: R10: 0000000000004022 R11: 0000000000000287 R12: 00007fd21deb5000
+Aug 18 10:42:35 dragon-pro18 kernel: R13: 0000000041eb8000 R14: 0000000000030d40 R15: 000000000791ddc0
+Aug 18 10:42:35 dragon-pro18 kernel: FS:  00007f34b3b02740(0000) GS:ffff8de158945000(0000) knlGS:0000000000000000
+Aug 18 10:42:35 dragon-pro18 kernel: CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+Aug 18 10:42:35 dragon-pro18 kernel: CR2: ffffd60d9628bcb0 CR3: 0000000b8f6b0005 CR4: 0000000008f72ef0
+Aug 18 10:42:35 dragon-pro18 kernel: PKRU: 55555554
+Aug 18 10:42:35 dragon-pro18 kernel: note: repro-c[1320017] exited with irqs disabled
+Aug 18 10:42:35 dragon-pro18 kernel: note: repro-c[1320017] exited with preempt_count 1

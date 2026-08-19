@@ -1078,6 +1078,9 @@ vulnerable-shape operations in the pure-execution modes):
 
 ### Kernel-mode manifestation from the native churn runs
 
+Full verbatim excerpts with forensic context:
+`captures/kernel-oops-cpu19-20260818.txt`.
+
 The churn-mem shape never faulted in userspace, but two of its
 ~75 loaded runs ended in **kernel oopses on CPU 19** (kernel
 7.1.8-1-cachyos, 2026-08-18 10:26 and 10:42), discovered in the previous
