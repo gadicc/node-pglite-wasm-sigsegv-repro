@@ -23,6 +23,7 @@ The suite covers:
 - Argument and exit-code validation
 - Draft workload-spec validation and typed outcome classification
 - Internal shell-free attempt execution, deadlines, bounded output, and process-group cleanup
+- Versioned workload-bound attempt records and tamper rejection
 - Settings restoration under simulated signals
 - Statistics and parser fixtures
 - Evidence-envelope validation
@@ -89,9 +90,9 @@ They also exercise fast child exit, retained output descriptors, unavailable
 process-group observations, launch-time provenance drift, parent IPC loss, and
 TERM-to-KILL grace timing. All fixtures are harmless process-lifecycle programs.
 
-Before exposing a public generic interface, bind the internal attempt result to
-a versioned evidence envelope and migrate one current phase without changing
-legacy bundle interpretation.
+Before exposing a public generic interface, place the internal attempt record
+inside a versioned phase envelope and migrate one current phase without
+changing legacy bundle interpretation.
 
 Custom commands should be documented as trusted local workloads, not sandboxed code. They must not daemonize or escape the supervised process group.
 
