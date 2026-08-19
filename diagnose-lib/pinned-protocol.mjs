@@ -71,6 +71,7 @@ const MAX_PATH_BYTES = 4_096;
 const MAX_STRING_BYTES = 16 * 1024;
 const MAX_CONTEXTS = 256;
 const MAX_CONTEXT_FILE_BYTES = 1024 * 1024;
+const EXACT_CPU_STATE_FILE_MAX_BYTES = 8 * 1024 * 1024;
 const PROTOCOL_MARKER = Symbol("pinnedProtocolPlan");
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 
@@ -505,8 +506,10 @@ function fsyncDirectory(directory) {
   }
 }
 
+// The exact-CPU store reuses this proven no-clobber adapter in its own private
+// directory; legacy protocol readers still select only their own final names.
 const STATE_COMMIT_TEMP_RE =
-  /^\.(isolated-[0-9]{9}\.json|concurrent-[0-9]{9}-[a-z][a-z0-9_-]{0,63}\.json)\.([1-9][0-9]*)\.([a-f0-9]{16})\.(writing|ready)\.tmp$/;
+  /^\.(isolated-[0-9]{9}\.json|concurrent-[0-9]{9}-[a-z][a-z0-9_-]{0,63}\.json|exact-cpu-phase\.json|exact-cpu-attempt-[0-9]{9}\.json)\.([1-9][0-9]*)\.([a-f0-9]{16})\.(writing|ready)\.tmp$/;
 
 function processIsLive(pidText) {
   const pid = Number(pidText);
@@ -530,7 +533,8 @@ function recoverInterruptedStateCommits(directory) {
   const finalNames = new Set();
 
   for (const name of names) {
-    if (!name.startsWith(".isolated-") && !name.startsWith(".concurrent-")) continue;
+    if (!name.startsWith(".isolated-") && !name.startsWith(".concurrent-") &&
+        !name.startsWith(".exact-cpu-")) continue;
     const match = name.match(STATE_COMMIT_TEMP_RE);
     if (match === null) continue;
     const [, finalName, pid, , stage] = match;
@@ -546,7 +550,9 @@ function recoverInterruptedStateCommits(directory) {
     const finalPath = path.join(directory, finalName);
     const maximumBytes = finalName.startsWith("concurrent-")
       ? MAX_WAVE_STATE_FILE_BYTES
-      : DEFAULT_STATE_FILE_MAX_BYTES;
+      : finalName.startsWith("exact-cpu-")
+        ? EXACT_CPU_STATE_FILE_MAX_BYTES
+        : DEFAULT_STATE_FILE_MAX_BYTES;
     let temporaryStat;
     try {
       temporaryStat = lstatSync(temporaryPath, { bigint: true });

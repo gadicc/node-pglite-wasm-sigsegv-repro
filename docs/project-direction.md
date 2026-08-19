@@ -81,10 +81,11 @@ The intended implementation sequence is:
 10. Adopt the Fault Affinity package, command, and repository identity.
 
 The documentation, safety-net, workload-spec, bounded attempt-runner,
-versioned attempt-record, and exact-CPU phase-envelope foundations are
-complete. The internal adapter reuses the existing balanced-cyclic isolated
-schedule, binds every valid attempt to an exact CPU slot, and resumes only an
-exact schedule prefix. Current diagnostic phases do not write the new format,
-and `fault-affinity` is not yet an executable command. The next migration step
-is durable phase publication and a schema-3 bundle owner, while legacy bundle
-interpretation remains unchanged.
+versioned attempt-record, exact-CPU phase-envelope, and durable phase-store
+foundations are complete. The internal adapter reuses the existing
+balanced-cyclic isolated schedule, binds every valid attempt to an exact CPU
+slot, and resumes only an exact durably published prefix. Current diagnostic
+phases do not write the new format, and `fault-affinity` is not yet an
+executable command. The next migration step is a schema-3 bundle owner and
+exclusive execution lease, while legacy bundle interpretation remains
+unchanged.

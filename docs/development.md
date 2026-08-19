@@ -24,7 +24,7 @@ The suite covers:
 - Draft workload-spec validation and typed outcome classification
 - Internal shell-free attempt execution, deadlines, bounded output, and process-group cleanup
 - Versioned workload-bound attempt records and tamper rejection
-- Deterministic exact-CPU manifests, attempt envelopes, affinity witnesses, and prefix resume
+- Deterministic exact-CPU manifests, attempt envelopes, affinity witnesses, durable commits, and prefix resume
 - Settings restoration under simulated signals
 - Statistics and parser fixtures
 - Evidence-envelope validation
@@ -74,9 +74,10 @@ Do not infer missing signal, stderr, boundary, or generation data for a legacy p
 
 ## Keep workload execution bounded
 
-The internal workload contract, attempt runner, and exact-CPU phase adapter are
-implemented as a foundation, but no current `diagnose.sh` phase, legacy bundle,
-or public command uses the new formats. The offline tests prove:
+The internal workload contract, attempt runner, exact-CPU phase adapter, and
+durable phase store are implemented as a foundation, but no current
+`diagnose.sh` phase, legacy bundle, or public command uses the new formats. The
+offline tests prove:
 
 - Deadline-aware process-group termination
 - Cleanup of descendants on success, failure, timeout, `SIGINT`, and `SIGTERM`
@@ -87,15 +88,17 @@ or public command uses the new formats. The offline tests prove:
 - Workload digest binding across resume
 - Distinct direct signals, handled-crash exits, corruption exits, and operational failures
 - Singleton CPU inheritance, schedule binding, and exact-prefix resume
+- Private no-clobber state publication and bounded interrupted-write recovery
 
 They also exercise fast child exit, retained output descriptors, unavailable
 process-group observations, launch-time provenance drift, parent IPC loss, and
 TERM-to-KILL grace timing. All fixtures are harmless process-lifecycle programs.
 
-The exact-CPU adapter reuses the current balanced-cyclic isolated schedule and
-places each valid attempt record in a versioned envelope. Before exposing a
-public generic interface, add durable transactional storage and a schema-3
-bundle owner without changing legacy bundle interpretation.
+The exact-CPU adapter reuses the current balanced-cyclic isolated schedule,
+places each valid attempt record in a versioned envelope, and can publish an
+exact prefix to its private internal store. Before exposing a public generic
+interface, add a schema-3 bundle owner and exclusive execution lease without
+changing legacy bundle interpretation.
 
 Custom commands should be documented as trusted local workloads, not sandboxed code. They must not daemonize or escape the supervised process group.
 

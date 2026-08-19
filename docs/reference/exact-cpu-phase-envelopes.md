@@ -36,9 +36,23 @@ order. It rejects gaps, reordering, duplicate slots, CPU substitutions,
 schedule changes, workload changes, and record or digest tampering. The next
 slot comes from the validated schedule rather than from caller-supplied state.
 
-The current module returns canonical records and prefix assessments to its
-caller. It does not yet own an on-disk publication transaction or authorize
-resume for a schema-1 or schema-2 bundle.
+The internal store uses this layout inside a caller-owned private directory:
+
+| Path | Meaning |
+| --- | --- |
+| `exact-cpu-phase.json` | Exclusive canonical phase manifest |
+| `exact-cpu-attempt-NNNNNNNNN.json` | One exclusive canonical attempt envelope per ordinal |
+
+Publication uses synchronized private temporary files and an atomic
+no-clobber link point. A reader reconciles a dead writer's known temporary
+file, refuses a live writer, rejects unknown files, and rereads the complete
+exact prefix after every commit. The store caps one phase at 65,536 attempts,
+8 MiB per envelope, and 256 MiB in aggregate.
+
+The store prevents overwrite and conflicting publication, but it is not an
+execution lock. A future bundle owner must hold one exclusive writer lease
+across choosing, running, and committing the next attempt. This format still
+does not authorize resume for a schema-1 or schema-2 bundle.
 
 ## Keep affinity outside workload identity
 

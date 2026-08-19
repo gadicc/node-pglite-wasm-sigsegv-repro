@@ -30,9 +30,13 @@ starts its stable supervisor with a singleton mask, verifies that mask, then
 directly launches and verifies the workload that inherits it. The workload's
 executable and argument array never enter a shell program string.
 
-This format remains internal until a separate durable publication adapter and
-schema-3 bundle contract exist. Schema-1 and schema-2 bundles retain their
-original formats and readers.
+The internal durable store publishes the manifest and each envelope through
+private synchronized no-clobber files, recovers only known dead-writer
+temporaries, and validates the entire prefix after publication. It does not
+replace the exclusive execution lease that a future bundle owner must hold.
+
+This format and store remain internal until a schema-3 bundle contract exists.
+Schema-1 and schema-2 bundles retain their original formats and readers.
 
 ## Consequences
 
@@ -42,8 +46,8 @@ original formats and readers.
   consuming a schedule slot.
 - The existing isolated schedule implementation is reused without teaching
   legacy bundle readers a new meaning.
-- Phase storage must later publish the manifest and attempt envelopes
-  transactionally before a public generic command can resume them.
+- A future schema-3 owner can reuse the durable store but must provide the
+  writer lease, bundle-level workload binding, and phase-completion transaction.
 
 ## Acceptance criteria
 
@@ -52,4 +56,6 @@ original formats and readers.
 - Tests reject gaps and reordering in a resumed prefix.
 - A harmless process demonstrates and reports the requested singleton CPU.
 - Operationally invalid attempts do not advance the schedule.
+- Durable tests cover no-clobber commits, exact restart, dead-writer recovery,
+  live-writer refusal, gaps, foreign files, and concurrent duplicate commits.
 - No current bundle schema or public CLI behavior changes.
