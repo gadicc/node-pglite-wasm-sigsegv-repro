@@ -157,6 +157,18 @@ capabilities.
 
 Custom commands should be documented as trusted local workloads, not sandboxed code. They must not daemonize or escape the supervised process group.
 
+## Keep the public entry point stable
+
+`fault-affinity.mjs` is the package binary and compatibility-facing entry
+point. Keep it thin: argument parsing and orchestration live under
+`fault-affinity-lib/`, while protocol and persistence modules remain under
+`diagnose-lib/` as long as the public command and historical suite share them.
+
+Do not move built-in scripts merely to make the tree look tidier. Their
+canonical command and provenance paths participate in persisted workload
+identities. A compatibility-safe move needs either a stable old identity or an
+explicitly new workload profile.
+
 ## Keep crash workloads out of automation
 
 Continuous integration should run only hermetic tests, syntax checks, and native compilation checks. It must not:
