@@ -1322,8 +1322,80 @@ boundaries only if the controlled binaries justify a source bisect.
 
 ## Related reports
 
-No exact open duplicate was found as of 2026-07-14. Related but materially
-different reports include:
+No indexed public report found as of 2026-08-19 contains the exact recurring
+signature captured here: an ordinary memory access with clean architectural
+operands whose reported linear fault address is the intended effective address
+plus `2^42`. One report nevertheless provides strong independent platform and
+CPU-topology corroboration.
+
+### Closest independent platform report
+
+- [Ubuntu bug 2158237](https://bugs.launchpad.net/bugs/2158237) concerns
+  another Dell Pro Max 18 Plus MB18250 with a Core Ultra 9 285HX. During an
+  NVIDIA DKMS build, GCC failed at moving source locations, generated an
+  incorrect conftest result, and triggered a kernel page fault in
+  `post_alloc_hook` on CPU 19. Affinity testing passed on CPUs 0-7 and 8-15,
+  failed on 16-23, and hung or wedged the machine on 16-19; the investigator
+  identified CPUs 16-19, especially CPU 19, as the strongest suspect. The
+  [full affinity analysis](https://www.mail-archive.com/ubuntu-bugs%40lists.ubuntu.com/msg6288457.html)
+  classifies the problem as platform/kernel/firmware/hardware rather than an
+  NVIDIA source failure.
+- A second MB18250, using a Core Ultra 7 265HX, passed the same build on every
+  tested CPU group, including 16-19. The
+  [comparison-system follow-up](https://www.mail-archive.com/ubuntu-bugs%40lists.ubuntu.com/msg6288458.html)
+  therefore narrows the public observation to the affected 285HX
+  system/firmware/sample/cluster combination rather than a generic build bug.
+  The affected system was then on BIOS 2.6.1 and microcode `0x11b`; this
+  repository shows that E-core-localized failures on the same model and CPU
+  SKU can persist on BIOS 3.3.2 and microcode `0x122`.
+
+CPU 19 is the highest-rate isolated target and the source of the clearest live
+GDB and kernel-mode captures in this repository, but it is not the only
+logical CPU on which the workload has failed. The full follow-up observed
+isolated failures on CPUs 11, 19, 21, and 23, and pinned-concurrent failures on
+CPUs 9, 11, 17, 19, 21, 22, and 23. All are E-cores in this topology. The
+important overlap with the Ubuntu report is therefore E-core localization with
+particularly strong CPU-19 involvement, not exclusivity to CPU 19 or its
+16-19 cluster.
+
+The Ubuntu report does not publish the complete `post_alloc_hook` oops or a
+fault-address calculation, so it cannot establish that its failure has the
+same `+2^42` mechanism. Its independently reported model, CPU SKU, E-core
+cluster, nondeterministic userspace failures, kernel page fault, and prominent
+CPU-19 involvement make it the closest public corroboration found so far.
+
+### Intel errata and Arrow Lake-HX reports
+
+- Intel's current
+  [Core Ultra Series 2 specification update](https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/core-ultra-200s-series-processors-specification-update/summary-tables-of-changes/)
+  is revision 021 dated 2026-07-01. None of ARL001-ARL074 describes an
+  effective-address/AGU error, a CR2 bit-42 addition, or an ordinary load/store
+  using `EA + 0x40000000000`. The closest wording-level candidates are ARL036
+  (incorrect data and unpredictable behavior around C6+ transitions, marked
+  Fixed for HX), ARL037 (a core may hang entering or exiting C6+, Planned Fix
+  for HX), ARL029 (incorrect TLB entry after VM exit, Fixed for HX), and ARL047
+  (indirect branches may execute incorrect instructions, Fixed for HX). Their
+  stated trigger conditions and implications do not match the captures here.
+- Intel's
+  [2026-08-11 microcode release](https://github.com/intel/Intel-Linux-Processor-Microcode-Data-Files/blob/main/releasenote.md)
+  updated Arrow Lake-S/HX B0, CPUID `06-c6-02/82`, from `0x121` to `0x122`.
+  The userspace captures and native kernel oopses in this repository reproduce
+  on that current public microcode revision.
+- A large
+  [Microsoft Q&A report cluster](https://learn.microsoft.com/en-us/answers/questions/5921413/recurring-0x1e-bugcheck-in-nt-exppooltrackercharge)
+  covers Arrow Lake-HX 265HX/275HX/285HX systems from several OEMs. In two
+  full dumps, `lock xadd qword ptr [r14+r8],rbp` raised `#GP` even though the
+  computed target was valid, writable, and canonical. A Lenovo 275HX
+  reproducer reported failures only on E-cores, including logical CPU 19, and
+  only in its Performance power profile; a P-core-only attempt passed. Other
+  dumps in the same cluster contain genuinely stale or invalid pointers, so
+  this is mixed evidence and not an exact duplicate. A Dell community manager
+  stated on 2026-08-11 that the associated issue was
+  [under investigation with Microsoft and Intel](https://www.dell.com/community/en/conversations/alienware/aurora-16x-ac16251-bsods-and-kernel-pool-corrupted-0x1e-0x3b-0x7e-0xc0000005-during-idlebackground-activity-on-core-ultra-9-275hx/6a42b880e2a46e7a5aed9b63).
+
+### Software reports with different signatures
+
+Related but materially different Node, V8, and PGlite reports include:
 
 - [nodejs/node#62393](https://github.com/nodejs/node/issues/62393): intermittent
   V8 GC crash on macOS/arm64 using workers and `vm`, without this WASM repro.
@@ -1338,6 +1410,6 @@ different reports include:
 - [V8 issue 42203228](https://issues.chromium.org/issues/42203228): lazy and
   background compilation feedback-vector handling across instances/isolates.
 
-Those reports have different platforms, failure modes, or sharing models; none
-currently matches the exact CPU localization and recurring high-bit
-fault-address signature captured here.
+Those software reports have different platforms, failure modes, or sharing
+models; none currently matches the exact CPU localization and recurring
+high-bit fault-address signature captured here.
