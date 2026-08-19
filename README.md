@@ -4,7 +4,7 @@ Fault Affinity is a Linux harness for bounded, resumable investigation of interm
 
 The project began with native faults during Node.js and PGlite WebAssembly initialization. That workload remains as a historical heavyweight built-in and case study. The recommended reduced built-in is now the dependency-free WebAssembly churn workload.
 
-The first public generic command owns exact-CPU schema-3 bundles. The broader legacy diagnostic suite still provides baseline, topology, telemetry, debugger, frequency, and final-report phases specifically for the Node/PGlite investigation.
+The public generic commands own exact-only schema-3 bundles and correlated baseline-plus-exact bundles. The broader legacy diagnostic suite still provides topology, telemetry, debugger, frequency, and final-report phases specifically for the Node/PGlite investigation.
 
 ## Safety
 
@@ -18,13 +18,21 @@ Custom workloads are trusted local programs, not sandboxed code. They run with t
 
 The generic command and main legacy diagnostic runner do not require root. They do not change firmware, write sysfs settings, or alter unrelated process affinity. Optional root operations live in separate scripts for review before use.
 
-## Start with the generic exact-CPU command
+## Start with the generic commands
 
 Listing, inspection, and dry runs do not execute a workload:
 
 ```sh
 node fault-affinity.mjs workloads
-node fault-affinity.mjs inspect --workload wasm-churn
+node fault-affinity.mjs inspect --workload wasm-churn-suite
+node fault-affinity.mjs baseline \
+  --workload wasm-churn-suite \
+  --children 4 \
+  --waves 10 \
+  --exact-cpus 18-21 \
+  --exact-rounds 10 \
+  --out-dir diagnostics/wasm-baseline \
+  --dry-run
 node fault-affinity.mjs exact \
   --workload wasm-churn \
   --cpus 19 \
@@ -49,7 +57,7 @@ node fault-affinity.mjs exact \
   --yes
 ```
 
-Use `--workload-file path/to/workload.json` to select a trusted local script or binary. The initial generic command is intentionally exact-CPU-only; it does not yet produce the legacy suite's complete report. Read [run a generic exact-CPU workload](docs/guides/generic-exact-cpu.md) for custom definitions, lifecycle rules, evidence semantics, and resume behavior.
+Use `--workload-file path/to/workload.json` to select a trusted local script or binary. `wasm-churn` and `node-pglite` preserve their exact-only identities; the `-suite` profiles declare baseline and later localization capabilities without changing old bundle identities. Read [run generic baseline waves](docs/guides/generic-baseline.md) and [run a generic exact-CPU workload](docs/guides/generic-exact-cpu.md). These commands do not yet produce the legacy suite's complete report.
 
 ## Reproduce the historical Node/PGlite failure
 
@@ -209,6 +217,7 @@ See [software controls](docs/case-study/software-controls.md) for the recorded N
 
 - [Documentation map](docs/README.md)
 - [Project direction](docs/project-direction.md)
+- [Run generic baseline waves](docs/guides/generic-baseline.md)
 - [Run a generic exact-CPU workload](docs/guides/generic-exact-cpu.md)
 - [Run the diagnostic suite](docs/guides/run-diagnostics.md)
 - [Run controlled-load experiments](docs/guides/controlled-load-experiments.md)

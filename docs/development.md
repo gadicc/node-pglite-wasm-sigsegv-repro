@@ -136,12 +136,13 @@ private store and holds one bundle lease across selecting, running, and
 committing the next slot. The public command creates and resumes this variant;
 its integration fixture is a harmless finite process, never a built-in trigger.
 
-The internal baseline adapter separately binds fixed concurrent waves and
-publishes only complete whole-wave envelopes. Schema-3 manifest version 2 binds
-baseline and exact-CPU state without adding fields to version 1 in place. The
-same bundle lease covers selecting, running, and committing an entire baseline
-wave. Expose that phase publicly only after its command-level capability and
-compatibility contract is equally explicit.
+The baseline adapter separately binds fixed concurrent waves and publishes only
+complete whole-wave envelopes. Schema-3 manifest version 2 binds baseline and
+exact-CPU state without adding fields to version 1 in place. The same bundle
+lease covers selecting, running, and committing an entire baseline wave. The
+public baseline command uses harmless finite custom processes in automation and
+keeps published exact-only built-in identities separate from multi-phase
+profiles.
 
 Schema-3 manifest version 3 additionally binds CPU-group contexts. Contexts
 may overlap, their order is deterministically balanced, and every child must
@@ -171,10 +172,9 @@ Manual crash experiments need an explicit operator, a reviewed plan, and a dispo
 
 ## Check documentation changes
 
-Documentation commands must reflect the current `--help` output. Do not
-present internal baseline, group, pinned-concurrent, controlled-load, debugger,
-or frequency adapters as public generic commands until their orchestration
-exists.
+Documentation commands must reflect the current `--help` output. Do not present
+internal group, pinned-concurrent, controlled-load, debugger, or frequency
+adapters as public generic commands until their orchestration exists.
 
 When headings move, search for repository-relative anchors:
 

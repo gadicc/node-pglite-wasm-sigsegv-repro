@@ -16,6 +16,67 @@ export const CUSTOM_WORKLOAD_FILE_MAX_BYTES = 1024 * 1024;
 
 const REPOSITORY_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
+
+function wasmChurnSpec({ id, label, capabilities }) {
+  const script = path.join(REPOSITORY_ROOT, "mini-wasm-churn.mjs");
+  return {
+    version: 1,
+    id,
+    label,
+    description: "Dependency-free reduced trigger with fresh WebAssembly module lifecycle churn.",
+    risk: "standard",
+    command: {
+      executable: process.execPath,
+      args: [script, "200000", "1000"],
+      cwd: REPOSITORY_ROOT,
+    },
+    environment: {},
+    attempt: {
+      mode: "survive-window",
+      timeoutMs: 10_000,
+      termGraceMs: 500,
+      killGraceMs: 1_000,
+    },
+    outcomes: {
+      targetSignals: ["SIGSEGV"],
+      mappedExits: [{ code: 43, category: "corruption", label: "data-mismatch" }],
+    },
+    capabilities,
+    provenance: { completeness: "complete", files: [script] },
+  };
+}
+
+function nodePgliteSpec({ id, label, capabilities }) {
+  const child = path.join(REPOSITORY_ROOT, "child.mjs");
+  const packageJson = path.join(REPOSITORY_ROOT, "package.json");
+  const lock = path.join(REPOSITORY_ROOT, "package-lock.json");
+  return {
+    version: 1,
+    id,
+    label,
+    description: "Historical application-derived PGlite initialization and query trigger.",
+    risk: "high-memory",
+    command: {
+      executable: process.execPath,
+      args: [child],
+      cwd: REPOSITORY_ROOT,
+    },
+    environment: {},
+    attempt: {
+      mode: "exit",
+      timeoutMs: 120_000,
+      termGraceMs: 1_000,
+      killGraceMs: 2_000,
+    },
+    outcomes: { targetSignals: ["SIGSEGV"], mappedExits: [] },
+    capabilities,
+    provenance: {
+      completeness: "partial",
+      files: [child, packageJson, lock],
+    },
+  };
+}
+
 const BUILT_INS = Object.freeze({
   "wasm-churn": Object.freeze({
     id: "wasm-churn",
@@ -25,32 +86,31 @@ const BUILT_INS = Object.freeze({
     risk: "standard",
     liveWarning: "Continuously compiles, instantiates, and executes fresh WebAssembly modules until the bounded attempt ends.",
     buildSpec() {
-      const script = path.join(REPOSITORY_ROOT, "mini-wasm-churn.mjs");
-      return {
-        version: 1,
+      return wasmChurnSpec({
         id: "wasm-churn",
         label: "WebAssembly churn",
-        description: "Dependency-free reduced trigger with fresh WebAssembly module lifecycle churn.",
-        risk: "standard",
-        command: {
-          executable: process.execPath,
-          args: [script, "200000", "1000"],
-          cwd: REPOSITORY_ROOT,
-        },
-        environment: {},
-        attempt: {
-          mode: "survive-window",
-          timeoutMs: 10_000,
-          termGraceMs: 500,
-          killGraceMs: 1_000,
-        },
-        outcomes: {
-          targetSignals: ["SIGSEGV"],
-          mappedExits: [{ code: 43, category: "corruption", label: "data-mismatch" }],
-        },
         capabilities: { isolated: true },
-        provenance: { completeness: "complete", files: [script] },
-      };
+      });
+    },
+  }),
+  "wasm-churn-suite": Object.freeze({
+    id: "wasm-churn-suite",
+    label: "WebAssembly churn multi-phase profile",
+    recommended: true,
+    role: "Recommended dependency-free baseline and CPU-localization profile",
+    risk: "standard",
+    liveWarning: "Continuously compiles, instantiates, and executes fresh WebAssembly modules; concurrent phases multiply CPU use.",
+    buildSpec() {
+      return wasmChurnSpec({
+        id: "wasm-churn-suite",
+        label: "WebAssembly churn multi-phase profile",
+        capabilities: {
+          baseline: true,
+          groups: true,
+          isolated: true,
+          pinnedConcurrent: true,
+        },
+      });
     },
   }),
   "node-pglite": Object.freeze({
@@ -61,34 +121,31 @@ const BUILT_INS = Object.freeze({
     risk: "high-memory",
     liveWarning: "One PGlite client can use about 1.2 GiB; run npm ci before selecting this workload.",
     buildSpec() {
-      const child = path.join(REPOSITORY_ROOT, "child.mjs");
-      const packageJson = path.join(REPOSITORY_ROOT, "package.json");
-      const lock = path.join(REPOSITORY_ROOT, "package-lock.json");
-      return {
-        version: 1,
+      return nodePgliteSpec({
         id: "node-pglite",
         label: "Node/PGlite historical reproduction",
-        description: "Historical application-derived PGlite initialization and query trigger.",
-        risk: "high-memory",
-        command: {
-          executable: process.execPath,
-          args: [child],
-          cwd: REPOSITORY_ROOT,
-        },
-        environment: {},
-        attempt: {
-          mode: "exit",
-          timeoutMs: 120_000,
-          termGraceMs: 1_000,
-          killGraceMs: 2_000,
-        },
-        outcomes: { targetSignals: ["SIGSEGV"], mappedExits: [] },
         capabilities: { isolated: true },
-        provenance: {
-          completeness: "partial",
-          files: [child, packageJson, lock],
+      });
+    },
+  }),
+  "node-pglite-suite": Object.freeze({
+    id: "node-pglite-suite",
+    label: "Node/PGlite historical multi-phase profile",
+    recommended: false,
+    role: "Historical heavyweight baseline and CPU-localization profile",
+    risk: "high-memory",
+    liveWarning: "One PGlite client can use about 1.2 GiB; concurrent phases multiply memory use and require npm ci first.",
+    buildSpec() {
+      return nodePgliteSpec({
+        id: "node-pglite-suite",
+        label: "Node/PGlite historical multi-phase profile",
+        capabilities: {
+          baseline: true,
+          groups: true,
+          isolated: true,
+          pinnedConcurrent: true,
         },
-      };
+      });
     },
   }),
 });

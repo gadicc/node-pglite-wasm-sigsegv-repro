@@ -1,10 +1,10 @@
 # Run a generic exact-CPU workload
 
 The `fault-affinity` command runs one explicitly selected workload through a
-bounded, deterministic exact-CPU schedule. This is the first public generic
-path. It creates and resumes schema-3 evidence bundles, but it does not yet run
-the generic baseline, topology-group, pinned-concurrent, controlled-load,
-debugger, or frequency phases.
+bounded, deterministic exact-CPU schedule. It creates exact-only schema-3
+version-1 bundles and can advance the exact phase in baseline-plus-exact
+version-2 bundles. It does not yet run topology-group, pinned-concurrent,
+controlled-load, debugger, or frequency phases.
 
 ## Inspect before running
 
@@ -20,6 +20,12 @@ node fault-affinity.mjs inspect --workload node-pglite --json
 `node-pglite` preserves the historical heavyweight reproduction and needs
 `npm ci` before a live run. Listing and inspection only resolve and hash the
 workload; they do not launch it.
+
+The `wasm-churn-suite` and `node-pglite-suite` IDs declare additional phase
+capabilities. Use one of those identities when creating a
+[generic baseline bundle](generic-baseline.md), and keep using the same suite ID
+when advancing that bundle's exact phase. The exact-only IDs remain unchanged
+for version-1 resume compatibility.
 
 ## Plan an exact-CPU schedule
 
@@ -69,6 +75,10 @@ node fault-affinity.mjs exact \
 Resume re-resolves the workload and refuses a different executable, arguments,
 environment binding, provenance, classifier, or lifecycle. One exclusive
 bundle lease prevents two writers from advancing the same schedule.
+
+For a version-2 bundle created by `fault-affinity baseline`, the exact schedule
+was fixed at bundle creation. `exact --resume` uses that stored schedule and
+shares the same lease with baseline operations.
 
 `SIGINT` and `SIGTERM` cancel the active attempt, retain ownership through
 bounded cleanup, and leave the interrupted schedule slot uncommitted so it can

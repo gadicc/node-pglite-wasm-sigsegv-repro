@@ -1,8 +1,8 @@
-# Understand internal baseline concurrent waves
+# Understand baseline concurrent waves
 
-Baseline phase version 1 is the internal bridge between the generic attempt
-runner and schema-3 bundle manifest version 2. No current `diagnose.sh` phase or
-legacy bundle writes this format.
+Baseline phase version 1 bridges the generic attempt runner and schema-3 bundle
+manifest version 2. `fault-affinity baseline` now creates and advances this
+format. No `diagnose.sh` phase or legacy bundle writes it.
 
 ## Treat one wave as the schedule unit
 
@@ -34,7 +34,7 @@ on resume.
 
 ## Resume one exact prefix
 
-The internal store uses this layout inside a caller-owned private directory:
+The store uses this layout inside a caller-owned private directory:
 
 | Path | Meaning |
 | --- | --- |
@@ -53,4 +53,5 @@ the phase, and the bundle owner holds its descriptor-backed lease across
 selection, execution, and commit. Manifest version 1 remains exact-only.
 
 See [ADR 0011](../decisions/0011-baseline-concurrent-waves.md) for the accepted
-format and migration boundary.
+format and [ADR 0020](../decisions/0020-public-baseline-cli-and-capability-profiles.md)
+for the public orchestration boundary.

@@ -70,16 +70,29 @@ function customFixture(overrides = {}) {
 
 test("the built-in catalog is descriptive and resolves without executing a workload", () => {
   const listed = listBuiltInWorkloads();
-  assert.deepEqual(listed.map(({ id }) => id), ["wasm-churn", "node-pglite"]);
+  assert.deepEqual(listed.map(({ id }) => id), [
+    "wasm-churn",
+    "wasm-churn-suite",
+    "node-pglite",
+    "node-pglite-suite",
+  ]);
   assert.equal(listed[0].recommended, true);
-  assert.equal(listed[1].risk, "high-memory");
+  assert.equal(listed[2].risk, "high-memory");
 
   const selected = resolveBuiltInWorkload("wasm-churn");
   assert.equal(selected.source, "built-in");
   assert.equal(selected.resolved.id, "wasm-churn");
+  assert.equal(selected.resolved.capabilities.baseline, false);
   assert.equal(selected.resolved.capabilities.isolated, true);
   assert.equal(selected.resolved.attempt.mode, "survive-window");
   assert.match(selected.resolved.digest, /^[a-f0-9]{64}$/);
+
+  const suite = resolveBuiltInWorkload("wasm-churn-suite");
+  assert.equal(suite.resolved.capabilities.baseline, true);
+  assert.equal(suite.resolved.capabilities.groups, true);
+  assert.equal(suite.resolved.capabilities.isolated, true);
+  assert.equal(suite.resolved.capabilities.pinnedConcurrent, true);
+  assert.notEqual(suite.resolved.digest, selected.resolved.digest);
 });
 
 test("custom files resolve relative paths and bind definition, environment, and provenance", () => {

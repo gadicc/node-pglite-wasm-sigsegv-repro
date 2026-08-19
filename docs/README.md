@@ -10,6 +10,7 @@ This index separates instructions for running the current tooling from the resul
 ## Run the current tools
 
 - [Run a generic exact-CPU workload](guides/generic-exact-cpu.md): built-in and custom workload selection, dry runs, live execution, and schema-3 resume
+- [Run generic baseline waves](guides/generic-baseline.md): correlated-wave planning, schema-3 v2 creation, resume, and its bound exact phase
 - [Run the diagnostic suite](guides/run-diagnostics.md): prerequisites, presets, exact-CPU protocols, optional privileged steps, and exploratory follow-ups
 - [Run controlled-load experiments](guides/controlled-load-experiments.md): load-state A/B/A, GDB capture, Node A/B/A, and Node/warmup matrix modes
 - [Understand evidence bundles](reference/evidence-bundles.md): output layout, integrity, privacy, resume, redo, and phase validation
@@ -33,7 +34,7 @@ This index separates instructions for running the current tooling from the resul
 - [Develop and test the tooling](development.md): offline tests, safe test scope, and repository boundaries
 - [Understand internal attempt records](reference/attempt-records.md): workload binding, typed outcomes, cleanup evidence, and canonical record bindings
 - [Understand internal exact-CPU phase envelopes](reference/exact-cpu-phase-envelopes.md): schedule identity, attempt slots, affinity, durable publication, and exact-prefix resume
-- [Understand internal baseline concurrent waves](reference/baseline-concurrent-waves.md): correlated wave identity, child slots, all-or-nothing publication, and exact-prefix resume
+- [Understand baseline concurrent waves](reference/baseline-concurrent-waves.md): correlated wave identity, child slots, all-or-nothing publication, and exact-prefix resume
 - [Understand internal CPU-group waves](reference/group-topology-waves.md): overlapping topology contexts, inherited masks, balanced scheduling, and whole-wave resume
 - [Understand internal pinned-concurrent waves](reference/pinned-concurrent-waves.md): controller placement, singleton child affinity, balanced scheduling, and whole-wave resume
 - [Understand managed auxiliary workloads](reference/managed-auxiliary-workloads.md): verified readiness, silent output, bounded cleanup, and separation from diagnostic attempts

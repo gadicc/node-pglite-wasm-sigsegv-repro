@@ -1,8 +1,8 @@
 # Workload catalog
 
-Fault Affinity selects every live workload explicitly. The initial public
-catalog exposes only the exact-CPU capability; the legacy diagnostic scripts
-remain separate until their other phases use the generic owner.
+Fault Affinity selects every live workload explicitly. The public catalog has
+exact-only and multi-phase identities; the legacy diagnostic scripts remain
+separate until their remaining phases use the generic owner.
 
 ```sh
 node fault-affinity.mjs workloads
@@ -12,10 +12,21 @@ node fault-affinity.mjs inspect --workload wasm-churn
 ## Built-ins
 
 - `wasm-churn` is the recommended dependency-free reduced trigger. Each
-  attempt is a bounded survival window around `mini-wasm-churn.mjs`.
+  attempt is a bounded survival window around `mini-wasm-churn.mjs`; this ID
+  preserves the published exact-only identity.
+- `wasm-churn-suite` runs the same trigger with a distinct identity declaring
+  baseline, group, exact-CPU, and pinned-concurrent capabilities. It is the
+  recommended built-in for a version-2 baseline bundle.
 - `node-pglite` is the historical heavyweight trigger. It keeps
   `child.mjs`, `package.json`, and `package-lock.json` in provenance and requires
-  the installed PGlite dependency at execution time.
+  the installed PGlite dependency at execution time; this ID remains
+  exact-only.
+- `node-pglite-suite` is the corresponding high-memory multi-phase identity.
+  Concurrent baseline waves multiply its roughly 1.2 GiB per-child memory use.
+
+Capability declarations are part of the workload digest. The `-suite` IDs
+therefore add phases without silently changing the identity used by existing
+exact-only bundles.
 
 Neither built-in runs while listing, inspecting, or planning.
 
@@ -61,6 +72,7 @@ Example finite workload:
     "mappedExits": []
   },
   "capabilities": {
+    "baseline": true,
     "isolated": true
   },
   "provenance": {
@@ -73,3 +85,7 @@ Example finite workload:
 Scripts should name their interpreter as `command.executable` and place the
 script path in `command.args` and `provenance.files`. Command strings are never
 evaluated through a shell.
+
+For exact-only use, omit `baseline` or set it to `false`. A version-2 baseline
+bundle requires both `baseline` and `isolated` because its immutable manifest
+binds both phase schedules.

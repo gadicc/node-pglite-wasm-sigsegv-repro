@@ -13,6 +13,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { readLinuxAllowedCpuList } from "./diagnose-lib/attempt-runner.mjs";
+import {
+  buildBaselinePhaseManifest,
+  MAX_BASELINE_CHILDREN,
+  MAX_BASELINE_WAVES,
+} from "./diagnose-lib/baseline-phase.mjs";
 import { buildExactCpuPhaseManifest } from "./diagnose-lib/exact-cpu-phase.mjs";
 import {
   MAX_SCHEDULE_ENTRIES,
@@ -22,9 +27,11 @@ import {
 } from "./diagnose-lib/pinned-runner.mjs";
 import {
   buildSchema3BundleManifest,
+  buildSchema3BundleManifestV2,
   initializeSchema3Bundle,
   newSchema3BundleGeneration,
   readSchema3Bundle,
+  runOneSchema3BaselineWave,
   runOneSchema3ExactCpuAttempt,
 } from "./diagnose-lib/schema3-bundle.mjs";
 import {
@@ -36,18 +43,24 @@ const DEFAULT_TASKSET_PATH = "/usr/bin/taskset";
 const ZERO_GENERATION = "0".repeat(32);
 const MAX_PATH_BYTES = 16 * 1024;
 
-const HELP = `Fault Affinity: bounded, resumable exact-CPU workload diagnostics
+const HELP = `Fault Affinity: bounded, resumable workload diagnostics
 
 Usage:
   fault-affinity workloads [--json]
   fault-affinity inspect (--workload ID | --workload-file FILE) [--json]
+  fault-affinity baseline (--workload ID | --workload-file FILE) \\
+    --children N --waves N --exact-cpus LIST [--exact-rounds N] \\
+    [--exact-seed N] --out-dir DIR (--dry-run | --yes)
+  fault-affinity baseline --resume DIR (--workload ID | --workload-file FILE) --yes
   fault-affinity exact (--workload ID | --workload-file FILE) \\
     --cpus LIST [--rounds N] [--seed N] --out-dir DIR (--dry-run | --yes)
   fault-affinity exact --resume DIR (--workload ID | --workload-file FILE) --yes
 
-The initial public command owns only exact-CPU schema-3 bundles. Listing,
-inspection, and dry runs never execute a workload or create an evidence bundle.
-Every live run requires an explicit workload selection and --yes.
+The baseline command owns schema-3 v2 bundles with correlated baseline waves
+and a pre-bound exact-CPU schedule. The exact command owns exact-only v1 bundles
+and can advance exact state in v2 bundles. Listing, inspection, and dry runs
+never execute a workload or create an evidence bundle. Every live run requires
+an explicit workload selection and --yes.
 `;
 
 export class FaultAffinityCliError extends Error {
@@ -116,16 +129,16 @@ function parseCanonicalInteger(value, label, minimum, maximum) {
   return number;
 }
 
-function parseCanonicalCpuList(value) {
+function parseCanonicalCpuList(value, label = "--cpus") {
   let cpus;
   try {
     cpus = expandCpuList(value);
   } catch (error) {
-    fail(`--cpus is invalid: ${error.message}`);
+    fail(`${label} is invalid: ${error.message}`);
   }
   const ascending = [...cpus].sort((left, right) => left - right);
   if (ascending.some((cpu, index) => cpu !== cpus[index]) || compressCpuList(cpus) !== value) {
-    fail("--cpus must be a canonical ascending CPU list such as 0-3,8");
+    fail(`${label} must be a canonical ascending CPU list such as 0-3,8`);
   }
   return cpus;
 }
@@ -193,6 +206,64 @@ export function parseFaultAffinityArgs(argv) {
       rounds: parseCanonicalInteger(options.roundsText ?? "1", "--rounds", 1,
         MAX_SCHEDULE_ENTRIES),
       seed: parseCanonicalInteger(options.seedText ?? "0", "--seed", 0, MAX_SEED),
+      outDir: options.outDir,
+      tasksetPath: options.tasksetPath ?? DEFAULT_TASKSET_PATH,
+    });
+  }
+  if (command === "baseline") {
+    const options = parseOptions(rest, new Map([
+      ["--workload", "workload"],
+      ["--workload-file", "workloadFile"],
+      ["--children", "childrenText"],
+      ["--waves", "wavesText"],
+      ["--exact-cpus", "exactCpuSpec"],
+      ["--exact-rounds", "exactRoundsText"],
+      ["--exact-seed", "exactSeedText"],
+      ["--out-dir", "outDir"],
+      ["--resume", "resumeDir"],
+      ["--taskset", "tasksetPath"],
+    ]), new Map([
+      ["--dry-run", "dryRun"], ["--yes", "yes"],
+      ["--help", "help"], ["-h", "help"],
+    ]));
+    if (options.help) return Object.freeze({ command, help: true });
+    const selection = selectionFrom(options);
+    if (options.resumeDir !== undefined) {
+      const fresh = [
+        "childrenText", "wavesText", "exactCpuSpec", "exactRoundsText",
+        "exactSeedText", "outDir", "tasksetPath",
+      ].filter((key) => options[key] !== undefined);
+      if (fresh.length > 0) fail("--resume cannot be combined with fresh schedule options");
+      if (!options.yes || options.dryRun) fail("a baseline resume requires --yes");
+      return Object.freeze({ command, mode: "resume", ...selection,
+        resumeDir: options.resumeDir });
+    }
+    if (options.childrenText === undefined || options.wavesText === undefined ||
+        options.exactCpuSpec === undefined || options.outDir === undefined) {
+      fail("a fresh baseline run requires --children N, --waves N, --exact-cpus LIST, and --out-dir DIR");
+    }
+    if (Boolean(options.dryRun) === Boolean(options.yes)) {
+      fail("choose exactly one --dry-run or --yes for a fresh baseline run");
+    }
+    const children = parseCanonicalInteger(options.childrenText, "--children", 1,
+      MAX_BASELINE_CHILDREN);
+    const waves = parseCanonicalInteger(options.wavesText, "--waves", 1,
+      MAX_BASELINE_WAVES);
+    if (children * waves > MAX_SCHEDULE_ENTRIES) {
+      fail(`baseline schedule exceeds ${MAX_SCHEDULE_ENTRIES} attempts`);
+    }
+    return Object.freeze({
+      command,
+      mode: options.dryRun ? "dry-run" : "fresh",
+      ...selection,
+      children,
+      waves,
+      exactCpus: parseCanonicalCpuList(options.exactCpuSpec, "--exact-cpus"),
+      exactCpuSpec: options.exactCpuSpec,
+      exactRounds: parseCanonicalInteger(options.exactRoundsText ?? "1", "--exact-rounds",
+        1, MAX_SCHEDULE_ENTRIES),
+      exactSeed: parseCanonicalInteger(options.exactSeedText ?? "0", "--exact-seed",
+        0, MAX_SEED),
       outDir: options.outDir,
       tasksetPath: options.tasksetPath ?? DEFAULT_TASKSET_PATH,
     });
@@ -316,6 +387,7 @@ function renderWorkload(selection) {
     `role: ${summary.role}`,
     `risk: ${summary.risk}`,
     `attempt: ${summary.attempt.mode}, ${summary.attempt.timeoutMs} ms deadline`,
+    `baseline capability: ${summary.capabilities.baseline ? "supported" : "unsupported"}`,
     `exact-CPU capability: ${summary.capabilities.isolated ? "supported" : "unsupported"}`,
     `workload digest: ${summary.digest}`,
     `warning: ${summary.liveWarning}`,
@@ -334,6 +406,15 @@ function resolveSelection(parsed, cwd) {
 function assertExactCapability(selection) {
   if (selection.resolved.capabilities.isolated !== true) {
     fail(`workload '${selection.resolved.id}' does not declare exact-CPU capability`);
+  }
+}
+
+function assertBaselineCapabilities(selection) {
+  if (selection.resolved.capabilities.baseline !== true) {
+    fail(`workload '${selection.resolved.id}' does not declare baseline capability`);
+  }
+  if (selection.resolved.capabilities.isolated !== true) {
+    fail(`workload '${selection.resolved.id}' does not declare exact-CPU capability required by schema-3 v2`);
   }
 }
 
@@ -358,6 +439,26 @@ function buildFreshManifest(resolved, parsed, tasksetPath, dryRun) {
   });
   return buildSchema3BundleManifest(resolved, {
     bundleGeneration: dryRun ? ZERO_GENERATION : newSchema3BundleGeneration(),
+    exactCpuManifest,
+  });
+}
+
+function buildFreshBaselineManifest(resolved, parsed, tasksetPath, dryRun) {
+  const baselineManifest = buildBaselinePhaseManifest(resolved, {
+    generation: dryRun ? ZERO_GENERATION : generation(),
+    childrenPerWave: parsed.children,
+    waves: parsed.waves,
+  });
+  const exactCpuManifest = buildExactCpuPhaseManifest(resolved, {
+    generation: dryRun ? ZERO_GENERATION : generation(),
+    cpus: parsed.exactCpus,
+    rounds: parsed.exactRounds,
+    seed: parsed.exactSeed,
+    tasksetPath,
+  });
+  return buildSchema3BundleManifestV2(resolved, {
+    bundleGeneration: dryRun ? ZERO_GENERATION : newSchema3BundleGeneration(),
+    baselineManifest,
     exactCpuManifest,
   });
 }
@@ -417,6 +518,56 @@ async function runExactBundle({ resolved, bundleDir, signalSource, writeOut, wri
   }
 }
 
+function baselineOutcomeSummary(envelope) {
+  const counts = new Map();
+  for (const entry of envelope.attempts) {
+    const category = entry.attempt.evidence.outcome.category;
+    counts.set(category, (counts.get(category) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+    .map(([category, count]) => `${category}:${count}`)
+    .join(",");
+}
+
+async function runBaselineBundle({ resolved, bundleDir, signalSource, writeOut, writeErr }) {
+  const forwarding = installSignalForwarding(signalSource);
+  try {
+    let bundle = await readSchema3Bundle({ resolved, bundleDir });
+    if (bundle.baseline === undefined) {
+      fail("schema-3 bundle does not bind a baseline phase");
+    }
+    while (!bundle.baseline.progress.complete) {
+      if (forwarding.signal.aborted) return signalExitCode(forwarding.received());
+      const { nextWave, committedWaves, totalWaves } = bundle.baseline.progress;
+      writeOut(`wave ${committedWaves + 1}/${totalWaves} children=${nextWave.childCount}\n`);
+      const execution = await runOneSchema3BaselineWave({
+        resolved,
+        bundleDir,
+        attemptOptions: { signal: forwarding.signal },
+      });
+      bundle = execution.bundle;
+      if (execution.result.committed) {
+        writeOut(`committed wave=${execution.result.wave.ordinal} outcomes=` +
+          `${baselineOutcomeSummary(execution.result.envelope)}\n`);
+        continue;
+      }
+      if (forwarding.signal.aborted) return signalExitCode(forwarding.received());
+      if (execution.result.reason === "complete") break;
+      writeErr(`baseline wave was not committed: ${execution.result.reason}` +
+        `${execution.result.errorCode ? ` (${execution.result.errorCode})` : ""}\n`);
+      return 1;
+    }
+    const { committedWaves, totalWaves, committedAttempts, totalAttempts } =
+      bundle.baseline.progress;
+    writeOut(`complete: ${committedWaves}/${totalWaves} baseline waves ` +
+      `(${committedAttempts}/${totalAttempts} attempts) in ${bundleDir}\n`);
+    return 0;
+  } finally {
+    forwarding.remove();
+  }
+}
+
 export async function runFaultAffinityCli(argv, io = {}) {
   const writeOut = io.stdout ?? ((value) => process.stdout.write(value));
   const writeErr = io.stderr ?? ((value) => process.stderr.write(value));
@@ -444,6 +595,60 @@ export async function runFaultAffinityCli(argv, io = {}) {
       if (parsed.json) writeOut(`${JSON.stringify(workloadSummary(selection), null, 2)}\n`);
       else writeOut(`${renderWorkload(selection)}\n`);
       return 0;
+    }
+    if (parsed.command === "baseline") {
+      assertBaselineCapabilities(selection);
+      if (parsed.mode !== "dry-run") assertAutomationBoundary(selection);
+      if (parsed.mode === "resume") {
+        const bundleDir = resolveExistingBundleDirectory(path.resolve(cwd, parsed.resumeDir));
+        writeOut(`resuming baseline workload=${selection.resolved.id} bundle=${bundleDir}\n`);
+        writeOut(`warning: ${selection.metadata.liveWarning}\n`);
+        return await runBaselineBundle({
+          resolved: selection.resolved,
+          bundleDir,
+          signalSource,
+          writeOut,
+          writeErr,
+        });
+      }
+      const tasksetPath = resolveExecutablePath(parsed.tasksetPath, "--taskset");
+      const allowedCpuSpec = ensureAllowedCpus(parsed.exactCpus);
+      const manifest = buildFreshBaselineManifest(
+        selection.resolved,
+        parsed,
+        tasksetPath,
+        parsed.mode === "dry-run",
+      );
+      const baselineAttempts = manifest.baseline.manifest.schedule.attemptCount;
+      const exactAttempts = manifest.exactCpu.manifest.schedule.attemptCount;
+      if (parsed.mode === "dry-run") {
+        writeOut(`${renderWorkload(selection)}\n`);
+        writeOut(`plan: baseline ${parsed.children} child(ren) x ${parsed.waves} wave(s); ` +
+          `${baselineAttempts} attempt(s)\n`);
+        writeOut(`bound exact plan: CPUs ${parsed.exactCpuSpec}; ${parsed.exactRounds} ` +
+          `round(s); ${exactAttempts} attempt(s); seed ${parsed.exactSeed}\n`);
+        writeOut(`host allowance: ${allowedCpuSpec}\n`);
+        writeOut(`planned bundle: ${path.resolve(cwd, parsed.outDir)}\n`);
+        writeOut("dry run: no workload executed and no bundle created\n");
+        return 0;
+      }
+      const bundleDir = createPrivateBundleDirectory(path.resolve(cwd, parsed.outDir));
+      await initializeSchema3Bundle({
+        resolved: selection.resolved,
+        manifest,
+        bundleDir,
+      });
+      writeOut(`starting baseline workload=${selection.resolved.id} ` +
+        `risk=${selection.resolved.risk} waves=${parsed.waves} ` +
+        `children=${parsed.children} bundle=${bundleDir}\n`);
+      writeOut(`warning: ${selection.metadata.liveWarning}\n`);
+      return await runBaselineBundle({
+        resolved: selection.resolved,
+        bundleDir,
+        signalSource,
+        writeOut,
+        writeErr,
+      });
     }
     assertExactCapability(selection);
     if (parsed.mode !== "dry-run") assertAutomationBoundary(selection);

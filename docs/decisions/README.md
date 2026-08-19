@@ -25,3 +25,4 @@ behavior and compatibility boundaries, not current runtime capabilities.
 | [ADR 0017](0017-controlled-load-aba-sessions.md) | Accepted | Publish only complete single-workload A1/B/A2 sessions with a verified B condition. |
 | [ADR 0018](0018-controlled-load-store-and-manifest-v5.md) | Accepted | Own complete controlled-load sessions in a no-clobber store and schema-3 manifest-v5 variant. |
 | [ADR 0019](0019-public-exact-cli-and-project-identity.md) | Accepted | Publish the exact-CPU schema-3 command and adopt the Fault Affinity package identity without renaming legacy state. |
+| [ADR 0020](0020-public-baseline-cli-and-capability-profiles.md) | Accepted | Publish schema-3 baseline orchestration while preserving exact-only built-in identities through explicit multi-phase profiles. |

@@ -2,7 +2,8 @@
 
 This page separates the implemented Fault Affinity foundation from the
 remaining migration work. **Fault Affinity** is now the package and public
-command identity; the first generic public path is exact-CPU execution.
+command identity. Exact-CPU execution was the first generic public path;
+correlated baseline waves are now public through schema-3 manifest version 2.
 
 ## Define the intended scope
 
@@ -109,17 +110,24 @@ stable supervisors retain the lease through bounded cleanup if the outer owner
 is interrupted.
 
 The `fault-affinity` command now exposes reviewed workload listing, inspection,
-dry-run planning, fresh exact-CPU schema-3 bundle creation, and exact-prefix
-resume. It supports the recommended `wasm-churn` and historical `node-pglite`
-built-ins plus trusted custom JSON workload definitions. This completes the
+dry-run planning, fresh exact-only schema-3 bundle creation, exact-prefix
+resume, and complete correlated baseline waves in manifest-v2 bundles. A
+baseline command pre-binds the downstream exact schedule; the exact command can
+then advance that same bundle. Trusted custom JSON workloads declare their own
+capabilities.
+
+The published `wasm-churn` and `node-pglite` IDs retain their exact-only
+workload identities. Separate `wasm-churn-suite` and `node-pglite-suite`
+profiles declare baseline, group, isolated, and pinned-concurrent capability so
+later public phases do not mutate old bundle identities. This completes the
 package/command portion of steps 9 and 10 without requiring a physical checkout
 or repository-host rename.
 
-The internal baseline, group, and pinned-concurrent adapters are not yet
-publicly orchestrated for arbitrary workloads. The controlled-load foundation
-has a managed auxiliary lifecycle, verified worker sets, complete A1/B/A2
-envelopes, a complete-only store, and schema-3 manifest-v5 ownership, but still
-has no generic public command. Debugger and frequency protocols still need
+The internal group and pinned-concurrent adapters are not yet publicly
+orchestrated for arbitrary workloads. The controlled-load foundation has a
+managed auxiliary lifecycle, verified worker sets, complete A1/B/A2 envelopes,
+a complete-only store, and schema-3 manifest-v5 ownership, but still has no
+generic public command. Debugger and frequency protocols still need
 workload-bound adapters where applicable. Historical Node A/B/A and
 Node-by-warmup modes remain multi-workload experiments outside the current
 schema.

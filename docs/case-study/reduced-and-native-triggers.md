@@ -45,7 +45,11 @@ Recorded CPU 19 results were:
 
 Fresh WebAssembly module churn is therefore the practical reduced trigger. It replaces PGlite with a dependency-free script while retaining the high measured failure rate.
 
-The script currently runs until it faults or receives an external termination request. The diagnostic suite does not yet provide bounded built-in supervision for it. Use an external deadline carefully and preserve termination as a control outcome, not a workload signal.
+Direct invocation runs until it faults or receives an external termination
+request. Fault Affinity provides bounded supervision through the `wasm-churn`
+exact-only and `wasm-churn-suite` multi-phase built-ins. The legacy diagnostic
+suite still does not select this trigger. Preserve planned termination as
+cleanup evidence, not a workload signal.
 
 ## Interpret the rate ladder
 
