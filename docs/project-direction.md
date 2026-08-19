@@ -80,7 +80,9 @@ The intended implementation sequence is:
 9. Extract built-in workloads and reorganize the source tree.
 10. Adopt the Fault Affinity package, command, and repository identity.
 
-The documentation and safety-net stages are complete. An internal workload-spec
-validator now establishes part of the contract foundation, but no generic
-attempt runner or evidence binding exists. `fault-affinity` is not yet an
-executable command.
+The documentation, safety-net, workload-spec, and bounded attempt-runner
+foundations are complete. The runner is internal: current diagnostic phases do
+not call it, it writes no public evidence schema, and it does not make
+`fault-affinity` an executable command. The next migration step is to bind its
+typed attempt result to versioned evidence before moving an existing diagnostic
+path onto it.

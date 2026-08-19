@@ -22,6 +22,7 @@ The suite covers:
 - CPU-list parsing
 - Argument and exit-code validation
 - Draft workload-spec validation and typed outcome classification
+- Internal shell-free attempt execution, deadlines, bounded output, and process-group cleanup
 - Settings restoration under simulated signals
 - Statistics and parser fixtures
 - Evidence-envelope validation
@@ -69,9 +70,11 @@ When changing a phase or record format:
 
 Do not infer missing signal, stderr, boundary, or generation data for a legacy protocol.
 
-## Keep future workload execution bounded
+## Keep workload execution bounded
 
-The planned generic workload interface is not implemented. Before exposing it, tests must prove:
+The internal workload contract and attempt runner are implemented as a
+foundation, but no current diagnostic phase or public command uses them. The
+offline tests prove:
 
 - Deadline-aware process-group termination
 - Cleanup of descendants on success, failure, timeout, `SIGINT`, and `SIGTERM`
@@ -81,6 +84,14 @@ The planned generic workload interface is not implemented. Before exposing it, t
 - Secret-safe environment provenance
 - Workload digest binding across resume
 - Distinct direct signals, handled-crash exits, corruption exits, and operational failures
+
+They also exercise fast child exit, retained output descriptors, unavailable
+process-group observations, launch-time provenance drift, parent IPC loss, and
+TERM-to-KILL grace timing. All fixtures are harmless process-lifecycle programs.
+
+Before exposing a public generic interface, bind the internal attempt result to
+a versioned evidence envelope and migrate one current phase without changing
+legacy bundle interpretation.
 
 Custom commands should be documented as trusted local workloads, not sandboxed code. They must not daemonize or escape the supervised process group.
 

@@ -40,6 +40,7 @@ export const WORKLOAD_OUTCOME_CATEGORIES = Object.freeze([
 export const ATTEMPT_TERMINAL_REASONS = Object.freeze([
   "natural-exit",
   "observation-window-elapsed",
+  "terminal-race-unresolved",
   "external-cancel",
   "launch-error",
   "cleanup-failure",
@@ -441,6 +442,15 @@ export function workloadLaunchEnvironment(resolved) {
 }
 
 function verifyFileRecord(record, label, { executable = false } = {}) {
+  plainObject(record, label);
+  exactKeys(record, ["path", "sha256", "bytes", "mode"], label);
+  if (typeof record.sha256 !== "string" || !DIGEST_RE.test(record.sha256) ||
+      typeof record.bytes !== "string" || record.bytes.length > 10 ||
+      !/^(0|[1-9][0-9]*)$/.test(record.bytes) ||
+      BigInt(record.bytes) > BigInt(MAX_ARTIFACT_BYTES) ||
+      !Number.isSafeInteger(record.mode) || record.mode < 0 || record.mode > 0o777) {
+    fail(`${label} contains malformed provenance fields`);
+  }
   const canonical = canonicalPath(record.path, label, "file");
   if (canonical !== record.path) {
     fail(`${label} no longer resolves to its recorded path`, "WORKLOAD_PROVENANCE_CHANGED");
@@ -452,15 +462,42 @@ function verifyFileRecord(record, label, { executable = false } = {}) {
   }
 }
 
-export function verifyWorkloadProvenance(resolved) {
+export function workloadLaunchProvenance(resolved) {
   if (!RESOLVED_WORKLOADS.has(resolved) || !DIGEST_RE.test(resolved.digest)) {
     fail("resolved workload is invalid");
   }
-  verifyFileRecord(resolved.command.executable, "command.executable", { executable: true });
-  for (const [index, artifact] of resolved.provenance.files.entries()) {
-    verifyFileRecord(artifact, `provenance.files[${index}]`);
+  return Object.freeze({
+    executable: resolved.command.executable,
+    cwd: resolved.command.cwd,
+    files: resolved.provenance.files,
+  });
+}
+
+export function verifyWorkloadLaunchProvenance(snapshot) {
+  const value = plainObject(snapshot, "workload launch provenance");
+  exactKeys(value, ["executable", "cwd", "files"], "workload launch provenance");
+  if (!Array.isArray(value.files) || value.files.length > MAX_ARTIFACTS) {
+    fail(`workload launch provenance.files must contain at most ${MAX_ARTIFACTS} records`);
+  }
+  const canonicalCwd = canonicalPath(value.cwd, "workload launch provenance.cwd", "directory");
+  if (canonicalCwd !== value.cwd) {
+    fail("workload launch provenance.cwd no longer resolves to its recorded path",
+      "WORKLOAD_PROVENANCE_CHANGED");
+  }
+  verifyFileRecord(value.executable, "workload launch provenance.executable", {
+    executable: true,
+  });
+  const seen = new Set();
+  for (const [index, record] of value.files.entries()) {
+    verifyFileRecord(record, `workload launch provenance.files[${index}]`);
+    if (seen.has(record.path)) fail(`workload launch provenance path '${record.path}' is duplicated`);
+    seen.add(record.path);
   }
   return true;
+}
+
+export function verifyWorkloadProvenance(resolved) {
+  return verifyWorkloadLaunchProvenance(workloadLaunchProvenance(resolved));
 }
 
 function invalidAttempt(invalidReason, raw) {
@@ -528,6 +565,9 @@ export function classifyWorkloadAttempt(resolved, observation) {
   }
   if (launchErrorCode !== null) return invalidAttempt("unexpected-launch-error", raw);
   if (terminalReason === "external-cancel") return invalidAttempt("external-cancel", raw);
+  if (terminalReason === "terminal-race-unresolved") {
+    return invalidAttempt("terminal-race-unresolved", raw);
+  }
   if (terminalReason === "observation-window-elapsed") {
     if (exitCode !== null || signal !== null) {
       return invalidAttempt("ambiguous-terminal-event", raw);

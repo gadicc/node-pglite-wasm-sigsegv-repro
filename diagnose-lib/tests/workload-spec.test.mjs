@@ -9,8 +9,10 @@ import {
   canonicalWorkloadJson,
   classifyWorkloadAttempt,
   resolveWorkloadSpec,
+  verifyWorkloadLaunchProvenance,
   verifyWorkloadProvenance,
   workloadLaunchEnvironment,
+  workloadLaunchProvenance,
 } from "../workload-spec.mjs";
 
 const fixtureDirectories = [];
@@ -161,8 +163,22 @@ test("provenance revalidation detects drift after resolution", () => {
   const files = fixture();
   const resolved = resolve(spec(files));
   assert.equal(verifyWorkloadProvenance(resolved), true);
+  assert.equal(verifyWorkloadLaunchProvenance(workloadLaunchProvenance(resolved)), true);
   writeFileSync(files.artifact, "changed after resolution\n");
   assert.throws(() => verifyWorkloadProvenance(resolved), /recorded identity/);
+});
+
+test("launch provenance rejects malformed or duplicated records", () => {
+  const resolved = resolve(spec(fixture()));
+  const snapshot = workloadLaunchProvenance(resolved);
+  assert.throws(() => verifyWorkloadLaunchProvenance({
+    ...snapshot,
+    executable: { ...snapshot.executable, bytes: "9".repeat(64) },
+  }), /malformed provenance/);
+  assert.throws(() => verifyWorkloadLaunchProvenance({
+    ...snapshot,
+    files: [snapshot.files[0], snapshot.files[0]],
+  }), /duplicated/);
 });
 
 test("workload resolution rejects ambiguous or unsafe command contracts", () => {
@@ -273,6 +289,20 @@ test("deadline races never hide a workload status", () => {
   assert.equal(classifyWorkloadAttempt(continuous, racedFault).category, "operational-invalid");
   assert.equal(classifyWorkloadAttempt(continuous, racedFault).invalidReason,
     "ambiguous-terminal-event");
+});
+
+test("an unresolved deadline race is always operationally invalid", () => {
+  const files = fixture();
+  const continuous = resolve(spec(files, {
+    attempt: { ...spec(files).attempt, mode: "survive-window" },
+  }));
+  const result = classifyWorkloadAttempt(continuous, observe({
+    exitCode: null,
+    terminalReason: "terminal-race-unresolved",
+  }));
+
+  assert.equal(result.category, "operational-invalid");
+  assert.equal(result.invalidReason, "terminal-race-unresolved");
 });
 
 test("a natural early exit keeps its raw outcome in survive-window mode", () => {
