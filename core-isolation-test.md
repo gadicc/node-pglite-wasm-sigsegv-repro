@@ -1,4 +1,9 @@
-# On problematic system, CPUs 0–7 are P-cores and 8–23 are E-cores.
+# Preliminary CPU-isolation transcript
+
+> [!IMPORTANT]
+> This historical console transcript is superseded by the seeded individual and pinned-concurrent protocols summarized in [the current CPU-localization case study](docs/case-study/fault-signature-and-cpu-localization.md). It remains available to preserve the investigation sequence and original raw observations.
+
+On the affected system, CPUs 0–7 are P-cores and CPUs 8–23 are E-cores.
 
 ## Yes, we can isolate to groups of cores
 

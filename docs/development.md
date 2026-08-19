@@ -1,0 +1,111 @@
+# Develop and test the tooling
+
+This guide describes the current offline test suite and safety boundary. The automated tests do not run the crash workload or change system settings.
+
+## Run the offline suite
+
+Install dependencies, then run:
+
+```sh
+npm ci
+npm test
+```
+
+The direct script remains available:
+
+```sh
+bash diagnose-lib/tests/run-tests.sh
+```
+
+The suite covers:
+
+- CPU-list parsing
+- Argument and exit-code validation
+- Draft workload-spec validation and typed outcome classification
+- Settings restoration under simulated signals
+- Statistics and parser fixtures
+- Evidence-envelope validation
+- Generation and workload binding
+- Derived-output write guards
+- Process-group supervision
+- Telemetry association and session handling
+- Synthetic collect-and-report integration
+
+It does not invoke `child.mjs`, `mini-wasm.mjs`, `mini-wasm-churn.mjs`, `repro-c`, or any other live fault trigger.
+
+## Test controlled-load orchestration safely
+
+Controlled-load tests use stubs and fake runners. They validate:
+
+- Mode and argument handling
+- Mode-specific phase plans
+- Constant-load Node A/B/A sequencing
+- Repeated worker identity and affinity checks
+- Controller signal forwarding
+- Exact Node provenance
+- GDB process and accounting reconciliation
+- Publication of a validated fake capture envelope
+
+The tests must not start `/usr/bin/yes` workers or execute the real PGlite child.
+
+## Keep privileged behavior separate
+
+`diagnose.sh` must remain unprivileged. Root-only behavior belongs in reviewable companion scripts with explicit staging, publication, restoration, and recovery contracts.
+
+Tests for privileged flows should simulate sysfs and process state in fixtures. They must not write real firmware, BIOS, cpufreq, turbo, or `/run` state.
+
+The historical recovery namespace `/run/node-pglite-wasm-sigsegv-repro/` is a compatibility boundary. Do not rename it as part of cosmetic project rebranding.
+
+## Preserve evidence semantics
+
+When changing a phase or record format:
+
+1. Define whether outcome meaning or liveness changes.
+2. Add a new version when old evidence cannot retain the same interpretation.
+3. Keep old readers faithful to their original semantics.
+4. Fail closed on missing, malformed, mismatched, or future-version evidence.
+5. Preserve superseded generations instead of overwriting them.
+6. Add adversarial resume and partial-publication fixtures.
+
+Do not infer missing signal, stderr, boundary, or generation data for a legacy protocol.
+
+## Keep future workload execution bounded
+
+The planned generic workload interface is not implemented. Before exposing it, tests must prove:
+
+- Deadline-aware process-group termination
+- Cleanup of descendants on success, failure, timeout, `SIGINT`, and `SIGTERM`
+- Distinction between harness termination and workload signals
+- Canonical executable and working-directory resolution
+- Argument-array execution without a shell
+- Secret-safe environment provenance
+- Workload digest binding across resume
+- Distinct direct signals, handled-crash exits, corruption exits, and operational failures
+
+Custom commands should be documented as trusted local workloads, not sandboxed code. They must not daemonize or escape the supervised process group.
+
+## Keep crash workloads out of automation
+
+Continuous integration should run only hermetic tests, syntax checks, and native compilation checks. It must not:
+
+- Start the PGlite reproduction
+- Run reduced WebAssembly churn
+- Execute native churn modes
+- Invoke GDB against a live fault trigger
+- Change sysfs or BIOS state
+- Require root
+
+Manual crash experiments need an explicit operator, a reviewed plan, and a disposable or recoverable environment appropriate to the stated risk.
+
+## Check documentation changes
+
+Documentation commands must reflect the current `--help` output. Do not publish future `fault-affinity` commands until the executable exists.
+
+When headings move, search for repository-relative anchors:
+
+```sh
+rg -n 'README\.md#|docs/.*\.md#' \
+  --glob '*.md'
+```
+
+Review all external evidence links and update measured dates only when a new documented experiment supports the change.

@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  safe-validation:
+    name: Safe validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Run hermetic diagnostic-tooling tests
+        run: npm test
+
+      - name: Compile native harness without running it
+        run: >-
+          cc -O2 -Wall -Wextra -pthread
+          -o "$RUNNER_TEMP/repro-c"
+          repro-c.c

@@ -11,7 +11,7 @@ The strongest reasons are:
 
 1. Three validated Node v25.2.1 captures show ordinary x86-64 base-plus-displacement instructions, an unchanged and correct `r13`, a mapped intended address, and an unmapped `si_addr` exactly `2^42` higher. For example, `r13=0x6720080` plus `0x1c0` is `0x6720240`, but the kernel reported `0x40006720240`. With the recorded instruction bytes and architectural register state, V8's emitted instruction has no operand that can add bit 42.
 2. The best direct V8 effective-address fix, [`89ab7b1e`](https://chromium.googlesource.com/v8/v8/+/89ab7b1efb333b85f5669b10659b8b4abf14bb9b), fixes signed 32-bit displacement overflow for an optimized `Load64 >> 32` fold near `0x7ffffffc`. It does not match the small `0xa8`/`0x1c0` displacements, the observed store/add forms, or the unchanged base register.
-3. Official Node v26.5.1, which already uses V8 `14.6.202.34`, also crashed in the repository's subsequent sweep; so did Node v25.9.0 and a Node 27 V8 canary. The v26.7.0 campaign itself had one endpoint-resolved failure. These observations directly rule out “V8 14.6.202.34 universally fixed it.” See [README.md](../README.md#post-report-flag-and-version-sweep).
+3. Official Node v26.5.1, which already uses V8 `14.6.202.34`, also crashed in the repository's subsequent sweep; so did Node v25.9.0 and a Node 27 V8 canary. The v26.7.0 campaign itself had one endpoint-resolved failure. These observations directly rule out “V8 14.6.202.34 universally fixed it.” See [the post-report flag sweep](../docs/case-study/origin-and-reproduction.md#repeat-the-post-report-flag-sweep).
 4. The two headline binaries are not controlled builds. The v25.2.1 NVM binary is a 123,759,744-byte, Clang-built, statically bundled official-style binary without PGO. `/usr/bin/node` is a 54,306,160-byte Arch-style, GCC-built, PGO-enabled, dynamically linked system binary. Compiler, PGO, layout, linkage, packaging, and potentially downstream patches change together with Node/V8.
 5. Several changes can plausibly perturb code layout, memory layout, spill placement, tiering timing, or signal/trap exposure. The strongest are V8's lazy Wasm `ArrayBuffer` allocation and its new default spill placement. They are credible **trigger perturbations**, not matches for the observed `+2^42` computation.
 
@@ -23,7 +23,7 @@ Direct observations used here:
 
 - Node v25.2.1 / V8 `14.1.146.11-node.14`, PGlite 0.5.4.
 - CPU 19 isolated single-process rate `146/398 = 36.7%`; pinned-concurrent contexts approached 100%.
-- Three validated GDB captures from the 2026-08-11 diagnostic bundle, matching the [fault-address signature documented in the README](../README.md#the-fault-address-signature), all with a mapped/writable intended address and `si_addr = intended + 2^42`.
+- Three validated GDB captures from the 2026-08-11 diagnostic bundle, matching the [documented fault-address signature](../docs/case-study/fault-signature-and-cpu-localization.md#identify-the-recurring-fault-address-signature), all with a mapped/writable intended address and `si_addr = intended + 2^42`.
 - Different instruction forms reproduced the same bit: `addl $1,0x1c0(%r13)` and `mov %r10,0xa8(%r13)`.
 - The current v26.7.0 observation was 20/20 immediate clean and nearly clean in the larger A/B/A campaign, but not failure-free over all trials.
 - PGlite 0.5.4 and the query stayed constant within the comparison.

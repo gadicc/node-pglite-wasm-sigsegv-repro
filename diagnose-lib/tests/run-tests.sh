@@ -2,8 +2,9 @@
 # run-tests.sh - test suite for the diagnostic runner tooling.
 #
 # Covers: CPU-list parsing, settings restore on SIGINT/SIGTERM/normal exit,
-# script argument validation and exit codes, statistics, log/capture
-# parsing, and an end-to-end collect+report run on a synthetic bundle.
+# script argument validation and exit codes, workload-contract validation,
+# statistics, log/capture parsing, and an end-to-end collect+report run on a
+# synthetic bundle.
 # Nothing here runs the actual crash workload.
 set -u
 
@@ -8007,11 +8008,11 @@ for variant in duplicate noncanonical meta-symlink results-symlink; do
 done
 check_eq "stored baseline config is unique, canonical, and loaded without symlinks" "1" "$baseline_config_guards"
 
-echo "== node unit tests (stats, parsers) =="
+echo "== node unit tests =="
 if (cd "$LIB" && node --test 'tests/*.test.mjs') > "$TMP/node-tests.log" 2>&1; then
-  ok "node --test stats+parsers"
+  ok "node --test unit modules"
 else
-  bad "node --test stats+parsers"
+  bad "node --test unit modules"
   sed 's/^/    /' "$TMP/node-tests.log" >&2
 fi
 
