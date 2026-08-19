@@ -15,6 +15,7 @@ import {
   MAX_BASELINE_WAVES,
 } from "../diagnose-lib/baseline-phase.mjs";
 import { buildExactCpuPhaseManifest } from "../diagnose-lib/exact-cpu-phase.mjs";
+import { buildGroupPhaseManifest } from "../diagnose-lib/group-phase.mjs";
 import {
   MAX_SCHEDULE_ENTRIES,
   MAX_SEED,
@@ -24,16 +25,19 @@ import {
 import {
   buildSchema3BundleManifest,
   buildSchema3BundleManifestV2,
+  buildSchema3BundleManifestV3,
   initializeSchema3Bundle,
   newSchema3BundleGeneration,
   readSchema3Bundle,
   runOneSchema3BaselineWave,
   runOneSchema3ExactCpuAttempt,
+  runOneSchema3GroupWave,
 } from "../diagnose-lib/schema3-bundle.mjs";
 import {
   listBuiltInWorkloads,
   resolveWorkloadSelection,
 } from "../workloads/catalog.mjs";
+import { readGroupPlanFile } from "./group-plan.mjs";
 
 const DEFAULT_TASKSET_PATH = "/usr/bin/taskset";
 const ZERO_GENERATION = "0".repeat(32);
@@ -48,15 +52,19 @@ Usage:
     --children N --waves N --exact-cpus LIST [--exact-rounds N] \\
     [--exact-seed N] --out-dir DIR (--dry-run | --yes)
   fault-affinity baseline --resume DIR (--workload ID | --workload-file FILE) --yes
+  fault-affinity groups (--workload ID | --workload-file FILE) \\
+    --plan-file FILE --out-dir DIR (--dry-run | --yes)
+  fault-affinity groups --resume DIR (--workload ID | --workload-file FILE) --yes
   fault-affinity exact (--workload ID | --workload-file FILE) \\
     --cpus LIST [--rounds N] [--seed N] --out-dir DIR (--dry-run | --yes)
   fault-affinity exact --resume DIR (--workload ID | --workload-file FILE) --yes
 
-The baseline command owns schema-3 v2 bundles with correlated baseline waves
-and a pre-bound exact-CPU schedule. The exact command owns exact-only v1 bundles
-and can advance exact state in v2 bundles. Listing, inspection, and dry runs
-never execute a workload or create an evidence bundle. Every live run requires
-an explicit workload selection and --yes.
+The baseline command creates schema-3 v2 bundles. The groups command creates
+v3 bundles from a bounded plan file that binds baseline, CPU-group, and exact
+schedules. Phase commands can advance their matching state in later compatible
+bundle versions. The exact command also creates exact-only v1 bundles. Listing,
+inspection, and dry runs never execute a workload or create an evidence bundle.
+Every live run requires an explicit workload selection and --yes.
 `;
 
 export class FaultAffinityCliError extends Error {
@@ -264,6 +272,43 @@ export function parseFaultAffinityArgs(argv) {
       tasksetPath: options.tasksetPath ?? DEFAULT_TASKSET_PATH,
     });
   }
+  if (command === "groups") {
+    const options = parseOptions(rest, new Map([
+      ["--workload", "workload"],
+      ["--workload-file", "workloadFile"],
+      ["--plan-file", "planFile"],
+      ["--out-dir", "outDir"],
+      ["--resume", "resumeDir"],
+      ["--taskset", "tasksetPath"],
+    ]), new Map([
+      ["--dry-run", "dryRun"], ["--yes", "yes"],
+      ["--help", "help"], ["-h", "help"],
+    ]));
+    if (options.help) return Object.freeze({ command, help: true });
+    const selection = selectionFrom(options);
+    if (options.resumeDir !== undefined) {
+      const fresh = ["planFile", "outDir", "tasksetPath"]
+        .filter((key) => options[key] !== undefined);
+      if (fresh.length > 0) fail("--resume cannot be combined with fresh group options");
+      if (!options.yes || options.dryRun) fail("a groups resume requires --yes");
+      return Object.freeze({ command, mode: "resume", ...selection,
+        resumeDir: options.resumeDir });
+    }
+    if (options.planFile === undefined || options.outDir === undefined) {
+      fail("a fresh groups run requires --plan-file FILE and --out-dir DIR");
+    }
+    if (Boolean(options.dryRun) === Boolean(options.yes)) {
+      fail("choose exactly one --dry-run or --yes for a fresh groups run");
+    }
+    return Object.freeze({
+      command,
+      mode: options.dryRun ? "dry-run" : "fresh",
+      ...selection,
+      planFile: options.planFile,
+      outDir: options.outDir,
+      tasksetPath: options.tasksetPath ?? DEFAULT_TASKSET_PATH,
+    });
+  }
   fail(`unknown command '${command}'`);
 }
 
@@ -384,6 +429,7 @@ function renderWorkload(selection) {
     `risk: ${summary.risk}`,
     `attempt: ${summary.attempt.mode}, ${summary.attempt.timeoutMs} ms deadline`,
     `baseline capability: ${summary.capabilities.baseline ? "supported" : "unsupported"}`,
+    `CPU-group capability: ${summary.capabilities.groups ? "supported" : "unsupported"}`,
     `exact-CPU capability: ${summary.capabilities.isolated ? "supported" : "unsupported"}`,
     `workload digest: ${summary.digest}`,
     `warning: ${summary.liveWarning}`,
@@ -411,6 +457,16 @@ function assertBaselineCapabilities(selection) {
   }
   if (selection.resolved.capabilities.isolated !== true) {
     fail(`workload '${selection.resolved.id}' does not declare exact-CPU capability required by schema-3 v2`);
+  }
+}
+
+function assertGroupCapabilities(selection) {
+  const required = ["baseline", "groups", "isolated"];
+  const missing = required.filter((capability) =>
+    selection.resolved.capabilities[capability] !== true);
+  if (missing.length > 0) {
+    fail(`workload '${selection.resolved.id}' does not declare required group-suite ` +
+      `capabilities: ${missing.join(", ")}`);
   }
 }
 
@@ -455,6 +511,35 @@ function buildFreshBaselineManifest(resolved, parsed, tasksetPath, dryRun) {
   return buildSchema3BundleManifestV2(resolved, {
     bundleGeneration: dryRun ? ZERO_GENERATION : newSchema3BundleGeneration(),
     baselineManifest,
+    exactCpuManifest,
+  });
+}
+
+function buildFreshGroupManifest(resolved, plan, tasksetPath, dryRun) {
+  const baselineManifest = buildBaselinePhaseManifest(resolved, {
+    generation: dryRun ? ZERO_GENERATION : generation(),
+    childrenPerWave: plan.baseline.childrenPerWave,
+    waves: plan.baseline.waves,
+  });
+  const groupManifest = buildGroupPhaseManifest(resolved, {
+    generation: dryRun ? ZERO_GENERATION : generation(),
+    cpuUniverse: plan.groups.cpuUniverse,
+    contexts: plan.groups.contexts,
+    rounds: plan.groups.rounds,
+    seed: plan.groups.seed,
+    tasksetPath,
+  });
+  const exactCpuManifest = buildExactCpuPhaseManifest(resolved, {
+    generation: dryRun ? ZERO_GENERATION : generation(),
+    cpus: plan.exact.cpus,
+    rounds: plan.exact.rounds,
+    seed: plan.exact.seed,
+    tasksetPath,
+  });
+  return buildSchema3BundleManifestV3(resolved, {
+    bundleGeneration: dryRun ? ZERO_GENERATION : newSchema3BundleGeneration(),
+    baselineManifest,
+    groupManifest,
     exactCpuManifest,
   });
 }
@@ -514,7 +599,7 @@ async function runExactBundle({ resolved, bundleDir, signalSource, writeOut, wri
   }
 }
 
-function baselineOutcomeSummary(envelope) {
+function outcomeSummary(envelope) {
   const counts = new Map();
   for (const entry of envelope.attempts) {
     const category = entry.attempt.evidence.outcome.category;
@@ -545,7 +630,7 @@ async function runBaselineBundle({ resolved, bundleDir, signalSource, writeOut, 
       bundle = execution.bundle;
       if (execution.result.committed) {
         writeOut(`committed wave=${execution.result.wave.ordinal} outcomes=` +
-          `${baselineOutcomeSummary(execution.result.envelope)}\n`);
+          `${outcomeSummary(execution.result.envelope)}\n`);
         continue;
       }
       if (forwarding.signal.aborted) return signalExitCode(forwarding.received());
@@ -557,6 +642,46 @@ async function runBaselineBundle({ resolved, bundleDir, signalSource, writeOut, 
     const { committedWaves, totalWaves, committedAttempts, totalAttempts } =
       bundle.baseline.progress;
     writeOut(`complete: ${committedWaves}/${totalWaves} baseline waves ` +
+      `(${committedAttempts}/${totalAttempts} attempts) in ${bundleDir}\n`);
+    return 0;
+  } finally {
+    forwarding.remove();
+  }
+}
+
+async function runGroupBundle({ resolved, bundleDir, signalSource, writeOut, writeErr }) {
+  const forwarding = installSignalForwarding(signalSource);
+  try {
+    let bundle = await readSchema3Bundle({ resolved, bundleDir });
+    if (bundle.groups === undefined) {
+      fail("schema-3 bundle does not bind a CPU-group phase");
+    }
+    while (!bundle.groups.progress.complete) {
+      if (forwarding.signal.aborted) return signalExitCode(forwarding.received());
+      const { nextWave, committedWaves, totalWaves } = bundle.groups.progress;
+      writeOut(`group wave ${committedWaves + 1}/${totalWaves} ` +
+        `context=${nextWave.contextId} children=${nextWave.childCount}\n`);
+      const execution = await runOneSchema3GroupWave({
+        resolved,
+        bundleDir,
+        attemptOptions: { signal: forwarding.signal },
+      });
+      bundle = execution.bundle;
+      if (execution.result.committed) {
+        writeOut(`committed group-wave=${execution.result.wave.ordinal} ` +
+          `context=${execution.result.wave.contextId} ` +
+          `outcomes=${outcomeSummary(execution.result.envelope)}\n`);
+        continue;
+      }
+      if (forwarding.signal.aborted) return signalExitCode(forwarding.received());
+      if (execution.result.reason === "complete") break;
+      writeErr(`group wave was not committed: ${execution.result.reason}` +
+        `${execution.result.errorCode ? ` (${execution.result.errorCode})` : ""}\n`);
+      return 1;
+    }
+    const { committedWaves, totalWaves, committedAttempts, totalAttempts } =
+      bundle.groups.progress;
+    writeOut(`complete: ${committedWaves}/${totalWaves} CPU-group waves ` +
       `(${committedAttempts}/${totalAttempts} attempts) in ${bundleDir}\n`);
     return 0;
   } finally {
@@ -639,6 +764,72 @@ export async function runFaultAffinityCli(argv, io = {}) {
         `children=${parsed.children} bundle=${bundleDir}\n`);
       writeOut(`warning: ${selection.metadata.liveWarning}\n`);
       return await runBaselineBundle({
+        resolved: selection.resolved,
+        bundleDir,
+        signalSource,
+        writeOut,
+        writeErr,
+      });
+    }
+    if (parsed.command === "groups") {
+      assertGroupCapabilities(selection);
+      if (parsed.mode !== "dry-run") assertAutomationBoundary(selection);
+      if (parsed.mode === "resume") {
+        const bundleDir = resolveExistingBundleDirectory(path.resolve(cwd, parsed.resumeDir));
+        writeOut(`resuming groups workload=${selection.resolved.id} bundle=${bundleDir}\n`);
+        writeOut(`warning: ${selection.metadata.liveWarning}\n`);
+        return await runGroupBundle({
+          resolved: selection.resolved,
+          bundleDir,
+          signalSource,
+          writeOut,
+          writeErr,
+        });
+      }
+      const planPath = path.resolve(cwd, parsed.planFile);
+      const plan = readGroupPlanFile(planPath);
+      const tasksetPath = resolveExecutablePath(parsed.tasksetPath, "--taskset");
+      const scheduledCpus = [...new Set([
+        ...plan.groups.cpuUniverse,
+        ...plan.exact.cpus,
+      ])].sort((left, right) => left - right);
+      const allowedCpuSpec = ensureAllowedCpus(scheduledCpus);
+      const manifest = buildFreshGroupManifest(
+        selection.resolved,
+        plan,
+        tasksetPath,
+        parsed.mode === "dry-run",
+      );
+      const baselineAttempts = manifest.baseline.manifest.schedule.attemptCount;
+      const groupSchedule = manifest.groups.manifest.schedule;
+      const exactSchedule = manifest.exactCpu.manifest.schedule;
+      if (parsed.mode === "dry-run") {
+        writeOut(`${renderWorkload(selection)}\n`);
+        writeOut(`plan file: ${planPath}\n`);
+        writeOut(`bound baseline: ${plan.baseline.childrenPerWave} child(ren) x ` +
+          `${plan.baseline.waves} wave(s); ${baselineAttempts} attempt(s)\n`);
+        writeOut(`groups: ${groupSchedule.contextCount} context(s); ` +
+          `${groupSchedule.waveCount} wave(s); ${groupSchedule.attemptCount} attempt(s); ` +
+          `seed ${groupSchedule.seed}\n`);
+        writeOut(`bound exact: CPUs ${compressCpuList(plan.exact.cpus)}; ` +
+          `${exactSchedule.rounds} round(s); ${exactSchedule.attemptCount} attempt(s); ` +
+          `seed ${exactSchedule.seed}\n`);
+        writeOut(`host allowance: ${allowedCpuSpec}\n`);
+        writeOut(`planned bundle: ${path.resolve(cwd, parsed.outDir)}\n`);
+        writeOut("dry run: no workload executed and no bundle created\n");
+        return 0;
+      }
+      const bundleDir = createPrivateBundleDirectory(path.resolve(cwd, parsed.outDir));
+      await initializeSchema3Bundle({
+        resolved: selection.resolved,
+        manifest,
+        bundleDir,
+      });
+      writeOut(`starting groups workload=${selection.resolved.id} ` +
+        `risk=${selection.resolved.risk} contexts=${groupSchedule.contextCount} ` +
+        `waves=${groupSchedule.waveCount} bundle=${bundleDir}\n`);
+      writeOut(`warning: ${selection.metadata.liveWarning}\n`);
+      return await runGroupBundle({
         resolved: selection.resolved,
         bundleDir,
         signalSource,

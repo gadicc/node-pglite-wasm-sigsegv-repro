@@ -3,7 +3,8 @@
 This page separates the implemented Fault Affinity foundation from the
 remaining migration work. **Fault Affinity** is now the package and public
 command identity. Exact-CPU execution was the first generic public path;
-correlated baseline waves are now public through schema-3 manifest version 2.
+correlated baseline waves and explicit CPU-group contexts are now public through
+schema-3 manifest versions 2 and 3.
 
 ## Define the intended scope
 
@@ -111,10 +112,12 @@ is interrupted.
 
 The `fault-affinity` command now exposes reviewed workload listing, inspection,
 dry-run planning, fresh exact-only schema-3 bundle creation, exact-prefix
-resume, and complete correlated baseline waves in manifest-v2 bundles. A
-baseline command pre-binds the downstream exact schedule; the exact command can
-then advance that same bundle. Trusted custom JSON workloads declare their own
-capabilities.
+resume, complete correlated baseline waves in manifest-v2 bundles, and complete
+CPU-group waves in manifest-v3 bundles. A baseline command pre-binds the
+downstream exact schedule. A groups command safely reads one explicit plan that
+pre-binds baseline, group topology, and exact schedules. The phase commands can
+then advance their matching prefixes in that same bundle. Trusted custom JSON
+workloads declare their own capabilities.
 
 The published `wasm-churn` and `node-pglite` IDs retain their exact-only
 workload identities. Separate `wasm-churn-suite` and `node-pglite-suite`
@@ -123,8 +126,8 @@ later public phases do not mutate old bundle identities. This completes the
 package/command portion of steps 9 and 10 without requiring a physical checkout
 or repository-host rename.
 
-The internal group and pinned-concurrent adapters are not yet publicly
-orchestrated for arbitrary workloads. The controlled-load foundation has a
+The internal pinned-concurrent adapter is not yet publicly orchestrated for
+arbitrary workloads. The controlled-load foundation has a
 managed auxiliary lifecycle, verified worker sets, complete A1/B/A2 envelopes,
 a complete-only store, and schema-3 manifest-v5 ownership, but still has no
 generic public command. Debugger and frequency protocols still need

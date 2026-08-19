@@ -1,6 +1,6 @@
-# Understand internal CPU-group waves
+# Understand CPU-group waves
 
-The internal group phase binds an explicit CPU universe and one or more named
+The group phase binds an explicit CPU universe and one or more named
 execution contexts. A context records a stable ID, descriptive kind, sorted CPU
 set, and child count. Contexts may overlap, matching topology plans that include
 both a broad CPU class and narrower clusters, but their union must cover the
@@ -19,9 +19,11 @@ of `group-wave-NNNNNNNNN.json` files following one immutable
 `group-phase.json` manifest.
 
 Schema-3 manifest version 3 binds this store at `state/groups/` alongside the
-version-2 baseline and exact-CPU inventory. The bundle lease covers the full
-select, run, cleanup, and commit transaction. No current `diagnose.sh` phase or
-legacy bundle writes this format.
+version-2 baseline and exact-CPU inventory. `fault-affinity groups` creates and
+advances this format from an explicit plan file. The bundle lease covers the
+full select, run, cleanup, and commit transaction. No current `diagnose.sh`
+phase or legacy bundle writes this format.
 
 See [ADR 0013](../decisions/0013-group-topology-and-manifest-v3.md) for the
-accepted compatibility boundary.
+accepted evidence format and [ADR 0021](../decisions/0021-public-group-cli-and-plan-file.md)
+for the public orchestration boundary.

@@ -4,7 +4,7 @@ Fault Affinity is a Linux harness for bounded, resumable investigation of interm
 
 The project began with native faults during Node.js and PGlite WebAssembly initialization. That workload remains as a historical heavyweight built-in and case study. The recommended reduced built-in is now the dependency-free WebAssembly churn workload.
 
-The public generic commands own exact-only schema-3 bundles and correlated baseline-plus-exact bundles. The broader legacy diagnostic suite still provides topology, telemetry, debugger, frequency, and final-report phases specifically for the Node/PGlite investigation.
+The public generic commands own exact-only, baseline-plus-exact, and explicit CPU-group schema-3 bundles. The broader legacy diagnostic suite still provides telemetry, debugger, frequency, and final-report phases specifically for the Node/PGlite investigation.
 
 ## Safety
 
@@ -57,7 +57,11 @@ node fault-affinity.mjs exact \
   --yes
 ```
 
-Use `--workload-file path/to/workload.json` to select a trusted local script or binary. `wasm-churn` and `node-pglite` preserve their exact-only identities; the `-suite` profiles declare baseline and later localization capabilities without changing old bundle identities. Read [run generic baseline waves](docs/guides/generic-baseline.md) and [run a generic exact-CPU workload](docs/guides/generic-exact-cpu.md). These commands do not yet produce the legacy suite's complete report.
+Use `--workload-file path/to/workload.json` to select a trusted local script or binary. `wasm-churn` and `node-pglite` preserve their exact-only identities; the `-suite` profiles declare baseline and group localization capabilities without changing old bundle identities. Read [run generic baseline waves](docs/guides/generic-baseline.md) and [run a generic exact-CPU workload](docs/guides/generic-exact-cpu.md). These commands do not yet produce the legacy suite's complete report.
+
+For CPU-group screening, a bounded JSON plan explicitly binds baseline, group
+topology, and exact schedules before execution. See
+[run generic CPU-group waves](docs/guides/generic-cpu-groups.md).
 
 ## Reproduce the historical Node/PGlite failure
 
@@ -218,6 +222,7 @@ See [software controls](docs/case-study/software-controls.md) for the recorded N
 - [Documentation map](docs/README.md)
 - [Project direction](docs/project-direction.md)
 - [Run generic baseline waves](docs/guides/generic-baseline.md)
+- [Run generic CPU-group waves](docs/guides/generic-cpu-groups.md)
 - [Run a generic exact-CPU workload](docs/guides/generic-exact-cpu.md)
 - [Run the diagnostic suite](docs/guides/run-diagnostics.md)
 - [Run controlled-load experiments](docs/guides/controlled-load-experiments.md)

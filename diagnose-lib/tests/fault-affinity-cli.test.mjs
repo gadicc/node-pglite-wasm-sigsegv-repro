@@ -55,12 +55,31 @@ function customWorkload(directory, overrides = {}) {
       killGraceMs: 500,
     },
     outcomes: { targetSignals: [], mappedExits: [] },
-    capabilities: { baseline: true, isolated: true },
+    capabilities: { baseline: true, groups: true, isolated: true },
     provenance: { completeness: "complete", files: [] },
     ...overrides,
   };
   writeFileSync(definition, `${JSON.stringify(value)}\n`, { mode: 0o600 });
   return definition;
+}
+
+function groupPlan(directory, overrides = {}) {
+  const cpu = allowedCpu();
+  const filename = path.join(directory, "group-plan.json");
+  const value = {
+    version: 1,
+    baseline: { children: 1, waves: 1 },
+    groups: {
+      cpuUniverse: String(cpu),
+      contexts: [{ id: "all", kind: "uniform", cpus: String(cpu), children: 1 }],
+      rounds: 1,
+      seed: 7,
+    },
+    exact: { cpus: String(cpu), rounds: 1, seed: 7 },
+    ...overrides,
+  };
+  writeFileSync(filename, `${JSON.stringify(value)}\n`, { mode: 0o600 });
+  return filename;
 }
 
 function capture(cwd) {
@@ -108,6 +127,17 @@ test("argument parsing keeps live selection and confirmation explicit", () => {
     "baseline", "--workload", "wasm-churn", "--children", "1", "--waves", "1",
     "--exact-cpus", "1,0", "--out-dir", "bundle", "--dry-run",
   ]), /--exact-cpus must be a canonical ascending CPU list/);
+  assert.throws(() => parseFaultAffinityArgs([
+    "groups", "--workload", "wasm-churn-suite", "--plan-file", "plan.json",
+    "--out-dir", "bundle",
+  ]), /exactly one --dry-run or --yes/);
+  assert.throws(() => parseFaultAffinityArgs([
+    "groups", "--resume", "bundle", "--workload", "wasm-churn-suite", "--dry-run",
+  ]), /groups resume requires --yes/);
+  assert.throws(() => parseFaultAffinityArgs([
+    "groups", "--resume", "bundle", "--workload", "wasm-churn-suite",
+    "--plan-file", "plan.json", "--yes",
+  ]), /fresh group options/);
 });
 
 test("listing and inspection describe built-ins without creating files", async () => {
@@ -146,6 +176,26 @@ test("a dry run validates baseline and bound exact schedules without creating ou
   assert.equal(existsSync(output), false);
   assert.match(captured.stdout(), /baseline 2 child\(ren\) x 3 wave\(s\); 6 attempt\(s\)/);
   assert.match(captured.stdout(), /bound exact plan:.*2 attempt\(s\); seed 7/);
+  assert.match(captured.stdout(), /no workload executed and no bundle created/);
+});
+
+test("a dry run validates all v3 schedules without creating output", async () => {
+  const directory = temporaryDirectory();
+  const definition = customWorkload(directory);
+  const plan = groupPlan(directory);
+  const output = path.join(directory, "planned-group-bundle");
+  const captured = capture(directory);
+  const rc = await runFaultAffinityCli([
+    "groups", "--workload-file", path.basename(definition),
+    "--plan-file", path.basename(plan), "--out-dir", path.basename(output),
+    "--dry-run",
+  ], captured.io);
+
+  assert.equal(rc, 0, captured.stderr());
+  assert.equal(existsSync(output), false);
+  assert.match(captured.stdout(), /bound baseline: 1 child\(ren\) x 1 wave\(s\)/);
+  assert.match(captured.stdout(), /groups: 1 context\(s\); 1 wave\(s\); 1 attempt\(s\)/);
+  assert.match(captured.stdout(), /bound exact: CPUs .*1 attempt\(s\); seed 7/);
   assert.match(captured.stdout(), /no workload executed and no bundle created/);
 });
 
@@ -236,6 +286,50 @@ test("the public baseline command completes schema-3 v2 and exact resumes that b
   assert.equal(bundle.exactCpu.progress.complete, true);
 });
 
+test("the public groups command completes v3 and sibling phase commands resume it", {
+  timeout: 20_000,
+}, async () => {
+  const directory = temporaryDirectory();
+  const definition = customWorkload(directory);
+  const plan = groupPlan(directory);
+  const bundleDir = path.join(directory, "group-bundle");
+  const selection = ["--workload-file", path.basename(definition)];
+  const groups = capture(directory);
+  assert.equal(await runFaultAffinityCli([
+    "groups", ...selection, "--plan-file", path.basename(plan),
+    "--out-dir", path.basename(bundleDir), "--yes",
+  ], groups.io), 0, groups.stderr());
+  assert.match(groups.stdout(), /committed group-wave=1 context=all outcomes=pass:1/);
+  assert.match(groups.stdout(), /complete: 1\/1 CPU-group waves \(1\/1 attempts\)/);
+
+  const resolved = resolveCustomWorkloadFile(definition).resolved;
+  let bundle = await readSchema3Bundle({ resolved, bundleDir });
+  assert.equal(bundle.manifest.version, 3);
+  assert.equal(bundle.groups.progress.complete, true);
+  assert.equal(bundle.baseline.progress.complete, false);
+  assert.equal(bundle.exactCpu.progress.complete, false);
+
+  const resumedGroups = capture(directory);
+  assert.equal(await runFaultAffinityCli([
+    "groups", "--resume", path.basename(bundleDir), ...selection, "--yes",
+  ], resumedGroups.io), 0, resumedGroups.stderr());
+  assert.match(resumedGroups.stdout(), /resuming groups workload=cli-finite/);
+  assert.match(resumedGroups.stdout(), /complete: 1\/1 CPU-group waves/);
+
+  const baseline = capture(directory);
+  assert.equal(await runFaultAffinityCli([
+    "baseline", "--resume", path.basename(bundleDir), ...selection, "--yes",
+  ], baseline.io), 0, baseline.stderr());
+  const exact = capture(directory);
+  assert.equal(await runFaultAffinityCli([
+    "exact", "--resume", path.basename(bundleDir), ...selection, "--yes",
+  ], exact.io), 0, exact.stderr());
+  bundle = await readSchema3Bundle({ resolved, bundleDir });
+  assert.equal(bundle.baseline.progress.complete, true);
+  assert.equal(bundle.groups.progress.complete, true);
+  assert.equal(bundle.exactCpu.progress.complete, true);
+});
+
 test("baseline planning requires both baseline and exact capabilities", async () => {
   const directory = temporaryDirectory();
   const definition = customWorkload(directory, { capabilities: { isolated: true } });
@@ -247,6 +341,21 @@ test("baseline planning requires both baseline and exact capabilities", async ()
   ], captured.io);
   assert.equal(rc, 2);
   assert.match(captured.stderr(), /does not declare baseline capability/);
+});
+
+test("group planning requires baseline, group, and exact capabilities", async () => {
+  const directory = temporaryDirectory();
+  const definition = customWorkload(directory, {
+    capabilities: { baseline: true, isolated: true },
+  });
+  const plan = groupPlan(directory);
+  const captured = capture(directory);
+  const rc = await runFaultAffinityCli([
+    "groups", "--workload-file", path.basename(definition),
+    "--plan-file", path.basename(plan), "--out-dir", "bundle", "--dry-run",
+  ], captured.io);
+  assert.equal(rc, 2);
+  assert.match(captured.stderr(), /required group-suite capabilities: groups/);
 });
 
 test("custom ambient pass-through is rejected before planning", async () => {

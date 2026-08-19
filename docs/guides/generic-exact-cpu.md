@@ -3,8 +3,8 @@
 The `fault-affinity` command runs one explicitly selected workload through a
 bounded, deterministic exact-CPU schedule. It creates exact-only schema-3
 version-1 bundles and can advance the exact phase in baseline-plus-exact
-version-2 bundles. It does not yet run topology-group, pinned-concurrent,
-controlled-load, debugger, or frequency phases.
+version-2 or CPU-group version-3 bundles. It does not itself run group,
+pinned-concurrent, controlled-load, debugger, or frequency phases.
 
 ## Inspect before running
 

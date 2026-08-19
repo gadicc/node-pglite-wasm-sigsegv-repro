@@ -121,8 +121,10 @@ collection of independent child trials. A complete exact prefix records
 singleton-affinity attempts. Compare those contexts without treating their
 different denominators as interchangeable.
 
-Schema-3 version 2 still does not provide topology-group, pinned-concurrent,
-controlled-load, debugger, frequency, telemetry, privacy-review, or final
-report orchestration. See the [baseline wave reference](../reference/baseline-concurrent-waves.md)
+Schema-3 version 2 still does not provide topology-group state; use the
+[generic CPU-group command](generic-cpu-groups.md) to create a version-3 bundle.
+Neither path yet provides pinned-concurrent, controlled-load, debugger,
+frequency, telemetry, privacy-review, or final-report orchestration. See the
+[baseline wave reference](../reference/baseline-concurrent-waves.md)
 for persisted semantics and [interpret experimental results](../concepts/interpreting-results.md)
 for inference limits.
