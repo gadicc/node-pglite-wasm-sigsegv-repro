@@ -46,8 +46,8 @@ public command surface.
   version-2 evidence.
 - Later phase additions require another explicit manifest version rather than
   optional fields whose absence is ambiguous.
-- Group screening is the next phase that needs a topology and affinity-mask
-  contract before bundle integration.
+- Manifest version 3 adds the separately versioned group topology and
+  affinity-mask contract without changing version 2.
 
 ## Acceptance criteria
 

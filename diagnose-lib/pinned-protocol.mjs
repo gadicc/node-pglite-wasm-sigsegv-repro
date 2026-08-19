@@ -75,6 +75,8 @@ const EXACT_CPU_STATE_FILE_MAX_BYTES = 8 * 1024 * 1024;
 const SCHEMA3_BUNDLE_STATE_FILE_MAX_BYTES = 8 * 1024 * 1024;
 const BASELINE_PHASE_STATE_FILE_MAX_BYTES = 1024 * 1024;
 const BASELINE_WAVE_STATE_FILE_MAX_BYTES = 64 * 1024 * 1024;
+const GROUP_PHASE_STATE_FILE_MAX_BYTES = 8 * 1024 * 1024;
+const GROUP_WAVE_STATE_FILE_MAX_BYTES = 64 * 1024 * 1024;
 const PROTOCOL_MARKER = Symbol("pinnedProtocolPlan");
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 
@@ -512,7 +514,7 @@ function fsyncDirectory(directory) {
 // The exact-CPU store reuses this proven no-clobber adapter in its own private
 // directory; legacy protocol readers still select only their own final names.
 const STATE_COMMIT_TEMP_RE =
-  /^\.(isolated-[0-9]{9}\.json|concurrent-[0-9]{9}-[a-z][a-z0-9_-]{0,63}\.json|exact-cpu-phase\.json|exact-cpu-attempt-[0-9]{9}\.json|baseline-phase\.json|baseline-wave-[0-9]{9}\.json|fault-affinity-bundle\.json)\.([1-9][0-9]*)\.([a-f0-9]{16})\.(writing|ready)\.tmp$/;
+  /^\.(isolated-[0-9]{9}\.json|concurrent-[0-9]{9}-[a-z][a-z0-9_-]{0,63}\.json|exact-cpu-phase\.json|exact-cpu-attempt-[0-9]{9}\.json|baseline-phase\.json|baseline-wave-[0-9]{9}\.json|group-phase\.json|group-wave-[0-9]{9}\.json|fault-affinity-bundle\.json)\.([1-9][0-9]*)\.([a-f0-9]{16})\.(writing|ready)\.tmp$/;
 
 function processIsLive(pidText) {
   const pid = Number(pidText);
@@ -539,6 +541,7 @@ function recoverInterruptedStateCommits(directory) {
     if (!name.startsWith(".isolated-") && !name.startsWith(".concurrent-") &&
         !name.startsWith(".exact-cpu-") &&
         !name.startsWith(".baseline-") &&
+        !name.startsWith(".group-") &&
         !name.startsWith(".fault-affinity-bundle.json.")) continue;
     const match = name.match(STATE_COMMIT_TEMP_RE);
     if (match === null) continue;
@@ -561,9 +564,13 @@ function recoverInterruptedStateCommits(directory) {
           ? BASELINE_PHASE_STATE_FILE_MAX_BYTES
           : finalName.startsWith("baseline-wave-")
             ? BASELINE_WAVE_STATE_FILE_MAX_BYTES
-            : finalName === "fault-affinity-bundle.json"
-              ? SCHEMA3_BUNDLE_STATE_FILE_MAX_BYTES
-              : DEFAULT_STATE_FILE_MAX_BYTES;
+            : finalName === "group-phase.json"
+              ? GROUP_PHASE_STATE_FILE_MAX_BYTES
+              : finalName.startsWith("group-wave-")
+                ? GROUP_WAVE_STATE_FILE_MAX_BYTES
+                : finalName === "fault-affinity-bundle.json"
+                  ? SCHEMA3_BUNDLE_STATE_FILE_MAX_BYTES
+                  : DEFAULT_STATE_FILE_MAX_BYTES;
     let temporaryStat;
     try {
       temporaryStat = lstatSync(temporaryPath, { bigint: true });

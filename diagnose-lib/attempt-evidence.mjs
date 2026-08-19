@@ -397,12 +397,23 @@ function validateRecord(resolved, value) {
 function validateRunnerExecution(value) {
   exactKeys(value, ["cpuAffinity"], "attempt runner execution context");
   if (value.cpuAffinity === null) return;
+  const singleton = Object.hasOwn(value.cpuAffinity, "requestedCpu");
   exactKeys(value.cpuAffinity, [
-    "requestedCpu", "supervisorAllowedCpuList", "workloadAllowedCpuList",
+    singleton ? "requestedCpu" : "requestedCpuList",
+    "supervisorAllowedCpuList",
+    "workloadAllowedCpuList",
   ], "attempt runner CPU-affinity context");
-  requireCondition(Number.isSafeInteger(value.cpuAffinity.requestedCpu) &&
-    value.cpuAffinity.requestedCpu >= 0 && value.cpuAffinity.requestedCpu <= 65_535,
-  "attempt runner requested CPU is invalid");
+  if (singleton) {
+    requireCondition(Number.isSafeInteger(value.cpuAffinity.requestedCpu) &&
+      value.cpuAffinity.requestedCpu >= 0 && value.cpuAffinity.requestedCpu <= 65_535,
+    "attempt runner requested CPU is invalid");
+  } else {
+    requireCondition(typeof value.cpuAffinity.requestedCpuList === "string" &&
+      value.cpuAffinity.requestedCpuList.length <= 64 * 1024 &&
+      /^[0-9]+(?:-[0-9]+)?(?:,[0-9]+(?:-[0-9]+)?)*$/.test(
+        value.cpuAffinity.requestedCpuList,
+      ), "attempt runner requested CPU list is invalid");
+  }
   for (const key of ["supervisorAllowedCpuList", "workloadAllowedCpuList"]) {
     requireCondition(value.cpuAffinity[key] === null ||
       (typeof value.cpuAffinity[key] === "string" && /^[0-9,-]+$/.test(value.cpuAffinity[key])),

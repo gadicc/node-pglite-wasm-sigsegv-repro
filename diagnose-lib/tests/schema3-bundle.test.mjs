@@ -21,18 +21,22 @@ import {
 } from "../bundle-execution-lease.mjs";
 import { buildBaselinePhaseManifest } from "../baseline-phase.mjs";
 import { buildExactCpuPhaseManifest } from "../exact-cpu-phase.mjs";
+import { buildGroupPhaseManifest } from "../group-phase.mjs";
 import { readLinuxProcessIdentity, runWorkloadAttempt } from "../attempt-runner.mjs";
 import {
   SCHEMA3_BUNDLE_FILE,
   SCHEMA3_BASELINE_STATE_DIRECTORY,
   SCHEMA3_EXACT_CPU_STATE_DIRECTORY,
+  SCHEMA3_GROUP_STATE_DIRECTORY,
   buildSchema3BundleManifest,
   buildSchema3BundleManifestV2,
+  buildSchema3BundleManifestV3,
   canonicalSchema3BundleManifestLine,
   initializeSchema3Bundle,
   readSchema3Bundle,
   runOneSchema3BaselineWave,
   runOneSchema3ExactCpuAttempt,
+  runOneSchema3GroupWave,
 } from "../schema3-bundle.mjs";
 import { createFileStateAdapter } from "../pinned-protocol.mjs";
 import { resolveWorkloadSpec } from "../workload-spec.mjs";
@@ -92,6 +96,13 @@ function baselineWorkload(options = {}) {
   return workload({ ...options, capabilities: { baseline: true, isolated: true } });
 }
 
+function groupWorkload(options = {}) {
+  return workload({
+    ...options,
+    capabilities: { baseline: true, groups: true, isolated: true },
+  });
+}
+
 function baselineManifest(resolved, { childrenPerWave = 2, waves = 1 } = {}) {
   return buildBaselinePhaseManifest(resolved, {
     generation: "fedcba9876543210fedcba9876543210",
@@ -110,6 +121,18 @@ function exactCpuManifest(resolved, { rounds = 1 } = {}) {
   });
 }
 
+function groupManifest(resolved, { groupRounds = 1 } = {}) {
+  const cpus = [allowedCpu()];
+  return buildGroupPhaseManifest(resolved, {
+    generation: "00112233445566778899aabbccddeeff",
+    cpuUniverse: cpus,
+    contexts: [{ id: "all", kind: "uniform", cpus, childrenPerWave: 2 }],
+    rounds: groupRounds,
+    seed: 20260819,
+    tasksetPath: "/usr/bin/taskset",
+  });
+}
+
 function bundleManifest(resolved, options = {}) {
   return buildSchema3BundleManifest(resolved, {
     bundleGeneration: "abcdef0123456789abcdef0123456789",
@@ -121,6 +144,15 @@ function bundleManifestV2(resolved, options = {}) {
   return buildSchema3BundleManifestV2(resolved, {
     bundleGeneration: "abcdef0123456789abcdef0123456789",
     baselineManifest: baselineManifest(resolved, options),
+    exactCpuManifest: exactCpuManifest(resolved, options),
+  });
+}
+
+function bundleManifestV3(resolved, options = {}) {
+  return buildSchema3BundleManifestV3(resolved, {
+    bundleGeneration: "abcdef0123456789abcdef0123456789",
+    baselineManifest: baselineManifest(resolved, options),
+    groupManifest: groupManifest(resolved, options),
     exactCpuManifest: exactCpuManifest(resolved, options),
   });
 }
@@ -263,6 +295,34 @@ test("schema-3 manifest v1 remains readable for a workload with baseline capabil
     /does not bind a baseline phase/);
 });
 
+test("schema-3 manifest v3 binds group topology without changing v1 or v2", {
+  timeout: 10_000,
+}, async () => {
+  const resolved = groupWorkload();
+  const manifest = bundleManifestV3(resolved);
+  const bundleDir = bundleDirectory();
+
+  await createFileStateAdapter(bundleDir).commit(
+    SCHEMA3_BUNDLE_FILE,
+    canonicalSchema3BundleManifestLine(resolved, manifest),
+  );
+  const initialized = await initializeSchema3Bundle({ resolved, manifest, bundleDir });
+  assert.equal(initialized.manifest.version, 3);
+  assert.equal(initialized.manifest.phaseControls.groups, "supported");
+  assert.equal(initialized.groups.progress.status, "empty");
+  assert.equal(initialized.baseline.progress.status, "empty");
+  assert.equal(initialized.exactCpu.progress.status, "empty");
+  assert.equal(statSync(path.join(bundleDir, SCHEMA3_GROUP_STATE_DIRECTORY)).mode & 0o777,
+    0o700);
+
+  const reopened = await readSchema3Bundle({ resolved, bundleDir });
+  assert.deepEqual(reopened.manifest, initialized.manifest);
+  assert.deepEqual(reopened.groups, initialized.groups);
+  const changed = bundleManifestV3(resolved, { groupRounds: 2 });
+  await assert.rejects(initializeSchema3Bundle({ resolved, manifest: changed, bundleDir }),
+    /different manifest/);
+});
+
 test("the execution lease makes selecting, running, and committing one slot indivisible", {
   timeout: 10_000,
 }, async () => {
@@ -380,6 +440,49 @@ test("an invalid schema-3 v2 baseline wave leaves the complete wave available", 
   const retried = await runOneSchema3BaselineWave({ resolved, bundleDir });
   assert.equal(retried.result.reason, "committed");
   assert.equal(retried.bundle.baseline.progress.status, "complete");
+});
+
+test("one schema-3 v3 lease owns the complete group-mask wave transaction", {
+  timeout: 10_000,
+}, async () => {
+  const resolved = groupWorkload();
+  const manifest = bundleManifestV3(resolved);
+  const bundleDir = bundleDirectory();
+  await initializeSchema3Bundle({ resolved, manifest, bundleDir });
+  const group = manifest.groups.manifest.topology.contexts[0];
+  const resultFixture = await runWorkloadAttempt(resolved, {
+    cpuAffinity: { cpus: group.cpus, tasksetPath: manifest.groups.manifest.execution.tasksetPath },
+  });
+  const started = deferred();
+  const release = deferred();
+  let launches = 0;
+  const runAttempt = async (_resolved, options) => {
+    launches += 1;
+    assert.deepEqual(options.cpuAffinity.cpus, group.cpus);
+    assert.equal(fstatSync(options.retainedDirectory.fd, { bigint: true }).ino.toString(),
+      options.retainedDirectory.inode);
+    if (launches === 2) started.resolve();
+    await release.promise;
+    return resultFixture;
+  };
+
+  const first = runOneSchema3GroupWave({ resolved, bundleDir, runAttempt });
+  await started.promise;
+  await assert.rejects(runOneSchema3BaselineWave({ resolved, bundleDir }),
+    (error) => error instanceof BundleExecutionLeaseError &&
+      error.code === "BUNDLE_EXECUTION_LEASE_BUSY");
+  await assert.rejects(runOneSchema3ExactCpuAttempt({ resolved, bundleDir }),
+    (error) => error instanceof BundleExecutionLeaseError &&
+      error.code === "BUNDLE_EXECUTION_LEASE_BUSY");
+  assert.equal(launches, 2);
+  release.resolve();
+
+  const completed = await first;
+  assert.equal(completed.result.reason, "committed");
+  assert.equal(completed.bundle.groups.progress.status, "complete");
+  const noOp = await runOneSchema3GroupWave({ resolved, bundleDir, runAttempt });
+  assert.equal(noOp.result.reason, "complete");
+  assert.equal(launches, 2);
 });
 
 test("operationally invalid execution leaves the slot available for a retained production attempt", {

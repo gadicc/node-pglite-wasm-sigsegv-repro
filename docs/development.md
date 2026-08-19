@@ -27,6 +27,7 @@ The suite covers:
 - Deterministic exact-CPU manifests, attempt envelopes, affinity witnesses, durable commits, and prefix resume
 - Immutable schema-3 bundle manifest versions and exclusive phase transactions
 - Workload-bound baseline manifests, correlated wave envelopes, and whole-wave resume
+- Workload-bound group topology, inherited CPU-mask witnesses, and whole-wave resume
 - Settings restoration under simulated signals
 - Statistics and parser fixtures
 - Evidence-envelope validation
@@ -111,6 +112,12 @@ same bundle lease covers selecting, running, and committing an entire baseline
 wave. Before exposing a public generic interface, extend that versioned
 ownership contract to the remaining applicable phases without changing legacy
 bundle interpretation.
+
+Schema-3 manifest version 3 additionally binds CPU-group contexts. Contexts
+may overlap, their order is deterministically balanced, and every child must
+witness the scheduled inherited mask before its complete wave can advance.
+Pinned-concurrent execution remains separate because it also needs a controller
+CPU and one singleton CPU per child.
 
 Custom commands should be documented as trusted local workloads, not sandboxed code. They must not daemonize or escape the supervised process group.
 

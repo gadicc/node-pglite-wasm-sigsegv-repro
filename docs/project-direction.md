@@ -84,13 +84,14 @@ The documentation, safety-net, workload-spec, bounded attempt-runner,
 versioned attempt-record, exact-CPU phase-envelope, durable phase-store,
 internal schema-3 bundle owner, and baseline whole-wave foundations are
 complete. Bundle manifest version 1 binds one workload and deterministic
-exact-CPU manifest. Version 2 additionally binds correlated baseline waves.
+exact-CPU manifest. Version 2 additionally binds correlated baseline waves,
+and version 3 binds overlapping CPU-group contexts and inherited masks.
 The owner holds one exclusive lease across selecting, running, and committing
 an exact attempt or complete baseline wave and derives completion from the
 durably published prefix. Its stable supervisors retain the lease through
 bounded cleanup if the outer owner is interrupted.
 
 Current diagnostic phases do not write the new formats, and `fault-affinity` is
-not yet an executable command. The next migration step is to add the topology
-and affinity-mask contract needed by group screening. Legacy bundle
-interpretation remains unchanged.
+not yet an executable command. The next migration step is the distinct
+pinned-concurrent contract: controller placement plus one singleton-affinity
+child per context CPU. Legacy bundle interpretation remains unchanged.

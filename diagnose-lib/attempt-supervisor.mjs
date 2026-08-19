@@ -154,7 +154,10 @@ function validateLaunch(message) {
       message.termGraceMs > 60_000 ||
       !(message.cpuAffinity === null ||
         (Number.isSafeInteger(message.cpuAffinity) && message.cpuAffinity >= 0 &&
-          message.cpuAffinity <= 65_535)) || message.provenance === null ||
+          message.cpuAffinity <= 65_535) ||
+        (typeof message.cpuAffinity === "string" && message.cpuAffinity.length <= 64 * 1024 &&
+          /^[0-9]+(?:-[0-9]+)?(?:,[0-9]+(?:-[0-9]+)?)*$/.test(message.cpuAffinity))) ||
+      message.provenance === null ||
       typeof message.provenance !== "object" || Array.isArray(message.provenance) ||
       message.provenance.executable?.path !== message.executable ||
       message.provenance.cwd !== message.cwd) {
@@ -172,8 +175,8 @@ function launch(message) {
   launchReceived = true;
   termGraceMs = message.termGraceMs;
 
-  if (message.cpuAffinity !== null &&
-      readAllowedCpuList(process.pid) !== String(message.cpuAffinity)) {
+  const expectedCpuList = message.cpuAffinity === null ? null : String(message.cpuAffinity);
+  if (expectedCpuList !== null && readAllowedCpuList(process.pid) !== expectedCpuList) {
     send({ type: "workload-launch-error", errorCode: "AFFINITY_MISMATCH" });
     return;
   }
@@ -218,8 +221,8 @@ function launch(message) {
       emergencyCleanup();
       return;
     }
-    if (allowedCpuList === null || (message.cpuAffinity !== null &&
-        observedAllowedCpuList !== String(message.cpuAffinity))) {
+    if (allowedCpuList === null || (expectedCpuList !== null &&
+        observedAllowedCpuList !== expectedCpuList)) {
       send({ type: "fatal", errorCode: "WORKLOAD_AFFINITY_MISMATCH" });
       emergencyCleanup();
       return;

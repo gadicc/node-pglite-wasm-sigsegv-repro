@@ -18,6 +18,7 @@ import {
   workloadLaunchEnvironment,
   workloadLaunchProvenance,
 } from "../workload-spec.mjs";
+import { expandCpuList, compressCpuList } from "../pinned-runner.mjs";
 
 const FIXTURE = fileURLToPath(new URL("./fixtures/attempt-workload-fixture.mjs", import.meta.url));
 const SUPERVISOR = fileURLToPath(new URL("../attempt-supervisor.mjs", import.meta.url));
@@ -179,6 +180,30 @@ test("launch is shell-free and preserves exact argv, cwd, and environment", { ti
   assert.equal(record.identity.sessionId, result.process.supervisor.sessionId);
   assert.equal(result.cleanup.groupDrained, true);
   assert.equal(result.cleanup.outputDrained, true);
+});
+
+test("a canonical CPU mask is inherited and witnessed by supervisor and workload", {
+  timeout: 5_000,
+}, async () => {
+  const files = launcher();
+  const allowed = readFileSync("/proc/self/status", "utf8")
+    .match(/^Cpus_allowed_list:\s*(\S+)\s*$/m)?.[1];
+  assert.equal(typeof allowed, "string");
+  const cpus = expandCpuList(allowed).slice(0, 2).sort((left, right) => left - right);
+  const expected = compressCpuList(cpus);
+  const result = track(await runWorkloadAttempt(workload(files, ["exact"]), {
+    cpuAffinity: { cpus, tasksetPath: "/usr/bin/taskset" },
+  }));
+
+  assert.equal(result.outcome.category, "pass", JSON.stringify(result.cleanup));
+  assert.deepEqual(result.execution.cpuAffinity, {
+    requestedCpuList: expected,
+    supervisorAllowedCpuList: expected,
+    workloadAllowedCpuList: expected,
+  });
+  await assert.rejects(runWorkloadAttempt(workload(files, ["exact"]), {
+    cpuAffinity: { cpus: [cpus[0], cpus[0]], tasksetPath: "/usr/bin/taskset" },
+  }), /strictly increasing/);
 });
 
 test("natural mapped exits retain exact output and typed evidence", { timeout: 5_000 }, async () => {

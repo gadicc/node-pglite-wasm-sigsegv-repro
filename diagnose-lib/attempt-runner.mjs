@@ -11,7 +11,7 @@ import {
   workloadLaunchProvenance,
 } from "./workload-spec.mjs";
 
-export const ATTEMPT_RESULT_VERSION = 2;
+export const ATTEMPT_RESULT_VERSION = 3;
 
 const SUPERVISOR_PROTOCOL_VERSION = 3;
 const ATTEMPT_SUPERVISOR = fileURLToPath(new URL("./attempt-supervisor.mjs", import.meta.url));
@@ -60,15 +60,52 @@ function excerptLimit(value, label) {
 function validateCpuAffinity(value) {
   if (value === undefined) return null;
   const affinity = plainObject(value, "attempt options.cpuAffinity");
-  exactKeys(affinity, ["cpu", "tasksetPath"], "attempt options.cpuAffinity");
-  if (!Number.isSafeInteger(affinity.cpu) || affinity.cpu < 0 || affinity.cpu > MAX_CPU_ID) {
-    fail(`attempt options.cpuAffinity.cpu must be an integer from 0 through ${MAX_CPU_ID}`);
-  }
+  const singleton = Object.hasOwn(affinity, "cpu");
+  exactKeys(affinity, singleton ? ["cpu", "tasksetPath"] : ["cpus", "tasksetPath"],
+    "attempt options.cpuAffinity");
   if (typeof affinity.tasksetPath !== "string" || !affinity.tasksetPath.startsWith("/") ||
       affinity.tasksetPath.includes("\0") || Buffer.byteLength(affinity.tasksetPath) > 16 * 1024) {
     fail("attempt options.cpuAffinity.tasksetPath must be a bounded absolute NUL-free path");
   }
-  return Object.freeze({ cpu: affinity.cpu, tasksetPath: affinity.tasksetPath });
+  if (singleton) {
+    if (!Number.isSafeInteger(affinity.cpu) || affinity.cpu < 0 || affinity.cpu > MAX_CPU_ID) {
+      fail(`attempt options.cpuAffinity.cpu must be an integer from 0 through ${MAX_CPU_ID}`);
+    }
+    return Object.freeze({
+      cpu: affinity.cpu,
+      cpuList: String(affinity.cpu),
+      tasksetPath: affinity.tasksetPath,
+    });
+  }
+  if (!Array.isArray(affinity.cpus) || affinity.cpus.length === 0 ||
+      affinity.cpus.length > MAX_CPU_ID + 1) {
+    fail(`attempt options.cpuAffinity.cpus must contain 1 through ${MAX_CPU_ID + 1} CPUs`);
+  }
+  const cpus = affinity.cpus.map((cpu, index) => {
+    if (!Number.isSafeInteger(cpu) || cpu < 0 || cpu > MAX_CPU_ID) {
+      fail(`attempt options.cpuAffinity.cpus[${index}] must be an integer from 0 through ${MAX_CPU_ID}`);
+    }
+    if (index > 0 && cpu <= affinity.cpus[index - 1]) {
+      fail("attempt options.cpuAffinity.cpus must be strictly increasing");
+    }
+    return cpu;
+  });
+  const tokens = [];
+  for (let first = 0; first < cpus.length;) {
+    let last = first;
+    while (last + 1 < cpus.length && cpus[last + 1] === cpus[last] + 1) last += 1;
+    tokens.push(first === last ? String(cpus[first]) : `${cpus[first]}-${cpus[last]}`);
+    first = last + 1;
+  }
+  const cpuList = tokens.join(",");
+  if (Buffer.byteLength(cpuList) > 64 * 1024) {
+    fail("attempt options.cpuAffinity.cpus produce an oversized CPU list");
+  }
+  return Object.freeze({
+    cpus: Object.freeze(cpus),
+    cpuList,
+    tasksetPath: affinity.tasksetPath,
+  });
 }
 
 function validateRetainedDirectory(value) {
@@ -298,11 +335,19 @@ function noSignalAction() {
 
 function executionEvidence(cpuAffinity, supervisorAllowedCpuList, workloadAllowedCpuList) {
   return {
-    cpuAffinity: cpuAffinity === null ? null : {
-      requestedCpu: cpuAffinity.cpu,
-      supervisorAllowedCpuList,
-      workloadAllowedCpuList,
-    },
+    cpuAffinity: cpuAffinity === null
+      ? null
+      : cpuAffinity.cpu === undefined
+        ? {
+          requestedCpuList: cpuAffinity.cpuList,
+          supervisorAllowedCpuList,
+          workloadAllowedCpuList,
+        }
+        : {
+          requestedCpu: cpuAffinity.cpu,
+          supervisorAllowedCpuList,
+          workloadAllowedCpuList,
+        },
   };
 }
 
@@ -660,7 +705,7 @@ export function createAttemptRunner({
         ]
         : [
           "-c",
-          String(options.cpuAffinity.cpu),
+          options.cpuAffinity.cpuList,
           process.execPath,
           supervisorPath,
           ...(options.retainedDirectory === null ? [] : [
@@ -733,7 +778,7 @@ export function createAttemptRunner({
                   message.retainedDirectory.device === options.retainedDirectory.device &&
                   message.retainedDirectory.inode === options.retainedDirectory.inode)) ||
               (options.cpuAffinity !== null &&
-                message.allowedCpuList !== String(options.cpuAffinity.cpu))) {
+                message.allowedCpuList !== options.cpuAffinity.cpuList)) {
             protocolViolation();
             return;
           }
@@ -770,7 +815,9 @@ export function createAttemptRunner({
               cwd: resolved.command.cwd,
               environment: launchEnvironment,
               termGraceMs: resolved.attempt.termGraceMs,
-              cpuAffinity: options.cpuAffinity?.cpu ?? null,
+              cpuAffinity: options.cpuAffinity === null
+                ? null
+                : options.cpuAffinity.cpu ?? options.cpuAffinity.cpuList,
               provenance: launchProvenance,
             }, (error) => {
               if (error) chooseLaunchError(normalizeErrorCode(error, "SUPERVISOR_SEND_ERROR"));
@@ -791,7 +838,7 @@ export function createAttemptRunner({
               typeof message.allowedCpuList !== "string" ||
               !/^[0-9,-]+$/.test(message.allowedCpuList) ||
               (options.cpuAffinity !== null &&
-                message.allowedCpuList !== String(options.cpuAffinity.cpu)) ||
+                message.allowedCpuList !== options.cpuAffinity.cpuList) ||
               (message.identityBound
                 ? typeof message.startTicks !== "string" || !START_TICKS_RE.test(message.startTicks)
                 : message.startTicks !== null)) {
