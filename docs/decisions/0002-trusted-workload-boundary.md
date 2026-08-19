@@ -14,7 +14,12 @@ Custom workloads are trusted user code. Fault Affinity will not claim to contain
 
 A workload and its descendants must remain inside the attempt's supervised process group or session. They must not daemonize, create a detached session, or deliberately evade cleanup. Workloads that need those behaviors require a future cgroup-backed execution design.
 
-The initial command contract must require a canonical absolute executable, an exact argument array, and a canonical existing working directory. It must pass arguments without shell interpolation or `eval`.
+The resolved command contract must contain a canonical absolute executable, an
+exact argument array, and a canonical existing working directory. As clarified
+by ADR 0019, a portable custom JSON file may express paths relative to its own
+directory; selection resolves and binds their canonical absolute identities
+before planning or execution. Arguments pass without shell interpolation or
+`eval`.
 
 The harness must use a documented minimal environment. Additional literal variables or named passthrough variables must be explicit. Secret values must not enter the evidence bundle by default, and an unrecorded value must be marked as provenance-incomplete.
 
@@ -32,7 +37,9 @@ This trust boundary has these consequences:
 This decision is satisfied when:
 
 - Live-run consent states that custom workloads are trusted and not sandboxed.
-- The parser rejects relative executables, malformed arguments, invalid working directories, and ambiguous environment declarations.
+- The resolver rejects executable or working-directory paths that cannot become
+  canonical valid identities, along with malformed arguments and ambiguous
+  environment declarations.
 - No user-controlled command text enters a shell program string.
 - Cleanup tests cover descendants that ignore `SIGTERM` and descendants that retain output descriptors.
 - Documentation states that daemonization and session escape violate the workload contract.

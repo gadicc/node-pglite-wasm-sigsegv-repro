@@ -1,10 +1,14 @@
 # Understand the Fault Affinity direction
 
-This page records the agreed destination for the repository without presenting unimplemented commands as current behavior. The working name is **Fault Affinity**.
+This page separates the implemented Fault Affinity foundation from the
+remaining migration work. **Fault Affinity** is now the package and public
+command identity; the first generic public path is exact-CPU execution.
 
 ## Define the intended scope
 
-Fault Affinity is intended to become a Linux harness for reproducing, localizing, and collecting reviewable evidence for intermittent CPU-sensitive process faults.
+Fault Affinity is a Linux harness for reproducing, localizing, and collecting
+reviewable evidence for intermittent CPU-sensitive process faults. Its current
+public generic surface is deliberately narrower than the full intended scope.
 
 The intended scope includes:
 
@@ -22,21 +26,29 @@ The project should not claim to be a universal crash debugger, hardware defect d
 
 The Node/PGlite workload remains valuable as the historical application-derived trigger and as a heavyweight regression workload. It records the path from a production-shaped failure to smaller WebAssembly probes.
 
-PGlite should stop owning the root project identity once the generic interface exists. Until then, the current commands, dependency, Dockerfile, evidence schemas, and diagnostic phases still depend on it.
+PGlite no longer owns the package or README identity. Its dependency,
+Dockerfile, legacy evidence schemas, and diagnostic commands remain because the
+historical reproduction and broader legacy suite still use them.
 
 ## Prefer WebAssembly churn as the reduced trigger
 
-`mini-wasm-churn.mjs` is the recommended reduced trigger for future built-in support. It is dependency-free and reproduced in 15/15 and 10/10 documented loaded attempts on the affected machine.
+`mini-wasm-churn.mjs` is the recommended `wasm-churn` built-in. It is
+dependency-free and reproduced in 15/15 and 10/10 documented loaded attempts
+on the affected machine.
 
 The native harness remains an advanced control. Its pure-execution modes did not reproduce the userspace fault in the documented runs, while `churn-mem` produced kernel oopses and a wedged process. That risk makes it unsuitable as a default workload.
 
-No built-in workload should run implicitly. A future invocation should require an explicit workload choice and display its resource and disruption risks.
+No built-in runs implicitly. Fresh and resumed live invocations require an
+explicit workload choice, and inspection and planning display the declared
+resource or disruption risk without launching it.
 
-## Introduce a workload contract before public commands
+## Bind public commands to a workload contract
 
-A generic harness needs more than a shell command string. It must record how the workload starts, when one attempt ends, and how each outcome is classified.
+A generic harness needs more than a shell command string. The version-1
+workload contract records how the workload starts, when one attempt ends, and
+how each outcome is classified.
 
-The planned workload contract should resolve and persist:
+The resolver and schema-3 evidence persist:
 
 - A stable workload identifier and version
 - An executable plus argument array, without shell evaluation
@@ -96,19 +108,23 @@ controlled-load session and derives completion from durable publication. Its
 stable supervisors retain the lease through bounded cleanup if the outer owner
 is interrupted.
 
-Current diagnostic phases do not write the new formats, and `fault-affinity` is
-not yet an executable command. The next migration step is reviewed workload
-selection and public orchestration for the controlled-load path, while debugger
-and frequency protocols still need workload-bound adapters where applicable.
-The controlled-load foundation now has a separate managed
-auxiliary-workload lifecycle with verified readiness, discarded output, and
-bounded cleanup. Its worker-set layer now adds complete readiness, stable
-boundary identities, peer cancellation, stop evidence, and interrupted-owner
-lease retention. The single-workload adapter now adds complete A1/B/A2
-envelopes, constant target affinity, and evidence-backed warm-up and recovery
-intervals. Its complete-only store and schema-3 manifest-v5 owner now hold one
-lease across the whole session and final commit. Historical Node A/B/A and
+The `fault-affinity` command now exposes reviewed workload listing, inspection,
+dry-run planning, fresh exact-CPU schema-3 bundle creation, and exact-prefix
+resume. It supports the recommended `wasm-churn` and historical `node-pglite`
+built-ins plus trusted custom JSON workload definitions. This completes the
+package/command portion of steps 9 and 10 without requiring a physical checkout
+or repository-host rename.
+
+The internal baseline, group, and pinned-concurrent adapters are not yet
+publicly orchestrated for arbitrary workloads. The controlled-load foundation
+has a managed auxiliary lifecycle, verified worker sets, complete A1/B/A2
+envelopes, a complete-only store, and schema-3 manifest-v5 ownership, but still
+has no generic public command. Debugger and frequency protocols still need
+workload-bound adapters where applicable. Historical Node A/B/A and
 Node-by-warmup modes remain multi-workload experiments outside the current
-schema. Public orchestration follows only after those compatibility and
-privilege boundaries are explicit. Legacy bundle interpretation remains
-unchanged.
+schema.
+
+The next high-value migration is to expose additional generic phases only where
+their capability, provenance, and compatibility contracts are complete. Legacy
+schema-1/schema-2 interpretation and the privileged recovery namespace remain
+unchanged throughout.

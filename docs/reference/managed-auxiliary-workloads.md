@@ -19,7 +19,7 @@ therefore preserves:
 - Optional retained bundle-directory ownership
 
 The auxiliary workload must still use the trusted local
-[workload contract](../project-direction.md#introduce-a-workload-contract-before-public-commands).
+[workload contract](../project-direction.md#bind-public-commands-to-a-workload-contract).
 
 ## Wait for verified readiness
 

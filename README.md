@@ -1,20 +1,57 @@
-# CPU-localized fault diagnostics for Node/PGlite
+# Fault Affinity
 
-This repository reproduces and diagnoses intermittent native faults that first appeared while Node.js initialized PGlite's PostgreSQL WebAssembly module. The investigation reduced the original 16-process workload to exact-CPU tests and a dependency-free WebAssembly churn trigger.
+Fault Affinity is a Linux harness for bounded, resumable investigation of intermittent CPU-sensitive process faults. It runs an explicitly selected workload across deterministic CPU-affinity schedules and records reviewable evidence. Observed affinity is evidence about where a workload reproduced; it is not, by itself, proof of CPU causation.
 
-The agreed project direction is **Fault Affinity**: a Linux harness for reproducing, localizing, and collecting reviewable evidence for intermittent CPU-sensitive process faults. The generic workload interface and renamed command do not exist yet. All commands on this page describe the current Node/PGlite implementation.
+The project began with native faults during Node.js and PGlite WebAssembly initialization. That workload remains as a historical heavyweight built-in and case study. The recommended reduced built-in is now the dependency-free WebAssembly churn workload.
+
+The first public generic command owns exact-CPU schema-3 bundles. The broader legacy diagnostic suite still provides baseline, topology, telemetry, debugger, frequency, and final-report phases specifically for the Node/PGlite investigation.
 
 ## Safety
 
 > [!CAUTION]
-> The original workload uses about 1.2 GiB per child. The default 16-child baseline needs about 20 GiB. It intentionally triggers `SIGSEGV`, and a full diagnostic run can take hours.
+> Live workloads are expected to consume CPU and may terminate abnormally. The original PGlite workload uses about 1.2 GiB per child; its default 16-child legacy baseline needs about 20 GiB. Always inspect and dry-run a plan first.
 
 > [!WARNING]
 > The native `churn-mem` experiment produced kernel oopses on the affected machine. One oops left an unkillable process until reboot. Do not run native churn modes unless a hang or forced reboot is acceptable.
 
-The main diagnostic runner does not require root. It does not change firmware, write sysfs settings, or alter unrelated process affinity. It disables core dumps only for its test processes. Optional root operations live in separate scripts for review before use.
+Custom workloads are trusted local programs, not sandboxed code. They run with the invoking account's access and must not daemonize or leave the supervised process group.
 
-## Reproduce the original failure
+The generic command and main legacy diagnostic runner do not require root. They do not change firmware, write sysfs settings, or alter unrelated process affinity. Optional root operations live in separate scripts for review before use.
+
+## Start with the generic exact-CPU command
+
+Listing, inspection, and dry runs do not execute a workload:
+
+```sh
+node fault-affinity.mjs workloads
+node fault-affinity.mjs inspect --workload wasm-churn
+node fault-affinity.mjs exact \
+  --workload wasm-churn \
+  --cpus 19 \
+  --rounds 10 \
+  --out-dir diagnostics/wasm-exact \
+  --dry-run
+```
+
+A live run needs the same explicit selection plus `--yes`:
+
+```sh
+node fault-affinity.mjs exact \
+  --workload wasm-churn \
+  --cpus 19 \
+  --rounds 10 \
+  --out-dir diagnostics/wasm-exact \
+  --yes
+
+node fault-affinity.mjs exact \
+  --resume diagnostics/wasm-exact \
+  --workload wasm-churn \
+  --yes
+```
+
+Use `--workload-file path/to/workload.json` to select a trusted local script or binary. The initial generic command is intentionally exact-CPU-only; it does not yet produce the legacy suite's complete report. Read [run a generic exact-CPU workload](docs/guides/generic-exact-cpu.md) for custom definitions, lifecycle rules, evidence semantics, and resume behavior.
+
+## Reproduce the historical Node/PGlite failure
 
 The original child creates an in-memory PGlite 0.5.4 client, runs `SELECT 1`, closes the client, and exits. There is no application framework, test runner, native add-on, or database persistence.
 
@@ -43,9 +80,9 @@ failedWaves=1 completedWaves=8 requestedWaves=50
 
 Sixteen release-build clients produced a measured cgroup peak of about 19 GiB. A smaller machine may produce a legitimate out-of-memory failure instead of the fault under investigation.
 
-## Run the current diagnostic suite
+## Run the legacy Node/PGlite diagnostic suite
 
-`diagnose.sh` collects environment data, runs baseline and CPU-localization protocols, samples read-only telemetry, optionally captures a live GNU Debugger (GDB) fault, and creates an integrity-checked evidence bundle.
+`diagnose.sh` preserves the original Node/PGlite workflow. It collects environment data, runs baseline and CPU-localization protocols, samples read-only telemetry, optionally captures a live GNU Debugger (GDB) fault, and creates an integrity-checked evidence bundle.
 
 Inspect the plan before a live run:
 
@@ -71,7 +108,7 @@ The available presets are:
 
 Read [run the diagnostic suite](docs/guides/run-diagnostics.md) before collecting evidence for publication or support.
 
-## Run controlled-load experiments
+## Run legacy controlled-load experiments
 
 `load-state-aba.mjs` pins one `/usr/bin/yes` worker to each selected load CPU and verifies each worker through `/proc`. A dry run is the default. A live experiment requires `--yes`.
 
@@ -100,7 +137,7 @@ The repository now contains smaller triggers than PGlite:
 | `child.mjs` with PGlite | Original application-derived trigger | 9/10 and 10/10 in matched sessions |
 | `repro-c.c` | Native controls and disruptive experiments | Pure execution stayed clean; `churn-mem` produced two kernel oopses |
 
-`mini-wasm-churn.mjs` compiles, instantiates, executes, and retires a fresh module each round. It is dependency-free, but it runs until it faults or you terminate it. The current diagnostic suite does not yet supervise it as a bounded built-in workload.
+`mini-wasm-churn.mjs` compiles, instantiates, executes, and retires a fresh module each round. Through `fault-affinity --workload wasm-churn`, each attempt has a bounded survival window and supervised cleanup. Direct invocation remains unbounded.
 
 Read [understand the reduced and native triggers](docs/case-study/reduced-and-native-triggers.md) before using the native harness.
 
@@ -120,9 +157,9 @@ The evidence points toward a platform-dependent execution anomaly, not a convent
 
 Read the [case-study index](docs/case-study/README.md) for measured results and inference boundaries.
 
-## Evidence integrity and privacy
+## Legacy evidence integrity and privacy
 
-Completed diagnostic bundles contain `report.md`, machine-readable results, phase logs, telemetry, a privacy-review aid, and `manifest.txt`.
+Completed legacy diagnostic bundles contain `report.md`, machine-readable results, phase logs, telemetry, a privacy-review aid, and `manifest.txt`. Generic exact-CPU schema-3 bundles use their own complete-prefix semantics described in the generic guide.
 
 `manifest.txt` is the readiness token. Treat a bundle as complete only when this command succeeds inside the bundle:
 
@@ -172,6 +209,7 @@ See [software controls](docs/case-study/software-controls.md) for the recorded N
 
 - [Documentation map](docs/README.md)
 - [Project direction](docs/project-direction.md)
+- [Run a generic exact-CPU workload](docs/guides/generic-exact-cpu.md)
 - [Run the diagnostic suite](docs/guides/run-diagnostics.md)
 - [Run controlled-load experiments](docs/guides/controlled-load-experiments.md)
 - [Understand evidence bundles](docs/reference/evidence-bundles.md)

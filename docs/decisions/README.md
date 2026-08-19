@@ -6,7 +6,7 @@ behavior and compatibility boundaries, not current runtime capabilities.
 
 | Decision | Status | Summary |
 | --- | --- | --- |
-| [ADR 0001](0001-fault-affinity-direction.md) | Accepted | Adopt the Fault Affinity scope and working name, with `wasm-churn` as the recommended explicit built-in. |
+| [ADR 0001](0001-fault-affinity-direction.md) | Accepted | Adopt the Fault Affinity scope and name, with `wasm-churn` as the recommended explicit built-in. |
 | [ADR 0002](0002-trusted-workload-boundary.md) | Accepted | Run trusted user workloads without claiming sandboxing or hostile-code containment. |
 | [ADR 0003](0003-attempt-lifecycle.md) | Accepted | Give every attempt a hard deadline and distinguish finite execution from survival windows. |
 | [ADR 0004](0004-typed-outcome-evidence.md) | Accepted | Preserve raw process status and classify outcomes without conflating distinct evidence types. |
@@ -24,3 +24,4 @@ behavior and compatibility boundaries, not current runtime capabilities.
 | [ADR 0016](0016-controlled-load-worker-sets.md) | Accepted | Bind complete worker readiness, stable boundary identities, peer cancellation, and stop evidence. |
 | [ADR 0017](0017-controlled-load-aba-sessions.md) | Accepted | Publish only complete single-workload A1/B/A2 sessions with a verified B condition. |
 | [ADR 0018](0018-controlled-load-store-and-manifest-v5.md) | Accepted | Own complete controlled-load sessions in a no-clobber store and schema-3 manifest-v5 variant. |
+| [ADR 0019](0019-public-exact-cli-and-project-identity.md) | Accepted | Publish the exact-CPU schema-3 command and adopt the Fault Affinity package identity without renaming legacy state. |

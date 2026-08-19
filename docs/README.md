@@ -4,11 +4,12 @@ This index separates instructions for running the current tooling from the resul
 
 ## Understand the project
 
-- [Project direction](project-direction.md): scope, working name, retained workloads, and migration boundaries
+- [Project direction](project-direction.md): scope, public identity, retained workloads, and migration boundaries
 - [Repository README](../README.md): safety, current commands, findings summary, and entry points
 
 ## Run the current tools
 
+- [Run a generic exact-CPU workload](guides/generic-exact-cpu.md): built-in and custom workload selection, dry runs, live execution, and schema-3 resume
 - [Run the diagnostic suite](guides/run-diagnostics.md): prerequisites, presets, exact-CPU protocols, optional privileged steps, and exploratory follow-ups
 - [Run controlled-load experiments](guides/controlled-load-experiments.md): load-state A/B/A, GDB capture, Node A/B/A, and Node/warmup matrix modes
 - [Understand evidence bundles](reference/evidence-bundles.md): output layout, integrity, privacy, resume, redo, and phase validation
@@ -28,6 +29,7 @@ This index separates instructions for running the current tooling from the resul
 ## Develop the tooling
 
 - [Architecture decisions](decisions/README.md): trust, lifecycle, evidence typing, schema compatibility, and privileged-state boundaries
+- [Workload catalog](../workloads/README.md): built-in roles and custom workload-contract JSON
 - [Develop and test the tooling](development.md): offline tests, safe test scope, and repository boundaries
 - [Understand internal attempt records](reference/attempt-records.md): workload binding, typed outcomes, cleanup evidence, and canonical record bindings
 - [Understand internal exact-CPU phase envelopes](reference/exact-cpu-phase-envelopes.md): schedule identity, attempt slots, affinity, durable publication, and exact-prefix resume

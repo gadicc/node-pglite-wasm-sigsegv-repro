@@ -16,15 +16,17 @@ trap 'rm -rf "$TMP"' EXIT
 
 # Keep every main-script test hermetic even when a fixture unexpectedly gets
 # farther than intended. Capture the real interpreter before prepending a
-# fail-closed wrapper; diagnostic helpers still run normally, while the two
-# memory-intensive workload entrypoints can never be launched by this suite.
+# fail-closed wrapper; diagnostic helpers still run normally, while known
+# JavaScript fault-workload entrypoints can never be launched through PATH by
+# this suite. The public CLI also rejects live built-ins while the marker is set.
 DIAG_TEST_REAL_NODE_BIN="$(command -v node)"
 DIAG_TEST_HERMETIC_BIN="$TMP/hermetic-bin"
 mkdir -p "$DIAG_TEST_HERMETIC_BIN"
 cat > "$DIAG_TEST_HERMETIC_BIN/node" << 'EOF'
 #!/usr/bin/env bash
 case "${1:-}" in
-  repro.mjs | child.mjs | */repro.mjs | */child.mjs)
+  repro.mjs | child.mjs | mini-wasm.mjs | mini-wasm-churn.mjs | \
+  */repro.mjs | */child.mjs | */mini-wasm.mjs | */mini-wasm-churn.mjs)
     printf 'test harness refused workload entrypoint: %s\n' "$1" >&2
     exit 97
     ;;

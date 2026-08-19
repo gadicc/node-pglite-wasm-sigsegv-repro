@@ -21,7 +21,8 @@ The suite covers:
 
 - CPU-list parsing
 - Argument and exit-code validation
-- Draft workload-spec validation and typed outcome classification
+- Workload-spec and catalog validation, including custom-file provenance
+- Public exact-CPU CLI parsing, dry-run safety, fresh bundle creation, and resume
 - Internal shell-free attempt execution, deadlines, bounded output, and process-group cleanup
 - Managed auxiliary-workload readiness, discarded output, and bounded cancellation
 - Controlled-load worker-set readiness, boundary identity checks, peer cancellation, and stop evidence
@@ -82,10 +83,10 @@ Do not infer missing signal, stderr, boundary, or generation data for a legacy p
 
 ## Keep workload execution bounded
 
-The internal workload contract, attempt runner, exact-CPU phase adapter, and
-durable phase store are implemented as a foundation, but no current
-`diagnose.sh` phase, legacy bundle, or public command uses the new formats. The
-offline tests prove:
+The public `fault-affinity exact` command composes the workload contract,
+attempt runner, exact-CPU phase adapter, durable phase store, and schema-3
+bundle owner. Legacy `diagnose.sh` phases and schema-1/schema-2 bundles retain
+their original formats. The offline tests prove:
 
 - Deadline-aware process-group termination
 - Cleanup of descendants on success, failure, timeout, `SIGINT`, and `SIGTERM`
@@ -132,15 +133,15 @@ The exact-CPU adapter reuses the current balanced-cyclic isolated schedule and
 places each valid attempt record in a versioned envelope. Schema-3 manifest
 version 1 binds only this phase. The owner publishes an exact prefix to a
 private store and holds one bundle lease across selecting, running, and
-committing the next slot.
+committing the next slot. The public command creates and resumes this variant;
+its integration fixture is a harmless finite process, never a built-in trigger.
 
 The internal baseline adapter separately binds fixed concurrent waves and
 publishes only complete whole-wave envelopes. Schema-3 manifest version 2 binds
 baseline and exact-CPU state without adding fields to version 1 in place. The
 same bundle lease covers selecting, running, and committing an entire baseline
-wave. Before exposing a public generic interface, extend that versioned
-ownership contract to the remaining applicable phases without changing legacy
-bundle interpretation.
+wave. Expose that phase publicly only after its command-level capability and
+compatibility contract is equally explicit.
 
 Schema-3 manifest version 3 additionally binds CPU-group contexts. Contexts
 may overlap, their order is deterministically balanced, and every child must
@@ -170,7 +171,10 @@ Manual crash experiments need an explicit operator, a reviewed plan, and a dispo
 
 ## Check documentation changes
 
-Documentation commands must reflect the current `--help` output. Do not publish future `fault-affinity` commands until the executable exists.
+Documentation commands must reflect the current `--help` output. Do not
+present internal baseline, group, pinned-concurrent, controlled-load, debugger,
+or frequency adapters as public generic commands until their orchestration
+exists.
 
 When headings move, search for repository-relative anchors:
 

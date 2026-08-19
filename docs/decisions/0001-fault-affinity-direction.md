@@ -10,7 +10,9 @@ The repository began as a Node.js and PGlite reproduction. Its diagnostic code n
 
 The project will become a Linux harness for reproducing, localizing, and collecting reviewable evidence for intermittent CPU-sensitive process faults.
 
-The working project name is **Fault Affinity**. The planned repository slug and command name are `fault-affinity`. The external rename remains deferred until the generic workload interface and compatibility path exist.
+The project name is **Fault Affinity** and the package and command name are
+`fault-affinity`. ADR 0019 records that the generic exact-CPU path satisfied the
+rename gate. Physical repository-host naming remains a separate operation.
 
 `wasm-churn` will be the recommended built-in workload. Every live run must select a workload explicitly, so recommendation does not imply silent execution. The Node/PGlite workload will remain available as the historical heavyweight reproduction.
 
@@ -23,7 +25,8 @@ This direction has these consequences:
 - New interfaces and reports must use workload-neutral fault terminology.
 - Linux-specific behavior may rely on `/proc`, sysfs, `taskset`, and Linux debugger semantics.
 - The historical case study may retain Node.js, PGlite, WebAssembly, and `SIGSEGV` terminology.
-- Existing package, command, directory, and recovery names remain until their compatibility requirements are met.
+- Existing legacy commands, checkout directories, and recovery names remain
+  wherever their compatibility requirements still apply.
 
 ## Acceptance criteria
 
