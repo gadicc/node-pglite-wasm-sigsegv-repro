@@ -57,6 +57,16 @@ import {
   readExactCpuPhaseStore,
 } from "./exact-cpu-phase-store.mjs";
 import {
+  controlledLoadSessionManifestBinding,
+  parseControlledLoadSessionManifest,
+  runControlledLoadSession,
+} from "./controlled-load-session.mjs";
+import {
+  commitControlledLoadSession,
+  initializeControlledLoadPhaseStore,
+  readControlledLoadPhaseStore,
+} from "./controlled-load-phase-store.mjs";
+import {
   PinnedProtocolStateError,
   canonicalProtocolJson,
   createFileStateAdapter,
@@ -72,12 +82,14 @@ export const SCHEMA3_BUNDLE_MANIFEST_VERSION = 1;
 export const SCHEMA3_BUNDLE_MANIFEST_V2_VERSION = 2;
 export const SCHEMA3_BUNDLE_MANIFEST_V3_VERSION = 3;
 export const SCHEMA3_BUNDLE_MANIFEST_V4_VERSION = 4;
+export const SCHEMA3_BUNDLE_MANIFEST_V5_VERSION = 5;
 export const SCHEMA3_RUN_SCHEMA_VERSION = 3;
 export const SCHEMA3_BUNDLE_FILE = "fault-affinity-bundle.json";
 export const SCHEMA3_BUNDLE_FILE_MAX_BYTES = 8 * 1024 * 1024;
 export const SCHEMA3_BASELINE_STATE_DIRECTORY = "state/baseline";
 export const SCHEMA3_GROUP_STATE_DIRECTORY = "state/groups";
 export const SCHEMA3_PINNED_CONCURRENT_STATE_DIRECTORY = "state/pinned-concurrent";
+export const SCHEMA3_CONTROLLED_LOAD_STATE_DIRECTORY = "state/controlled-load";
 export const SCHEMA3_EXACT_CPU_STATE_DIRECTORY = "state/exact-cpu";
 
 const GENERATION_RE = /^[a-f0-9]{32}$/;
@@ -158,19 +170,20 @@ function workloadBinding(resolved) {
   };
 }
 
-function expectedPhaseControls(resolved, supportedCapabilities) {
+function expectedPhaseControls(resolved, supportedCapabilities, { controlledLoad = false } = {}) {
   requireCondition(resolved.capabilities.isolated === true,
     "schema-3 exact-CPU bundles require isolated workload capability");
   for (const capability of supportedCapabilities) {
     requireCondition(resolved.capabilities[capability] === true,
       `schema-3 bundle implementation requires '${capability}' workload capability`);
   }
-  return Object.fromEntries(WORKLOAD_CAPABILITIES.map((capability) => [
+  const controls = Object.fromEntries(WORKLOAD_CAPABILITIES.map((capability) => [
     capability,
     supportedCapabilities.has(capability)
       ? "supported"
       : resolved.capabilities[capability] === true ? "unavailable" : "unsupported",
   ]));
+  return controlledLoad ? { ...controls, controlledLoad: "supported" } : controls;
 }
 
 function validateBinding(value, expected, label) {
@@ -189,12 +202,31 @@ function validateWorkloadBinding(value, expected) {
 }
 
 function validatePhaseControls(value, expected) {
-  exactKeys(value, WORKLOAD_CAPABILITIES, "bundle phase controls");
-  for (const capability of WORKLOAD_CAPABILITIES) {
+  const capabilities = Object.keys(expected);
+  exactKeys(value, capabilities, "bundle phase controls");
+  for (const capability of capabilities) {
     requireCondition(PHASE_CONTROLS.has(value[capability]) &&
       value[capability] === expected[capability],
     `bundle phase control '${capability}' does not match this internal implementation`);
   }
+}
+
+function parseControlledLoadPhaseContext(measured, auxiliary, value) {
+  exactKeys(value, [
+    "protocol",
+    "stateDirectory",
+    "manifestBinding",
+    "manifest",
+  ], "bundle controlled-load phase");
+  requireCondition(value.protocol === "controlled-load-aba-v1",
+    "bundle controlled-load protocol is unsupported");
+  requireCondition(value.stateDirectory === SCHEMA3_CONTROLLED_LOAD_STATE_DIRECTORY,
+    "bundle controlled-load state directory is invalid");
+  const manifest = parseControlledLoadSessionManifest(measured, auxiliary, value.manifest);
+  validateBinding(value.manifestBinding,
+    controlledLoadSessionManifestBinding(measured, auxiliary, manifest),
+    "bundle controlled-load manifest binding");
+  return manifest;
 }
 
 function parseBaselinePhaseContext(resolved, value) {
@@ -266,18 +298,27 @@ function parsePinnedConcurrentPhaseContext(resolved, value) {
   return manifest;
 }
 
-function parseManifestContext(resolved, value) {
+function parseManifestContext(resolved, value, auxiliary) {
   plainObject(value, "schema-3 bundle manifest");
   requireCondition(value.version === SCHEMA3_BUNDLE_MANIFEST_VERSION ||
     value.version === SCHEMA3_BUNDLE_MANIFEST_V2_VERSION ||
     value.version === SCHEMA3_BUNDLE_MANIFEST_V3_VERSION ||
-    value.version === SCHEMA3_BUNDLE_MANIFEST_V4_VERSION,
+    value.version === SCHEMA3_BUNDLE_MANIFEST_V4_VERSION ||
+    value.version === SCHEMA3_BUNDLE_MANIFEST_V5_VERSION,
   `schema-3 bundle manifest version must be ${SCHEMA3_BUNDLE_MANIFEST_VERSION} or ` +
     `${SCHEMA3_BUNDLE_MANIFEST_V2_VERSION}, ${SCHEMA3_BUNDLE_MANIFEST_V3_VERSION}, or ` +
-    `${SCHEMA3_BUNDLE_MANIFEST_V4_VERSION}`);
-  const hasBaseline = value.version >= SCHEMA3_BUNDLE_MANIFEST_V2_VERSION;
-  const hasGroups = value.version >= SCHEMA3_BUNDLE_MANIFEST_V3_VERSION;
-  const hasPinnedConcurrent = value.version >= SCHEMA3_BUNDLE_MANIFEST_V4_VERSION;
+    `${SCHEMA3_BUNDLE_MANIFEST_V4_VERSION}, or ${SCHEMA3_BUNDLE_MANIFEST_V5_VERSION}`);
+  const hasBaseline = [
+    SCHEMA3_BUNDLE_MANIFEST_V2_VERSION,
+    SCHEMA3_BUNDLE_MANIFEST_V3_VERSION,
+    SCHEMA3_BUNDLE_MANIFEST_V4_VERSION,
+  ].includes(value.version);
+  const hasGroups = [
+    SCHEMA3_BUNDLE_MANIFEST_V3_VERSION,
+    SCHEMA3_BUNDLE_MANIFEST_V4_VERSION,
+  ].includes(value.version);
+  const hasPinnedConcurrent = value.version === SCHEMA3_BUNDLE_MANIFEST_V4_VERSION;
+  const hasControlledLoad = value.version === SCHEMA3_BUNDLE_MANIFEST_V5_VERSION;
   exactKeys(value, [
     "version",
     "bundleFormatVersion",
@@ -285,10 +326,12 @@ function parseManifestContext(resolved, value) {
     "bundleGeneration",
     "workload",
     "workloadBinding",
+    ...(hasControlledLoad ? ["auxiliaryWorkload", "auxiliaryWorkloadBinding"] : []),
     "phaseControls",
     ...(hasBaseline ? ["baseline"] : []),
     ...(hasGroups ? ["groups"] : []),
     ...(hasPinnedConcurrent ? ["pinnedConcurrent"] : []),
+    ...(hasControlledLoad ? ["controlledLoad"] : []),
     "exactCpu",
   ], "schema-3 bundle manifest");
   requireCondition(value.bundleFormatVersion === SCHEMA3_BUNDLE_FORMAT_VERSION,
@@ -304,16 +347,30 @@ function parseManifestContext(resolved, value) {
     canonicalWorkloadJson(expectedWorkload),
   "bundle workload does not match the resolved workload identity");
   validateWorkloadBinding(value.workloadBinding, workloadBinding(resolved));
+  if (hasControlledLoad) {
+    requireCondition(auxiliary !== undefined,
+      "schema-3 controlled-load manifests require the resolved auxiliary workload");
+    const expectedAuxiliary = resolvedWorkloadJson(auxiliary);
+    requireCondition(canonicalWorkloadJson(value.auxiliaryWorkload) ===
+      canonicalWorkloadJson(expectedAuxiliary),
+    "bundle auxiliary workload does not match the resolved auxiliary identity");
+    validateWorkloadBinding(value.auxiliaryWorkloadBinding, workloadBinding(auxiliary));
+  }
   const supported = new Set(hasPinnedConcurrent
     ? ["baseline", "groups", "isolated", "pinnedConcurrent"]
     : hasGroups ? ["baseline", "groups", "isolated"]
     : hasBaseline ? ["baseline", "isolated"] : ["isolated"]);
-  validatePhaseControls(value.phaseControls, expectedPhaseControls(resolved, supported));
+  validatePhaseControls(value.phaseControls, expectedPhaseControls(resolved, supported, {
+    controlledLoad: hasControlledLoad,
+  }));
 
   const baselineManifest = hasBaseline ? parseBaselinePhaseContext(resolved, value.baseline) : null;
   const groupManifest = hasGroups ? parseGroupPhaseContext(resolved, value.groups) : null;
   const pinnedConcurrentManifest = hasPinnedConcurrent
     ? parsePinnedConcurrentPhaseContext(resolved, value.pinnedConcurrent)
+    : null;
+  const controlledLoadManifest = hasControlledLoad
+    ? parseControlledLoadPhaseContext(resolved, auxiliary, value.controlledLoad)
     : null;
   const exactCpuManifest = parseExactCpuPhaseContext(resolved, value.exactCpu);
   return {
@@ -321,6 +378,7 @@ function parseManifestContext(resolved, value) {
     baselineManifest,
     groupManifest,
     pinnedConcurrentManifest,
+    controlledLoadManifest,
     exactCpuManifest,
   };
 }
@@ -475,17 +533,61 @@ export function buildSchema3BundleManifestV4(resolved, options) {
   });
 }
 
-export function parseSchema3BundleManifest(resolved, value) {
-  parseManifestContext(resolved, value);
+export function buildSchema3BundleManifestV5(measured, auxiliary, options) {
+  exactKeys(options, [
+    "bundleGeneration", "controlledLoadManifest", "exactCpuManifest",
+  ], "schema-3 bundle v5 options");
+  requireCondition(typeof options.bundleGeneration === "string" &&
+    GENERATION_RE.test(options.bundleGeneration),
+  "bundle generation must be exactly 32 lowercase hexadecimal characters");
+  const controlledLoadManifest = parseControlledLoadSessionManifest(
+    measured,
+    auxiliary,
+    options.controlledLoadManifest,
+  );
+  const exactCpuManifest = parseExactCpuPhaseManifest(measured, options.exactCpuManifest);
+  return parseSchema3BundleManifest(measured, {
+    version: SCHEMA3_BUNDLE_MANIFEST_V5_VERSION,
+    bundleFormatVersion: SCHEMA3_BUNDLE_FORMAT_VERSION,
+    runSchemaVersion: SCHEMA3_RUN_SCHEMA_VERSION,
+    bundleGeneration: options.bundleGeneration,
+    workload: resolvedWorkloadJson(measured),
+    workloadBinding: workloadBinding(measured),
+    auxiliaryWorkload: resolvedWorkloadJson(auxiliary),
+    auxiliaryWorkloadBinding: workloadBinding(auxiliary),
+    phaseControls: expectedPhaseControls(measured, new Set(["isolated"]), {
+      controlledLoad: true,
+    }),
+    controlledLoad: {
+      protocol: "controlled-load-aba-v1",
+      stateDirectory: SCHEMA3_CONTROLLED_LOAD_STATE_DIRECTORY,
+      manifestBinding: controlledLoadSessionManifestBinding(
+        measured,
+        auxiliary,
+        controlledLoadManifest,
+      ),
+      manifest: controlledLoadManifest,
+    },
+    exactCpu: {
+      protocol: "isolated-exact-cpu-v1",
+      stateDirectory: SCHEMA3_EXACT_CPU_STATE_DIRECTORY,
+      manifestBinding: exactCpuPhaseManifestBinding(measured, exactCpuManifest),
+      manifest: exactCpuManifest,
+    },
+  }, auxiliary);
+}
+
+export function parseSchema3BundleManifest(resolved, value, auxiliary) {
+  parseManifestContext(resolved, value, auxiliary);
   return canonicalClone(value);
 }
 
-export function canonicalSchema3BundleManifestLine(resolved, value) {
-  return canonicalLine(parseSchema3BundleManifest(resolved, value));
+export function canonicalSchema3BundleManifestLine(resolved, value, auxiliary) {
+  return canonicalLine(parseSchema3BundleManifest(resolved, value, auxiliary));
 }
 
-export function schema3BundleManifestBinding(resolved, value) {
-  return bindingForBytes(canonicalSchema3BundleManifestLine(resolved, value));
+export function schema3BundleManifestBinding(resolved, value, auxiliary) {
+  return bindingForBytes(canonicalSchema3BundleManifestLine(resolved, value, auxiliary));
 }
 
 function validatePrivateDirectory(directory, label) {
@@ -550,6 +652,9 @@ async function listRoot(adapter) {
 }
 
 function expectedStateDirectories(manifest) {
+  if (manifest.version === SCHEMA3_BUNDLE_MANIFEST_V5_VERSION) {
+    return ["controlled-load", "exact-cpu"];
+  }
   if (manifest.version === SCHEMA3_BUNDLE_MANIFEST_V4_VERSION) {
     return ["baseline", "exact-cpu", "groups", "pinned-concurrent"];
   }
@@ -593,7 +698,7 @@ function decodeJsonLine(bytes, label) {
   }
 }
 
-async function readManifest(resolved, adapter) {
+async function readManifest(resolved, auxiliary, adapter) {
   let bytes;
   try {
     bytes = await adapter.read(SCHEMA3_BUNDLE_FILE, SCHEMA3_BUNDLE_FILE_MAX_BYTES);
@@ -609,24 +714,33 @@ async function readManifest(resolved, adapter) {
   const manifest = parseSchema3BundleManifest(
     resolved,
     decodeJsonLine(bytes, "schema-3 bundle manifest"),
+    auxiliary,
   );
-  requireCondition(bytes.equals(canonicalSchema3BundleManifestLine(resolved, manifest)),
+  requireCondition(bytes.equals(canonicalSchema3BundleManifestLine(
+    resolved,
+    manifest,
+    auxiliary,
+  )),
     "schema-3 bundle manifest is not canonical");
   return manifest;
 }
 
-async function readBundleState(resolved, bundleDir) {
+async function readBundleState(resolved, auxiliary, bundleDir) {
   const root = validatePrivateDirectory(bundleDir, "schema-3 bundle directory");
   const adapter = createFileStateAdapter(root);
   const names = await listRoot(adapter);
   requireCondition(names.has(SCHEMA3_BUNDLE_FILE), "schema-3 bundle manifest is missing");
   requireCondition(names.has("state"), "schema-3 bundle state directory is missing");
-  const manifest = await readManifest(resolved, adapter);
+  const manifest = await readManifest(resolved, auxiliary, adapter);
   const stateRoot = validatePrivateDirectory(path.join(root, "state"),
     "schema-3 bundle state directory");
   await validateStateRootInventory(stateRoot, manifest);
   let baseline;
-  if (manifest.version >= SCHEMA3_BUNDLE_MANIFEST_V2_VERSION) {
+  if ([
+    SCHEMA3_BUNDLE_MANIFEST_V2_VERSION,
+    SCHEMA3_BUNDLE_MANIFEST_V3_VERSION,
+    SCHEMA3_BUNDLE_MANIFEST_V4_VERSION,
+  ].includes(manifest.version)) {
     const baselineStateDir = validatePrivateDirectory(path.join(stateRoot, "baseline"),
       "schema-3 baseline state directory");
     baseline = await readBaselinePhaseStore({ resolved, stateDir: baselineStateDir });
@@ -635,7 +749,10 @@ async function readBundleState(resolved, bundleDir) {
     "schema-3 baseline state belongs to a different phase manifest");
   }
   let groups;
-  if (manifest.version >= SCHEMA3_BUNDLE_MANIFEST_V3_VERSION) {
+  if ([
+    SCHEMA3_BUNDLE_MANIFEST_V3_VERSION,
+    SCHEMA3_BUNDLE_MANIFEST_V4_VERSION,
+  ].includes(manifest.version)) {
     const groupStateDir = validatePrivateDirectory(path.join(stateRoot, "groups"),
       "schema-3 group state directory");
     groups = await readGroupPhaseStore({ resolved, stateDir: groupStateDir });
@@ -657,6 +774,21 @@ async function readBundleState(resolved, bundleDir) {
       canonicalProtocolJson(manifest.pinnedConcurrent.manifest),
     "schema-3 pinned-concurrent state belongs to a different phase manifest");
   }
+  let controlledLoad;
+  if (manifest.version === SCHEMA3_BUNDLE_MANIFEST_V5_VERSION) {
+    const controlledLoadStateDir = validatePrivateDirectory(
+      path.join(stateRoot, "controlled-load"),
+      "schema-3 controlled-load state directory",
+    );
+    controlledLoad = await readControlledLoadPhaseStore({
+      measured: resolved,
+      auxiliary,
+      stateDir: controlledLoadStateDir,
+    });
+    requireCondition(canonicalProtocolJson(controlledLoad.manifest) ===
+      canonicalProtocolJson(manifest.controlledLoad.manifest),
+    "schema-3 controlled-load state belongs to a different phase manifest");
+  }
   const exactCpuStateDir = validatePrivateDirectory(path.join(stateRoot, "exact-cpu"),
     "schema-3 exact-CPU state directory");
   const exactCpu = await readExactCpuPhaseStore({ resolved, stateDir: exactCpuStateDir });
@@ -665,10 +797,11 @@ async function readBundleState(resolved, bundleDir) {
   "schema-3 exact-CPU state belongs to a different phase manifest");
   return deepFreeze({
     manifest,
-    manifestBinding: schema3BundleManifestBinding(resolved, manifest),
+    manifestBinding: schema3BundleManifestBinding(resolved, manifest, auxiliary),
     ...(baseline === undefined ? {} : { baseline }),
     ...(groups === undefined ? {} : { groups }),
     ...(pinnedConcurrent === undefined ? {} : { pinnedConcurrent }),
+    ...(controlledLoad === undefined ? {} : { controlledLoad }),
     exactCpu,
   });
 }
@@ -685,13 +818,14 @@ function validateAttemptOptions(value, label) {
 
 export async function initializeSchema3Bundle({
   resolved,
+  auxiliary,
   manifest: manifestValue,
   bundleDir,
   flockPath,
   leaseWaitMs = 0,
 }) {
-  const manifest = parseSchema3BundleManifest(resolved, manifestValue);
-  const expectedBytes = canonicalSchema3BundleManifestLine(resolved, manifest);
+  const manifest = parseSchema3BundleManifest(resolved, manifestValue, auxiliary);
+  const expectedBytes = canonicalSchema3BundleManifestLine(resolved, manifest, auxiliary);
   requireCondition(expectedBytes.length <= SCHEMA3_BUNDLE_FILE_MAX_BYTES,
     "schema-3 bundle manifest exceeds its byte limit");
   return withBundleExecutionLease({ bundleDir, flockPath, waitMs: leaseWaitMs }, async (lease) => {
@@ -708,10 +842,11 @@ export async function initializeSchema3Bundle({
       }
       names = await listRoot(adapter);
     }
-    const storedManifest = await readManifest(resolved, adapter);
+    const storedManifest = await readManifest(resolved, auxiliary, adapter);
     requireCondition(expectedBytes.equals(canonicalSchema3BundleManifestLine(
       resolved,
       storedManifest,
+      auxiliary,
     )), "existing schema-3 bundle belongs to a different manifest");
 
     if (!names.has("state")) ensurePrivateSubdirectory(root, "state",
@@ -724,14 +859,21 @@ export async function initializeSchema3Bundle({
       if (!present.has(name)) ensurePrivateSubdirectory(stateRoot, name,
         `schema-3 ${name} state directory`);
     }
-    if (storedManifest.version >= SCHEMA3_BUNDLE_MANIFEST_V2_VERSION) {
+    if ([
+      SCHEMA3_BUNDLE_MANIFEST_V2_VERSION,
+      SCHEMA3_BUNDLE_MANIFEST_V3_VERSION,
+      SCHEMA3_BUNDLE_MANIFEST_V4_VERSION,
+    ].includes(storedManifest.version)) {
       await initializeBaselinePhaseStore({
         resolved,
         manifest: storedManifest.baseline.manifest,
         stateDir: path.join(stateRoot, "baseline"),
       });
     }
-    if (storedManifest.version >= SCHEMA3_BUNDLE_MANIFEST_V3_VERSION) {
+    if ([
+      SCHEMA3_BUNDLE_MANIFEST_V3_VERSION,
+      SCHEMA3_BUNDLE_MANIFEST_V4_VERSION,
+    ].includes(storedManifest.version)) {
       await initializeGroupPhaseStore({
         resolved,
         manifest: storedManifest.groups.manifest,
@@ -745,6 +887,14 @@ export async function initializeSchema3Bundle({
         stateDir: path.join(stateRoot, "pinned-concurrent"),
       });
     }
+    if (storedManifest.version === SCHEMA3_BUNDLE_MANIFEST_V5_VERSION) {
+      await initializeControlledLoadPhaseStore({
+        measured: resolved,
+        auxiliary,
+        manifest: storedManifest.controlledLoad.manifest,
+        stateDir: path.join(stateRoot, "controlled-load"),
+      });
+    }
     const exactCpuStateDir = path.join(stateRoot, "exact-cpu");
     await initializeExactCpuPhaseStore({
       resolved,
@@ -752,13 +902,14 @@ export async function initializeSchema3Bundle({
       stateDir: exactCpuStateDir,
     });
     assertBundleExecutionLeaseHeld(lease);
-    const bundle = await readBundleState(resolved, root);
+    const bundle = await readBundleState(resolved, auxiliary, root);
     return deepFreeze({ ...bundle, lease: bundleExecutionLeaseEvidence(lease) });
   });
 }
 
 export async function readSchema3Bundle({
   resolved,
+  auxiliary,
   bundleDir,
   flockPath,
   leaseWaitMs = 0,
@@ -766,7 +917,7 @@ export async function readSchema3Bundle({
   return withBundleExecutionLease(
     { bundleDir, flockPath, waitMs: leaseWaitMs },
     async (lease) => {
-      const bundle = await readBundleState(resolved, bundleDir);
+      const bundle = await readBundleState(resolved, auxiliary, bundleDir);
       assertBundleExecutionLeaseHeld(lease);
       return bundle;
     },
@@ -775,6 +926,7 @@ export async function readSchema3Bundle({
 
 export async function runOneSchema3ExactCpuAttempt({
   resolved,
+  auxiliary,
   bundleDir,
   flockPath,
   leaseWaitMs = 0,
@@ -786,7 +938,7 @@ export async function runOneSchema3ExactCpuAttempt({
   requireCondition(runAttempt === undefined || typeof runAttempt === "function",
     "schema-3 runAttempt must be a function");
   return withBundleExecutionLease({ bundleDir, flockPath, waitMs: leaseWaitMs }, async (lease) => {
-    let bundle = await readBundleState(resolved, bundleDir);
+    let bundle = await readBundleState(resolved, auxiliary, bundleDir);
     assertBundleExecutionLeaseHeld(lease);
     const result = await runNextExactCpuPhaseAttempt({
       resolved,
@@ -805,7 +957,7 @@ export async function runOneSchema3ExactCpuAttempt({
         envelope: result.envelope,
         stateDir: path.join(bundleDir, SCHEMA3_EXACT_CPU_STATE_DIRECTORY),
       });
-      bundle = await readBundleState(resolved, bundleDir);
+      bundle = await readBundleState(resolved, auxiliary, bundleDir);
     }
     assertBundleExecutionLeaseHeld(lease);
     return deepFreeze({
@@ -818,6 +970,7 @@ export async function runOneSchema3ExactCpuAttempt({
 
 export async function runOneSchema3BaselineWave({
   resolved,
+  auxiliary,
   bundleDir,
   flockPath,
   leaseWaitMs = 0,
@@ -829,9 +982,8 @@ export async function runOneSchema3BaselineWave({
   requireCondition(runAttempt === undefined || typeof runAttempt === "function",
     "schema-3 runAttempt must be a function");
   return withBundleExecutionLease({ bundleDir, flockPath, waitMs: leaseWaitMs }, async (lease) => {
-    let bundle = await readBundleState(resolved, bundleDir);
-    requireCondition(bundle.manifest.version >= SCHEMA3_BUNDLE_MANIFEST_V2_VERSION &&
-      bundle.baseline !== undefined,
+    let bundle = await readBundleState(resolved, auxiliary, bundleDir);
+    requireCondition(bundle.baseline !== undefined,
     "schema-3 bundle manifest does not bind a baseline phase");
     assertBundleExecutionLeaseHeld(lease);
     const result = await runNextBaselinePhaseWave({
@@ -851,7 +1003,7 @@ export async function runOneSchema3BaselineWave({
         envelope: result.envelope,
         stateDir: path.join(bundleDir, SCHEMA3_BASELINE_STATE_DIRECTORY),
       });
-      bundle = await readBundleState(resolved, bundleDir);
+      bundle = await readBundleState(resolved, auxiliary, bundleDir);
     }
     assertBundleExecutionLeaseHeld(lease);
     return deepFreeze({
@@ -864,6 +1016,7 @@ export async function runOneSchema3BaselineWave({
 
 export async function runOneSchema3GroupWave({
   resolved,
+  auxiliary,
   bundleDir,
   flockPath,
   leaseWaitMs = 0,
@@ -875,9 +1028,8 @@ export async function runOneSchema3GroupWave({
   requireCondition(runAttempt === undefined || typeof runAttempt === "function",
     "schema-3 runAttempt must be a function");
   return withBundleExecutionLease({ bundleDir, flockPath, waitMs: leaseWaitMs }, async (lease) => {
-    let bundle = await readBundleState(resolved, bundleDir);
-    requireCondition(bundle.manifest.version >= SCHEMA3_BUNDLE_MANIFEST_V3_VERSION &&
-      bundle.groups !== undefined,
+    let bundle = await readBundleState(resolved, auxiliary, bundleDir);
+    requireCondition(bundle.groups !== undefined,
     "schema-3 bundle manifest does not bind a group phase");
     assertBundleExecutionLeaseHeld(lease);
     const result = await runNextGroupPhaseWave({
@@ -897,7 +1049,7 @@ export async function runOneSchema3GroupWave({
         envelope: result.envelope,
         stateDir: path.join(bundleDir, SCHEMA3_GROUP_STATE_DIRECTORY),
       });
-      bundle = await readBundleState(resolved, bundleDir);
+      bundle = await readBundleState(resolved, auxiliary, bundleDir);
     }
     assertBundleExecutionLeaseHeld(lease);
     return deepFreeze({
@@ -910,6 +1062,7 @@ export async function runOneSchema3GroupWave({
 
 export async function runOneSchema3PinnedConcurrentWave({
   resolved,
+  auxiliary,
   bundleDir,
   flockPath,
   leaseWaitMs = 0,
@@ -925,7 +1078,7 @@ export async function runOneSchema3PinnedConcurrentWave({
     typeof readControllerCpuList === "function",
   "schema-3 readControllerCpuList must be a function");
   return withBundleExecutionLease({ bundleDir, flockPath, waitMs: leaseWaitMs }, async (lease) => {
-    let bundle = await readBundleState(resolved, bundleDir);
+    let bundle = await readBundleState(resolved, auxiliary, bundleDir);
     requireCondition(bundle.manifest.version === SCHEMA3_BUNDLE_MANIFEST_V4_VERSION &&
       bundle.pinnedConcurrent !== undefined,
     "schema-3 bundle manifest does not bind a pinned-concurrent phase");
@@ -948,7 +1101,78 @@ export async function runOneSchema3PinnedConcurrentWave({
         envelope: result.envelope,
         stateDir: path.join(bundleDir, SCHEMA3_PINNED_CONCURRENT_STATE_DIRECTORY),
       });
-      bundle = await readBundleState(resolved, bundleDir);
+      bundle = await readBundleState(resolved, auxiliary, bundleDir);
+    }
+    assertBundleExecutionLeaseHeld(lease);
+    return deepFreeze({
+      result,
+      bundle,
+      lease: bundleExecutionLeaseEvidence(lease),
+    });
+  });
+}
+
+export async function runOneSchema3ControlledLoadSession({
+  resolved,
+  auxiliary,
+  bundleDir,
+  flockPath,
+  leaseWaitMs = 0,
+  runAttempt,
+  startWorkerSet,
+  waitInterval,
+  attemptOptions,
+}) {
+  const options = validateAttemptOptions(attemptOptions,
+    "schema-3 controlled-load attempt options");
+  requireCondition(runAttempt === undefined || typeof runAttempt === "function",
+    "schema-3 runAttempt must be a function");
+  requireCondition(startWorkerSet === undefined || typeof startWorkerSet === "function",
+    "schema-3 startWorkerSet must be a function");
+  requireCondition(waitInterval === undefined || typeof waitInterval === "function",
+    "schema-3 waitInterval must be a function");
+  return withBundleExecutionLease({ bundleDir, flockPath, waitMs: leaseWaitMs }, async (lease) => {
+    let bundle = await readBundleState(resolved, auxiliary, bundleDir);
+    requireCondition(bundle.manifest.version === SCHEMA3_BUNDLE_MANIFEST_V5_VERSION &&
+      bundle.controlledLoad !== undefined,
+    "schema-3 bundle manifest does not bind a controlled-load phase");
+    assertBundleExecutionLeaseHeld(lease);
+    if (bundle.controlledLoad.progress.complete) {
+      return deepFreeze({
+        result: {
+          committed: false,
+          reason: "complete",
+          stage: "complete",
+          errorCode: null,
+          envelope: null,
+          attempts: null,
+          condition: null,
+        },
+        bundle,
+        lease: bundleExecutionLeaseEvidence(lease),
+      });
+    }
+    const { signal, ...excerptOptions } = options;
+    const result = await runControlledLoadSession({
+      measured: resolved,
+      auxiliary,
+      manifest: bundle.manifest.controlledLoad.manifest,
+      ...(signal === undefined ? {} : { signal }),
+      retainedDirectory: bundleExecutionLeaseAttemptRetention(lease),
+      attemptOptions: excerptOptions,
+      ...(runAttempt === undefined ? {} : { runAttempt }),
+      ...(startWorkerSet === undefined ? {} : { startWorkerSet }),
+      ...(waitInterval === undefined ? {} : { waitInterval }),
+    });
+    assertBundleExecutionLeaseHeld(lease);
+    if (result.committed) {
+      await commitControlledLoadSession({
+        measured: resolved,
+        auxiliary,
+        envelope: result.envelope,
+        stateDir: path.join(bundleDir, SCHEMA3_CONTROLLED_LOAD_STATE_DIRECTORY),
+      });
+      bundle = await readBundleState(resolved, auxiliary, bundleDir);
     }
     assertBundleExecutionLeaseHeld(lease);
     return deepFreeze({

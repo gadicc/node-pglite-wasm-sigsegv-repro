@@ -21,10 +21,12 @@ Introduce an internal bundle-format-3 owner with one immutable canonical
 run schema versions, a fresh bundle generation, the complete resolved workload
 and digest binding, phase capability states, and the bound exact-CPU phase
 manifest. Manifest version 2 adds baseline, version 3 adds group topology, and
-version 4 adds pinned-concurrent topology. Each version retains all preceding
-phases without changing the fields or state inventory of an earlier version. A
-retry may complete initialization after the manifest was published, but it may
-not replace or change that manifest.
+version 4 adds pinned-concurrent topology. Versions 1 through 4 retain all
+preceding phases without changing the fields or state inventory of an earlier
+version. Manifest version 5 is a separate controlled-load variant that binds
+exact-CPU state plus a second auxiliary workload and complete-session state; it
+does not change versions 1 through 4. A retry may complete initialization after
+the manifest was published, but it may not replace or change that manifest.
 
 Store mutable exact-CPU state below `state/exact-cpu/`, baseline state below
 `state/baseline/` from version 2, group state below `state/groups/` from version
@@ -60,8 +62,10 @@ recovery namespace.
   can mutate internal housekeeping state.
 - Manifest version 1 remains exact-only; versions 2 through 4 add baseline,
   groups, and pinned-concurrent state without reinterpreting earlier versions.
-- Controlled-load, debugger, and frequency phases still need explicit schema-3
-  bundle adapters before a public generic run can include them.
+- Manifest version 5 separately owns exact-CPU and controlled-load state without
+  requiring the unrelated version-4 phase set.
+- Debugger and frequency phases still need explicit schema-3 bundle adapters
+  before a public generic run can include them.
 
 ## Acceptance criteria
 

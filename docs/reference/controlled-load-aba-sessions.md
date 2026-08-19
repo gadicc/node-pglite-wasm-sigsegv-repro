@@ -61,8 +61,8 @@ or temporal reordering all return no complete envelope. Retained bundle
 ownership can span attempts and managed workers, but the direct workloads do
 not inherit the bundle directory descriptor.
 
-No public command or current bundle schema consumes this contract yet. The
-next layer is durable complete-session storage and schema-3 phase ownership.
+The internal [complete-only phase store](controlled-load-phase-storage.md) and
+schema-3 manifest-v5 owner now consume this contract. No public command does.
 The existing `load-state-aba.mjs` modes and their historical multi-workload
 evidence remain unchanged.
 

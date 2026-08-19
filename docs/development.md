@@ -26,6 +26,7 @@ The suite covers:
 - Managed auxiliary-workload readiness, discarded output, and bounded cancellation
 - Controlled-load worker-set readiness, boundary identity checks, peer cancellation, and stop evidence
 - Complete controlled-load A1/B/A2 ordering, target affinity, interval proof, and failure cleanup
+- Complete-only controlled-load storage, manifest-v5 dual-workload binding, and whole-session lease ownership
 - Versioned workload-bound attempt records and tamper rejection
 - Deterministic exact-CPU manifests, attempt envelopes, affinity witnesses, durable commits, and prefix resume
 - Immutable schema-3 bundle manifest versions and exclusive phase transactions
@@ -122,7 +123,10 @@ The controlled-load session adapter pins all measured attempts to one target
 CPU and publishes only a complete A1/B/A2 envelope. Its B attempts are enclosed
 by the same worker-set readiness, identity boundaries, and valid stop record;
 declared warm-up and recovery times are checked against monotonic evidence.
-The adapter has no public command or durable phase store yet.
+The private phase store publishes only one complete session. Schema-3 manifest
+version 5 binds that store, the auxiliary workload identity, and exact-CPU
+state as a controlled-load variant. One bundle lease covers the whole session
+and commit. The adapter still has no public command.
 
 The exact-CPU adapter reuses the current balanced-cyclic isolated schedule and
 places each valid attempt record in a versioned envelope. Schema-3 manifest
@@ -144,6 +148,10 @@ witness the scheduled inherited mask before its complete wave can advance.
 Manifest version 4 adds pinned-concurrent contexts. The bundle owner must
 witness its scheduled controller CPU, and each child supervisor and workload
 must witness one scheduled singleton CPU before the complete wave can advance.
+Manifest version 5 is a separate controlled-load variant. It binds the measured
+and auxiliary workload identities, exact-CPU state, and one complete-only
+controlled-load store without requiring baseline, group, or pinned-concurrent
+capabilities.
 
 Custom commands should be documented as trusted local workloads, not sandboxed code. They must not daemonize or escape the supervised process group.
 

@@ -87,23 +87,28 @@ pinned-concurrent foundations are complete. Bundle manifest version 1 binds one
 workload and deterministic exact-CPU manifest. Version 2 additionally binds
 correlated baseline waves, version 3 binds overlapping CPU-group contexts and
 inherited masks, and version 4 binds a separate controller CPU plus one
-singleton-affinity child per active CPU.
+singleton-affinity child per active CPU. Version 5 is a separate controlled-load
+variant that binds measured and auxiliary workload identities, exact-CPU state,
+and one complete A1/B/A2 store.
 The owner holds one exclusive lease across selecting, running, and committing
-an exact attempt or complete baseline, group, or pinned-concurrent wave and
-derives completion from the durably published prefix. Its stable supervisors
-retain the lease through bounded cleanup if the outer owner is interrupted.
+an exact attempt, complete baseline/group/pinned-concurrent wave, or complete
+controlled-load session and derives completion from durable publication. Its
+stable supervisors retain the lease through bounded cleanup if the outer owner
+is interrupted.
 
 Current diagnostic phases do not write the new formats, and `fault-affinity` is
-not yet an executable command. The next migration step is to adapt the
-controlled-load, debugger, and frequency protocols to the workload-bound owner
-where applicable. The controlled-load foundation now has a separate managed
+not yet an executable command. The next migration step is reviewed workload
+selection and public orchestration for the controlled-load path, while debugger
+and frequency protocols still need workload-bound adapters where applicable.
+The controlled-load foundation now has a separate managed
 auxiliary-workload lifecycle with verified readiness, discarded output, and
 bounded cleanup. Its worker-set layer now adds complete readiness, stable
 boundary identities, peer cancellation, stop evidence, and interrupted-owner
 lease retention. The single-workload adapter now adds complete A1/B/A2
 envelopes, constant target affinity, and evidence-backed warm-up and recovery
-intervals. It still needs durable phase storage and schema-3 state. Historical
-Node A/B/A and Node-by-warmup modes remain multi-workload experiments outside
-the current schema. Public orchestration follows only after those compatibility
-and privilege boundaries are explicit. Legacy bundle interpretation remains
+intervals. Its complete-only store and schema-3 manifest-v5 owner now hold one
+lease across the whole session and final commit. Historical Node A/B/A and
+Node-by-warmup modes remain multi-workload experiments outside the current
+schema. Public orchestration follows only after those compatibility and
+privilege boundaries are explicit. Legacy bundle interpretation remains
 unchanged.

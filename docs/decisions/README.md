@@ -23,3 +23,4 @@ behavior and compatibility boundaries, not current runtime capabilities.
 | [ADR 0015](0015-managed-auxiliary-workloads.md) | Accepted | Separate verified long-lived condition workers from canonical diagnostic attempt evidence. |
 | [ADR 0016](0016-controlled-load-worker-sets.md) | Accepted | Bind complete worker readiness, stable boundary identities, peer cancellation, and stop evidence. |
 | [ADR 0017](0017-controlled-load-aba-sessions.md) | Accepted | Publish only complete single-workload A1/B/A2 sessions with a verified B condition. |
+| [ADR 0018](0018-controlled-load-store-and-manifest-v5.md) | Accepted | Own complete controlled-load sessions in a no-clobber store and schema-3 manifest-v5 variant. |

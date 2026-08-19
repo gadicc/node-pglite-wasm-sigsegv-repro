@@ -37,21 +37,21 @@ no session envelope.
 
 The adapter still returns bounded operational detail after an incomplete run
 so an owner can report or recover it, but only the complete envelope is phase
-evidence. This layer does not modify `load-state-aba.mjs`, publish bundle state,
-change schema 3, or reinterpret historical multi-workload results.
+evidence. [ADR 0018](0018-controlled-load-store-and-manifest-v5.md) adds the
+separate durable store and schema-3 owner. Neither layer modifies
+`load-state-aba.mjs` or reinterprets historical multi-workload results.
 
 ## Consequences
 
-- A later schema-3 phase can bind one indivisible A1/B/A2 comparison rather
-  than three independently publishable legs.
+- The schema-3 controlled-load phase can bind one indivisible A1/B/A2
+  comparison rather than three independently publishable legs.
 - The load condition is attributable to the exact original worker identities,
   not merely to process names or a final worker count.
 - All measured samples retain the same target-CPU placement across conditions.
 - Warm-up and recovery declarations become evidence-backed minimum intervals.
 - Historical Node comparison and GDB modes remain on their existing evidence
   path until a separate multi-workload contract is designed.
-- Durable complete-session storage, phase ownership, and schema-3 integration
-  remain the next internal layer.
+- Public workload selection and orchestration remain separate.
 
 ## Acceptance criteria
 

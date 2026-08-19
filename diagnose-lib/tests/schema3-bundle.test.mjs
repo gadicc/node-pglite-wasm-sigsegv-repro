@@ -23,6 +23,7 @@ import { buildBaselinePhaseManifest } from "../baseline-phase.mjs";
 import { buildExactCpuPhaseManifest } from "../exact-cpu-phase.mjs";
 import { buildGroupPhaseManifest } from "../group-phase.mjs";
 import { buildPinnedConcurrentPhaseManifest } from "../pinned-concurrent-phase.mjs";
+import { buildControlledLoadSessionManifest } from "../controlled-load-session.mjs";
 import { readLinuxProcessIdentity, runWorkloadAttempt } from "../attempt-runner.mjs";
 import {
   SCHEMA3_BUNDLE_FILE,
@@ -30,10 +31,12 @@ import {
   SCHEMA3_EXACT_CPU_STATE_DIRECTORY,
   SCHEMA3_GROUP_STATE_DIRECTORY,
   SCHEMA3_PINNED_CONCURRENT_STATE_DIRECTORY,
+  SCHEMA3_CONTROLLED_LOAD_STATE_DIRECTORY,
   buildSchema3BundleManifest,
   buildSchema3BundleManifestV2,
   buildSchema3BundleManifestV3,
   buildSchema3BundleManifestV4,
+  buildSchema3BundleManifestV5,
   canonicalSchema3BundleManifestLine,
   initializeSchema3Bundle,
   readSchema3Bundle,
@@ -41,6 +44,7 @@ import {
   runOneSchema3ExactCpuAttempt,
   runOneSchema3GroupWave,
   runOneSchema3PinnedConcurrentWave,
+  runOneSchema3ControlledLoadSession,
 } from "../schema3-bundle.mjs";
 import { createFileStateAdapter } from "../pinned-protocol.mjs";
 import { resolveWorkloadSpec } from "../workload-spec.mjs";
@@ -90,6 +94,7 @@ function workload({
   args = ["-e", ""],
   id = "schema3-fixture",
   capabilities = { isolated: true },
+  attemptMode = "exit",
 } = {}) {
   const cwd = temporaryDirectory("schema3-workload-");
   return resolveWorkloadSpec({
@@ -100,10 +105,19 @@ function workload({
     risk: "standard",
     command: { executable: process.execPath, args, cwd },
     environment: {},
-    attempt: { mode: "exit", timeoutMs: 2_000, termGraceMs: 50, killGraceMs: 500 },
+    attempt: { mode: attemptMode, timeoutMs: 5_000, termGraceMs: 50, killGraceMs: 500 },
     outcomes: { targetSignals: [], mappedExits: [] },
     capabilities,
     provenance: { completeness: "complete", files: [] },
+  });
+}
+
+function controlledLoadAuxiliaryWorkload() {
+  return workload({
+    args: ["-e", "setInterval(() => {}, 1000)"],
+    id: "schema3-controlled-load-auxiliary",
+    capabilities: {},
+    attemptMode: "survive-window",
   });
 }
 
@@ -178,6 +192,20 @@ function pinnedConcurrentManifest(resolved, { pinnedRounds = 1 } = {}) {
   });
 }
 
+function controlledLoadManifest(measured, auxiliary, options = {}) {
+  const cpus = allowedCpus(2);
+  assert.equal(cpus.length, 2);
+  return buildControlledLoadSessionManifest(measured, auxiliary, {
+    generation: "11223344556677889900aabbccddeeff",
+    attemptsPerLeg: options.loadAttemptsPerLeg ?? 1,
+    targetCpu: cpus[0],
+    workerCpus: [cpus[1]],
+    tasksetPath: "/usr/bin/taskset",
+    warmupMs: 0,
+    recoveryMs: 0,
+  });
+}
+
 function bundleManifest(resolved, options = {}) {
   return buildSchema3BundleManifest(resolved, {
     bundleGeneration: "abcdef0123456789abcdef0123456789",
@@ -209,6 +237,14 @@ function bundleManifestV4(resolved, options = {}) {
     groupManifest: groupManifest(resolved, options),
     pinnedConcurrentManifest: pinnedConcurrentManifest(resolved, options),
     exactCpuManifest: exactCpuManifest(resolved, options),
+  });
+}
+
+function bundleManifestV5(measured, auxiliary, options = {}) {
+  return buildSchema3BundleManifestV5(measured, auxiliary, {
+    bundleGeneration: "abcdef0123456789abcdef0123456789",
+    controlledLoadManifest: controlledLoadManifest(measured, auxiliary, options),
+    exactCpuManifest: exactCpuManifest(measured, options),
   });
 }
 
@@ -402,6 +438,55 @@ test("schema-3 manifest v4 binds pinned-concurrent state without changing v1 thr
   const changed = bundleManifestV4(resolved, { pinnedRounds: 2 });
   await assert.rejects(initializeSchema3Bundle({ resolved, manifest: changed, bundleDir }),
     /different manifest/);
+});
+
+test("schema-3 manifest v5 binds a composed controlled-load variant without changing v1 through v4", {
+  timeout: 10_000,
+}, async () => {
+  const resolved = workload();
+  const auxiliary = controlledLoadAuxiliaryWorkload();
+  const manifest = bundleManifestV5(resolved, auxiliary);
+  const bundleDir = bundleDirectory();
+  await createFileStateAdapter(bundleDir).commit(
+    SCHEMA3_BUNDLE_FILE,
+    canonicalSchema3BundleManifestLine(resolved, manifest, auxiliary),
+  );
+  const initialized = await initializeSchema3Bundle({
+    resolved,
+    auxiliary,
+    manifest,
+    bundleDir,
+  });
+  assert.equal(initialized.manifest.version, 5);
+  assert.equal(initialized.manifest.phaseControls.controlledLoad, "supported");
+  assert.equal(initialized.manifest.phaseControls.isolated, "supported");
+  assert.equal("baseline" in initialized.manifest, false);
+  assert.equal("pinnedConcurrent" in initialized.manifest, false);
+  assert.equal(initialized.controlledLoad.progress.status, "empty");
+  assert.equal(initialized.exactCpu.progress.status, "empty");
+  assert.equal(initialized.manifest.auxiliaryWorkloadBinding.digest, auxiliary.digest);
+  assert.equal(statSync(path.join(
+    bundleDir,
+    SCHEMA3_CONTROLLED_LOAD_STATE_DIRECTORY,
+  )).mode & 0o777, 0o700);
+
+  const reopened = await readSchema3Bundle({ resolved, auxiliary, bundleDir });
+  assert.deepEqual(reopened.controlledLoad, initialized.controlledLoad);
+  await assert.rejects(readSchema3Bundle({ resolved, bundleDir }),
+    /require the resolved auxiliary workload/);
+  const changedAuxiliary = controlledLoadAuxiliaryWorkload();
+  await assert.rejects(readSchema3Bundle({
+    resolved,
+    auxiliary: changedAuxiliary,
+    bundleDir,
+  }), /auxiliary workload does not match/);
+  const changed = bundleManifestV5(resolved, auxiliary, { loadAttemptsPerLeg: 2 });
+  await assert.rejects(initializeSchema3Bundle({
+    resolved,
+    auxiliary,
+    manifest: changed,
+    bundleDir,
+  }), /different manifest/);
 });
 
 test("the execution lease makes selecting, running, and committing one slot indivisible", {
@@ -619,6 +704,99 @@ test("one schema-3 v4 lease owns controller and singleton-child wave execution",
   });
   assert.equal(noOp.result.reason, "complete");
   assert.equal(launches, context.cpus.length);
+});
+
+test("one schema-3 v5 lease owns the entire controlled-load session transaction", {
+  timeout: 15_000,
+}, async () => {
+  const resolved = workload();
+  const auxiliary = controlledLoadAuxiliaryWorkload();
+  const manifest = bundleManifestV5(resolved, auxiliary);
+  const bundleDir = bundleDirectory();
+  await initializeSchema3Bundle({ resolved, auxiliary, manifest, bundleDir });
+  const startedB = deferred();
+  const releaseB = deferred();
+  let launches = 0;
+  const runAttempt = async (measured, options) => {
+    launches += 1;
+    assert.equal(fstatSync(options.retainedDirectory.fd, { bigint: true }).ino.toString(),
+      options.retainedDirectory.inode);
+    if (launches === 2) {
+      startedB.resolve();
+      await releaseB.promise;
+    }
+    return runWorkloadAttempt(measured, options);
+  };
+
+  const first = runOneSchema3ControlledLoadSession({
+    resolved,
+    auxiliary,
+    bundleDir,
+    runAttempt,
+  });
+  await startedB.promise;
+  await assert.rejects(readSchema3Bundle({ resolved, auxiliary, bundleDir }),
+    (error) => error instanceof BundleExecutionLeaseError &&
+      error.code === "BUNDLE_EXECUTION_LEASE_BUSY");
+  await assert.rejects(runOneSchema3ExactCpuAttempt({
+    resolved,
+    auxiliary,
+    bundleDir,
+  }), (error) => error instanceof BundleExecutionLeaseError &&
+    error.code === "BUNDLE_EXECUTION_LEASE_BUSY");
+  releaseB.resolve();
+
+  const completed = await first;
+  assert.equal(completed.result.reason, "committed", JSON.stringify(completed.result));
+  assert.equal(completed.bundle.controlledLoad.progress.status, "complete");
+  assert.equal(completed.bundle.controlledLoad.envelope.legs.length, 3);
+  assert.equal(launches, 3);
+  const noOp = await runOneSchema3ControlledLoadSession({
+    resolved,
+    auxiliary,
+    bundleDir,
+    runAttempt,
+  });
+  assert.equal(noOp.result.reason, "complete");
+  assert.equal(launches, 3);
+  await assert.rejects(runOneSchema3BaselineWave({
+    resolved,
+    auxiliary,
+    bundleDir,
+  }), /does not bind a baseline phase/);
+});
+
+test("an incomplete schema-3 v5 session consumes no durable phase frontier", {
+  timeout: 15_000,
+}, async () => {
+  const resolved = workload();
+  const auxiliary = controlledLoadAuxiliaryWorkload();
+  const manifest = bundleManifestV5(resolved, auxiliary);
+  const bundleDir = bundleDirectory();
+  await initializeSchema3Bundle({ resolved, auxiliary, manifest, bundleDir });
+
+  const incomplete = await runOneSchema3ControlledLoadSession({
+    resolved,
+    auxiliary,
+    bundleDir,
+    runAttempt: async () => {
+      throw Object.assign(new Error("fixture runner unavailable"), {
+        code: "FIXTURE_UNAVAILABLE",
+      });
+    },
+  });
+  assert.equal(incomplete.result.reason, "runner-error");
+  assert.equal(incomplete.result.stage, "a1");
+  assert.equal(incomplete.bundle.controlledLoad.progress.status, "empty");
+  assert.equal(incomplete.bundle.controlledLoad.envelope, null);
+
+  const retried = await runOneSchema3ControlledLoadSession({
+    resolved,
+    auxiliary,
+    bundleDir,
+  });
+  assert.equal(retried.result.reason, "committed", JSON.stringify(retried.result));
+  assert.equal(retried.bundle.controlledLoad.progress.status, "complete");
 });
 
 test("operationally invalid execution leaves the slot available for a retained production attempt", {
