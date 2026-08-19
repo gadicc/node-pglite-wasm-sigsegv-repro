@@ -372,7 +372,12 @@ function assessPrefixWithContext(resolved, { manifest, plan }, envelopeValues) {
 function validateAttemptOptions(value) {
   const options = value ?? {};
   plainObject(options, "exact-CPU attempt runner options");
-  const allowed = ["signal", "stdoutExcerptBytes", "stderrExcerptBytes"];
+  const allowed = [
+    "signal",
+    "stdoutExcerptBytes",
+    "stderrExcerptBytes",
+    "retainedDirectory",
+  ];
   const unknown = Object.keys(options).filter((key) => !allowed.includes(key));
   requireCondition(unknown.length === 0,
     `exact-CPU attempt runner options contain unknown field '${unknown.sort()[0]}'`);

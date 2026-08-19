@@ -1,5 +1,5 @@
-// Durable no-clobber storage for one internal exact-CPU phase. A future bundle
-// owner still has to hold the exclusive lease that fences workload execution.
+// Durable no-clobber storage for one internal exact-CPU phase. The schema-3
+// bundle owner holds the exclusive lease that fences workload execution.
 import { lstatSync } from "node:fs";
 import path from "node:path";
 

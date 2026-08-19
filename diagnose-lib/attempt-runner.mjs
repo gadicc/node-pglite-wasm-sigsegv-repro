@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync, readdirSync } from "node:fs";
+import { fstatSync, readFileSync, readdirSync } from "node:fs";
 import { constants as osConstants } from "node:os";
 import { fileURLToPath } from "node:url";
 
@@ -13,12 +13,13 @@ import {
 
 export const ATTEMPT_RESULT_VERSION = 2;
 
-const SUPERVISOR_PROTOCOL_VERSION = 2;
+const SUPERVISOR_PROTOCOL_VERSION = 3;
 const ATTEMPT_SUPERVISOR = fileURLToPath(new URL("./attempt-supervisor.mjs", import.meta.url));
 const LIVE_STATES = new Set(["R", "S", "D", "T", "t", "I", "W"]);
 const ERROR_CODE_RE = /^[A-Z][A-Z0-9_]{0,63}$/;
 const MONOTONIC_NS_RE = /^(0|[1-9][0-9]{0,31})$/;
 const START_TICKS_RE = /^(0|[1-9][0-9]*)$/;
+const DEVICE_INODE_RE = /^(0|[1-9][0-9]*)$/;
 const KNOWN_SIGNALS = new Set(Object.keys(osConstants.signals));
 const DEFAULT_EXCERPT_BYTES = 64 * 1024;
 const MAX_EXCERPT_BYTES = 1024 * 1024;
@@ -68,6 +69,28 @@ function validateCpuAffinity(value) {
     fail("attempt options.cpuAffinity.tasksetPath must be a bounded absolute NUL-free path");
   }
   return Object.freeze({ cpu: affinity.cpu, tasksetPath: affinity.tasksetPath });
+}
+
+function validateRetainedDirectory(value) {
+  if (value === undefined) return null;
+  const retained = plainObject(value, "attempt options.retainedDirectory");
+  exactKeys(retained, ["fd", "device", "inode"], "attempt options.retainedDirectory");
+  if (!Number.isSafeInteger(retained.fd) || retained.fd < 0 || retained.fd > 0x7fffffff ||
+      typeof retained.device !== "string" || !DEVICE_INODE_RE.test(retained.device) ||
+      typeof retained.inode !== "string" || !DEVICE_INODE_RE.test(retained.inode)) {
+    fail("attempt options.retainedDirectory contains an invalid descriptor identity");
+  }
+  let stat;
+  try {
+    stat = fstatSync(retained.fd, { bigint: true });
+  } catch {
+    fail("attempt options.retainedDirectory descriptor is unavailable");
+  }
+  if (!stat.isDirectory() || stat.dev.toString() !== retained.device ||
+      stat.ino.toString() !== retained.inode) {
+    fail("attempt options.retainedDirectory does not match its open directory descriptor");
+  }
+  return Object.freeze({ ...retained });
 }
 
 function normalizeErrorCode(error, fallback) {
@@ -324,6 +347,7 @@ function validateOptions(options) {
   const value = plainObject(options, "attempt options");
   exactKeys(value, [
     "signal", "stdoutExcerptBytes", "stderrExcerptBytes", "cpuAffinity",
+    "retainedDirectory",
   ], "attempt options");
   const signal = value.signal;
   if (signal !== undefined &&
@@ -335,6 +359,7 @@ function validateOptions(options) {
   return {
     signal,
     cpuAffinity: validateCpuAffinity(value.cpuAffinity),
+    retainedDirectory: validateRetainedDirectory(value.retainedDirectory),
     stdoutExcerptBytes: excerptLimit(
       value.stdoutExcerptBytes ?? DEFAULT_EXCERPT_BYTES,
       "attempt options.stdoutExcerptBytes",
@@ -624,19 +649,39 @@ export function createAttemptRunner({
     try {
       const supervisorExecutable = options.cpuAffinity?.tasksetPath ?? process.execPath;
       const supervisorArguments = options.cpuAffinity === null
-        ? [supervisorPath]
+        ? [
+          supervisorPath,
+          ...(options.retainedDirectory === null ? [] : [
+            "--retained-directory-fd",
+            "4",
+            options.retainedDirectory.device,
+            options.retainedDirectory.inode,
+          ]),
+        ]
         : [
           "-c",
           String(options.cpuAffinity.cpu),
           process.execPath,
           supervisorPath,
+          ...(options.retainedDirectory === null ? [] : [
+            "--retained-directory-fd",
+            "4",
+            options.retainedDirectory.device,
+            options.retainedDirectory.inode,
+          ]),
         ];
       supervisor = spawnProcess(supervisorExecutable, supervisorArguments, {
         cwd: "/",
         env: {},
         detached: true,
         shell: false,
-        stdio: ["ignore", "pipe", "pipe", "ipc"],
+        stdio: [
+          "ignore",
+          "pipe",
+          "pipe",
+          "ipc",
+          ...(options.retainedDirectory === null ? [] : [options.retainedDirectory.fd]),
+        ],
         windowsHide: true,
       });
       stdout = new OutputAccumulator(supervisor.stdout, options.stdoutExcerptBytes);
@@ -675,13 +720,18 @@ export function createAttemptRunner({
         if (message.type === "supervisor-ready") {
           if (!hasExactKeys(message, [
             "version", "type", "pid", "startTicks", "processGroupId", "sessionId",
-            "allowedCpuList", "monotonicNs",
+            "allowedCpuList", "retainedDirectory", "monotonicNs",
           ]) || protocolState !== "awaiting-ready" ||
               !Number.isSafeInteger(message.pid) || message.pid <= 1 ||
               typeof message.startTicks !== "string" || !START_TICKS_RE.test(message.startTicks) ||
               message.processGroupId !== message.pid || message.sessionId !== message.pid ||
               message.pid !== supervisor.pid || typeof message.allowedCpuList !== "string" ||
               !/^[0-9,-]+$/.test(message.allowedCpuList) ||
+              !((options.retainedDirectory === null && message.retainedDirectory === null) ||
+                (options.retainedDirectory !== null &&
+                  hasExactKeys(message.retainedDirectory, ["device", "inode"]) &&
+                  message.retainedDirectory.device === options.retainedDirectory.device &&
+                  message.retainedDirectory.inode === options.retainedDirectory.inode)) ||
               (options.cpuAffinity !== null &&
                 message.allowedCpuList !== String(options.cpuAffinity.cpu))) {
             protocolViolation();

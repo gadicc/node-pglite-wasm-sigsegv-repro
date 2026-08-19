@@ -418,7 +418,7 @@ test("the supervisor revalidates provenance immediately before launch", {
           startTicks: message.startTicks,
         });
         child.send({
-          version: 2,
+          version: 3,
           type: "launch",
           executable: resolved.command.executable.path,
           args: [...resolved.command.args],
@@ -430,7 +430,7 @@ test("the supervisor revalidates provenance immediately before launch", {
         });
       } else if (message.type === "workload-launch-error") {
         launchErrorCode = message.errorCode;
-        child.send({ version: 2, type: "shutdown" });
+        child.send({ version: 3, type: "shutdown" });
       } else if (message.type === "workload-started" || message.type === "fatal") {
         reject(new Error(`unexpected supervisor event: ${message.type}`));
       }
@@ -469,7 +469,7 @@ test("the stable supervisor cleans its group when the parent IPC channel disappe
         };
         supervisorIdentities.push(supervisorIdentity);
         child.send({
-          version: 2,
+          version: 3,
           type: "launch",
           executable: resolved.command.executable.path,
           args: [...resolved.command.args],

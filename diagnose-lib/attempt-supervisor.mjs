@@ -6,15 +6,16 @@
 // is spawned directly with an exact argv and environment. This process stays
 // alive as the session/process-group identity until the parent confirms that
 // cleanup is complete.
-import { readFileSync } from "node:fs";
+import { fstatSync, readFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 
 import { verifyWorkloadLaunchProvenance } from "./workload-spec.mjs";
 
-const PROTOCOL_VERSION = 2;
+const PROTOCOL_VERSION = 3;
 const SUPERVISOR_ERROR_EXIT = 125;
 const LIVE_STATES = new Set(["R", "S", "D", "T", "t", "I", "W"]);
 const ERROR_CODE_RE = /^[A-Z][A-Z0-9_]{0,63}$/;
+const DEVICE_INODE_RE = /^(0|[1-9][0-9]*)$/;
 
 let workload = null;
 let workloadStarted = false;
@@ -23,6 +24,22 @@ let launchReceived = false;
 let intentionalShutdown = false;
 let emergencyCleanupStarted = false;
 let termGraceMs = 1_000;
+
+function retainedDirectoryFromArguments() {
+  const args = process.argv.slice(2);
+  if (args.length === 0) return null;
+  if (args.length !== 4 || args[0] !== "--retained-directory-fd" ||
+      args[1] !== "4" || !DEVICE_INODE_RE.test(args[2]) ||
+      !DEVICE_INODE_RE.test(args[3])) return false;
+  try {
+    const stat = fstatSync(4, { bigint: true });
+    if (!stat.isDirectory() || stat.dev.toString() !== args[2] ||
+        stat.ino.toString() !== args[3]) return false;
+    return Object.freeze({ device: args[2], inode: args[3] });
+  } catch {
+    return false;
+  }
+}
 
 function readIdentity(pid) {
   try {
@@ -276,9 +293,10 @@ process.on("unhandledRejection", () => {
 
 const self = readIdentity(process.pid);
 const selfAllowedCpuList = readAllowedCpuList(process.pid);
+const retainedDirectory = retainedDirectoryFromArguments();
 if (typeof process.send !== "function" || self === null || !self.live ||
     self.processGroupId !== process.pid || self.sessionId !== process.pid ||
-    selfAllowedCpuList === null) {
+    selfAllowedCpuList === null || retainedDirectory === false) {
   process.exit(SUPERVISOR_ERROR_EXIT);
 }
 
@@ -289,4 +307,5 @@ send({
   processGroupId: self.processGroupId,
   sessionId: self.sessionId,
   allowedCpuList: selfAllowedCpuList,
+  retainedDirectory,
 });

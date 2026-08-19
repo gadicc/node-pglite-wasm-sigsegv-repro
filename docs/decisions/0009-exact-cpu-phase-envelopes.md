@@ -32,11 +32,13 @@ executable and argument array never enter a shell program string.
 
 The internal durable store publishes the manifest and each envelope through
 private synchronized no-clobber files, recovers only known dead-writer
-temporaries, and validates the entire prefix after publication. It does not
-replace the exclusive execution lease that a future bundle owner must hold.
+temporaries, and validates the entire prefix after publication. The internal
+schema-3 bundle owner supplies the exclusive execution lease across selecting,
+running, and committing an attempt.
 
-This format and store remain internal until a schema-3 bundle contract exists.
-Schema-1 and schema-2 bundles retain their original formats and readers.
+This format, store, and schema-3 owner remain internal until the public runtime
+is generalized. Schema-1 and schema-2 bundles retain their original formats
+and readers.
 
 ## Consequences
 
@@ -46,8 +48,9 @@ Schema-1 and schema-2 bundles retain their original formats and readers.
   consuming a schedule slot.
 - The existing isolated schedule implementation is reused without teaching
   legacy bundle readers a new meaning.
-- A future schema-3 owner can reuse the durable store but must provide the
-  writer lease, bundle-level workload binding, and phase-completion transaction.
+- The schema-3 owner binds the workload and phase manifest once, derives
+  completion from the exact durable prefix, and holds one lease for the entire
+  next-attempt transaction.
 
 ## Acceptance criteria
 
@@ -58,4 +61,6 @@ Schema-1 and schema-2 bundles retain their original formats and readers.
 - Operationally invalid attempts do not advance the schedule.
 - Durable tests cover no-clobber commits, exact restart, dead-writer recovery,
   live-writer refusal, gaps, foreign files, and concurrent duplicate commits.
+- Bundle tests cover competing readers and writers, interrupted-owner cleanup,
+  manifest-only restart, and workload mismatch.
 - No current bundle schema or public CLI behavior changes.

@@ -50,9 +50,11 @@ exact prefix after every commit. The store caps one phase at 65,536 attempts,
 8 MiB per envelope, and 256 MiB in aggregate.
 
 The store prevents overwrite and conflicting publication, but it is not an
-execution lock. A future bundle owner must hold one exclusive writer lease
-across choosing, running, and committing the next attempt. This format still
-does not authorize resume for a schema-1 or schema-2 bundle.
+execution lock by itself. The internal schema-3 bundle owner holds one
+exclusive lease across choosing, running, and committing the next attempt. A
+stable supervisor retains that lease while attempt cleanup is active, including
+when the outer owner is interrupted. This format still does not authorize
+resume for a schema-1 or schema-2 bundle.
 
 ## Keep affinity outside workload identity
 

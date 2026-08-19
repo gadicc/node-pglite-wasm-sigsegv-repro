@@ -75,17 +75,20 @@ The intended implementation sequence is:
 4. Build a deadline-aware attempt runner with process-group cleanup tests.
 5. Resolve canonical workload identities and bind them to evidence.
 6. Migrate exact-CPU paths internally while checking PGlite compatibility.
-7. Migrate baseline and group screening, then add a new bundle schema.
+7. Add the internal schema-3 bundle owner, then migrate baseline and group screening.
 8. Migrate controlled-load, GDB, and frequency protocols.
 9. Extract built-in workloads and reorganize the source tree.
 10. Adopt the Fault Affinity package, command, and repository identity.
 
 The documentation, safety-net, workload-spec, bounded attempt-runner,
-versioned attempt-record, exact-CPU phase-envelope, and durable phase-store
-foundations are complete. The internal adapter reuses the existing
-balanced-cyclic isolated schedule, binds every valid attempt to an exact CPU
-slot, and resumes only an exact durably published prefix. Current diagnostic
-phases do not write the new format, and `fault-affinity` is not yet an
-executable command. The next migration step is a schema-3 bundle owner and
-exclusive execution lease, while legacy bundle interpretation remains
-unchanged.
+versioned attempt-record, exact-CPU phase-envelope, durable phase-store, and
+internal schema-3 bundle-owner foundations are complete. The bundle owner binds
+one workload and deterministic exact-CPU manifest, holds one exclusive lease
+across selecting, running, and committing an attempt, and derives completion
+from the exact durably published prefix. Its stable supervisor retains the
+lease through bounded cleanup if the outer owner is interrupted.
+
+Current diagnostic phases do not write the new format, and `fault-affinity` is
+not yet an executable command. The next migration step is to extend schema-3
+ownership to baseline and group screening while legacy bundle interpretation
+remains unchanged.
