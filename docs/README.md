@@ -48,6 +48,7 @@ This index separates instructions for running the current tooling from the resul
 - [Understand controlled-load phase storage](reference/controlled-load-phase-storage.md): complete-only no-clobber publication, manifest-v5 identity, and exclusive ownership
 - [Understand the generic debugger phase manifest](reference/generic-debugger-phase.md): workload binding, GDB provenance, fixed capture profile, and the remaining execution boundary
 - [Understand the generic debugger control protocol](reference/generic-debugger-control.md): manifest-bound lifecycle records, strict sequencing, and separation from diagnostic output
+- [Understand bounded generic debugger attempt I/O](reference/generic-debugger-attempt-io.md): distinct channels, anonymous transcript retention, overflow evidence, and complete draining
 - [Node/V8 source-history review](../research/node-v8-25.2.1-to-26.7.0-review.md): 5,693-commit source and provenance screen
 - [Node/V8 screened-commit audit](../research/node-v8-screened-commits.tsv): complete disposition table for the source-history review
 

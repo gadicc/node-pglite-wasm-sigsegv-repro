@@ -33,3 +33,4 @@ behavior and compatibility boundaries, not current runtime capabilities.
 | [ADR 0025](0025-internal-source-layout.md) | Accepted | Move internal public-command modules under `src/` while preserving stable entry points and workload paths. |
 | [ADR 0026](0026-generic-debugger-phase-manifest.md) | Accepted | Bind workload, GDB provenance, capture profile, CPU, and bounded schedule before generic debugger execution. |
 | [ADR 0027](0027-generic-debugger-control-protocol.md) | Accepted | Separate bounded machine-readable debugger lifecycle evidence from human-readable transcripts. |
+| [ADR 0028](0028-bounded-debugger-attempt-io.md) | Accepted | Retain distinct bounded transcript and control streams while draining complete debugger-attempt output. |

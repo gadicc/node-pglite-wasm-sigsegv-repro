@@ -61,8 +61,10 @@ human-readable debugger output.
 
 ## Remaining execution boundary
 
-The next implementation layer must create the fixed GDB command profile, keep
-the control descriptor private from the inferior, spool a bounded transcript,
-reuse the established process-group cleanup lifecycle, and combine those facts
-into a complete-only attempt envelope. Until that exists, the control protocol
-is an internal contract exercised only by synthetic tests.
+The [bounded attempt-I/O layer](generic-debugger-attempt-io.md) now retains the
+control bytes separately from an anonymous, size-capped transcript while fully
+draining both inputs. The next implementation layer must connect those channels
+to the fixed GDB command profile, keep the control descriptor private from the
+inferior, reuse the established process-group cleanup lifecycle, and combine
+those facts into a complete-only attempt envelope. Until that exists, the
+control protocol is an internal contract exercised only by synthetic tests.

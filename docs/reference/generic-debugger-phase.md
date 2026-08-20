@@ -43,7 +43,7 @@ provenance check.
 The manifest does not claim that a capture occurred. A complete generic phase
 still needs:
 
-1. a bounded GDB runner implementing the [structured control protocol](generic-debugger-control.md);
+1. a supervised GDB runner connecting the [structured control protocol](generic-debugger-control.md) to the [bounded attempt-I/O layer](generic-debugger-attempt-io.md);
 2. typed clean, captured, error, and operational outcomes;
 3. affinity and process-cleanup evidence;
 4. complete-only durable publication;
