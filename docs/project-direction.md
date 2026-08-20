@@ -138,7 +138,10 @@ and 10 without requiring a physical checkout or repository-host rename.
 The controlled-load foundation and public command now compose the managed
 auxiliary lifecycle, verified worker sets, complete A1/B/A2 envelopes,
 complete-only store, and schema-3 manifest-v5 ownership. Debugger and frequency
-protocols still need workload-bound adapters where applicable. Historical Node
+protocols still need workload-bound adapters where applicable. The debugger
+path now has an internal manifest that binds one workload, GDB executable,
+fixed capture profile, CPU, and bounded schedule without executing or changing
+schema-3. Historical Node
 A/B/A and Node-by-warmup modes remain multi-workload experiments outside the
 current schema.
 

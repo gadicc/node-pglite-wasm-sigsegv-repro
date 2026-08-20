@@ -25,6 +25,7 @@ The suite covers:
 - Public exact-CPU CLI parsing, dry-run safety, fresh bundle creation, and resume
 - Public baseline, CPU-group, pinned-concurrent, and controlled-load CLI planning, fresh bundle creation, and complete-unit resume
 - Read-only schema-3 v1-v5 summaries with phase, context, leg, CPU, and typed-outcome counts
+- Generic debugger-phase manifest validation without launching GDB
 - Internal shell-free attempt execution, deadlines, bounded output, and process-group cleanup
 - Managed auxiliary-workload readiness, discarded output, and bounded cancellation
 - Controlled-load worker-set readiness, boundary identity checks, peer cancellation, and stop evidence
@@ -171,6 +172,11 @@ The public summary command reuses the authoritative schema-3 reader and writes
 only text or versioned JSON to stdout. It never creates a bundle artifact. Unit
 fixtures cover every phase shape, and public integration tests summarize both
 exact-only and dual-workload version-5 bundles.
+
+The generic debugger foundation currently stops at a canonical phase manifest.
+Its tests use a temporary inert executable to cover workload capability, target
+signals, GDB provenance, schedule limits, canonical bindings, tamper rejection,
+and pre-launch drift detection. They never start GDB or a fault workload.
 
 Custom commands should be documented as trusted local workloads, not sandboxed code. They must not daemonize or escape the supervised process group.
 
