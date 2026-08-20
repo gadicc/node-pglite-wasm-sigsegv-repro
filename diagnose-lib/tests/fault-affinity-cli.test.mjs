@@ -15,6 +15,7 @@ import {
   runFaultAffinityCli,
 } from "../../fault-affinity.mjs";
 import { readLinuxAllowedCpuList } from "../attempt-runner.mjs";
+import { expandCpuList } from "../pinned-runner.mjs";
 import { readSchema3Bundle } from "../schema3-bundle.mjs";
 import { resolveCustomWorkloadFile } from "../../workloads/catalog.mjs";
 
@@ -32,10 +33,15 @@ function temporaryDirectory() {
   return directory;
 }
 
-function allowedCpu() {
+function allowedCpus(count = 1) {
   const spec = readLinuxAllowedCpuList(process.pid, { strict: true });
-  const token = spec.split(",")[0];
-  return Number(token.split("-")[0]);
+  const cpus = expandCpuList(spec);
+  assert.ok(cpus.length >= count, `test requires at least ${count} allowed CPUs`);
+  return cpus.slice(0, count);
+}
+
+function allowedCpu() {
+  return allowedCpus()[0];
 }
 
 function customWorkload(directory, overrides = {}) {
@@ -55,7 +61,12 @@ function customWorkload(directory, overrides = {}) {
       killGraceMs: 500,
     },
     outcomes: { targetSignals: [], mappedExits: [] },
-    capabilities: { baseline: true, groups: true, isolated: true },
+    capabilities: {
+      baseline: true,
+      groups: true,
+      pinnedConcurrent: true,
+      isolated: true,
+    },
     provenance: { completeness: "complete", files: [] },
     ...overrides,
   };
@@ -76,6 +87,41 @@ function groupPlan(directory, overrides = {}) {
       seed: 7,
     },
     exact: { cpus: String(cpu), rounds: 1, seed: 7 },
+    ...overrides,
+  };
+  writeFileSync(filename, `${JSON.stringify(value)}\n`, { mode: 0o600 });
+  return filename;
+}
+
+function pinnedPlan(directory, overrides = {}) {
+  const [controller, active] = allowedCpus(2);
+  const filename = path.join(directory, "pinned-plan.json");
+  const value = {
+    version: 1,
+    baseline: { children: 1, waves: 1 },
+    groups: {
+      cpuUniverse: String(active),
+      contexts: [{
+        id: "active",
+        kind: "subset",
+        cpus: String(active),
+        children: 1,
+      }],
+      rounds: 1,
+      seed: 7,
+    },
+    pinnedConcurrent: {
+      contexts: [{
+        id: "active",
+        kind: "subset",
+        cpus: String(active),
+        cluster: `l2:${active}`,
+        controllerCpu: controller,
+      }],
+      rounds: 1,
+      seed: 11,
+    },
+    exact: { cpus: String(active), rounds: 1, seed: 13 },
     ...overrides,
   };
   writeFileSync(filename, `${JSON.stringify(value)}\n`, { mode: 0o600 });
@@ -138,6 +184,28 @@ test("argument parsing keeps live selection and confirmation explicit", () => {
     "groups", "--resume", "bundle", "--workload", "wasm-churn-suite",
     "--plan-file", "plan.json", "--yes",
   ]), /fresh group options/);
+  assert.deepEqual(parseFaultAffinityArgs([
+    "pinned", "--workload", "wasm-churn-suite", "--plan-file", "plan.json",
+    "--out-dir", "bundle", "--dry-run",
+  ]), {
+    command: "pinned",
+    mode: "dry-run",
+    workload: "wasm-churn-suite",
+    planFile: "plan.json",
+    outDir: "bundle",
+    tasksetPath: "/usr/bin/taskset",
+  });
+  assert.deepEqual(parseFaultAffinityArgs([
+    "pinned", "--resume", "bundle", "--workload", "wasm-churn-suite", "--yes",
+  ]), {
+    command: "pinned",
+    mode: "resume",
+    workload: "wasm-churn-suite",
+    resumeDir: "bundle",
+  });
+  assert.throws(() => parseFaultAffinityArgs([
+    "pinned", "--resume", "bundle", "--workload", "wasm-churn-suite", "--dry-run",
+  ]), /pinned resume requires --yes/);
 });
 
 test("listing and inspection describe built-ins without creating files", async () => {
@@ -196,6 +264,27 @@ test("a dry run validates all v3 schedules without creating output", async () =>
   assert.match(captured.stdout(), /bound baseline: 1 child\(ren\) x 1 wave\(s\)/);
   assert.match(captured.stdout(), /groups: 1 context\(s\); 1 wave\(s\); 1 attempt\(s\)/);
   assert.match(captured.stdout(), /bound exact: CPUs .*1 attempt\(s\); seed 7/);
+  assert.match(captured.stdout(), /no workload executed and no bundle created/);
+});
+
+test("a dry run validates all v4 schedules without creating output", async () => {
+  const directory = temporaryDirectory();
+  const definition = customWorkload(directory);
+  const plan = pinnedPlan(directory);
+  const output = path.join(directory, "planned-pinned-bundle");
+  const captured = capture(directory);
+  const rc = await runFaultAffinityCli([
+    "pinned", "--workload-file", path.basename(definition),
+    "--plan-file", path.basename(plan), "--out-dir", path.basename(output),
+    "--dry-run",
+  ], captured.io);
+
+  assert.equal(rc, 0, captured.stderr());
+  assert.equal(existsSync(output), false);
+  assert.match(captured.stdout(), /bound baseline: 1 child\(ren\) x 1 wave\(s\)/);
+  assert.match(captured.stdout(), /bound groups: 1 context\(s\); 1 wave\(s\)/);
+  assert.match(captured.stdout(), /pinned-concurrent: 1 context\(s\); 1 wave\(s\); 1 attempt\(s\)/);
+  assert.match(captured.stdout(), /bound exact: CPUs .*1 attempt\(s\); seed 13/);
   assert.match(captured.stdout(), /no workload executed and no bundle created/);
 });
 
@@ -330,6 +419,60 @@ test("the public groups command completes v3 and sibling phase commands resume i
   assert.equal(bundle.exactCpu.progress.complete, true);
 });
 
+test("the public pinned command completes v4 under its scheduled controller", {
+  timeout: 30_000,
+}, async () => {
+  const directory = temporaryDirectory();
+  const definition = customWorkload(directory);
+  const plan = pinnedPlan(directory);
+  const bundleDir = path.join(directory, "pinned-bundle");
+  const selection = ["--workload-file", path.basename(definition)];
+  const pinned = capture(directory);
+  assert.equal(await runFaultAffinityCli([
+    "pinned", ...selection, "--plan-file", path.basename(plan),
+    "--out-dir", path.basename(bundleDir), "--yes",
+  ], pinned.io), 0, pinned.stderr());
+  assert.match(pinned.stdout(), /pinned wave 1\/1 context=active controller=/);
+  assert.match(pinned.stdout(),
+    /committed pinned-wave=1 context=active controller=.*outcomes=pass:1/);
+  assert.match(pinned.stdout(),
+    /complete: 1\/1 pinned-concurrent waves \(1\/1 attempts\)/);
+
+  const resolved = resolveCustomWorkloadFile(definition).resolved;
+  let bundle = await readSchema3Bundle({ resolved, bundleDir });
+  assert.equal(bundle.manifest.version, 4);
+  assert.equal(bundle.pinnedConcurrent.progress.complete, true);
+  assert.equal(bundle.pinnedConcurrent.envelopes.length, 1);
+  assert.equal(bundle.baseline.progress.complete, false);
+  assert.equal(bundle.groups.progress.complete, false);
+  assert.equal(bundle.exactCpu.progress.complete, false);
+
+  const resumedPinned = capture(directory);
+  assert.equal(await runFaultAffinityCli([
+    "pinned", "--resume", path.basename(bundleDir), ...selection, "--yes",
+  ], resumedPinned.io), 0, resumedPinned.stderr());
+  assert.match(resumedPinned.stdout(), /resuming pinned workload=cli-finite/);
+  assert.match(resumedPinned.stdout(), /complete: 1\/1 pinned-concurrent waves/);
+
+  const baseline = capture(directory);
+  assert.equal(await runFaultAffinityCli([
+    "baseline", "--resume", path.basename(bundleDir), ...selection, "--yes",
+  ], baseline.io), 0, baseline.stderr());
+  const groups = capture(directory);
+  assert.equal(await runFaultAffinityCli([
+    "groups", "--resume", path.basename(bundleDir), ...selection, "--yes",
+  ], groups.io), 0, groups.stderr());
+  const exact = capture(directory);
+  assert.equal(await runFaultAffinityCli([
+    "exact", "--resume", path.basename(bundleDir), ...selection, "--yes",
+  ], exact.io), 0, exact.stderr());
+  bundle = await readSchema3Bundle({ resolved, bundleDir });
+  assert.equal(bundle.baseline.progress.complete, true);
+  assert.equal(bundle.groups.progress.complete, true);
+  assert.equal(bundle.pinnedConcurrent.progress.complete, true);
+  assert.equal(bundle.exactCpu.progress.complete, true);
+});
+
 test("baseline planning requires both baseline and exact capabilities", async () => {
   const directory = temporaryDirectory();
   const definition = customWorkload(directory, { capabilities: { isolated: true } });
@@ -356,6 +499,21 @@ test("group planning requires baseline, group, and exact capabilities", async ()
   ], captured.io);
   assert.equal(rc, 2);
   assert.match(captured.stderr(), /required group-suite capabilities: groups/);
+});
+
+test("pinned planning requires all four v4 capabilities", async () => {
+  const directory = temporaryDirectory();
+  const definition = customWorkload(directory, {
+    capabilities: { baseline: true, groups: true, isolated: true },
+  });
+  const plan = pinnedPlan(directory);
+  const captured = capture(directory);
+  const rc = await runFaultAffinityCli([
+    "pinned", "--workload-file", path.basename(definition),
+    "--plan-file", path.basename(plan), "--out-dir", "bundle", "--dry-run",
+  ], captured.io);
+  assert.equal(rc, 2);
+  assert.match(captured.stderr(), /required pinned-suite capabilities: pinnedConcurrent/);
 });
 
 test("custom ambient pass-through is rejected before planning", async () => {

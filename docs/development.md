@@ -23,7 +23,7 @@ The suite covers:
 - Argument and exit-code validation
 - Workload-spec and catalog validation, including custom-file provenance
 - Public exact-CPU CLI parsing, dry-run safety, fresh bundle creation, and resume
-- Public baseline and CPU-group CLI planning, fresh bundle creation, and whole-wave resume
+- Public baseline, CPU-group, and pinned-concurrent CLI planning, fresh bundle creation, and whole-wave resume
 - Internal shell-free attempt execution, deadlines, bounded output, and process-group cleanup
 - Managed auxiliary-workload readiness, discarded output, and bounded cancellation
 - Controlled-load worker-set readiness, boundary identity checks, peer cancellation, and stop evidence
@@ -150,9 +150,12 @@ may overlap, their order is deterministically balanced, and every child must
 witness the scheduled inherited mask before its complete wave can advance. The
 public groups command reads a bounded explicit plan before creating a bundle;
 automation exercises it only with finite custom processes.
-Manifest version 4 adds pinned-concurrent contexts. The bundle owner must
-witness its scheduled controller CPU, and each child supervisor and workload
-must witness one scheduled singleton CPU before the complete wave can advance.
+Manifest version 4 adds pinned-concurrent contexts. The public command creates
+one short-lived bundle owner under each scheduled controller CPU and receives
+its bounded result through a dedicated descriptor. That owner must witness its
+controller placement, and each child supervisor and workload must witness one
+scheduled singleton CPU before the complete wave can advance. Automation uses
+only a finite custom process and checks all sibling phase resumes.
 Manifest version 5 is a separate controlled-load variant. It binds the measured
 and auxiliary workload identities, exact-CPU state, and one complete-only
 controlled-load store without requiring baseline, group, or pinned-concurrent
@@ -188,8 +191,8 @@ Manual crash experiments need an explicit operator, a reviewed plan, and a dispo
 ## Check documentation changes
 
 Documentation commands must reflect the current `--help` output. Do not present
-internal pinned-concurrent, controlled-load, debugger, or frequency adapters as
-public generic commands until their orchestration exists.
+controlled-load, debugger, or frequency adapters as public generic commands
+until their orchestration exists.
 
 When headings move, search for repository-relative anchors:
 

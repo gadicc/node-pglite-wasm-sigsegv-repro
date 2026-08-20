@@ -1,4 +1,4 @@
-# Understand internal pinned-concurrent waves
+# Understand pinned-concurrent waves
 
 The pinned-concurrent phase models one topology context as a correlated wave.
 Every context declares an active CPU set and a distinct controller CPU. The
@@ -23,7 +23,8 @@ rounds, seed, execution mode, or workload identity invalidates resume.
 ## Witness the controller and every child
 
 Before launching a wave, the phase adapter reads the bundle owner's allowed CPU
-list and requires it to contain exactly the scheduled controller CPU. Each
+list and requires it to contain exactly the scheduled controller CPU. The
+public command creates one short-lived owner under that CPU for each wave. Each
 attempt then records that its stable supervisor and direct workload were both
 restricted to exactly the scheduled child CPU.
 
@@ -53,8 +54,11 @@ writer, gap, changed manifest, or foreign entry.
 Schema-3 manifest version 4 binds this store at
 `state/pinned-concurrent/` alongside baseline, group, and exact-CPU state. The
 bundle lease covers selection, execution, cleanup, and commit, and remains held
-by active supervisors if the outer owner is interrupted. No current
-`diagnose.sh` phase or legacy bundle writes this format.
+by active supervisors if the interactive CLI is interrupted. The public owner
+returns one bounded record over a dedicated descriptor and the CLI rereads the
+authoritative store. No `diagnose.sh` phase or legacy bundle writes this
+format.
 
-See [ADR 0014](../decisions/0014-pinned-concurrent-and-manifest-v4.md) for the
-accepted compatibility boundary.
+See [the public guide](../guides/generic-pinned-concurrent.md),
+[ADR 0014](../decisions/0014-pinned-concurrent-and-manifest-v4.md), and
+[ADR 0022](../decisions/0022-public-pinned-orchestration.md).

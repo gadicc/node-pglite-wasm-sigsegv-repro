@@ -20,10 +20,17 @@ New public phases should keep these boundaries:
 - exercise live orchestration in automation only with harmless finite custom
   workloads.
 
-`group-plan.mjs` is the current bounded plan-file boundary for schema-3
-manifest version 3. It normalizes operator-facing CPU-list strings and public
-field names before the existing phase builders validate and bind the complete
-topology and schedules.
+`plan-file.mjs` owns the shared bounded, stable JSON read boundary.
+`group-plan.mjs` normalizes the manifest-version-3 public plan, while
+`pinned-plan.mjs` normalizes the four schedules required by manifest version 4.
+The existing phase builders remain authoritative for canonical topology and
+schedule validation.
+
+Pinned waves use a separate process boundary. `pinned-wave-client.mjs` starts
+one `pinned-wave-owner.mjs` process under the stored controller CPU. The owner
+acquires the bundle lease, advances at most one wave, and returns a bounded
+structured result over a dedicated descriptor rather than workload stdout or
+stderr. The public coordinator then rereads durable bundle state.
 
 The top-level entry point re-exports the CLI error, parser, and runner for the
 existing test and embedding boundary.

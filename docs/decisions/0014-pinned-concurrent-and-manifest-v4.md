@@ -40,9 +40,10 @@ fields and directory inventories. One descriptor-backed bundle lease spans
 wave selection, execution, cleanup, and commit. Each child supervisor retains
 that descriptor through bounded cleanup if the outer owner is interrupted.
 
-This remains an internal integration boundary. A future public orchestrator
-must place the per-wave owner on its scheduled controller CPU; this decision
-does not add a public command or change legacy evidence.
+This decision originally established an internal integration boundary and did
+not add a public command. [ADR 0022](0022-public-pinned-orchestration.md) now
+supplies the public per-wave owner while preserving this evidence contract and
+legacy behavior.
 
 ## Consequences
 

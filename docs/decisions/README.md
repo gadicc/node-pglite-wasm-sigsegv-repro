@@ -27,3 +27,4 @@ behavior and compatibility boundaries, not current runtime capabilities.
 | [ADR 0019](0019-public-exact-cli-and-project-identity.md) | Accepted | Publish the exact-CPU schema-3 command and adopt the Fault Affinity package identity without renaming legacy state. |
 | [ADR 0020](0020-public-baseline-cli-and-capability-profiles.md) | Accepted | Publish schema-3 baseline orchestration while preserving exact-only built-in identities through explicit multi-phase profiles. |
 | [ADR 0021](0021-public-group-cli-and-plan-file.md) | Accepted | Publish explicit CPU-group orchestration through a bounded plan file that binds all manifest-v3 schedules. |
+| [ADR 0022](0022-public-pinned-orchestration.md) | Accepted | Publish manifest-v4 waves through short-lived controller-pinned bundle owners and a dedicated result descriptor. |

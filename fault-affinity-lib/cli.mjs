@@ -16,6 +16,7 @@ import {
 } from "../diagnose-lib/baseline-phase.mjs";
 import { buildExactCpuPhaseManifest } from "../diagnose-lib/exact-cpu-phase.mjs";
 import { buildGroupPhaseManifest } from "../diagnose-lib/group-phase.mjs";
+import { buildPinnedConcurrentPhaseManifest } from "../diagnose-lib/pinned-concurrent-phase.mjs";
 import {
   MAX_SCHEDULE_ENTRIES,
   MAX_SEED,
@@ -26,6 +27,7 @@ import {
   buildSchema3BundleManifest,
   buildSchema3BundleManifestV2,
   buildSchema3BundleManifestV3,
+  buildSchema3BundleManifestV4,
   initializeSchema3Bundle,
   newSchema3BundleGeneration,
   readSchema3Bundle,
@@ -38,6 +40,8 @@ import {
   resolveWorkloadSelection,
 } from "../workloads/catalog.mjs";
 import { readGroupPlanFile } from "./group-plan.mjs";
+import { readPinnedPlanFile } from "./pinned-plan.mjs";
+import { runPinnedWaveProcess } from "./pinned-wave-client.mjs";
 
 const DEFAULT_TASKSET_PATH = "/usr/bin/taskset";
 const ZERO_GENERATION = "0".repeat(32);
@@ -55,16 +59,20 @@ Usage:
   fault-affinity groups (--workload ID | --workload-file FILE) \\
     --plan-file FILE --out-dir DIR (--dry-run | --yes)
   fault-affinity groups --resume DIR (--workload ID | --workload-file FILE) --yes
+  fault-affinity pinned (--workload ID | --workload-file FILE) \\
+    --plan-file FILE --out-dir DIR (--dry-run | --yes)
+  fault-affinity pinned --resume DIR (--workload ID | --workload-file FILE) --yes
   fault-affinity exact (--workload ID | --workload-file FILE) \\
     --cpus LIST [--rounds N] [--seed N] --out-dir DIR (--dry-run | --yes)
   fault-affinity exact --resume DIR (--workload ID | --workload-file FILE) --yes
 
 The baseline command creates schema-3 v2 bundles. The groups command creates
-v3 bundles from a bounded plan file that binds baseline, CPU-group, and exact
-schedules. Phase commands can advance their matching state in later compatible
-bundle versions. The exact command also creates exact-only v1 bundles. Listing,
-inspection, and dry runs never execute a workload or create an evidence bundle.
-Every live run requires an explicit workload selection and --yes.
+v3 bundles from a bounded plan file. The pinned command creates v4 bundles that
+also bind controller-aware pinned-concurrent schedules. Phase commands can
+advance their matching state in later compatible bundle versions. The exact
+command also creates exact-only v1 bundles. Listing, inspection, and dry runs
+never execute a workload or create an evidence bundle. Every live run requires
+an explicit workload selection and --yes.
 `;
 
 export class FaultAffinityCliError extends Error {
@@ -272,7 +280,8 @@ export function parseFaultAffinityArgs(argv) {
       tasksetPath: options.tasksetPath ?? DEFAULT_TASKSET_PATH,
     });
   }
-  if (command === "groups") {
+  if (command === "groups" || command === "pinned") {
+    const planLabel = command === "groups" ? "group" : "pinned";
     const options = parseOptions(rest, new Map([
       ["--workload", "workload"],
       ["--workload-file", "workloadFile"],
@@ -289,16 +298,18 @@ export function parseFaultAffinityArgs(argv) {
     if (options.resumeDir !== undefined) {
       const fresh = ["planFile", "outDir", "tasksetPath"]
         .filter((key) => options[key] !== undefined);
-      if (fresh.length > 0) fail("--resume cannot be combined with fresh group options");
-      if (!options.yes || options.dryRun) fail("a groups resume requires --yes");
+      if (fresh.length > 0) {
+        fail(`--resume cannot be combined with fresh ${planLabel} options`);
+      }
+      if (!options.yes || options.dryRun) fail(`a ${command} resume requires --yes`);
       return Object.freeze({ command, mode: "resume", ...selection,
         resumeDir: options.resumeDir });
     }
     if (options.planFile === undefined || options.outDir === undefined) {
-      fail("a fresh groups run requires --plan-file FILE and --out-dir DIR");
+      fail(`a fresh ${command} run requires --plan-file FILE and --out-dir DIR`);
     }
     if (Boolean(options.dryRun) === Boolean(options.yes)) {
-      fail("choose exactly one --dry-run or --yes for a fresh groups run");
+      fail(`choose exactly one --dry-run or --yes for a fresh ${command} run`);
     }
     return Object.freeze({
       command,
@@ -430,6 +441,7 @@ function renderWorkload(selection) {
     `attempt: ${summary.attempt.mode}, ${summary.attempt.timeoutMs} ms deadline`,
     `baseline capability: ${summary.capabilities.baseline ? "supported" : "unsupported"}`,
     `CPU-group capability: ${summary.capabilities.groups ? "supported" : "unsupported"}`,
+    `pinned-concurrent capability: ${summary.capabilities.pinnedConcurrent ? "supported" : "unsupported"}`,
     `exact-CPU capability: ${summary.capabilities.isolated ? "supported" : "unsupported"}`,
     `workload digest: ${summary.digest}`,
     `warning: ${summary.liveWarning}`,
@@ -466,6 +478,16 @@ function assertGroupCapabilities(selection) {
     selection.resolved.capabilities[capability] !== true);
   if (missing.length > 0) {
     fail(`workload '${selection.resolved.id}' does not declare required group-suite ` +
+      `capabilities: ${missing.join(", ")}`);
+  }
+}
+
+function assertPinnedCapabilities(selection) {
+  const required = ["baseline", "groups", "pinnedConcurrent", "isolated"];
+  const missing = required.filter((capability) =>
+    selection.resolved.capabilities[capability] !== true);
+  if (missing.length > 0) {
+    fail(`workload '${selection.resolved.id}' does not declare required pinned-suite ` +
       `capabilities: ${missing.join(", ")}`);
   }
 }
@@ -540,6 +562,43 @@ function buildFreshGroupManifest(resolved, plan, tasksetPath, dryRun) {
     bundleGeneration: dryRun ? ZERO_GENERATION : newSchema3BundleGeneration(),
     baselineManifest,
     groupManifest,
+    exactCpuManifest,
+  });
+}
+
+function buildFreshPinnedManifest(resolved, plan, tasksetPath, dryRun) {
+  const baselineManifest = buildBaselinePhaseManifest(resolved, {
+    generation: dryRun ? ZERO_GENERATION : generation(),
+    childrenPerWave: plan.baseline.childrenPerWave,
+    waves: plan.baseline.waves,
+  });
+  const groupManifest = buildGroupPhaseManifest(resolved, {
+    generation: dryRun ? ZERO_GENERATION : generation(),
+    cpuUniverse: plan.groups.cpuUniverse,
+    contexts: plan.groups.contexts,
+    rounds: plan.groups.rounds,
+    seed: plan.groups.seed,
+    tasksetPath,
+  });
+  const pinnedConcurrentManifest = buildPinnedConcurrentPhaseManifest(resolved, {
+    generation: dryRun ? ZERO_GENERATION : generation(),
+    contexts: plan.pinnedConcurrent.contexts,
+    rounds: plan.pinnedConcurrent.rounds,
+    seed: plan.pinnedConcurrent.seed,
+    tasksetPath,
+  });
+  const exactCpuManifest = buildExactCpuPhaseManifest(resolved, {
+    generation: dryRun ? ZERO_GENERATION : generation(),
+    cpus: plan.exact.cpus,
+    rounds: plan.exact.rounds,
+    seed: plan.exact.seed,
+    tasksetPath,
+  });
+  return buildSchema3BundleManifestV4(resolved, {
+    bundleGeneration: dryRun ? ZERO_GENERATION : newSchema3BundleGeneration(),
+    baselineManifest,
+    groupManifest,
+    pinnedConcurrentManifest,
     exactCpuManifest,
   });
 }
@@ -689,6 +748,75 @@ async function runGroupBundle({ resolved, bundleDir, signalSource, writeOut, wri
   }
 }
 
+async function runPinnedBundle({
+  selection,
+  bundleDir,
+  signalSource,
+  writeOut,
+  writeErr,
+}) {
+  const { resolved } = selection;
+  const forwarding = installSignalForwarding(signalSource);
+  try {
+    let bundle = await readSchema3Bundle({ resolved, bundleDir });
+    if (bundle.pinnedConcurrent === undefined) {
+      fail("schema-3 bundle does not bind a pinned-concurrent phase");
+    }
+    const tasksetPath = bundle.manifest.pinnedConcurrent.manifest.execution.tasksetPath;
+    while (!bundle.pinnedConcurrent.progress.complete) {
+      if (forwarding.signal.aborted) return signalExitCode(forwarding.received());
+      const { nextWave, committedWaves, totalWaves } =
+        bundle.pinnedConcurrent.progress;
+      writeOut(`pinned wave ${committedWaves + 1}/${totalWaves} ` +
+        `context=${nextWave.contextId} controller=${nextWave.controllerCpu} ` +
+        `children=${nextWave.childCount}\n`);
+      let execution;
+      try {
+        execution = await runPinnedWaveProcess({
+          selection,
+          bundleDir,
+          controllerCpu: nextWave.controllerCpu,
+          tasksetPath,
+          signal: forwarding.signal,
+        });
+      } catch (error) {
+        if (forwarding.signal.aborted) return signalExitCode(forwarding.received());
+        throw error;
+      }
+      bundle = await readSchema3Bundle({ resolved, bundleDir });
+      if (forwarding.signal.aborted) return signalExitCode(forwarding.received());
+      if (execution.record.committed) {
+        const ordinal = execution.record.wave?.ordinal;
+        const envelope = bundle.pinnedConcurrent.envelopes.find(
+          (candidate) => candidate.wave.ordinal === ordinal,
+        );
+        if (envelope === undefined) {
+          fail("pinned wave owner reported a commit absent from the authoritative bundle",
+            "PINNED_WAVE_COMMIT_MISSING");
+        }
+        writeOut(`committed pinned-wave=${envelope.wave.ordinal} ` +
+          `context=${envelope.wave.contextId} controller=${envelope.wave.controllerCpu} ` +
+          `outcomes=${outcomeSummary(envelope)}\n`);
+        continue;
+      }
+      if (execution.record.reason === "complete" &&
+          bundle.pinnedConcurrent.progress.complete) break;
+      const errorCode = execution.record.errorCode;
+      if (execution.stderr.length > 0) writeErr(execution.stderr);
+      writeErr(`pinned-concurrent wave was not committed: ${execution.record.reason}` +
+        `${errorCode === null ? "" : ` (${errorCode})`}\n`);
+      return errorCode === "BUNDLE_EXECUTION_LEASE_BUSY" ? 75 : 1;
+    }
+    const { committedWaves, totalWaves, committedAttempts, totalAttempts } =
+      bundle.pinnedConcurrent.progress;
+    writeOut(`complete: ${committedWaves}/${totalWaves} pinned-concurrent waves ` +
+      `(${committedAttempts}/${totalAttempts} attempts) in ${bundleDir}\n`);
+    return 0;
+  } finally {
+    forwarding.remove();
+  }
+}
+
 export async function runFaultAffinityCli(argv, io = {}) {
   const writeOut = io.stdout ?? ((value) => process.stdout.write(value));
   const writeErr = io.stderr ?? ((value) => process.stderr.write(value));
@@ -831,6 +959,80 @@ export async function runFaultAffinityCli(argv, io = {}) {
       writeOut(`warning: ${selection.metadata.liveWarning}\n`);
       return await runGroupBundle({
         resolved: selection.resolved,
+        bundleDir,
+        signalSource,
+        writeOut,
+        writeErr,
+      });
+    }
+    if (parsed.command === "pinned") {
+      assertPinnedCapabilities(selection);
+      if (parsed.mode !== "dry-run") assertAutomationBoundary(selection);
+      if (parsed.mode === "resume") {
+        const bundleDir = resolveExistingBundleDirectory(path.resolve(cwd, parsed.resumeDir));
+        writeOut(`resuming pinned workload=${selection.resolved.id} bundle=${bundleDir}\n`);
+        writeOut(`warning: ${selection.metadata.liveWarning}\n`);
+        return await runPinnedBundle({
+          selection,
+          bundleDir,
+          signalSource,
+          writeOut,
+          writeErr,
+        });
+      }
+      const planPath = path.resolve(cwd, parsed.planFile);
+      const plan = readPinnedPlanFile(planPath);
+      const tasksetPath = resolveExecutablePath(parsed.tasksetPath, "--taskset");
+      const scheduledCpus = [...new Set([
+        ...plan.groups.cpuUniverse,
+        ...plan.exact.cpus,
+        ...plan.pinnedConcurrent.contexts.flatMap((context) => [
+          ...context.cpus,
+          context.controllerCpu,
+        ]),
+      ])].sort((left, right) => left - right);
+      const allowedCpuSpec = ensureAllowedCpus(scheduledCpus);
+      const manifest = buildFreshPinnedManifest(
+        selection.resolved,
+        plan,
+        tasksetPath,
+        parsed.mode === "dry-run",
+      );
+      const baselineAttempts = manifest.baseline.manifest.schedule.attemptCount;
+      const groupSchedule = manifest.groups.manifest.schedule;
+      const pinnedSchedule = manifest.pinnedConcurrent.manifest.schedule;
+      const exactSchedule = manifest.exactCpu.manifest.schedule;
+      if (parsed.mode === "dry-run") {
+        writeOut(`${renderWorkload(selection)}\n`);
+        writeOut(`plan file: ${planPath}\n`);
+        writeOut(`bound baseline: ${plan.baseline.childrenPerWave} child(ren) x ` +
+          `${plan.baseline.waves} wave(s); ${baselineAttempts} attempt(s)\n`);
+        writeOut(`bound groups: ${groupSchedule.contextCount} context(s); ` +
+          `${groupSchedule.waveCount} wave(s); ${groupSchedule.attemptCount} attempt(s); ` +
+          `seed ${groupSchedule.seed}\n`);
+        writeOut(`pinned-concurrent: ${pinnedSchedule.contextCount} context(s); ` +
+          `${pinnedSchedule.waveCount} wave(s); ${pinnedSchedule.attemptCount} ` +
+          `attempt(s); seed ${pinnedSchedule.seed}\n`);
+        writeOut(`bound exact: CPUs ${compressCpuList(plan.exact.cpus)}; ` +
+          `${exactSchedule.rounds} round(s); ${exactSchedule.attemptCount} attempt(s); ` +
+          `seed ${exactSchedule.seed}\n`);
+        writeOut(`host allowance: ${allowedCpuSpec}\n`);
+        writeOut(`planned bundle: ${path.resolve(cwd, parsed.outDir)}\n`);
+        writeOut("dry run: no workload executed and no bundle created\n");
+        return 0;
+      }
+      const bundleDir = createPrivateBundleDirectory(path.resolve(cwd, parsed.outDir));
+      await initializeSchema3Bundle({
+        resolved: selection.resolved,
+        manifest,
+        bundleDir,
+      });
+      writeOut(`starting pinned workload=${selection.resolved.id} ` +
+        `risk=${selection.resolved.risk} contexts=${pinnedSchedule.contextCount} ` +
+        `waves=${pinnedSchedule.waveCount} bundle=${bundleDir}\n`);
+      writeOut(`warning: ${selection.metadata.liveWarning}\n`);
+      return await runPinnedBundle({
+        selection,
         bundleDir,
         signalSource,
         writeOut,

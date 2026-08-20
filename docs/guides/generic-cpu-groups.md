@@ -133,4 +133,6 @@ changes its workload, plan, `taskset` path, or schedule.
 Group waves are correlated execution contexts, not independent child trials.
 Compare their wave-level and child-level evidence carefully. See the
 [CPU-group wave reference](../reference/group-topology-waves.md) and
-[interpretation guide](../concepts/interpreting-results.md).
+[interpretation guide](../concepts/interpreting-results.md). When each child
+needs a singleton CPU and the owner needs a separate controller, use the
+[manifest-v4 pinned-concurrent guide](generic-pinned-concurrent.md).

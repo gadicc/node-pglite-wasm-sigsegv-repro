@@ -84,7 +84,10 @@ test("group plan files are bounded stable single-link UTF-8 JSON inputs", () => 
 
   const symlink = path.join(directory, "plan-link.json");
   symlinkSync(filename, symlink);
-  assert.throws(() => readGroupPlanFile(symlink), /singly-linked regular file/);
+  assert.throws(() => readGroupPlanFile(symlink),
+    (error) => error instanceof GroupPlanError &&
+      error.code === "GROUP_PLAN_FILE_ERROR" &&
+      /singly-linked regular file/.test(error.message));
 
   const hardlink = path.join(directory, "plan-hardlink.json");
   linkSync(filename, hardlink);
@@ -95,7 +98,9 @@ test("group plan files reject malformed JSON and forbidden control bytes", () =>
   const directory = temporaryDirectory();
   const malformed = path.join(directory, "malformed.json");
   writeFileSync(malformed, "{\n", { mode: 0o600 });
-  assert.throws(() => readGroupPlanFile(malformed), /valid JSON/);
+  assert.throws(() => readGroupPlanFile(malformed),
+    (error) => error instanceof GroupPlanError &&
+      error.code === "INVALID_GROUP_PLAN" && /valid JSON/.test(error.message));
 
   const carriageReturn = path.join(directory, "carriage-return.json");
   writeFileSync(carriageReturn, "{}\r\n", { mode: 0o600 });
