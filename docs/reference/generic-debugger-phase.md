@@ -22,9 +22,31 @@ capture sections:
 - thread information; and
 - process mappings.
 
-The transcript profile has its own version and a fixed 64 MiB upper bound. A
-later runner must implement this exact profile rather than accepting arbitrary
-GDB command text in a bundle.
+The transcript profile has its own version and a fixed 64 MiB upper bound.
+
+## Materialize the fixed command profile
+
+`diagnose-lib/debugger-command-profile.mjs` turns a parsed manifest, a run
+number, and a per-attempt nonce into an immutable versioned command
+descriptor. The descriptor binds the phase generation, manifest SHA-256, run,
+nonce, profile ID, scheduled CPU, sorted target signals, fixed capture
+sections and commands, and the target workload ID and digest. Its canonical
+identity line carries its own SHA-256 and byte count, and the complete
+descriptor is bounded to 1 MiB with a stable typed error when oversized.
+
+The recorded command is shell-free: fixed noninteractive GDB startup arguments
+(no init files, no auto-loading or debuginfod downloads,
+`set startup-with-shell off`), then `--args` followed byte-exactly by the
+target executable and its argument array. Target environment values never
+appear in the descriptor.
+
+A fixed embedded Python profile makes control fd 3 non-inheritable before the
+inferior starts, witnesses the inferior PID, `/proc` start ticks, and the
+singleton allowed-CPU list, runs only the manifest-bound capture commands, and
+emits the [structured control protocol](generic-debugger-control.md) to fd 3,
+always closing a started profile with `profile-complete`. Synthetic tests
+execute the profile's gdb-free emission prelude under `python3` and parse the
+bytes with the real control parser; they never launch GDB.
 
 ## Bind debugger provenance and execution
 
@@ -43,7 +65,7 @@ provenance check.
 The manifest does not claim that a capture occurred. A complete generic phase
 still needs:
 
-1. a supervised GDB runner connecting the [structured control protocol](generic-debugger-control.md) to the [bounded attempt-I/O layer](generic-debugger-attempt-io.md);
+1. a supervised GDB adapter that launches the materialized command profile and routes the [structured control protocol](generic-debugger-control.md) descriptor separately from the transcript into the [bounded attempt-I/O layer](generic-debugger-attempt-io.md);
 2. typed clean, captured, error, and operational outcomes;
 3. affinity and process-cleanup evidence;
 4. complete-only durable publication;

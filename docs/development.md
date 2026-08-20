@@ -25,7 +25,7 @@ The suite covers:
 - Public exact-CPU CLI parsing, dry-run safety, fresh bundle creation, and resume
 - Public baseline, CPU-group, pinned-concurrent, and controlled-load CLI planning, fresh bundle creation, and complete-unit resume
 - Read-only schema-3 v1-v5 summaries with phase, context, leg, CPU, and typed-outcome counts
-- Generic debugger-phase manifest, structured control-protocol, and bounded attempt-I/O validation without launching GDB
+- Generic debugger-phase manifest, materialized command-profile descriptor, structured control-protocol, and bounded attempt-I/O validation without launching GDB
 - Internal shell-free attempt execution, deadlines, bounded output, and process-group cleanup
 - Managed auxiliary-workload readiness, discarded output, and bounded cancellation
 - Controlled-load worker-set readiness, boundary identity checks, peer cancellation, and stop evidence
@@ -179,7 +179,14 @@ workload capability, target signals, GDB provenance, schedule limits,
 canonical bindings, tamper rejection, pre-launch drift detection, record
 ordering, attempt binding, affinity witnesses, incomplete control streams,
 separate transcript and control bounds, full draining after overflow, and
-descriptor disposal. They never start GDB or a fault workload.
+descriptor disposal. The materialized command profile is covered the same
+way: descriptor determinism and identity hashing, recursive freezing, exact
+target-argv preservation, embedded Python source and config extraction,
+private control-fd handling, fixed capture commands and state records, and
+context, tamper, workload-mismatch, and oversize rejection. When `python3` is
+available, the suite also compiles the generated profile and runs its gdb-free
+emission prelude, parsing the emitted bytes with the real control-protocol
+parser. No test starts GDB or a fault workload.
 
 Custom commands should be documented as trusted local workloads, not sandboxed code. They must not daemonize or escape the supervised process group.
 

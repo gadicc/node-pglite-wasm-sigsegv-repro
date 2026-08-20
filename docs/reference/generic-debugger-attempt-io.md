@@ -33,6 +33,14 @@ Each channel reports:
 - retained byte count; and
 - whether the bound was exceeded.
 
+When a channel's stream never finishes draining and its storage also fails,
+the status is `stream-error`: an incomplete drain invalidates the observed
+byte accounting itself and is never hidden behind a storage failure.
+`storage-error` is reserved for fully drained streams whose retained bytes are
+suspect. The precedence lives in a single status-ordering function; a
+synthetic regression test would require injecting faults into the private
+spool and memory channels, which the module deliberately does not expose.
+
 The attempt-level I/O result is complete only when the transcript is complete
 and the entire control stream is both complete and valid. A debugger-generated
 `profile-error` sequence is still valid control evidence; it describes a
@@ -47,5 +55,6 @@ store must consume the handle before disposal and must not publish overflowed,
 partial, or invalid input as a complete attempt.
 
 The remaining execution work is to connect the two channels to a stable
-supervised debugger adapter, implement the fixed command profile, and combine
-process cleanup, control, and transcript facts in a typed attempt envelope.
+supervised debugger adapter running the [materialized command profile](generic-debugger-phase.md),
+and to combine process cleanup, control, and transcript facts in a typed
+attempt envelope.

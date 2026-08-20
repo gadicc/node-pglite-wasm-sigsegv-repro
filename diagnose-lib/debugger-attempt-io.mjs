@@ -246,14 +246,18 @@ async function collectChannel(input, channel, transcriptSpool) {
 }
 
 function channelStatus(channel, prefix) {
-  if (channel.storageErrorCode !== null) {
-    return { status: "storage-error", errorCode: channel.storageErrorCode };
-  }
+  // An incompletely drained stream invalidates the observed-byte accounting
+  // itself, so it is reported even when storage also failed. The storage-error
+  // status is reserved for fully drained streams whose retained bytes are
+  // suspect; it must never hide an incomplete drain.
   if (!channel.streamComplete || channel.streamErrorCode !== null) {
     return {
       status: "stream-error",
       errorCode: channel.streamErrorCode ?? `${prefix}_STREAM_INCOMPLETE`,
     };
+  }
+  if (channel.storageErrorCode !== null) {
+    return { status: "storage-error", errorCode: channel.storageErrorCode };
   }
   if (channel.overflowed) {
     return { status: "overflow", errorCode: `${prefix}_OVERFLOW` };
