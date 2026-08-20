@@ -32,3 +32,4 @@ behavior and compatibility boundaries, not current runtime capabilities.
 | [ADR 0024](0024-read-only-schema3-summaries.md) | Accepted | Add a read-only v1-v5 summary surface without treating derived output as evidence. |
 | [ADR 0025](0025-internal-source-layout.md) | Accepted | Move internal public-command modules under `src/` while preserving stable entry points and workload paths. |
 | [ADR 0026](0026-generic-debugger-phase-manifest.md) | Accepted | Bind workload, GDB provenance, capture profile, CPU, and bounded schedule before generic debugger execution. |
+| [ADR 0027](0027-generic-debugger-control-protocol.md) | Accepted | Separate bounded machine-readable debugger lifecycle evidence from human-readable transcripts. |
