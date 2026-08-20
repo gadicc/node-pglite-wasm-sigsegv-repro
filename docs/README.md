@@ -14,6 +14,7 @@ This index separates instructions for running the current tooling from the resul
 - [Run generic CPU-group waves](guides/generic-cpu-groups.md): explicit topology plans, schema-3 v3 creation, whole-wave resume, and sibling phases
 - [Run generic pinned-concurrent waves](guides/generic-pinned-concurrent.md): explicit controller/active plans, schema-3 v4 creation, controller placement, and sibling phases
 - [Run a generic controlled-load comparison](guides/generic-controlled-load.md): trusted measured and condition workloads, schema-3 v5 creation, complete-only A1/B/A2 resume, and its sibling exact phase
+- [Summarize a schema-3 bundle](guides/schema3-summaries.md): read-only text and JSON views of validated v1-v5 progress, outcomes, contexts, legs, and CPUs
 - [Run the diagnostic suite](guides/run-diagnostics.md): prerequisites, presets, exact-CPU protocols, optional privileged steps, and exploratory follow-ups
 - [Run controlled-load experiments](guides/controlled-load-experiments.md): load-state A/B/A, GDB capture, Node A/B/A, and Node/warmup matrix modes
 - [Understand evidence bundles](reference/evidence-bundles.md): output layout, integrity, privacy, resume, redo, and phase validation

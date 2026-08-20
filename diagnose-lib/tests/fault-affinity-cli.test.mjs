@@ -197,6 +197,19 @@ function capture(cwd) {
 
 test("argument parsing keeps live selection and confirmation explicit", () => {
   assert.deepEqual(parseFaultAffinityArgs(["workloads"]), { command: "workloads" });
+  assert.deepEqual(parseFaultAffinityArgs([
+    "summarize", "--bundle-dir", "bundle", "--workload-file", "measured.json",
+    "--condition-workload-file", "condition.json", "--json",
+  ]), {
+    command: "summarize",
+    workloadFile: "measured.json",
+    bundleDir: "bundle",
+    conditionWorkloadFile: "condition.json",
+    json: true,
+  });
+  assert.throws(() => parseFaultAffinityArgs([
+    "summarize", "--workload", "wasm-churn",
+  ]), /requires --bundle-dir/);
   assert.throws(() => parseFaultAffinityArgs([
     "exact", "--workload", "wasm-churn", "--cpus", "0", "--out-dir", "bundle",
   ]), /exactly one --dry-run or --yes/);
@@ -441,6 +454,24 @@ test("the public exact command creates, completes, and resumes its own schema-3 
   ], resumed.io), 0, resumed.stderr());
   assert.match(resumed.stdout(), /resuming workload=cli-finite/);
   assert.match(resumed.stdout(), /complete: 1\/1/);
+
+  const summarized = capture(directory);
+  assert.equal(await runFaultAffinityCli([
+    "summarize", "--bundle-dir", path.basename(bundleDir), ...selection, "--json",
+  ], summarized.io), 0, summarized.stderr());
+  const summary = JSON.parse(summarized.stdout());
+  assert.equal(summary.bundle.manifestVersion, 1);
+  assert.equal(summary.phases.exactCpu.status, "complete");
+  assert.equal(summary.phases.exactCpu.cpus[0].committedAttempts, 1);
+  assert.equal(summary.phases.baseline.status, "not-bound");
+
+  const condition = conditionWorkload(directory);
+  const extraCondition = capture(directory);
+  assert.equal(await runFaultAffinityCli([
+    "summarize", "--bundle-dir", path.basename(bundleDir), ...selection,
+    "--condition-workload-file", path.basename(condition),
+  ], extraCondition.io), 2);
+  assert.match(extraCondition.stderr(), /applies only to schema-3 manifest-v5 bundles/);
 });
 
 test("the public baseline command completes schema-3 v2 and exact resumes that bundle", {
@@ -631,6 +662,16 @@ test("the public controlled-load command completes v5 and exact resumes its sibl
   bundle = await readSchema3Bundle({ resolved, auxiliary, bundleDir });
   assert.equal(bundle.controlledLoad.progress.complete, true);
   assert.equal(bundle.exactCpu.progress.complete, true);
+
+  const summarized = capture(directory);
+  assert.equal(await runFaultAffinityCli([
+    "summarize", "--bundle-dir", path.basename(bundleDir),
+    ...measuredArgs, ...conditionArgs,
+  ], summarized.io), 0, summarized.stderr());
+  assert.match(summarized.stdout(), /condition workload: cli-condition/);
+  assert.match(summarized.stdout(), /controlled-load: complete; 1\/1 sessions/);
+  assert.match(summarized.stdout(), /leg b condition=with-load attempts=1/);
+  assert.match(summarized.stdout(), /exact-CPU: complete; 1\/1 attempts/);
 });
 
 test("controlled-load rejects a finite condition workload before creating output", async () => {

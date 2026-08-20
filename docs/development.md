@@ -24,6 +24,7 @@ The suite covers:
 - Workload-spec and catalog validation, including custom-file provenance
 - Public exact-CPU CLI parsing, dry-run safety, fresh bundle creation, and resume
 - Public baseline, CPU-group, pinned-concurrent, and controlled-load CLI planning, fresh bundle creation, and complete-unit resume
+- Read-only schema-3 v1-v5 summaries with phase, context, leg, CPU, and typed-outcome counts
 - Internal shell-free attempt execution, deadlines, bounded output, and process-group cleanup
 - Managed auxiliary-workload readiness, discarded output, and bounded cancellation
 - Controlled-load worker-set readiness, boundary identity checks, peer cancellation, and stop evidence
@@ -165,6 +166,11 @@ and auxiliary workload identities, exact-CPU state, and one complete-only
 controlled-load store without requiring baseline, group, or pinned-concurrent
 capabilities. Its public integration fixture completes and resumes A1/B/A2,
 then resumes the sibling exact phase with the same auxiliary identity.
+
+The public summary command reuses the authoritative schema-3 reader and writes
+only text or versioned JSON to stdout. It never creates a bundle artifact. Unit
+fixtures cover every phase shape, and public integration tests summarize both
+exact-only and dual-workload version-5 bundles.
 
 Custom commands should be documented as trusted local workloads, not sandboxed code. They must not daemonize or escape the supervised process group.
 

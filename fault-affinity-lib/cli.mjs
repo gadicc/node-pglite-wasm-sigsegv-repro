@@ -46,6 +46,10 @@ import { readControlledLoadPlanFile } from "./controlled-load-plan.mjs";
 import { readGroupPlanFile } from "./group-plan.mjs";
 import { readPinnedPlanFile } from "./pinned-plan.mjs";
 import { runPinnedWaveProcess } from "./pinned-wave-client.mjs";
+import {
+  buildSchema3BundleSummary,
+  renderSchema3BundleSummary,
+} from "./schema3-summary.mjs";
 
 const DEFAULT_TASKSET_PATH = "/usr/bin/taskset";
 const ZERO_GENERATION = "0".repeat(32);
@@ -56,6 +60,8 @@ const HELP = `Fault Affinity: bounded, resumable workload diagnostics
 Usage:
   fault-affinity workloads [--json]
   fault-affinity inspect (--workload ID | --workload-file FILE) [--json]
+  fault-affinity summarize --bundle-dir DIR \\
+    (--workload ID | --workload-file FILE) [--condition-workload-file FILE] [--json]
   fault-affinity baseline (--workload ID | --workload-file FILE) \\
     --children N --waves N --exact-cpus LIST [--exact-rounds N] \\
     [--exact-seed N] --out-dir DIR (--dry-run | --yes)
@@ -82,8 +88,8 @@ also bind controller-aware pinned-concurrent schedules. The controlled-load
 command creates the v5 A/B/A variant with separate measured and condition
 workloads. Phase commands can advance their matching state in later compatible
 bundle versions. The exact command also creates exact-only v1 bundles. Listing,
-inspection, and dry runs never execute a workload or create an evidence bundle.
-Every live run requires explicit workload selection and --yes.
+inspection, summaries, and dry runs never execute a workload or create an
+evidence bundle. Every live run requires explicit workload selection and --yes.
 `;
 
 export class FaultAffinityCliError extends Error {
@@ -189,6 +195,28 @@ export function parseFaultAffinityArgs(argv) {
     ]));
     if (!options.help) selectionFrom(options);
     return Object.freeze({ command, ...options });
+  }
+  if (command === "summarize") {
+    const options = parseOptions(rest, new Map([
+      ["--bundle-dir", "bundleDir"],
+      ["--workload", "workload"],
+      ["--workload-file", "workloadFile"],
+      ["--condition-workload-file", "conditionWorkloadFile"],
+    ]), new Map([
+      ["--json", "json"], ["--help", "help"], ["-h", "help"],
+    ]));
+    if (options.help) return Object.freeze({ command, help: true });
+    if (options.bundleDir === undefined) fail("summarize requires --bundle-dir DIR");
+    const selection = selectionFrom(options);
+    return Object.freeze({
+      command,
+      ...selection,
+      bundleDir: options.bundleDir,
+      ...(options.conditionWorkloadFile === undefined ? {} : {
+        conditionWorkloadFile: options.conditionWorkloadFile,
+      }),
+      ...(options.json === undefined ? {} : { json: true }),
+    });
   }
   if (command === "exact") {
     const options = parseOptions(rest, new Map([
@@ -1018,6 +1046,25 @@ export async function runFaultAffinityCli(argv, io = {}) {
     if (parsed.command === "inspect") {
       if (parsed.json) writeOut(`${JSON.stringify(workloadSummary(selection), null, 2)}\n`);
       else writeOut(`${renderWorkload(selection)}\n`);
+      return 0;
+    }
+    if (parsed.command === "summarize") {
+      const conditionSelection = parsed.conditionWorkloadFile === undefined
+        ? undefined
+        : resolveConditionSelection(parsed, cwd);
+      const bundleDir = resolveExistingBundleDirectory(path.resolve(cwd, parsed.bundleDir));
+      const bundle = await readSchema3Bundle({
+        resolved: selection.resolved,
+        auxiliary: conditionSelection?.resolved,
+        bundleDir,
+      });
+      if (bundle.manifest.version !== 5 && conditionSelection !== undefined) {
+        fail("--condition-workload-file applies only to schema-3 manifest-v5 bundles");
+      }
+      const summary = buildSchema3BundleSummary(bundle);
+      writeOut(parsed.json
+        ? `${JSON.stringify(summary, null, 2)}\n`
+        : renderSchema3BundleSummary(summary));
       return 0;
     }
     if (parsed.command === "baseline") {

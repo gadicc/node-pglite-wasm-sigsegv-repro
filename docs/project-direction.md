@@ -122,7 +122,9 @@ schedule before bundle creation. The pinned command starts one short-lived
 bundle owner under each scheduled controller CPU. The controlled-load command
 binds separate measured and trusted custom condition workloads and publishes no
 partial session. Phase commands can then advance their matching prefixes in
-that same bundle. Trusted custom JSON workloads declare their own capabilities.
+that same bundle. A read-only `summarize` command validates versions 1 through 5
+and renders committed outcomes by phase, context, leg, and CPU without changing
+the bundle. Trusted custom JSON workloads declare their own capabilities.
 
 The published `wasm-churn` and `node-pglite` IDs retain their exact-only
 workload identities. Separate `wasm-churn-suite` and `node-pglite-suite`
@@ -139,6 +141,8 @@ A/B/A and Node-by-warmup modes remain multi-workload experiments outside the
 current schema.
 
 The next high-value migration is to expose additional generic phases only where
-their capability, provenance, and compatibility contracts are complete. Legacy
+their capability, provenance, and compatibility contracts are complete. The
+schema-3 summary deliberately stops short of the legacy suite's telemetry,
+debugger, statistics, privacy, and final-report behavior. Legacy
 schema-1/schema-2 interpretation and the privileged recovery namespace remain
 unchanged throughout.

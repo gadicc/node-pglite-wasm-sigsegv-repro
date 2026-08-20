@@ -40,5 +40,10 @@ schema-3 owner retains one bundle lease across the complete A1/B/A2 session;
 exact resume of the same v5 bundle receives the auxiliary identity only for
 manifest validation and does not start the condition workload.
 
+`schema3-summary.mjs` derives read-only text and versioned JSON from bundle
+objects that have already passed the authoritative schema-3 reader. It reports
+only committed observations, preserves incomplete and unbound phase status, and
+writes no derived bundle artifact.
+
 The top-level entry point re-exports the CLI error, parser, and runner for the
 existing test and embedding boundary.

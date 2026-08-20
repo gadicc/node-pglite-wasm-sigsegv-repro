@@ -173,3 +173,21 @@ The current readers follow these principles:
 - Keep superseded generations separate from current results
 
 Future generic-workload schemas must extend these rules. Existing Node/PGlite bundles should never be upgraded in place.
+
+## Inspect schema-3 bundles without mutation
+
+Schema-3 bundles use their own manifest and phase-store formats rather than the
+legacy layout described above. Inspect versions 1 through 5 with the read-only
+public command:
+
+```sh
+node fault-affinity.mjs summarize \
+  --bundle-dir diagnostics/schema3-bundle \
+  --workload-file workloads/measured.json \
+  --json
+```
+
+Manifest version 5 also requires the matching
+`--condition-workload-file`. The command validates the bundle through its
+authoritative reader, writes nothing inside it, and counts only committed typed
+outcomes. See [summarize a schema-3 bundle](../guides/schema3-summaries.md).

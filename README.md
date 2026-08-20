@@ -4,10 +4,10 @@ Fault Affinity is a Linux harness for bounded, resumable investigation of interm
 
 The project began with native faults during Node.js and PGlite WebAssembly initialization. That workload remains as a historical heavyweight built-in and case study. The recommended reduced built-in is now the dependency-free WebAssembly churn workload.
 
-The public generic commands own exact-only, baseline, explicit CPU-group, and
-controller-aware pinned-concurrent schema-3 bundles. The broader legacy
-diagnostic suite still provides telemetry, debugger, frequency, and final-report
-phases specifically for the Node/PGlite investigation.
+The public generic commands own exact-only, baseline, explicit CPU-group,
+controller-aware pinned-concurrent, and controlled-load schema-3 bundles. The
+broader legacy diagnostic suite still provides telemetry, debugger, frequency,
+and final-report phases specifically for the Node/PGlite investigation.
 
 ## Safety
 
@@ -23,11 +23,15 @@ The generic command and main legacy diagnostic runner do not require root. They 
 
 ## Start with the generic commands
 
-Listing, inspection, and dry runs do not execute a workload:
+Listing, inspection, summaries, and dry runs do not execute a workload. For
+example, the summary command below reads an existing bundle:
 
 ```sh
 node fault-affinity.mjs workloads
 node fault-affinity.mjs inspect --workload wasm-churn-suite
+node fault-affinity.mjs summarize \
+  --bundle-dir diagnostics/wasm-exact \
+  --workload wasm-churn
 node fault-affinity.mjs baseline \
   --workload wasm-churn-suite \
   --children 4 \
@@ -61,6 +65,9 @@ node fault-affinity.mjs exact \
 ```
 
 Use `--workload-file path/to/workload.json` to select a trusted local script or binary. `wasm-churn` and `node-pglite` preserve their exact-only identities; the `-suite` profiles declare baseline, group, pinned-concurrent, and exact capabilities without changing old bundle identities. Read [run generic baseline waves](docs/guides/generic-baseline.md) and [run a generic exact-CPU workload](docs/guides/generic-exact-cpu.md). These commands do not yet produce the legacy suite's complete report.
+
+Existing schema-3 bundles have a read-only text or JSON view. See
+[summarize a schema-3 bundle](docs/guides/schema3-summaries.md).
 
 For CPU-group screening, a bounded JSON plan explicitly binds baseline, group
 topology, and exact schedules before execution. See

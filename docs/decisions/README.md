@@ -29,3 +29,4 @@ behavior and compatibility boundaries, not current runtime capabilities.
 | [ADR 0021](0021-public-group-cli-and-plan-file.md) | Accepted | Publish explicit CPU-group orchestration through a bounded plan file that binds all manifest-v3 schedules. |
 | [ADR 0022](0022-public-pinned-orchestration.md) | Accepted | Publish manifest-v4 waves through short-lived controller-pinned bundle owners and a dedicated result descriptor. |
 | [ADR 0023](0023-public-controlled-load-command.md) | Accepted | Publish complete-only generic A1/B/A2 orchestration with separate measured and condition workload identities. |
+| [ADR 0024](0024-read-only-schema3-summaries.md) | Accepted | Add a read-only v1-v5 summary surface without treating derived output as evidence. |
