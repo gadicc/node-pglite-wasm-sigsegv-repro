@@ -8,22 +8,22 @@ import {
   statSync,
 } from "node:fs";
 import path from "node:path";
-import { readLinuxAllowedCpuList } from "../diagnose-lib/attempt-runner.mjs";
+import { readLinuxAllowedCpuList } from "../../diagnose-lib/attempt-runner.mjs";
 import {
   buildBaselinePhaseManifest,
   MAX_BASELINE_CHILDREN,
   MAX_BASELINE_WAVES,
-} from "../diagnose-lib/baseline-phase.mjs";
-import { buildControlledLoadSessionManifest } from "../diagnose-lib/controlled-load-session.mjs";
-import { buildExactCpuPhaseManifest } from "../diagnose-lib/exact-cpu-phase.mjs";
-import { buildGroupPhaseManifest } from "../diagnose-lib/group-phase.mjs";
-import { buildPinnedConcurrentPhaseManifest } from "../diagnose-lib/pinned-concurrent-phase.mjs";
+} from "../../diagnose-lib/baseline-phase.mjs";
+import { buildControlledLoadSessionManifest } from "../../diagnose-lib/controlled-load-session.mjs";
+import { buildExactCpuPhaseManifest } from "../../diagnose-lib/exact-cpu-phase.mjs";
+import { buildGroupPhaseManifest } from "../../diagnose-lib/group-phase.mjs";
+import { buildPinnedConcurrentPhaseManifest } from "../../diagnose-lib/pinned-concurrent-phase.mjs";
 import {
   MAX_SCHEDULE_ENTRIES,
   MAX_SEED,
   compressCpuList,
   expandCpuList,
-} from "../diagnose-lib/pinned-runner.mjs";
+} from "../../diagnose-lib/pinned-runner.mjs";
 import {
   buildSchema3BundleManifest,
   buildSchema3BundleManifestV2,
@@ -37,11 +37,11 @@ import {
   runOneSchema3ControlledLoadSession,
   runOneSchema3ExactCpuAttempt,
   runOneSchema3GroupWave,
-} from "../diagnose-lib/schema3-bundle.mjs";
+} from "../../diagnose-lib/schema3-bundle.mjs";
 import {
   listBuiltInWorkloads,
   resolveWorkloadSelection,
-} from "../workloads/catalog.mjs";
+} from "../../workloads/catalog.mjs";
 import { readControlledLoadPlanFile } from "./controlled-load-plan.mjs";
 import { readGroupPlanFile } from "./group-plan.mjs";
 import { readPinnedPlanFile } from "./pinned-plan.mjs";

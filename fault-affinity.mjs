@@ -3,13 +3,13 @@
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import { runFaultAffinityCli } from "./fault-affinity-lib/cli.mjs";
+import { runFaultAffinityCli } from "./src/fault-affinity/cli.mjs";
 
 export {
   FaultAffinityCliError,
   parseFaultAffinityArgs,
   runFaultAffinityCli,
-} from "./fault-affinity-lib/cli.mjs";
+} from "./src/fault-affinity/cli.mjs";
 
 function isMainModule() {
   if (process.argv[1] === undefined) return false;

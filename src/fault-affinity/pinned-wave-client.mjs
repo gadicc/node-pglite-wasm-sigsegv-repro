@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { MAX_CPU_ID } from "../diagnose-lib/pinned-runner.mjs";
+import { MAX_CPU_ID } from "../../diagnose-lib/pinned-runner.mjs";
 
 const OWNER_PATH = fileURLToPath(new URL("./pinned-wave-owner.mjs", import.meta.url));
 const MAX_OWNER_OUTPUT_BYTES = 64 * 1024;

@@ -14,7 +14,7 @@ import {
   GroupPlanError,
   parseGroupPlan,
   readGroupPlanFile,
-} from "../../fault-affinity-lib/group-plan.mjs";
+} from "../../src/fault-affinity/group-plan.mjs";
 
 const directories = [];
 

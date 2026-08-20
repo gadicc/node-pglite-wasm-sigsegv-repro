@@ -4,7 +4,7 @@ import test from "node:test";
 import {
   buildSchema3BundleSummary,
   renderSchema3BundleSummary,
-} from "../../fault-affinity-lib/schema3-summary.mjs";
+} from "../../src/fault-affinity/schema3-summary.mjs";
 
 function identity(id) {
   return {

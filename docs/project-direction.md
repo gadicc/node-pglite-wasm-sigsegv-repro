@@ -129,9 +129,11 @@ the bundle. Trusted custom JSON workloads declare their own capabilities.
 The published `wasm-churn` and `node-pglite` IDs retain their exact-only
 workload identities. Separate `wasm-churn-suite` and `node-pglite-suite`
 profiles declare baseline, group, isolated, and pinned-concurrent capability so
-later public phases do not mutate old bundle identities. This completes the
-package/command portion of steps 9 and 10 without requiring a physical checkout
-or repository-host rename.
+later public phases do not mutate old bundle identities. The public-command
+implementation now lives under `src/fault-affinity/`, while the stable root
+executable and compatibility-sensitive workload paths remain in place. This
+completes the generic source-extraction and package/command portions of steps 9
+and 10 without requiring a physical checkout or repository-host rename.
 
 The controlled-load foundation and public command now compose the managed
 auxiliary lifecycle, verified worker sets, complete A1/B/A2 envelopes,

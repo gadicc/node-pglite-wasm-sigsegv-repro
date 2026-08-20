@@ -1,16 +1,16 @@
 import {
   MAX_CONTROLLED_LOAD_ATTEMPTS_PER_LEG,
-} from "../diagnose-lib/controlled-load-session.mjs";
+} from "../../diagnose-lib/controlled-load-session.mjs";
 import {
   CONTROLLED_LOAD_WORKER_SET_MAX_WORKERS,
-} from "../diagnose-lib/controlled-load-workers.mjs";
+} from "../../diagnose-lib/controlled-load-workers.mjs";
 import {
   MAX_CPU_ID,
   MAX_SCHEDULE_ENTRIES,
   MAX_SEED,
   compressCpuList,
   expandCpuList,
-} from "../diagnose-lib/pinned-runner.mjs";
+} from "../../diagnose-lib/pinned-runner.mjs";
 import {
   PLAN_FILE_MAX_BYTES,
   PlanFileError,

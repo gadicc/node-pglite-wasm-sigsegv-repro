@@ -178,8 +178,10 @@ Custom commands should be documented as trusted local workloads, not sandboxed c
 
 `fault-affinity.mjs` is the package binary and compatibility-facing entry
 point. Keep it thin: argument parsing and orchestration live under
-`fault-affinity-lib/`, while protocol and persistence modules remain under
+`src/fault-affinity/`, while protocol and persistence modules remain under
 `diagnose-lib/` as long as the public command and historical suite share them.
+See the [`src/` layout](../src/README.md) and
+[ADR 0025](decisions/0025-internal-source-layout.md).
 
 Do not move built-in scripts merely to make the tree look tidier. Their
 canonical command and provenance paths participate in persisted workload

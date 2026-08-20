@@ -1,17 +1,17 @@
 import {
   MAX_BASELINE_CHILDREN,
   MAX_BASELINE_WAVES,
-} from "../diagnose-lib/baseline-phase.mjs";
+} from "../../diagnose-lib/baseline-phase.mjs";
 import {
   MAX_GROUP_CHILDREN,
   MAX_GROUP_CONTEXTS,
-} from "../diagnose-lib/group-phase.mjs";
+} from "../../diagnose-lib/group-phase.mjs";
 import {
   MAX_SCHEDULE_ENTRIES,
   MAX_SEED,
   compressCpuList,
   expandCpuList,
-} from "../diagnose-lib/pinned-runner.mjs";
+} from "../../diagnose-lib/pinned-runner.mjs";
 import {
   PLAN_FILE_MAX_BYTES,
   PlanFileError,

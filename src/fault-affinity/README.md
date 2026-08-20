@@ -2,12 +2,12 @@
 
 This directory owns argument parsing and orchestration for the public
 `fault-affinity` command. The stable executable remains
-[`../fault-affinity.mjs`](../fault-affinity.mjs), which is intentionally a thin
+[`../../fault-affinity.mjs`](../../fault-affinity.mjs), which is intentionally a thin
 entry point so package and shell invocations do not depend on the internal
 module layout.
 
 Protocol, evidence, store, lease, and lifecycle modules still live in
-`../diagnose-lib/`. Many are shared with the historical diagnostic suite, and
+`../../diagnose-lib/`. Many are shared with the historical diagnostic suite, and
 their paths must not be changed casually: compatibility-sensitive scripts,
 tests, and recovery behavior still import them directly.
 

@@ -4,8 +4,8 @@ import {
   MAX_SEED,
   compressCpuList,
   expandCpuList,
-} from "../diagnose-lib/pinned-runner.mjs";
-import { buildPinnedConcurrentPlan } from "../diagnose-lib/pinned-protocol.mjs";
+} from "../../diagnose-lib/pinned-runner.mjs";
+import { buildPinnedConcurrentPlan } from "../../diagnose-lib/pinned-protocol.mjs";
 import { parseGroupPlan } from "./group-plan.mjs";
 import { readPlanJsonFile } from "./plan-file.mjs";
 

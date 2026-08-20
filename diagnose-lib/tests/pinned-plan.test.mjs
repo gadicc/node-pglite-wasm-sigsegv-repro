@@ -12,7 +12,7 @@ import {
   PinnedPlanError,
   parsePinnedPlan,
   readPinnedPlanFile,
-} from "../../fault-affinity-lib/pinned-plan.mjs";
+} from "../../src/fault-affinity/pinned-plan.mjs";
 
 const directories = [];
 

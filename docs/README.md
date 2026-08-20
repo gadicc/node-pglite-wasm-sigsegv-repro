@@ -35,6 +35,7 @@ This index separates instructions for running the current tooling from the resul
 
 - [Architecture decisions](decisions/README.md): trust, lifecycle, evidence typing, schema compatibility, and privileged-state boundaries
 - [Workload catalog](../workloads/README.md): built-in roles and custom workload-contract JSON
+- [Source layout](../src/README.md): stable entry points, internal generic modules, and compatibility-sensitive paths
 - [Develop and test the tooling](development.md): offline tests, safe test scope, and repository boundaries
 - [Understand internal attempt records](reference/attempt-records.md): workload binding, typed outcomes, cleanup evidence, and canonical record bindings
 - [Understand internal exact-CPU phase envelopes](reference/exact-cpu-phase-envelopes.md): schedule identity, attempt slots, affinity, durable publication, and exact-prefix resume

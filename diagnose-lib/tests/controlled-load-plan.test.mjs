@@ -14,7 +14,7 @@ import {
   ControlledLoadPlanError,
   parseControlledLoadPlan,
   readControlledLoadPlanFile,
-} from "../../fault-affinity-lib/controlled-load-plan.mjs";
+} from "../../src/fault-affinity/controlled-load-plan.mjs";
 
 const directories = [];
 

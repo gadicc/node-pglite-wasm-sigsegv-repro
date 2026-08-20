@@ -1,8 +1,8 @@
 import { realpathSync, writeSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import { runOneSchema3PinnedConcurrentWave } from "../diagnose-lib/schema3-bundle.mjs";
-import { resolveWorkloadSelection } from "../workloads/catalog.mjs";
+import { runOneSchema3PinnedConcurrentWave } from "../../diagnose-lib/schema3-bundle.mjs";
+import { resolveWorkloadSelection } from "../../workloads/catalog.mjs";
 
 const OWNER_RECORD_VERSION = 1;
 
