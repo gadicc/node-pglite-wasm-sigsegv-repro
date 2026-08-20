@@ -23,7 +23,7 @@ The suite covers:
 - Argument and exit-code validation
 - Workload-spec and catalog validation, including custom-file provenance
 - Public exact-CPU CLI parsing, dry-run safety, fresh bundle creation, and resume
-- Public baseline, CPU-group, and pinned-concurrent CLI planning, fresh bundle creation, and whole-wave resume
+- Public baseline, CPU-group, pinned-concurrent, and controlled-load CLI planning, fresh bundle creation, and complete-unit resume
 - Internal shell-free attempt execution, deadlines, bounded output, and process-group cleanup
 - Managed auxiliary-workload readiness, discarded output, and bounded cancellation
 - Controlled-load worker-set readiness, boundary identity checks, peer cancellation, and stop evidence
@@ -48,7 +48,9 @@ It does not invoke `child.mjs`, `mini-wasm.mjs`, `mini-wasm-churn.mjs`, `repro-c
 
 ## Test controlled-load orchestration safely
 
-Controlled-load tests use stubs and fake runners. They validate:
+Historical controlled-load tests use stubs and fake runners. Generic public
+integration tests use only a harmless finite measured process and a harmless
+waiting condition process. Together they validate:
 
 - Mode and argument handling
 - Mode-specific phase plans
@@ -109,17 +111,18 @@ They also exercise fast child exit, retained output descriptors, unavailable
 process-group observations, launch-time provenance drift, parent IPC loss, and
 TERM-to-KILL grace timing. All fixtures are harmless process-lifecycle programs.
 
-The managed auxiliary-workload path reuses that supervisor for future
-controlled conditions. It reports readiness only after identity and CPU-list
-validation, discards intentionally unbounded worker output, and returns a
-separate result shape that cannot be published as a diagnostic attempt record.
-No current controlled-load command uses this internal path yet.
+The managed auxiliary-workload path reuses that supervisor for controlled
+conditions. It reports readiness only after identity and CPU-list validation,
+discards intentionally unbounded worker output, and returns a separate result
+shape that cannot be published as a diagnostic attempt record. The public
+controlled-load command reaches it only through the complete worker-set and
+session owners.
 
 The controlled-load worker-set layer starts one managed worker per canonical
 CPU, reports running only after complete readiness, rechecks the same PID and
 start-ticks identities at named boundaries, and returns one complete stop
-record. Early termination or placement drift cancels the set. The current
-public controlled-load script remains unchanged.
+record. Early termination or placement drift cancels the set. The historical
+multi-mode controlled-load script remains unchanged.
 
 The controlled-load session adapter pins all measured attempts to one target
 CPU and publishes only a complete A1/B/A2 envelope. Its B attempts are enclosed
@@ -128,7 +131,8 @@ declared warm-up and recovery times are checked against monotonic evidence.
 The private phase store publishes only one complete session. Schema-3 manifest
 version 5 binds that store, the auxiliary workload identity, and exact-CPU
 state as a controlled-load variant. One bundle lease covers the whole session
-and commit. The adapter still has no public command.
+and commit. The public command supplies a bounded plan and both trusted
+workload identities.
 
 The exact-CPU adapter reuses the current balanced-cyclic isolated schedule and
 places each valid attempt record in a versioned envelope. Schema-3 manifest
@@ -159,7 +163,8 @@ only a finite custom process and checks all sibling phase resumes.
 Manifest version 5 is a separate controlled-load variant. It binds the measured
 and auxiliary workload identities, exact-CPU state, and one complete-only
 controlled-load store without requiring baseline, group, or pinned-concurrent
-capabilities.
+capabilities. Its public integration fixture completes and resumes A1/B/A2,
+then resumes the sibling exact phase with the same auxiliary identity.
 
 Custom commands should be documented as trusted local workloads, not sandboxed code. They must not daemonize or escape the supervised process group.
 
@@ -191,8 +196,8 @@ Manual crash experiments need an explicit operator, a reviewed plan, and a dispo
 ## Check documentation changes
 
 Documentation commands must reflect the current `--help` output. Do not present
-controlled-load, debugger, or frequency adapters as public generic commands
-until their orchestration exists.
+debugger or frequency adapters as public generic commands until their
+orchestration exists.
 
 When headings move, search for repository-relative anchors:
 

@@ -74,6 +74,59 @@ function customWorkload(directory, overrides = {}) {
   return definition;
 }
 
+function conditionWorkload(directory, overrides = {}) {
+  const definition = path.join(directory, "condition-workload.json");
+  const value = {
+    version: 1,
+    id: "cli-condition",
+    label: "CLI waiting fixture",
+    description: "Harmless waiting process for controlled-load CLI integration tests.",
+    risk: "standard",
+    command: {
+      executable: process.execPath,
+      args: ["-e", "setInterval(() => {}, 1000)"],
+      cwd: ".",
+    },
+    environment: {},
+    attempt: {
+      mode: "survive-window",
+      timeoutMs: 5_000,
+      termGraceMs: 50,
+      killGraceMs: 500,
+    },
+    outcomes: { targetSignals: [], mappedExits: [] },
+    capabilities: {
+      baseline: false,
+      groups: false,
+      pinnedConcurrent: false,
+      isolated: false,
+    },
+    provenance: { completeness: "complete", files: [] },
+    ...overrides,
+  };
+  writeFileSync(definition, `${JSON.stringify(value)}\n`, { mode: 0o600 });
+  return definition;
+}
+
+function controlledLoadPlan(directory, overrides = {}) {
+  const [targetCpu, workerCpu] = allowedCpus(2);
+  const filename = path.join(directory, "controlled-load-plan.json");
+  const value = {
+    version: 1,
+    controlledLoad: {
+      targetCpu,
+      workerCpus: String(workerCpu),
+      attemptsPerLeg: 1,
+      warmupMs: 0,
+      recoveryMs: 0,
+    },
+    exact: { cpus: String(targetCpu), rounds: 1, seed: 17 },
+    ...overrides,
+  };
+  writeFileSync(filename, `${JSON.stringify(value)}\n`, { mode: 0o600 });
+  return filename;
+}
+
 function groupPlan(directory, overrides = {}) {
   const cpu = allowedCpu();
   const filename = path.join(directory, "group-plan.json");
@@ -206,6 +259,37 @@ test("argument parsing keeps live selection and confirmation explicit", () => {
   assert.throws(() => parseFaultAffinityArgs([
     "pinned", "--resume", "bundle", "--workload", "wasm-churn-suite", "--dry-run",
   ]), /pinned resume requires --yes/);
+  assert.deepEqual(parseFaultAffinityArgs([
+    "controlled-load", "--workload-file", "measured.json",
+    "--condition-workload-file", "condition.json", "--plan-file", "plan.json",
+    "--out-dir", "bundle", "--dry-run",
+  ]), {
+    command: "controlled-load",
+    mode: "dry-run",
+    workloadFile: "measured.json",
+    conditionWorkloadFile: "condition.json",
+    planFile: "plan.json",
+    outDir: "bundle",
+    tasksetPath: "/usr/bin/taskset",
+  });
+  assert.deepEqual(parseFaultAffinityArgs([
+    "exact", "--resume", "bundle", "--workload-file", "measured.json",
+    "--condition-workload-file", "condition.json", "--yes",
+  ]), {
+    command: "exact",
+    mode: "resume",
+    workloadFile: "measured.json",
+    conditionWorkloadFile: "condition.json",
+    resumeDir: "bundle",
+  });
+  assert.throws(() => parseFaultAffinityArgs([
+    "controlled-load", "--resume", "bundle", "--workload-file", "measured.json",
+    "--condition-workload-file", "condition.json", "--dry-run",
+  ]), /controlled-load resume requires --yes/);
+  assert.throws(() => parseFaultAffinityArgs([
+    "controlled-load", "--workload-file", "measured.json", "--plan-file", "plan.json",
+    "--out-dir", "bundle", "--dry-run",
+  ]), /requires --condition-workload-file/);
 });
 
 test("listing and inspection describe built-ins without creating files", async () => {
@@ -285,6 +369,30 @@ test("a dry run validates all v4 schedules without creating output", async () =>
   assert.match(captured.stdout(), /bound groups: 1 context\(s\); 1 wave\(s\)/);
   assert.match(captured.stdout(), /pinned-concurrent: 1 context\(s\); 1 wave\(s\); 1 attempt\(s\)/);
   assert.match(captured.stdout(), /bound exact: CPUs .*1 attempt\(s\); seed 13/);
+  assert.match(captured.stdout(), /no workload executed and no bundle created/);
+});
+
+test("a dry run validates the v5 A/B/A and bound exact schedules", async () => {
+  const directory = temporaryDirectory();
+  const measured = customWorkload(directory);
+  const condition = conditionWorkload(directory);
+  const plan = controlledLoadPlan(directory);
+  const output = path.join(directory, "planned-controlled-load-bundle");
+  const captured = capture(directory);
+  const rc = await runFaultAffinityCli([
+    "controlled-load", "--workload-file", path.basename(measured),
+    "--condition-workload-file", path.basename(condition),
+    "--plan-file", path.basename(plan), "--out-dir", path.basename(output),
+    "--dry-run",
+  ], captured.io);
+
+  assert.equal(rc, 0, captured.stderr());
+  assert.equal(existsSync(output), false);
+  assert.match(captured.stdout(), /measured workload:\ncli-finite:/);
+  assert.match(captured.stdout(), /condition workload:\ncli-condition:/);
+  assert.match(captured.stdout(),
+    /controlled load: target CPU .*1 attempt\(s\) per A1\/B\/A2 leg; 3 attempt\(s\) total/);
+  assert.match(captured.stdout(), /bound exact: CPUs .*1 attempt\(s\); seed 17/);
   assert.match(captured.stdout(), /no workload executed and no bundle created/);
 });
 
@@ -471,6 +579,77 @@ test("the public pinned command completes v4 under its scheduled controller", {
   assert.equal(bundle.groups.progress.complete, true);
   assert.equal(bundle.pinnedConcurrent.progress.complete, true);
   assert.equal(bundle.exactCpu.progress.complete, true);
+});
+
+test("the public controlled-load command completes v5 and exact resumes its sibling phase", {
+  timeout: 30_000,
+}, async () => {
+  const directory = temporaryDirectory();
+  const measuredFile = customWorkload(directory);
+  const conditionFile = conditionWorkload(directory);
+  const plan = controlledLoadPlan(directory);
+  const bundleDir = path.join(directory, "controlled-load-bundle");
+  const measuredArgs = ["--workload-file", path.basename(measuredFile)];
+  const conditionArgs = ["--condition-workload-file", path.basename(conditionFile)];
+  const controlled = capture(directory);
+  assert.equal(await runFaultAffinityCli([
+    "controlled-load", ...measuredArgs, ...conditionArgs,
+    "--plan-file", path.basename(plan), "--out-dir", path.basename(bundleDir), "--yes",
+  ], controlled.io), 0, controlled.stderr());
+  assert.match(controlled.stdout(), /session 1\/1 protocol=A1\/B\/A2/);
+  assert.match(controlled.stdout(),
+    /committed controlled-load session a1:pass:1 b:pass:1 a2:pass:1/);
+  assert.match(controlled.stdout(), /complete: 1\/1 controlled-load sessions/);
+
+  const resolved = resolveCustomWorkloadFile(measuredFile).resolved;
+  const auxiliary = resolveCustomWorkloadFile(conditionFile).resolved;
+  let bundle = await readSchema3Bundle({ resolved, auxiliary, bundleDir });
+  assert.equal(bundle.manifest.version, 5);
+  assert.equal(bundle.controlledLoad.progress.complete, true);
+  assert.equal(bundle.exactCpu.progress.complete, false);
+
+  const resumed = capture(directory);
+  assert.equal(await runFaultAffinityCli([
+    "controlled-load", "--resume", path.basename(bundleDir),
+    ...measuredArgs, ...conditionArgs, "--yes",
+  ], resumed.io), 0, resumed.stderr());
+  assert.match(resumed.stdout(), /resuming controlled-load measured=cli-finite condition=cli-condition/);
+  assert.match(resumed.stdout(), /complete: 1\/1 controlled-load sessions/);
+
+  const missingCondition = capture(directory);
+  assert.equal(await runFaultAffinityCli([
+    "exact", "--resume", path.basename(bundleDir), ...measuredArgs, "--yes",
+  ], missingCondition.io), 2);
+  assert.match(missingCondition.stderr(), /require the resolved auxiliary workload/);
+
+  const exact = capture(directory);
+  assert.equal(await runFaultAffinityCli([
+    "exact", "--resume", path.basename(bundleDir),
+    ...measuredArgs, ...conditionArgs, "--yes",
+  ], exact.io), 0, exact.stderr());
+  assert.match(exact.stdout(), /complete: 1\/1 exact-CPU attempts/);
+  bundle = await readSchema3Bundle({ resolved, auxiliary, bundleDir });
+  assert.equal(bundle.controlledLoad.progress.complete, true);
+  assert.equal(bundle.exactCpu.progress.complete, true);
+});
+
+test("controlled-load rejects a finite condition workload before creating output", async () => {
+  const directory = temporaryDirectory();
+  const measured = customWorkload(directory);
+  const condition = conditionWorkload(directory, {
+    attempt: { mode: "exit", timeoutMs: 5_000, termGraceMs: 50, killGraceMs: 500 },
+  });
+  const plan = controlledLoadPlan(directory);
+  const output = path.join(directory, "bundle");
+  const captured = capture(directory);
+  const rc = await runFaultAffinityCli([
+    "controlled-load", "--workload-file", path.basename(measured),
+    "--condition-workload-file", path.basename(condition),
+    "--plan-file", path.basename(plan), "--out-dir", path.basename(output), "--yes",
+  ], captured.io);
+  assert.equal(rc, 2);
+  assert.match(captured.stderr(), /must use survive-window lifecycle semantics/);
+  assert.equal(existsSync(output), false);
 });
 
 test("baseline planning requires both baseline and exact capabilities", async () => {

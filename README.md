@@ -70,6 +70,11 @@ For controller-aware waves, a version-4 plan also binds one distinct controller
 CPU and one independently supervised child per active CPU. See
 [run generic pinned-concurrent waves](docs/guides/generic-pinned-concurrent.md).
 
+For a generic before/during/after comparison, a version-5 plan binds one
+measured workload, a trusted custom condition workload, disjoint target and
+worker CPUs, and a sibling exact schedule. See
+[run a generic controlled-load comparison](docs/guides/generic-controlled-load.md).
+
 ## Reproduce the historical Node/PGlite failure
 
 The original child creates an in-memory PGlite 0.5.4 client, runs `SELECT 1`, closes the client, and exits. There is no application framework, test runner, native add-on, or database persistence.

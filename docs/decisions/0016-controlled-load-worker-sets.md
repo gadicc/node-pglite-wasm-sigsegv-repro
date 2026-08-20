@@ -65,3 +65,7 @@ session, or add schema-3 state.
 - Interrupted-owner coverage proves lease retention through cleanup and proves
   that the direct auxiliary workload receives no bundle descriptor.
 - Automated coverage uses harmless waiting fixtures only.
+
+[ADR 0023](0023-public-controlled-load-command.md) later composes this
+controller into the public single-workload controlled-load command without
+changing the worker-set records.

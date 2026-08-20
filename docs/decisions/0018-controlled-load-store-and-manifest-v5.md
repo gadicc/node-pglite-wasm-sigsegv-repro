@@ -78,3 +78,7 @@ the privileged recovery namespace.
   commit.
 - A complete retry launches no new attempts.
 - Automated coverage uses harmless finite and waiting fixtures only.
+
+[ADR 0023](0023-public-controlled-load-command.md) later adds the public
+selection, plan, creation, and resume layer for this unchanged manifest-v5
+ownership contract.

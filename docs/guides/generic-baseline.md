@@ -123,8 +123,9 @@ different denominators as interchangeable.
 
 Schema-3 version 2 still does not provide topology-group state; use the
 [generic CPU-group command](generic-cpu-groups.md) to create a version-3 bundle.
-Neither path yet provides pinned-concurrent, controlled-load, debugger,
-frequency, telemetry, privacy-review, or final-report orchestration. See the
+Pinned-concurrent and controlled-load protocols use their own later manifest
+variants and public guides. Debugger, frequency, telemetry, privacy-review, and
+final-report orchestration remain outside this baseline path. See the
 [baseline wave reference](../reference/baseline-concurrent-waves.md)
 for persisted semantics and [interpret experimental results](../concepts/interpreting-results.md)
 for inference limits.

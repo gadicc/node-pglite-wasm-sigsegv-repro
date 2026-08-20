@@ -62,3 +62,6 @@ separate durable store and schema-3 owner. Neither layer modifies
   and the recovery interval precede A2.
 - Any incomplete attempt or worker lifecycle publishes no session envelope.
 - Automated coverage uses only harmless finite and waiting fixtures.
+
+[ADR 0023](0023-public-controlled-load-command.md) later publishes this
+complete-only session contract through the public command.

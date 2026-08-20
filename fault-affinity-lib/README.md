@@ -14,23 +14,31 @@ tests, and recovery behavior still import them directly.
 New public phases should keep these boundaries:
 
 - parse and validate all operator input before creating an output directory;
-- resolve one explicit workload identity and check its declared capabilities;
+- resolve every explicit workload identity and check its declared capabilities
+  or lifecycle role;
 - build an immutable schema-3 manifest before launching anything;
 - use the schema-3 bundle owner for selection, execution, cleanup, and commit;
 - exercise live orchestration in automation only with harmless finite custom
   workloads.
 
 `plan-file.mjs` owns the shared bounded, stable JSON read boundary.
-`group-plan.mjs` normalizes the manifest-version-3 public plan, while
-`pinned-plan.mjs` normalizes the four schedules required by manifest version 4.
-The existing phase builders remain authoritative for canonical topology and
-schedule validation.
+`group-plan.mjs` normalizes the manifest-version-3 public plan,
+`pinned-plan.mjs` normalizes the four schedules required by manifest version 4,
+and `controlled-load-plan.mjs` normalizes the A1/B/A2 and sibling exact
+schedules required by manifest version 5. The existing phase builders remain
+authoritative for canonical topology and schedule validation.
 
 Pinned waves use a separate process boundary. `pinned-wave-client.mjs` starts
 one `pinned-wave-owner.mjs` process under the stored controller CPU. The owner
 acquires the bundle lease, advances at most one wave, and returns a bounded
 structured result over a dedicated descriptor rather than workload stdout or
 stderr. The public coordinator then rereads durable bundle state.
+
+Controlled-load orchestration resolves a second trusted custom workload for
+the condition workers. That workload must use `survive-window` semantics. The
+schema-3 owner retains one bundle lease across the complete A1/B/A2 session;
+exact resume of the same v5 bundle receives the auxiliary identity only for
+manifest validation and does not start the condition workload.
 
 The top-level entry point re-exports the CLI error, parser, and runner for the
 existing test and embedding boundary.

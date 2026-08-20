@@ -73,3 +73,7 @@ command, or admit multi-workload comparisons to schema 3.
 - Invalid readiness observers stop the workload and return operationally
   invalid lifecycle evidence.
 - Automated coverage uses only harmless lifecycle fixtures.
+
+[ADR 0023](0023-public-controlled-load-command.md) later composes this lifecycle
+into the public single-workload controlled-load command without changing the
+managed result format.

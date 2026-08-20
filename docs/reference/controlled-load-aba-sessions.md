@@ -1,7 +1,7 @@
 # Understand controlled-load A/B/A sessions
 
-The internal controlled-load session adapter produces one complete comparison
-for one measured workload:
+The controlled-load session adapter produces one complete comparison for one
+measured workload:
 
 1. **A1:** measured attempts without the condition workers
 2. **B:** measured attempts bracketed by the same verified worker set
@@ -61,10 +61,11 @@ or temporal reordering all return no complete envelope. Retained bundle
 ownership can span attempts and managed workers, but the direct workloads do
 not inherit the bundle directory descriptor.
 
-The internal [complete-only phase store](controlled-load-phase-storage.md) and
-schema-3 manifest-v5 owner now consume this contract. No public command does.
-The existing `load-state-aba.mjs` modes and their historical multi-workload
-evidence remain unchanged.
+The [complete-only phase store](controlled-load-phase-storage.md), schema-3
+manifest-v5 owner, and public
+[`fault-affinity controlled-load`](../guides/generic-controlled-load.md) command
+consume this contract. The existing `load-state-aba.mjs` modes and their
+historical multi-workload evidence remain unchanged.
 
 See [ADR 0017](../decisions/0017-controlled-load-aba-sessions.md) for the
 accepted boundary.

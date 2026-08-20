@@ -114,14 +114,15 @@ is interrupted.
 The `fault-affinity` command now exposes reviewed workload listing, inspection,
 dry-run planning, fresh exact-only schema-3 bundle creation, exact-prefix
 resume, complete correlated baseline waves in manifest-v2 bundles, complete
-CPU-group waves in manifest-v3 bundles, and controller-aware waves in
-manifest-v4 bundles. A baseline command pre-binds the downstream exact
-schedule. The groups and pinned commands safely read explicit plans that bind
-every sibling schedule before bundle creation. The pinned command starts one
-short-lived bundle owner under each scheduled controller CPU and rereads
-durable state after every complete wave. Phase commands can then advance their
-matching prefixes in that same bundle. Trusted custom JSON workloads declare
-their own capabilities.
+CPU-group waves in manifest-v3 bundles, controller-aware waves in manifest-v4
+bundles, and complete A1/B/A2 sessions in manifest-v5 bundles. A baseline
+command pre-binds the downstream exact schedule. The groups, pinned, and
+controlled-load commands safely read explicit plans that bind every sibling
+schedule before bundle creation. The pinned command starts one short-lived
+bundle owner under each scheduled controller CPU. The controlled-load command
+binds separate measured and trusted custom condition workloads and publishes no
+partial session. Phase commands can then advance their matching prefixes in
+that same bundle. Trusted custom JSON workloads declare their own capabilities.
 
 The published `wasm-churn` and `node-pglite` IDs retain their exact-only
 workload identities. Separate `wasm-churn-suite` and `node-pglite-suite`
@@ -130,12 +131,12 @@ later public phases do not mutate old bundle identities. This completes the
 package/command portion of steps 9 and 10 without requiring a physical checkout
 or repository-host rename.
 
-The controlled-load foundation has a managed auxiliary lifecycle, verified
-worker sets, complete A1/B/A2 envelopes, a complete-only store, and schema-3
-manifest-v5 ownership, but still has no generic public command. Debugger and
-frequency protocols still need workload-bound adapters where applicable.
-Historical Node A/B/A and Node-by-warmup modes remain multi-workload experiments
-outside the current schema.
+The controlled-load foundation and public command now compose the managed
+auxiliary lifecycle, verified worker sets, complete A1/B/A2 envelopes,
+complete-only store, and schema-3 manifest-v5 ownership. Debugger and frequency
+protocols still need workload-bound adapters where applicable. Historical Node
+A/B/A and Node-by-warmup modes remain multi-workload experiments outside the
+current schema.
 
 The next high-value migration is to expose additional generic phases only where
 their capability, provenance, and compatibility contracts are complete. Legacy

@@ -14,6 +14,7 @@ import {
   MAX_BASELINE_CHILDREN,
   MAX_BASELINE_WAVES,
 } from "../diagnose-lib/baseline-phase.mjs";
+import { buildControlledLoadSessionManifest } from "../diagnose-lib/controlled-load-session.mjs";
 import { buildExactCpuPhaseManifest } from "../diagnose-lib/exact-cpu-phase.mjs";
 import { buildGroupPhaseManifest } from "../diagnose-lib/group-phase.mjs";
 import { buildPinnedConcurrentPhaseManifest } from "../diagnose-lib/pinned-concurrent-phase.mjs";
@@ -28,10 +29,12 @@ import {
   buildSchema3BundleManifestV2,
   buildSchema3BundleManifestV3,
   buildSchema3BundleManifestV4,
+  buildSchema3BundleManifestV5,
   initializeSchema3Bundle,
   newSchema3BundleGeneration,
   readSchema3Bundle,
   runOneSchema3BaselineWave,
+  runOneSchema3ControlledLoadSession,
   runOneSchema3ExactCpuAttempt,
   runOneSchema3GroupWave,
 } from "../diagnose-lib/schema3-bundle.mjs";
@@ -39,6 +42,7 @@ import {
   listBuiltInWorkloads,
   resolveWorkloadSelection,
 } from "../workloads/catalog.mjs";
+import { readControlledLoadPlanFile } from "./controlled-load-plan.mjs";
 import { readGroupPlanFile } from "./group-plan.mjs";
 import { readPinnedPlanFile } from "./pinned-plan.mjs";
 import { runPinnedWaveProcess } from "./pinned-wave-client.mjs";
@@ -62,17 +66,24 @@ Usage:
   fault-affinity pinned (--workload ID | --workload-file FILE) \\
     --plan-file FILE --out-dir DIR (--dry-run | --yes)
   fault-affinity pinned --resume DIR (--workload ID | --workload-file FILE) --yes
+  fault-affinity controlled-load (--workload ID | --workload-file FILE) \\
+    --condition-workload-file FILE --plan-file FILE --out-dir DIR \\
+    (--dry-run | --yes)
+  fault-affinity controlled-load --resume DIR \\
+    (--workload ID | --workload-file FILE) --condition-workload-file FILE --yes
   fault-affinity exact (--workload ID | --workload-file FILE) \\
     --cpus LIST [--rounds N] [--seed N] --out-dir DIR (--dry-run | --yes)
-  fault-affinity exact --resume DIR (--workload ID | --workload-file FILE) --yes
+  fault-affinity exact --resume DIR (--workload ID | --workload-file FILE) \\
+    [--condition-workload-file FILE] --yes
 
 The baseline command creates schema-3 v2 bundles. The groups command creates
 v3 bundles from a bounded plan file. The pinned command creates v4 bundles that
-also bind controller-aware pinned-concurrent schedules. Phase commands can
-advance their matching state in later compatible bundle versions. The exact
-command also creates exact-only v1 bundles. Listing, inspection, and dry runs
-never execute a workload or create an evidence bundle. Every live run requires
-an explicit workload selection and --yes.
+also bind controller-aware pinned-concurrent schedules. The controlled-load
+command creates the v5 A/B/A variant with separate measured and condition
+workloads. Phase commands can advance their matching state in later compatible
+bundle versions. The exact command also creates exact-only v1 bundles. Listing,
+inspection, and dry runs never execute a workload or create an evidence bundle.
+Every live run requires explicit workload selection and --yes.
 `;
 
 export class FaultAffinityCliError extends Error {
@@ -183,6 +194,7 @@ export function parseFaultAffinityArgs(argv) {
     const options = parseOptions(rest, new Map([
       ["--workload", "workload"],
       ["--workload-file", "workloadFile"],
+      ["--condition-workload-file", "conditionWorkloadFile"],
       ["--cpus", "cpuSpec"],
       ["--rounds", "roundsText"],
       ["--seed", "seedText"],
@@ -201,7 +213,13 @@ export function parseFaultAffinityArgs(argv) {
       if (fresh.length > 0) fail("--resume cannot be combined with fresh schedule options");
       if (!options.yes || options.dryRun) fail("an exact resume requires --yes");
       return Object.freeze({ command, mode: "resume", ...selection,
-        resumeDir: options.resumeDir });
+        resumeDir: options.resumeDir,
+        ...(options.conditionWorkloadFile === undefined ? {} : {
+          conditionWorkloadFile: options.conditionWorkloadFile,
+        }) });
+    }
+    if (options.conditionWorkloadFile !== undefined) {
+      fail("--condition-workload-file is supported only when resuming a controlled-load bundle");
     }
     if (options.cpuSpec === undefined || options.outDir === undefined) {
       fail("a fresh exact run requires --cpus LIST and --out-dir DIR");
@@ -276,6 +294,55 @@ export function parseFaultAffinityArgs(argv) {
         1, MAX_SCHEDULE_ENTRIES),
       exactSeed: parseCanonicalInteger(options.exactSeedText ?? "0", "--exact-seed",
         0, MAX_SEED),
+      outDir: options.outDir,
+      tasksetPath: options.tasksetPath ?? DEFAULT_TASKSET_PATH,
+    });
+  }
+  if (command === "controlled-load") {
+    const options = parseOptions(rest, new Map([
+      ["--workload", "workload"],
+      ["--workload-file", "workloadFile"],
+      ["--condition-workload-file", "conditionWorkloadFile"],
+      ["--plan-file", "planFile"],
+      ["--out-dir", "outDir"],
+      ["--resume", "resumeDir"],
+      ["--taskset", "tasksetPath"],
+    ]), new Map([
+      ["--dry-run", "dryRun"], ["--yes", "yes"],
+      ["--help", "help"], ["-h", "help"],
+    ]));
+    if (options.help) return Object.freeze({ command, help: true });
+    const selection = selectionFrom(options);
+    if (options.conditionWorkloadFile === undefined) {
+      fail("controlled-load requires --condition-workload-file FILE");
+    }
+    if (options.resumeDir !== undefined) {
+      const fresh = ["planFile", "outDir", "tasksetPath"]
+        .filter((key) => options[key] !== undefined);
+      if (fresh.length > 0) {
+        fail("--resume cannot be combined with fresh controlled-load options");
+      }
+      if (!options.yes || options.dryRun) fail("a controlled-load resume requires --yes");
+      return Object.freeze({
+        command,
+        mode: "resume",
+        ...selection,
+        conditionWorkloadFile: options.conditionWorkloadFile,
+        resumeDir: options.resumeDir,
+      });
+    }
+    if (options.planFile === undefined || options.outDir === undefined) {
+      fail("a fresh controlled-load run requires --plan-file FILE and --out-dir DIR");
+    }
+    if (Boolean(options.dryRun) === Boolean(options.yes)) {
+      fail("choose exactly one --dry-run or --yes for a fresh controlled-load run");
+    }
+    return Object.freeze({
+      command,
+      mode: options.dryRun ? "dry-run" : "fresh",
+      ...selection,
+      conditionWorkloadFile: options.conditionWorkloadFile,
+      planFile: options.planFile,
       outDir: options.outDir,
       tasksetPath: options.tasksetPath ?? DEFAULT_TASKSET_PATH,
     });
@@ -457,6 +524,18 @@ function resolveSelection(parsed, cwd) {
   });
 }
 
+function resolveConditionSelection(parsed, cwd) {
+  return resolveWorkloadSelection({
+    workloadFile: path.resolve(cwd, parsed.conditionWorkloadFile),
+  });
+}
+
+function assertControlledLoadCondition(selection) {
+  if (selection.resolved.attempt.mode !== "survive-window") {
+    fail(`condition workload '${selection.resolved.id}' must use survive-window lifecycle semantics`);
+  }
+}
+
 function assertExactCapability(selection) {
   if (selection.resolved.capabilities.isolated !== true) {
     fail(`workload '${selection.resolved.id}' does not declare exact-CPU capability`);
@@ -603,6 +682,36 @@ function buildFreshPinnedManifest(resolved, plan, tasksetPath, dryRun) {
   });
 }
 
+function buildFreshControlledLoadManifest(
+  resolved,
+  auxiliary,
+  plan,
+  tasksetPath,
+  dryRun,
+) {
+  const controlledLoadManifest = buildControlledLoadSessionManifest(resolved, auxiliary, {
+    generation: dryRun ? ZERO_GENERATION : generation(),
+    attemptsPerLeg: plan.controlledLoad.attemptsPerLeg,
+    targetCpu: plan.controlledLoad.targetCpu,
+    workerCpus: plan.controlledLoad.workerCpus,
+    tasksetPath,
+    warmupMs: plan.controlledLoad.warmupMs,
+    recoveryMs: plan.controlledLoad.recoveryMs,
+  });
+  const exactCpuManifest = buildExactCpuPhaseManifest(resolved, {
+    generation: dryRun ? ZERO_GENERATION : generation(),
+    cpus: plan.exact.cpus,
+    rounds: plan.exact.rounds,
+    seed: plan.exact.seed,
+    tasksetPath,
+  });
+  return buildSchema3BundleManifestV5(resolved, auxiliary, {
+    bundleGeneration: dryRun ? ZERO_GENERATION : newSchema3BundleGeneration(),
+    controlledLoadManifest,
+    exactCpuManifest,
+  });
+}
+
 function installSignalForwarding(signalSource) {
   const controller = new AbortController();
   let received = null;
@@ -624,16 +733,24 @@ function signalExitCode(signal) {
   return signal === "SIGINT" ? 130 : signal === "SIGTERM" ? 143 : 1;
 }
 
-async function runExactBundle({ resolved, bundleDir, signalSource, writeOut, writeErr }) {
+async function runExactBundle({
+  resolved,
+  auxiliary,
+  bundleDir,
+  signalSource,
+  writeOut,
+  writeErr,
+}) {
   const forwarding = installSignalForwarding(signalSource);
   try {
-    let bundle = await readSchema3Bundle({ resolved, bundleDir });
+    let bundle = await readSchema3Bundle({ resolved, auxiliary, bundleDir });
     while (!bundle.exactCpu.progress.complete) {
       if (forwarding.signal.aborted) return signalExitCode(forwarding.received());
       const { nextSlot, committedAttempts, totalAttempts } = bundle.exactCpu.progress;
       writeOut(`attempt ${committedAttempts + 1}/${totalAttempts} cpu=${nextSlot.cpu}\n`);
       const execution = await runOneSchema3ExactCpuAttempt({
         resolved,
+        auxiliary,
         bundleDir,
         attemptOptions: { signal: forwarding.signal },
       });
@@ -652,6 +769,64 @@ async function runExactBundle({ resolved, bundleDir, signalSource, writeOut, wri
     }
     writeOut(`complete: ${bundle.exactCpu.progress.committedAttempts}/` +
       `${bundle.exactCpu.progress.totalAttempts} exact-CPU attempts in ${bundleDir}\n`);
+    return 0;
+  } finally {
+    forwarding.remove();
+  }
+}
+
+function controlledLegOutcomeSummary(leg) {
+  const counts = new Map();
+  for (const entry of leg.attempts) {
+    const category = entry.evidence.outcome.category;
+    counts.set(category, (counts.get(category) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+    .map(([category, count]) => `${category}:${count}`)
+    .join(",");
+}
+
+async function runControlledLoadBundle({
+  resolved,
+  auxiliary,
+  bundleDir,
+  signalSource,
+  writeOut,
+  writeErr,
+}) {
+  const forwarding = installSignalForwarding(signalSource);
+  try {
+    let bundle = await readSchema3Bundle({ resolved, auxiliary, bundleDir });
+    if (bundle.controlledLoad === undefined) {
+      fail("schema-3 bundle does not bind a controlled-load phase");
+    }
+    if (!bundle.controlledLoad.progress.complete) {
+      writeOut("session 1/1 protocol=A1/B/A2\n");
+      const execution = await runOneSchema3ControlledLoadSession({
+        resolved,
+        auxiliary,
+        bundleDir,
+        attemptOptions: { signal: forwarding.signal },
+      });
+      bundle = execution.bundle;
+      if (execution.result.committed) {
+        const summaries = execution.result.envelope.legs
+          .map((leg) => `${leg.leg}:${controlledLegOutcomeSummary(leg)}`)
+          .join(" ");
+        writeOut(`committed controlled-load session ${summaries}\n`);
+      } else if (forwarding.signal.aborted) {
+        return signalExitCode(forwarding.received());
+      } else if (execution.result.reason !== "complete") {
+        writeErr(`controlled-load session was not committed: ${execution.result.reason}` +
+          ` stage=${execution.result.stage}` +
+          `${execution.result.errorCode ? ` (${execution.result.errorCode})` : ""}\n`);
+        return 1;
+      }
+    }
+    writeOut(`complete: ${bundle.controlledLoad.progress.committedSessions}/` +
+      `${bundle.controlledLoad.progress.totalSessions} controlled-load sessions in ` +
+      `${bundleDir}\n`);
     return 0;
   } finally {
     forwarding.remove();
@@ -899,6 +1074,89 @@ export async function runFaultAffinityCli(argv, io = {}) {
         writeErr,
       });
     }
+    if (parsed.command === "controlled-load") {
+      assertExactCapability(selection);
+      const conditionSelection = resolveConditionSelection(parsed, cwd);
+      assertControlledLoadCondition(conditionSelection);
+      if (parsed.mode !== "dry-run") {
+        assertAutomationBoundary(selection);
+        assertAutomationBoundary(conditionSelection);
+      }
+      if (parsed.mode === "resume") {
+        const bundleDir = resolveExistingBundleDirectory(path.resolve(cwd, parsed.resumeDir));
+        writeOut(`resuming controlled-load measured=${selection.resolved.id} ` +
+          `condition=${conditionSelection.resolved.id} bundle=${bundleDir}\n`);
+        writeOut(`measured warning: ${selection.metadata.liveWarning}\n`);
+        writeOut(`condition warning: ${conditionSelection.metadata.liveWarning}\n`);
+        return await runControlledLoadBundle({
+          resolved: selection.resolved,
+          auxiliary: conditionSelection.resolved,
+          bundleDir,
+          signalSource,
+          writeOut,
+          writeErr,
+        });
+      }
+      const planPath = path.resolve(cwd, parsed.planFile);
+      const plan = readControlledLoadPlanFile(planPath);
+      const tasksetPath = resolveExecutablePath(parsed.tasksetPath, "--taskset");
+      const scheduledCpus = [...new Set([
+        plan.controlledLoad.targetCpu,
+        ...plan.controlledLoad.workerCpus,
+        ...plan.exact.cpus,
+      ])].sort((left, right) => left - right);
+      const allowedCpuSpec = ensureAllowedCpus(scheduledCpus);
+      const manifest = buildFreshControlledLoadManifest(
+        selection.resolved,
+        conditionSelection.resolved,
+        plan,
+        tasksetPath,
+        parsed.mode === "dry-run",
+      );
+      const controlledSchedule = manifest.controlledLoad.manifest.schedule;
+      const controlledExecution = manifest.controlledLoad.manifest.execution;
+      const exactSchedule = manifest.exactCpu.manifest.schedule;
+      if (parsed.mode === "dry-run") {
+        writeOut("measured workload:\n");
+        writeOut(`${renderWorkload(selection)}\n`);
+        writeOut("condition workload:\n");
+        writeOut(`${renderWorkload(conditionSelection)}\n`);
+        writeOut(`plan file: ${planPath}\n`);
+        writeOut(`controlled load: target CPU ${controlledExecution.targetCpu}; workers ` +
+          `${compressCpuList(controlledExecution.workerCpus)}; ` +
+          `${controlledSchedule.attemptsPerLeg} attempt(s) per A1/B/A2 leg; ` +
+          `${controlledSchedule.attemptCount} attempt(s) total\n`);
+        writeOut(`timing: warmup ${controlledSchedule.warmupMs} ms; ` +
+          `recovery ${controlledSchedule.recoveryMs} ms\n`);
+        writeOut(`bound exact: CPUs ${compressCpuList(plan.exact.cpus)}; ` +
+          `${exactSchedule.rounds} round(s); ${exactSchedule.attemptCount} attempt(s); ` +
+          `seed ${exactSchedule.seed}\n`);
+        writeOut(`host allowance: ${allowedCpuSpec}\n`);
+        writeOut(`planned bundle: ${path.resolve(cwd, parsed.outDir)}\n`);
+        writeOut("dry run: no workload executed and no bundle created\n");
+        return 0;
+      }
+      const bundleDir = createPrivateBundleDirectory(path.resolve(cwd, parsed.outDir));
+      await initializeSchema3Bundle({
+        resolved: selection.resolved,
+        auxiliary: conditionSelection.resolved,
+        manifest,
+        bundleDir,
+      });
+      writeOut(`starting controlled-load measured=${selection.resolved.id} ` +
+        `condition=${conditionSelection.resolved.id} target=${controlledExecution.targetCpu} ` +
+        `workers=${compressCpuList(controlledExecution.workerCpus)} bundle=${bundleDir}\n`);
+      writeOut(`measured warning: ${selection.metadata.liveWarning}\n`);
+      writeOut(`condition warning: ${conditionSelection.metadata.liveWarning}\n`);
+      return await runControlledLoadBundle({
+        resolved: selection.resolved,
+        auxiliary: conditionSelection.resolved,
+        bundleDir,
+        signalSource,
+        writeOut,
+        writeErr,
+      });
+    }
     if (parsed.command === "groups") {
       assertGroupCapabilities(selection);
       if (parsed.mode !== "dry-run") assertAutomationBoundary(selection);
@@ -1040,13 +1298,21 @@ export async function runFaultAffinityCli(argv, io = {}) {
       });
     }
     assertExactCapability(selection);
+    const conditionSelection = parsed.conditionWorkloadFile === undefined
+      ? undefined
+      : resolveConditionSelection(parsed, cwd);
+    if (conditionSelection !== undefined) assertControlledLoadCondition(conditionSelection);
     if (parsed.mode !== "dry-run") assertAutomationBoundary(selection);
+    if (parsed.mode !== "dry-run" && conditionSelection !== undefined) {
+      assertAutomationBoundary(conditionSelection);
+    }
     if (parsed.mode === "resume") {
       const bundleDir = resolveExistingBundleDirectory(path.resolve(cwd, parsed.resumeDir));
       writeOut(`resuming workload=${selection.resolved.id} bundle=${bundleDir}\n`);
       writeOut(`warning: ${selection.metadata.liveWarning}\n`);
       return await runExactBundle({
         resolved: selection.resolved,
+        auxiliary: conditionSelection?.resolved,
         bundleDir,
         signalSource,
         writeOut,

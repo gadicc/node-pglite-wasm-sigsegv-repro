@@ -1,8 +1,7 @@
 # Understand controlled-load phase storage
 
-The internal controlled-load store publishes an A1/B/A2 comparison only after
-the entire session validates. It deliberately has no partial-session resume
-format.
+The controlled-load store publishes an A1/B/A2 comparison only after the
+entire session validates. It deliberately has no partial-session resume format.
 
 ## Store files
 
@@ -53,8 +52,11 @@ Other readers and phase owners cannot enter during that interval. If the outer
 owner is interrupted, inherited supervisor descriptors retain the lease until
 bounded cleanup ends; direct workloads receive no bundle descriptor.
 
-No current public command initializes or runs manifest version 5. The existing
-controlled-load script and historical multi-workload evidence remain separate.
+The public [`fault-affinity controlled-load`](../guides/generic-controlled-load.md)
+command initializes and advances this variant. Its sibling `exact` resume also
+requires the auxiliary workload identity to validate the manifest, but does not
+start condition workers. The historical controlled-load script and
+multi-workload evidence remain separate.
 
 See [ADR 0018](../decisions/0018-controlled-load-store-and-manifest-v5.md) for
 the accepted storage and ownership boundary.

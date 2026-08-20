@@ -33,8 +33,8 @@ must still match the start evidence. A replacement process with a reused PID
 does not pass because its start ticks differ.
 
 The controller invalidates and cancels the set on any identity or affinity
-mismatch. A future A/B/A envelope will require checks immediately before and
-after its measured B leg.
+mismatch. The A1/B/A2 envelope requires checks immediately before and after its
+measured B leg.
 
 ## Stop and account for every worker
 
@@ -53,10 +53,10 @@ each stable supervisor. The direct condition workload does not receive it. If
 the outer owner is interrupted, replacement ownership remains unavailable only
 until those supervisors finish bounded parent-loss cleanup.
 
-No public command or current controlled-load bundle writes these records yet.
-The internal [single-workload A1/B/A2 adapter](controlled-load-aba-sessions.md)
-now binds them into a complete comparison. Durable phase storage and schema-3
-ownership remain future work; the historical multi-Node modes stay separate.
+The public controlled-load command binds these records through the
+[single-workload A1/B/A2 adapter](controlled-load-aba-sessions.md) and publishes
+them only inside a complete manifest-version-5 session. The historical
+multi-Node modes stay separate.
 
 See [ADR 0016](../decisions/0016-controlled-load-worker-sets.md) for the accepted
 worker-set boundary.

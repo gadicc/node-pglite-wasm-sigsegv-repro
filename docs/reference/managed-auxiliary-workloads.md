@@ -47,13 +47,12 @@ That shape is intentionally incompatible with the versioned
 of an auxiliary worker is operational lifecycle evidence, not a pass, clean
 result, or fault-rate sample.
 
-No public command or current `load-state-aba.mjs` mode uses this internal path
-yet. The internal [worker-set controller](controlled-load-worker-sets.md) now
-manages complete readiness, rechecks original identities at measurement
-boundaries, and accounts for every stop. The internal
-[single-workload session adapter](controlled-load-aba-sessions.md) now publishes
-only complete A1/B/A2 envelopes. Durable phase ownership remains separate, and
-the existing historical modes retain their interpretation.
+The public [generic controlled-load command](../guides/generic-controlled-load.md)
+uses this path through the worker-set controller, which manages complete
+readiness, rechecks original identities at measurement boundaries, and accounts
+for every stop. The single-workload session adapter publishes only complete
+A1/B/A2 envelopes. Existing historical `load-state-aba.mjs` modes retain their
+separate interpretation.
 
 See [ADR 0015](../decisions/0015-managed-auxiliary-workloads.md) for the accepted
 boundary.
