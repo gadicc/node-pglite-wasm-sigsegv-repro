@@ -6,8 +6,10 @@ import test, { afterEach } from "node:test";
 
 import {
   WorkloadSpecError,
+  buildWorkloadLaunchCapsule,
   canonicalWorkloadJson,
   classifyWorkloadAttempt,
+  resolveWorkloadLaunchCapsule,
   resolveWorkloadSpec,
   verifyWorkloadLaunchProvenance,
   verifyWorkloadProvenance,
@@ -346,4 +348,115 @@ test("classifiers reject forged resolutions and redact malformed launch errors",
   assert.equal(result.invalidReason, "malformed-launch-error-code");
   assert.equal(result.raw.launchErrorCode, null);
   assert.doesNotMatch(JSON.stringify(result), /do-not-serialize/);
+});
+
+test("a launch capsule round-trips an HMAC-bound workload with verified values", () => {
+  const files = fixture();
+  const environmentBindingKey = Buffer.alloc(32, 0x41);
+  const resolved = resolve(spec(files), { environmentBindingKey });
+  const capsule = buildWorkloadLaunchCapsule(resolved, { environmentBindingKey });
+
+  assert.equal(Object.isFrozen(capsule), true);
+  assert.equal(Object.isFrozen(capsule.environment), true);
+  assert.equal(capsule.environmentBindingKey, environmentBindingKey.toString("base64"));
+
+  const revived = resolveWorkloadLaunchCapsule(JSON.parse(JSON.stringify(capsule)));
+  assert.equal(revived.digest, resolved.digest);
+  assert.equal(revived.environment.bindingMode, "hmac-sha256");
+  assert.deepEqual(workloadLaunchEnvironment(revived), workloadLaunchEnvironment(resolved));
+  assert.deepEqual(workloadLaunchProvenance(revived), workloadLaunchProvenance(resolved));
+  assert.deepEqual(revived.environment.bindings, resolved.environment.bindings);
+});
+
+test("an unrecorded workload capsule round-trips without a key", () => {
+  const files = fixture();
+  const resolved = resolve(spec(files));
+  assert.equal(resolved.environment.bindingMode, "unrecorded");
+  const capsule = buildWorkloadLaunchCapsule(resolved);
+  assert.equal(capsule.environmentBindingKey, null);
+
+  const revived = resolveWorkloadLaunchCapsule(JSON.parse(JSON.stringify(capsule)));
+  assert.equal(revived.digest, resolved.digest);
+  assert.deepEqual(workloadLaunchEnvironment(revived), workloadLaunchEnvironment(resolved));
+  assert.throws(
+    () => buildWorkloadLaunchCapsule(resolved, {
+      environmentBindingKey: Buffer.alloc(32, 0x41),
+    }),
+    /applies only to hmac-sha256-bound workloads/,
+  );
+});
+
+test("substituted capsule environment values are rejected", () => {
+  const files = fixture();
+  const environmentBindingKey = Buffer.alloc(32, 0x41);
+  const resolved = resolve(spec(files), { environmentBindingKey });
+  const capsule = JSON.parse(JSON.stringify(buildWorkloadLaunchCapsule(resolved, {
+    environmentBindingKey,
+  })));
+
+  for (const name of ["TEST_FIXED", "TEST_AMBIENT"]) {
+    const tampered = JSON.parse(JSON.stringify(capsule));
+    tampered.environment[name] = "substituted-private-value";
+    assert.throws(
+      () => resolveWorkloadLaunchCapsule(tampered),
+      (error) => error instanceof WorkloadSpecError &&
+        error.code === "WORKLOAD_CAPSULE_ENVIRONMENT_MISMATCH",
+      name,
+    );
+  }
+
+  const removed = JSON.parse(JSON.stringify(capsule));
+  delete removed.environment.TEST_FIXED;
+  assert.throws(() => resolveWorkloadLaunchCapsule(removed),
+    /do not match the bindings/);
+
+  const extra = JSON.parse(JSON.stringify(capsule));
+  extra.environment.TEST_EXTRA = "unexpected";
+  assert.throws(() => resolveWorkloadLaunchCapsule(extra),
+    /do not match the bindings/);
+
+  const keyless = JSON.parse(JSON.stringify(capsule));
+  keyless.environmentBindingKey = null;
+  assert.throws(() => resolveWorkloadLaunchCapsule(keyless),
+    /requires its environment binding key/);
+
+  const forgedHmac = JSON.parse(JSON.stringify(capsule));
+  forgedHmac.workload.environment.bindings[0].valueHmacSha256 = "0".repeat(64);
+  assert.throws(() => resolveWorkloadLaunchCapsule(forgedHmac),
+    /do not match their binding HMACs/);
+
+  assert.throws(
+    () => buildWorkloadLaunchCapsule(resolved, {
+      environmentBindingKey: Buffer.alloc(32, 0x42),
+    }),
+    /does not reproduce the workload environment bindings/,
+  );
+  assert.throws(
+    () => buildWorkloadLaunchCapsule(resolved),
+    /environmentBindingKey must be a Buffer/,
+  );
+});
+
+test("capsule tampering with public fields changes the workload digest", () => {
+  const files = fixture();
+  const environmentBindingKey = Buffer.alloc(32, 0x41);
+  const resolved = resolve(spec(files), { environmentBindingKey });
+  const capsule = JSON.parse(JSON.stringify(buildWorkloadLaunchCapsule(resolved, {
+    environmentBindingKey,
+  })));
+
+  const tampered = JSON.parse(JSON.stringify(capsule));
+  tampered.workload.command.args = ["changed"];
+  const revived = resolveWorkloadLaunchCapsule(tampered);
+  assert.notEqual(revived.digest, resolved.digest);
+
+  const malformed = JSON.parse(JSON.stringify(capsule));
+  malformed.workload.command.executable.sha256 = "0".repeat(64);
+  const revivedIdentity = resolveWorkloadLaunchCapsule(malformed);
+  assert.notEqual(revivedIdentity.digest, resolved.digest);
+  assert.throws(() => verifyWorkloadProvenance(revivedIdentity),
+    /no longer matches its recorded identity/);
+
+  assert.throws(() => resolveWorkloadLaunchCapsule({ version: 2 }),
+    /must contain exactly|version must be 1/);
 });

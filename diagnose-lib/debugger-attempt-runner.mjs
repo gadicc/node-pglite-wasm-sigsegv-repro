@@ -16,8 +16,8 @@ import { buildDebuggerCommandProfile } from "./debugger-command-profile.mjs";
 import { parseDebuggerPhaseManifest } from "./debugger-phase.mjs";
 import { canonicalProtocolJson } from "./pinned-protocol.mjs";
 import {
+  buildWorkloadLaunchCapsule,
   resolveWorkloadSpec,
-  workloadLaunchEnvironment,
 } from "./workload-spec.mjs";
 
 export const DEBUGGER_ATTEMPT_RUNNER_VERSION = 1;
@@ -69,17 +69,10 @@ function deepFreeze(value) {
   return value;
 }
 
-// The adapter re-resolves the target workload from the delivered spec. Its
-// own environment carries exactly the values that pass-style environment
-// names resolve to, so resolution reproduces the target digest while nothing
-// else from the operator environment reaches the adapter process.
-function adapterEnvironment(resolved) {
-  const execution = workloadLaunchEnvironment(resolved);
-  return Object.fromEntries(resolved.environment.bindings
-    .filter((binding) => binding.source === "ambient")
-    .map((binding) => [binding.name, execution[binding.name]]));
-}
-
+// The adapter receives a single workload launch capsule as its authority:
+// the exact public workload identity, the private environment values, and —
+// only for HMAC-bound workloads — the environment binding key, all inside the
+// private stdin payload. The adapter's own environment stays empty.
 function adapterWorkload(resolved, manifest) {
   return resolveWorkloadSpec({
     version: 1,
@@ -92,7 +85,7 @@ function adapterWorkload(resolved, manifest) {
       args: [DEBUGGER_ADAPTER_PATH],
       cwd: "/",
     },
-    environment: { set: adapterEnvironment(resolved) },
+    environment: {},
     attempt: {
       mode: "exit",
       timeoutMs: manifest.execution.runTimeoutMs,
@@ -107,7 +100,6 @@ function adapterWorkload(resolved, manifest) {
 
 export async function runDebuggerAttempt(
   resolved,
-  workloadSpec,
   manifestValue,
   contextValue,
   options = {},
@@ -115,16 +107,21 @@ export async function runDebuggerAttempt(
   requireCondition(resolved !== null && typeof resolved === "object",
     "debugger attempt requires a resolved workload");
   requireCondition(options !== null && typeof options === "object" &&
-    !Array.isArray(options) && Object.keys(options).every((key) => key === "signal"),
-  "debugger attempt options must contain only: signal");
+    !Array.isArray(options) &&
+    Object.keys(options).every((key) => key === "signal" || key === "environmentBindingKey"),
+  "debugger attempt options must contain only: signal, environmentBindingKey");
   // Validate the manifest, context, and command profile before any process
-  // exists; the adapter rebuilds the same descriptor authoritatively.
+  // exists; the adapter rebuilds the same descriptor authoritatively from the
+  // launch capsule.
   const manifest = parseDebuggerPhaseManifest(resolved, manifestValue);
   const descriptor = buildDebuggerCommandProfile(resolved, manifest, contextValue);
+  const capsule = buildWorkloadLaunchCapsule(resolved, {
+    environmentBindingKey: options.environmentBindingKey,
+  });
   const adapterResolved = adapterWorkload(resolved, manifest);
   const payload = canonicalProtocolJson({
     version: DEBUGGER_ADAPTER_PACKAGE_VERSION,
-    workloadSpec,
+    capsule,
     manifest,
     context: { run: contextValue.run, nonce: contextValue.nonce },
   });

@@ -89,6 +89,28 @@ switch (mode) {
     emit("inferior-signaled", { signal: "SIGUSR2" });
     emit("profile-complete");
     break;
+  case "nonzero":
+    emit("profile-ready", { profileId: config.profileId });
+    emit("inferior-started", {
+      pid: process.pid,
+      startTicks: "987654",
+      allowedCpuList: config.allowedCpuList,
+    });
+    emit("inferior-exited", { exitCode: 0 });
+    emit("profile-complete");
+    process.exit(3);
+    break;
+  case "signal":
+    emit("profile-ready", { profileId: config.profileId });
+    emit("inferior-started", {
+      pid: process.pid,
+      startTicks: "987654",
+      allowedCpuList: config.allowedCpuList,
+    });
+    emit("inferior-exited", { exitCode: 0 });
+    emit("profile-complete");
+    process.kill(process.pid, "SIGTERM");
+    break;
   case "launch-error":
     emit("profile-ready", { profileId: config.profileId });
     emit("profile-error", { stage: "launch", code: "GDB_LAUNCH_ERROR" });

@@ -500,6 +500,341 @@ export function verifyWorkloadProvenance(resolved) {
   return verifyWorkloadLaunchProvenance(workloadLaunchProvenance(resolved));
 }
 
+// A workload launch capsule is the single authority a supervised helper
+// process receives for one launch: the exact public workload identity, the
+// private environment values, and — only for HMAC-bound workloads — the
+// environment binding key. The receiving process revalidates the workload
+// digest against the public fields and every environment value against its
+// digest-covered binding HMAC, so substituted values fail closed. The capsule
+// travels only through private in-memory channels; it is never written to
+// the filesystem, arguments, or environment.
+export const WORKLOAD_LAUNCH_CAPSULE_VERSION = 1;
+
+const CAPSULE_BINDING_MODES = new Set(["none", "unrecorded", "hmac-sha256"]);
+
+function deepFreeze(value) {
+  if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const child of Object.values(value)) deepFreeze(child);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+function capsuleEnvironmentHmac(key, source, name, value) {
+  return createHmac("sha256", key)
+    .update(source).update("\0").update(name).update("\0").update(value)
+    .digest("hex");
+}
+
+function validateCapsuleIdentityRecord(value, label, { executable = false } = {}) {
+  plainObject(value, label);
+  exactKeys(value, ["path", "sha256", "bytes", "mode"], label);
+  boundedString(value.path, `${label}.path`);
+  if (!path.isAbsolute(value.path) || Buffer.byteLength(value.path) > MAX_PATH_BYTES) {
+    fail(`${label}.path must be an absolute bounded path`, "INVALID_WORKLOAD_CAPSULE");
+  }
+  if (typeof value.sha256 !== "string" || !DIGEST_RE.test(value.sha256)) {
+    fail(`${label}.sha256 is invalid`, "INVALID_WORKLOAD_CAPSULE");
+  }
+  if (typeof value.bytes !== "string" || value.bytes.length > 10 ||
+      !/^(0|[1-9][0-9]*)$/.test(value.bytes) ||
+      BigInt(value.bytes) > BigInt(MAX_ARTIFACT_BYTES)) {
+    fail(`${label}.bytes is invalid`, "INVALID_WORKLOAD_CAPSULE");
+  }
+  canonicalInteger(value.mode, `${label}.mode`, 0, 0o777);
+  if (executable && (value.mode & 0o111) === 0) {
+    fail(`${label} must record an execute bit`, "INVALID_WORKLOAD_CAPSULE");
+  }
+  return value;
+}
+
+function validateCapsuleEnvironmentBindings(value, label) {
+  if (!Array.isArray(value) || value.length > MAX_ENVIRONMENT_ENTRIES) {
+    fail(`${label} must be an array with at most ${MAX_ENVIRONMENT_ENTRIES} entries`,
+      "INVALID_WORKLOAD_CAPSULE");
+  }
+  const names = new Set();
+  for (const [index, binding] of value.entries()) {
+    const entryLabel = `${label}[${index}]`;
+    plainObject(binding, entryLabel);
+    const hasHmac = Object.hasOwn(binding, "valueHmacSha256");
+    exactKeys(binding, hasHmac ? ["name", "source", "valueHmacSha256"] : ["name", "source"],
+      entryLabel);
+    boundedString(binding.name, `${entryLabel}.name`);
+    if (!ENVIRONMENT_NAME_RE.test(binding.name)) {
+      fail(`${entryLabel}.name is invalid`, "INVALID_WORKLOAD_CAPSULE");
+    }
+    if (names.has(binding.name)) {
+      fail(`${entryLabel}.name is duplicated`, "INVALID_WORKLOAD_CAPSULE");
+    }
+    names.add(binding.name);
+    if (!["ambient", "set"].includes(binding.source)) {
+      fail(`${entryLabel}.source is invalid`, "INVALID_WORKLOAD_CAPSULE");
+    }
+    if (hasHmac &&
+        (typeof binding.valueHmacSha256 !== "string" || !DIGEST_RE.test(binding.valueHmacSha256))) {
+      fail(`${entryLabel}.valueHmacSha256 is invalid`, "INVALID_WORKLOAD_CAPSULE");
+    }
+  }
+  return value;
+}
+
+function validateCapsuleWorkload(value) {
+  const workload = plainObject(value, "workload launch capsule workload");
+  exactKeys(workload, [
+    "version", "id", "label", "description", "risk", "command", "environment",
+    "attempt", "outcomes", "capabilities", "provenance",
+  ], "workload launch capsule workload");
+  if (workload.version !== WORKLOAD_SPEC_VERSION) {
+    fail(`workload launch capsule workload version must be ${WORKLOAD_SPEC_VERSION}`,
+      "INVALID_WORKLOAD_CAPSULE");
+  }
+  if (typeof workload.id !== "string" || !WORKLOAD_ID_RE.test(workload.id)) {
+    fail("workload launch capsule workload id is invalid", "INVALID_WORKLOAD_CAPSULE");
+  }
+  boundedString(workload.label, "workload launch capsule workload label");
+  boundedString(workload.description, "workload launch capsule workload description");
+  if (!WORKLOAD_RISKS.includes(workload.risk)) {
+    fail("workload launch capsule workload risk is invalid", "INVALID_WORKLOAD_CAPSULE");
+  }
+
+  const command = plainObject(workload.command, "workload launch capsule command");
+  exactKeys(command, ["executable", "args", "cwd"], "workload launch capsule command");
+  validateCapsuleIdentityRecord(command.executable, "workload launch capsule executable", {
+    executable: true,
+  });
+  if (!Array.isArray(command.args) || command.args.length > MAX_ARGUMENTS) {
+    fail("workload launch capsule command args are invalid", "INVALID_WORKLOAD_CAPSULE");
+  }
+  for (const [index, argument] of command.args.entries()) {
+    boundedString(argument, `workload launch capsule command args[${index}]`, {
+      allowEmpty: true,
+    });
+  }
+  boundedString(command.cwd, "workload launch capsule command cwd");
+  if (!path.isAbsolute(command.cwd) || Buffer.byteLength(command.cwd) > MAX_PATH_BYTES) {
+    fail("workload launch capsule command cwd must be an absolute bounded path",
+      "INVALID_WORKLOAD_CAPSULE");
+  }
+
+  const environment = plainObject(workload.environment,
+    "workload launch capsule environment");
+  exactKeys(environment, ["bindingMode", "provenanceComplete", "bindings"],
+    "workload launch capsule environment");
+  if (!CAPSULE_BINDING_MODES.has(environment.bindingMode)) {
+    fail("workload launch capsule environment binding mode is invalid",
+      "INVALID_WORKLOAD_CAPSULE");
+  }
+  if (environment.provenanceComplete !== (environment.bindingMode !== "unrecorded")) {
+    fail("workload launch capsule environment provenance completeness is inconsistent",
+      "INVALID_WORKLOAD_CAPSULE");
+  }
+  validateCapsuleEnvironmentBindings(environment.bindings,
+    "workload launch capsule environment bindings");
+  if (environment.bindingMode === "hmac-sha256") {
+    if (environment.bindings.length === 0 ||
+        environment.bindings.some((binding) => !Object.hasOwn(binding, "valueHmacSha256"))) {
+      fail("workload launch capsule hmac-sha256 bindings must all carry value HMACs",
+        "INVALID_WORKLOAD_CAPSULE");
+    }
+  } else if (environment.bindings.some((binding) => Object.hasOwn(binding, "valueHmacSha256"))) {
+    fail("workload launch capsule value HMACs require the hmac-sha256 binding mode",
+      "INVALID_WORKLOAD_CAPSULE");
+  }
+
+  const attempt = plainObject(workload.attempt, "workload launch capsule attempt");
+  exactKeys(attempt, ["mode", "timeoutMs", "termGraceMs", "killGraceMs"],
+    "workload launch capsule attempt");
+  if (!WORKLOAD_ATTEMPT_MODES.includes(attempt.mode)) {
+    fail("workload launch capsule attempt mode is invalid", "INVALID_WORKLOAD_CAPSULE");
+  }
+  canonicalInteger(attempt.timeoutMs, "workload launch capsule attempt timeoutMs", 1,
+    MAX_TIMEOUT_MS);
+  canonicalInteger(attempt.termGraceMs, "workload launch capsule attempt termGraceMs", 0,
+    MAX_GRACE_MS);
+  canonicalInteger(attempt.killGraceMs, "workload launch capsule attempt killGraceMs", 0,
+    MAX_GRACE_MS);
+
+  const outcomes = plainObject(workload.outcomes, "workload launch capsule outcomes");
+  exactKeys(outcomes, ["targetSignals", "mappedExits"], "workload launch capsule outcomes");
+  if (!Array.isArray(outcomes.targetSignals) || outcomes.targetSignals.length > 64) {
+    fail("workload launch capsule target signals are invalid", "INVALID_WORKLOAD_CAPSULE");
+  }
+  const signalSet = new Set();
+  for (const signal of outcomes.targetSignals) {
+    if (typeof signal !== "string" || !KNOWN_SIGNALS.has(signal) || signalSet.has(signal)) {
+      fail("workload launch capsule target signals are invalid", "INVALID_WORKLOAD_CAPSULE");
+    }
+    signalSet.add(signal);
+  }
+  if (!Array.isArray(outcomes.mappedExits) || outcomes.mappedExits.length > 256) {
+    fail("workload launch capsule mapped exits are invalid", "INVALID_WORKLOAD_CAPSULE");
+  }
+  const codeSet = new Set();
+  for (const [index, mapped] of outcomes.mappedExits.entries()) {
+    const mappedLabel = `workload launch capsule mappedExits[${index}]`;
+    plainObject(mapped, mappedLabel);
+    exactKeys(mapped, ["code", "category", "label"], mappedLabel);
+    canonicalInteger(mapped.code, `${mappedLabel}.code`, 1, 255);
+    if (codeSet.has(mapped.code)) {
+      fail(`${mappedLabel}.code is duplicated`, "INVALID_WORKLOAD_CAPSULE");
+    }
+    codeSet.add(mapped.code);
+    if (!WORKLOAD_OUTCOME_CATEGORIES.includes(mapped.category)) {
+      fail(`${mappedLabel}.category is invalid`, "INVALID_WORKLOAD_CAPSULE");
+    }
+    boundedString(mapped.label, `${mappedLabel}.label`);
+  }
+
+  const capabilities = plainObject(workload.capabilities,
+    "workload launch capsule capabilities");
+  exactKeys(capabilities, WORKLOAD_CAPABILITIES, "workload launch capsule capabilities");
+  for (const name of WORKLOAD_CAPABILITIES) {
+    if (typeof capabilities[name] !== "boolean") {
+      fail(`workload launch capsule capabilities.${name} must be boolean`,
+        "INVALID_WORKLOAD_CAPSULE");
+    }
+  }
+
+  const provenance = plainObject(workload.provenance, "workload launch capsule provenance");
+  exactKeys(provenance, ["completeness", "files"], "workload launch capsule provenance");
+  if (!["complete", "partial"].includes(provenance.completeness)) {
+    fail("workload launch capsule provenance completeness is invalid",
+      "INVALID_WORKLOAD_CAPSULE");
+  }
+  if (!Array.isArray(provenance.files) || provenance.files.length > MAX_ARTIFACTS) {
+    fail("workload launch capsule provenance files are invalid", "INVALID_WORKLOAD_CAPSULE");
+  }
+  const seen = new Set();
+  for (const [index, record] of provenance.files.entries()) {
+    validateCapsuleIdentityRecord(record, `workload launch capsule provenance.files[${index}]`);
+    if (seen.has(record.path)) {
+      fail("workload launch capsule provenance path is duplicated", "INVALID_WORKLOAD_CAPSULE");
+    }
+    seen.add(record.path);
+  }
+  return workload;
+}
+
+function validateCapsuleEnvironmentValues(capsule, workload) {
+  const values = plainObject(capsule.environment, "workload launch capsule environment values");
+  const names = Object.keys(values);
+  if (names.length > MAX_ENVIRONMENT_ENTRIES) {
+    fail("workload launch capsule environment values are invalid", "INVALID_WORKLOAD_CAPSULE");
+  }
+  const bindingNames = new Set(workload.environment.bindings.map((binding) => binding.name));
+  for (const name of names) {
+    if (!ENVIRONMENT_NAME_RE.test(name) || !bindingNames.has(name)) {
+      fail("workload launch capsule environment values do not match the bindings",
+        "INVALID_WORKLOAD_CAPSULE");
+    }
+    boundedString(values[name], `workload launch capsule environment value '${name}'`, {
+      allowEmpty: true,
+    });
+  }
+  if (bindingNames.size !== names.length) {
+    fail("workload launch capsule environment values do not match the bindings",
+      "INVALID_WORKLOAD_CAPSULE");
+  }
+
+  if (workload.environment.bindingMode === "hmac-sha256") {
+    if (typeof capsule.environmentBindingKey !== "string") {
+      fail("workload launch capsule requires its environment binding key",
+        "WORKLOAD_CAPSULE_KEY_REQUIRED");
+    }
+    const key = Buffer.from(capsule.environmentBindingKey, "base64");
+    try {
+      if (key.length < ENVIRONMENT_BINDING_KEY_BYTES ||
+          key.toString("base64") !== capsule.environmentBindingKey) {
+        fail("workload launch capsule environment binding key is invalid",
+          "INVALID_WORKLOAD_CAPSULE");
+      }
+      for (const binding of workload.environment.bindings) {
+        if (capsuleEnvironmentHmac(key, binding.source, binding.name, values[binding.name]) !==
+            binding.valueHmacSha256) {
+          fail("workload launch capsule environment values do not match their binding HMACs",
+            "WORKLOAD_CAPSULE_ENVIRONMENT_MISMATCH");
+        }
+      }
+    } finally {
+      key.fill(0);
+    }
+  } else if (capsule.environmentBindingKey !== null) {
+    fail("workload launch capsule environment binding key requires the hmac-sha256 binding mode",
+      "INVALID_WORKLOAD_CAPSULE");
+  }
+  return Object.freeze({ ...values });
+}
+
+export function buildWorkloadLaunchCapsule(resolved, options = {}) {
+  plainObject(options, "workload launch capsule options");
+  exactKeys(options, ["environmentBindingKey"], "workload launch capsule options");
+  workloadLaunchProvenance(resolved);
+  const values = workloadLaunchEnvironment(resolved);
+  let encodedKey = null;
+  if (resolved.environment.bindingMode === "hmac-sha256") {
+    const key = options.environmentBindingKey;
+    if (!Buffer.isBuffer(key) || key.length < ENVIRONMENT_BINDING_KEY_BYTES) {
+      fail("options.environmentBindingKey must be a Buffer of at least " +
+        `${ENVIRONMENT_BINDING_KEY_BYTES} bytes`,
+      "WORKLOAD_CAPSULE_KEY_REQUIRED");
+    }
+    for (const binding of resolved.environment.bindings) {
+      if (capsuleEnvironmentHmac(key, binding.source, binding.name, values[binding.name]) !==
+          binding.valueHmacSha256) {
+        fail("environment binding key does not reproduce the workload environment bindings",
+          "WORKLOAD_CAPSULE_ENVIRONMENT_MISMATCH");
+      }
+    }
+    encodedKey = key.toString("base64");
+  } else if (options.environmentBindingKey !== undefined) {
+    fail("options.environmentBindingKey applies only to hmac-sha256-bound workloads",
+      "INVALID_WORKLOAD_CAPSULE");
+  }
+  return deepFreeze({
+    version: WORKLOAD_LAUNCH_CAPSULE_VERSION,
+    workload: {
+      version: resolved.version,
+      id: resolved.id,
+      label: resolved.label,
+      description: resolved.description,
+      risk: resolved.risk,
+      command: resolved.command,
+      environment: resolved.environment,
+      attempt: resolved.attempt,
+      outcomes: resolved.outcomes,
+      capabilities: resolved.capabilities,
+      provenance: resolved.provenance,
+    },
+    environment: values,
+    environmentBindingKey: encodedKey,
+  });
+}
+
+export function resolveWorkloadLaunchCapsule(value) {
+  const capsule = plainObject(value, "workload launch capsule");
+  exactKeys(capsule, ["version", "workload", "environment", "environmentBindingKey"],
+    "workload launch capsule");
+  if (capsule.version !== WORKLOAD_LAUNCH_CAPSULE_VERSION) {
+    fail(`workload launch capsule version must be ${WORKLOAD_LAUNCH_CAPSULE_VERSION}`,
+      "INVALID_WORKLOAD_CAPSULE");
+  }
+  const workload = validateCapsuleWorkload(capsule.workload);
+  const environment = validateCapsuleEnvironmentValues(capsule, workload);
+  const digest = createHash("sha256").update(canonicalWorkloadJson(workload)).digest("hex");
+  const resolved = { ...workload, digest };
+  Object.defineProperty(resolved, WORKLOAD_ENVIRONMENT, {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value: environment,
+  });
+  Object.freeze(resolved);
+  RESOLVED_WORKLOADS.add(resolved);
+  return resolved;
+}
+
+
 function invalidAttempt(invalidReason, raw) {
   return Object.freeze({
     category: "operational-invalid",

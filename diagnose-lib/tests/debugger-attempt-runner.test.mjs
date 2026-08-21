@@ -13,6 +13,10 @@ import { fileURLToPath } from "node:url";
 
 import { readLinuxProcessIdentity, runWorkloadAttempt } from "../attempt-runner.mjs";
 import {
+  customWorkloadEnvironmentBindingKey,
+  resolveCustomWorkloadFile,
+} from "../../workloads/catalog.mjs";
+import {
   DEBUGGER_ADAPTER_MODULES,
   DEBUGGER_ADAPTER_PATH,
   DEBUGGER_ATTEMPT_RUNNER_VERSION,
@@ -122,12 +126,12 @@ function fixture({ mode = "exited", pass = false, targetArgs = [] } = {}) {
   };
 }
 
-async function run(files) {
+async function run(files, options = {}) {
   const result = await runDebuggerAttempt(
     files.resolved,
-    files.spec,
     files.manifest,
     files.context,
+    options,
   );
   if (result.io !== null) captures.add(result.io);
   if (result.adapter.process.supervisor !== null) {
@@ -337,21 +341,107 @@ test("the runner validates manifest and context before any process launches", as
   const tampered = JSON.parse(JSON.stringify(files.manifest));
   tampered.schedule.maxRuns += 1;
   await assert.rejects(
-    runDebuggerAttempt(files.resolved, files.spec, tampered, files.context),
+    runDebuggerAttempt(files.resolved, tampered, files.context),
     /schedule digest does not match|does not match its identity/,
   );
   await assert.rejects(
-    runDebuggerAttempt(files.resolved, files.spec, files.manifest, {
+    runDebuggerAttempt(files.resolved, files.manifest, {
       run: 99,
       nonce: NONCE,
     }),
     /run must be an integer from 1 through 4/,
   );
   await assert.rejects(
-    runDebuggerAttempt(files.resolved, files.spec, files.manifest, {
+    runDebuggerAttempt(files.resolved, files.manifest, {
       run: 1,
       nonce: "0".repeat(31),
     }),
     /nonce must be exactly/,
+  );
+});
+
+test("a valid control transcript with a nonzero debugger exit is unsuccessful", async () => {
+  const files = fixture({ mode: "nonzero" });
+  const result = await run(files);
+
+  assert.equal(result.adapter.observation.exitCode, 1);
+  assert.equal(result.adapter.observation.signal, null);
+  assert.equal(result.io.evidence.complete, true);
+  assert.deepEqual(result.io.control.terminal, { kind: "exited", exitCode: 0 });
+  assert.ok(transcriptOf(result).includes(
+    "DEBUGGER_ADAPTER_ERROR\tDEBUGGER_EXIT_NONZERO\tdebugger completed with exit code 3\n",
+  ), transcriptOf(result));
+});
+
+test("a valid control transcript with a signaled debugger exit is unsuccessful", async () => {
+  const files = fixture({ mode: "signal" });
+  const result = await run(files);
+
+  assert.equal(result.adapter.observation.exitCode, 1);
+  assert.equal(result.io.evidence.complete, true);
+  assert.deepEqual(result.io.control.terminal, { kind: "exited", exitCode: 0 });
+  assert.ok(transcriptOf(result).includes(
+    "DEBUGGER_ADAPTER_ERROR\tDEBUGGER_EXIT_SIGNALED\tdebugger completed with signal SIGTERM\n",
+  ), transcriptOf(result));
+});
+
+test("an HMAC-bound custom workload runs through the real catalog resolution path", async () => {
+  const files = fixture({ mode: "exited" });
+  const customPath = path.join(files.directory, "custom-workload.json");
+  writeFileSync(customPath, JSON.stringify({
+    version: 1,
+    id: "debugger-custom-fixture",
+    label: "Custom debugger fixture",
+    description: "Custom workload file resolved through the catalog path.",
+    risk: "standard",
+    command: {
+      executable: files.targetPath,
+      args: [],
+      cwd: files.directory,
+    },
+    environment: {
+      set: { FAKE_DEBUGGER_MODE: "exited", FAKE_DEBUGGER_PASS_VALUE: PASS_VALUE },
+    },
+    attempt: { mode: "exit", timeoutMs: 5_000, termGraceMs: 100, killGraceMs: 500 },
+    outcomes: { targetSignals: ["SIGSEGV", "SIGUSR2"], mappedExits: [] },
+    capabilities: { gdb: true },
+    provenance: { completeness: "complete", files: [] },
+  }));
+  const custom = resolveCustomWorkloadFile(customPath);
+  assert.equal(custom.resolved.environment.bindingMode, "hmac-sha256");
+  const bindingKey = customWorkloadEnvironmentBindingKey(readFileSync(customPath));
+  const manifest = buildDebuggerPhaseManifest(custom.resolved, {
+    generation: GENERATION,
+    cpu: files.cpu,
+    maxRuns: 4,
+    maxCaptures: 2,
+    debuggerPath: files.debuggerPath,
+    tasksetPath: "/usr/bin/taskset",
+    runTimeoutMs: 30_000,
+    termGraceMs: 500,
+    killGraceMs: 1_000,
+  });
+  const result = await runDebuggerAttempt(custom.resolved, manifest, files.context, {
+    environmentBindingKey: bindingKey,
+  });
+  captures.add(result.io);
+  if (result.adapter.process.supervisor !== null) {
+    supervisorIdentities.push(result.adapter.process.supervisor);
+  }
+
+  assert.equal(result.io.evidence.complete, true);
+  assert.deepEqual(result.io.control.terminal, { kind: "exited", exitCode: 0 });
+  assert.equal(result.adapter.observation.exitCode, 0);
+  assert.ok(transcriptOf(result).includes(`FAKE_DEBUGGER_ENV\t${PASS_VALUE}\n`));
+
+  await assert.rejects(
+    runDebuggerAttempt(custom.resolved, manifest, files.context),
+    /environmentBindingKey must be a Buffer/,
+  );
+  await assert.rejects(
+    runDebuggerAttempt(custom.resolved, manifest, files.context, {
+      environmentBindingKey: Buffer.alloc(32, 0x42),
+    }),
+    /does not reproduce the workload environment bindings/,
   );
 });

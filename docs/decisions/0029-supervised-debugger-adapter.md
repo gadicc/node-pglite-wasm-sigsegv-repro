@@ -30,14 +30,20 @@ package: the workload spec, the debugger-phase manifest, and the attempt
 context. The payload never travels through command-line arguments,
 environment, or the filesystem.
 
-The adapter re-derives every authority locally: it resolves the workload from
-the delivered spec, validates the manifest against that resolution, rebuilds
-the fixed command profile, and revalidates target and debugger provenance
+The adapter's only workload authority is a single launch capsule carried in
+the payload: the exact public workload identity, the private environment
+values, and — only for HMAC-bound workloads — the environment binding key.
+Resolving the capsule revalidates the workload digest against the public
+fields and every environment value against its digest-covered binding HMAC,
+so HMAC-bound custom workloads keep their digest and substituted private
+values fail closed. The adapter does not re-resolve a spec and its own
+environment stays empty.
+
+The adapter rebuilds the fixed command profile from the capsule-validated
+manifest and context, and revalidates target and debugger provenance
 immediately before spawning GDB. The supervisor revalidates the adapter's own
 launch provenance (the interpreter plus every module it loads) in the same
-window. The adapter's environment carries exactly the values that pass-style
-target environment names resolve to, so re-resolution reproduces the target
-digest while nothing else from the operator environment reaches it.
+window.
 
 The adapter launches GDB shell-free with the materialized descriptor. GDB
 stdout and stderr forward together to the adapter's stdout (the transcript
@@ -46,9 +52,11 @@ stderr (the control channel). The bounded attempt-I/O layer captures both
 while the attempt runner keeps the adapter's own lifecycle evidence distinct.
 
 Adapter operational failure is a typed single-line transcript record and a
-nonzero adapter exit; it never produces control bytes. Partial, overflowed,
-invalid, or incompletely drained channels can never qualify as a complete
-attempt.
+nonzero adapter exit; it never produces control bytes. The debugger's own
+completion is also adapter-lifecycle evidence: a valid control transcript
+followed by a nonzero or signaled debugger exit still leaves the adapter
+operationally unsuccessful. Partial, overflowed, invalid, or incompletely
+drained channels can never qualify as a complete attempt.
 
 This decision adds no public command, no attempt envelope, no durable bundle
 artifact, and no schema-3 manifest change.

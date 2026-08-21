@@ -189,9 +189,11 @@ emission prelude, parsing the emitted bytes with the real control-protocol
 parser. The supervised adapter layer runs the real Node process-group
 supervisor against a harmless finite fake-debugger fixture: stdin launch
 payloads, separate transcript and control routing, exact target-argv
-delivery, pass-environment reproduction, adapter/lifecycle distinction,
-silent and garbage control rejection, and last-moment provenance refusal for
-a drifted target or debugger. No test starts GDB or a fault workload.
+delivery, HMAC-bound custom workloads through the real catalog resolution
+path, substituted private environment value rejection, adapter/lifecycle
+distinction, silent and garbage control rejection, nonzero and signaled
+debugger completions, and last-moment provenance refusal for a drifted
+target or debugger. No test starts GDB or a fault workload.
 
 Custom commands should be documented as trusted local workloads, not sandboxed code. They must not daemonize or escape the supervised process group.
 

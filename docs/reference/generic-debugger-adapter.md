@@ -28,13 +28,18 @@ Node interpreter plus the adapter module; its provenance files cover every
 module the adapter loads. The supervisor revalidates that provenance
 immediately before the adapter starts.
 
-The adapter's configuration — workload spec, manifest, and attempt context —
-travels as a bounded stdin payload through the version-4 supervisor launch
-protocol. It never appears in arguments, environment, or files. The adapter's
-own environment contains exactly the values that pass-style target environment
-names resolve to, so the adapter re-resolves the workload specification and
-reproduces its digest while nothing else from the operator environment
-reaches it.
+The adapter's configuration travels as a bounded stdin payload through the
+version-4 supervisor launch protocol. It never appears in arguments,
+environment, or files, and the adapter's own environment stays empty.
+
+The payload carries a single workload launch capsule as the adapter's only
+workload authority: the exact public workload identity, the private
+environment values, and — only for HMAC-bound workloads — the environment
+binding key. Resolving the capsule revalidates the workload digest against
+the public fields and every environment value against its digest-covered
+binding HMAC, so the project's HMAC-bound custom workloads keep their digest
+and substituted private values fail closed. Nothing is re-resolved from a
+spec.
 
 ## Revalidate provenance at the last moment
 
@@ -61,8 +66,11 @@ The parent captures two distinct results:
 
 A debugger that stays silent or emits garbage leaves the control channel
 invalid without faking completion. A valid `profile-error` sequence remains
-complete control evidence. Partial, overflowed, invalid, or incompletely
-drained channels never qualify as a complete attempt.
+complete control evidence. The debugger's own completion is adapter-lifecycle
+evidence: a valid control transcript followed by a nonzero or signaled
+debugger exit still leaves the adapter operationally unsuccessful. Partial,
+overflowed, invalid, or incompletely drained channels never qualify as a
+complete attempt.
 
 ## Remaining boundaries
 

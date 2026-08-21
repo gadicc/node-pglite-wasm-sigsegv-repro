@@ -257,6 +257,14 @@ export function resolveBuiltInWorkload(id) {
   });
 }
 
+// The environment binding key for one custom workload file, derived from its
+// exact bytes. Callers that hand an HMAC-bound custom workload to a supervised
+// launch capsule must present this same key.
+export function customWorkloadEnvironmentBindingKey(bytes) {
+  return createHash("sha256").update("fault-affinity/custom-workload/v1\0")
+    .update(bytes).digest();
+}
+
 export function resolveCustomWorkloadFile(filename) {
   if (typeof filename !== "string" || filename.length === 0 || filename.includes("\0")) {
     fail("custom workload file path must be nonempty and NUL-free");
@@ -272,8 +280,7 @@ export function resolveCustomWorkloadFile(filename) {
   const environmentSet = spec.environment?.set ?? {};
   const bindingKey = Object.keys(environmentSet).length === 0
     ? undefined
-    : createHash("sha256").update("fault-affinity/custom-workload/v1\0")
-      .update(bytes).digest();
+    : customWorkloadEnvironmentBindingKey(bytes);
   const resolved = resolveWorkloadSpec(spec,
     bindingKey === undefined ? {} : { environmentBindingKey: bindingKey });
   const specRecord = resolved.provenance.files.find((record) => record.path === canonical);

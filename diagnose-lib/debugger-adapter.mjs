@@ -18,7 +18,7 @@ import {
   verifyDebuggerPhaseLaunchProvenance,
 } from "./debugger-phase.mjs";
 import {
-  resolveWorkloadSpec,
+  resolveWorkloadLaunchCapsule,
   verifyWorkloadProvenance,
   workloadLaunchEnvironment,
 } from "./workload-spec.mjs";
@@ -69,7 +69,7 @@ async function readPackage() {
       "debugger adapter launch package must be a plain object");
   }
   const keys = Object.keys(value).sort();
-  if (keys.join(",") !== "context,manifest,version,workloadSpec" ||
+  if (keys.join(",") !== "capsule,context,manifest,version" ||
       value.version !== PACKAGE_VERSION) {
     fail("DEBUGGER_ADAPTER_PACKAGE_INVALID",
       "debugger adapter launch package has an unsupported shape");
@@ -87,13 +87,12 @@ function forward(from, to) {
 
 async function run() {
   const launchPackage = await readPackage();
-  // The adapter re-derives every authority locally instead of trusting the
-  // delivered bytes: the workload is resolved from its spec, the manifest is
-  // validated against that resolution, and the command profile is rebuilt
-  // from the validated manifest and context.
-  const resolved = resolveWorkloadSpec(launchPackage.workloadSpec, {
-    environment: process.env,
-  });
+  // The launch capsule is the adapter's only workload authority: it carries
+  // the exact public identity and private environment values, and resolving
+  // it here revalidates the workload digest and every environment value
+  // against its digest-covered binding HMAC. Nothing is re-resolved from a
+  // spec and nothing arrives through this process's own environment.
+  const resolved = resolveWorkloadLaunchCapsule(launchPackage.capsule);
   const manifest = parseDebuggerPhaseManifest(resolved, launchPackage.manifest);
   const descriptor = buildDebuggerCommandProfile(
     resolved,
@@ -123,12 +122,23 @@ async function run() {
   if (control === undefined) {
     fail("DEBUGGER_ADAPTER_SPAWN_ERROR", "debugger control channel is unavailable");
   }
-  await Promise.all([
+  const [[exitCode, exitSignal]] = await Promise.all([
     once(gdb, "exit"),
     forward(gdb.stdout, process.stdout),
     forward(gdb.stderr, process.stdout),
     forward(control, process.stderr),
   ]);
+  // The debugger's own completion is adapter-lifecycle evidence: a valid
+  // control transcript followed by a nonzero or signaled debugger exit still
+  // leaves this adapter operationally unsuccessful.
+  if (exitSignal !== null || exitCode !== 0) {
+    fail(
+      exitSignal !== null ? "DEBUGGER_EXIT_SIGNALED" : "DEBUGGER_EXIT_NONZERO",
+      exitSignal !== null
+        ? `debugger completed with signal ${exitSignal}`
+        : `debugger completed with exit code ${exitCode === null ? "null" : exitCode}`,
+    );
+  }
 }
 
 run().then(
