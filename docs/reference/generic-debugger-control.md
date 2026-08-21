@@ -63,12 +63,13 @@ human-readable debugger output.
 
 The [bounded attempt-I/O layer](generic-debugger-attempt-io.md) now retains the
 control bytes separately from an anonymous, size-capped transcript while fully
-draining both inputs, and the [materialized command profile](generic-debugger-phase.md)
+draining both inputs, the [materialized command profile](generic-debugger-phase.md)
 embeds a fixed Python profile that emits this protocol to a control descriptor
-kept non-inheritable from the inferior. Synthetic tests run that profile's
-gdb-free emission prelude under `python3` and validate the bytes with the real
-parser. The remaining work is a supervised adapter that launches the
-materialized command, keeps the control descriptor private from the inferior,
-reuses the established process-group cleanup lifecycle, and combines those
-facts into a complete-only attempt envelope. Until that exists, the control
-protocol is an internal contract exercised only by synthetic tests.
+kept non-inheritable from the inferior, and the [supervised adapter](generic-debugger-adapter.md)
+routes that descriptor separately from the combined transcript. Synthetic
+tests run the profile's gdb-free emission prelude under `python3` and validate
+the bytes with the real parser, and runner tests route a fake debugger's
+records through the full supervision stack. The remaining work is to combine
+adapter lifecycle, cleanup, control, and transcript facts into a complete-only
+attempt envelope. Until that exists, the control protocol is an internal
+contract exercised only by synthetic tests.

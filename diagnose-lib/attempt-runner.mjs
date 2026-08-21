@@ -16,7 +16,7 @@ export const ATTEMPT_RESULT_VERSION = 3;
 // result shape so they cannot be published as diagnostic attempt evidence.
 export const MANAGED_WORKLOAD_RESULT_VERSION = 1;
 
-const SUPERVISOR_PROTOCOL_VERSION = 3;
+const SUPERVISOR_PROTOCOL_VERSION = 4;
 const ATTEMPT_SUPERVISOR = fileURLToPath(new URL("./attempt-supervisor.mjs", import.meta.url));
 const LIVE_STATES = new Set(["R", "S", "D", "T", "t", "I", "W"]);
 const ERROR_CODE_RE = /^[A-Z][A-Z0-9_]{0,63}$/;
@@ -26,6 +26,7 @@ const DEVICE_INODE_RE = /^(0|[1-9][0-9]*)$/;
 const KNOWN_SIGNALS = new Set(Object.keys(osConstants.signals));
 const DEFAULT_EXCERPT_BYTES = 64 * 1024;
 const MAX_EXCERPT_BYTES = 1024 * 1024;
+const MAX_LAUNCH_PAYLOAD_BYTES = 2 * 1024 * 1024;
 const MAX_CPU_ID = 65_535;
 const GROUP_POLL_MS = 10;
 const MANAGED_RESULT_METADATA = Symbol("managedResultMetadata");
@@ -414,7 +415,7 @@ function validateOptions(options, managed) {
   const value = plainObject(options, "attempt options");
   exactKeys(value, [
     "signal", "stdoutExcerptBytes", "stderrExcerptBytes", "cpuAffinity",
-    "retainedDirectory",
+    "retainedDirectory", "stdinPayload", "streamForward",
     ...(managed ? ["onStarted"] : []),
   ], "attempt options");
   const signal = value.signal;
@@ -424,12 +425,23 @@ function validateOptions(options, managed) {
        typeof signal.removeEventListener !== "function")) {
     fail("attempt options.signal must be an AbortSignal");
   }
+  if (value.stdinPayload !== undefined &&
+      (typeof value.stdinPayload !== "string" ||
+       Buffer.byteLength(value.stdinPayload) > MAX_LAUNCH_PAYLOAD_BYTES)) {
+    fail(`attempt options.stdinPayload must be a string of at most ` +
+      `${MAX_LAUNCH_PAYLOAD_BYTES} bytes`);
+  }
+  if (value.streamForward !== undefined && typeof value.streamForward !== "function") {
+    fail("attempt options.streamForward must be a function");
+  }
   if (managed && typeof value.onStarted !== "function") {
     fail("managed attempt options.onStarted must be a synchronous function");
   }
   return {
     signal,
     onStarted: managed ? value.onStarted : null,
+    stdinPayload: value.stdinPayload,
+    streamForward: value.streamForward,
     cpuAffinity: validateCpuAffinity(value.cpuAffinity),
     retainedDirectory: validateRetainedDirectory(value.retainedDirectory),
     stdoutExcerptBytes: excerptLimit(
@@ -770,6 +782,13 @@ function createRunner({
       });
       stdout = new OutputAccumulator(supervisor.stdout ?? null, options.stdoutExcerptBytes);
       stderr = new OutputAccumulator(supervisor.stderr ?? null, options.stderrExcerptBytes);
+      // Hand the raw channel streams to an interested caller synchronously so
+      // a full-channel consumer (such as the debugger attempt I/O layer) can
+      // attach before any data flows. Accumulator evidence is unaffected.
+      options.streamForward?.({
+        stdout: supervisor.stdout ?? null,
+        stderr: supervisor.stderr ?? null,
+      });
     } catch (error) {
       supervisorSpawnErrorCode = normalizeErrorCode(error, "SUPERVISOR_SPAWN_THROW");
       chooseLaunchError(supervisorSpawnErrorCode);
@@ -854,6 +873,9 @@ function createRunner({
               cwd: resolved.command.cwd,
               environment: launchEnvironment,
               termGraceMs: resolved.attempt.termGraceMs,
+              ...(options.stdinPayload === undefined
+                ? {}
+                : { stdinPayload: options.stdinPayload }),
               cpuAffinity: options.cpuAffinity === null
                 ? null
                 : options.cpuAffinity.cpu ?? options.cpuAffinity.cpuList,

@@ -25,7 +25,7 @@ The suite covers:
 - Public exact-CPU CLI parsing, dry-run safety, fresh bundle creation, and resume
 - Public baseline, CPU-group, pinned-concurrent, and controlled-load CLI planning, fresh bundle creation, and complete-unit resume
 - Read-only schema-3 v1-v5 summaries with phase, context, leg, CPU, and typed-outcome counts
-- Generic debugger-phase manifest, materialized command-profile descriptor, structured control-protocol, and bounded attempt-I/O validation without launching GDB
+- Generic debugger-phase manifest, materialized command-profile descriptor, structured control-protocol, bounded attempt-I/O validation, and supervised adapter routing without launching GDB
 - Internal shell-free attempt execution, deadlines, bounded output, and process-group cleanup
 - Managed auxiliary-workload readiness, discarded output, and bounded cancellation
 - Controlled-load worker-set readiness, boundary identity checks, peer cancellation, and stop evidence
@@ -186,7 +186,12 @@ private control-fd handling, fixed capture commands and state records, and
 context, tamper, workload-mismatch, and oversize rejection. When `python3` is
 available, the suite also compiles the generated profile and runs its gdb-free
 emission prelude, parsing the emitted bytes with the real control-protocol
-parser. No test starts GDB or a fault workload.
+parser. The supervised adapter layer runs the real Node process-group
+supervisor against a harmless finite fake-debugger fixture: stdin launch
+payloads, separate transcript and control routing, exact target-argv
+delivery, pass-environment reproduction, adapter/lifecycle distinction,
+silent and garbage control rejection, and last-moment provenance refusal for
+a drifted target or debugger. No test starts GDB or a fault workload.
 
 Custom commands should be documented as trusted local workloads, not sandboxed code. They must not daemonize or escape the supervised process group.
 

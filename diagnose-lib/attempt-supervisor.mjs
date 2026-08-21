@@ -11,8 +11,9 @@ import { spawn } from "node:child_process";
 
 import { verifyWorkloadLaunchProvenance } from "./workload-spec.mjs";
 
-const PROTOCOL_VERSION = 3;
+const PROTOCOL_VERSION = 4;
 const SUPERVISOR_ERROR_EXIT = 125;
+const MAX_LAUNCH_PAYLOAD_BYTES = 2 * 1024 * 1024;
 const LIVE_STATES = new Set(["R", "S", "D", "T", "t", "I", "W"]);
 const ERROR_CODE_RE = /^[A-Z][A-Z0-9_]{0,63}$/;
 const DEVICE_INODE_RE = /^(0|[1-9][0-9]*)$/;
@@ -129,7 +130,7 @@ function hasExactKeys(value, expected) {
 }
 
 function validateLaunch(message) {
-  if (!hasExactKeys(message, [
+  const baseKeys = [
     "version",
     "type",
     "executable",
@@ -139,8 +140,13 @@ function validateLaunch(message) {
     "termGraceMs",
     "cpuAffinity",
     "provenance",
-  ]) ||
+  ];
+  const hasPayload = Object.hasOwn(message ?? {}, "stdinPayload");
+  if (!(hasExactKeys(message, baseKeys) ||
+        (hasPayload && hasExactKeys(message, [...baseKeys, "stdinPayload"]))) ||
       message.version !== PROTOCOL_VERSION || message.type !== "launch" ||
+      (hasPayload && (typeof message.stdinPayload !== "string" ||
+        Buffer.byteLength(message.stdinPayload) > MAX_LAUNCH_PAYLOAD_BYTES)) ||
       !validString(message.executable) || !message.executable.startsWith("/") ||
       !Array.isArray(message.args) || message.args.length > 4_096 ||
       !message.args.every(validString) ||
@@ -199,8 +205,10 @@ function launch(message) {
       shell: false,
       // Forward the supervisor's inherited descriptors, not its JavaScript
       // Stream wrappers. Pipe-backed process.stdout/process.stderr objects are
-      // not portable child stdio handles across Node invocation modes.
-      stdio: ["ignore", 1, 2],
+      // not portable child stdio handles across Node invocation modes. A launch
+      // payload instead arrives on a fresh stdin pipe; the descriptor layout
+      // the workload inherits is unchanged.
+      stdio: [message.stdinPayload === undefined ? "ignore" : "pipe", 1, 2],
       windowsHide: true,
     });
   } catch (error) {
@@ -209,6 +217,18 @@ function launch(message) {
       errorCode: normalizeErrorCode(error, "SPAWN_THROW"),
     });
     return;
+  }
+
+  if (message.stdinPayload !== undefined && workload.stdin !== null) {
+    // Deliver the payload exactly once and close. The payload ends whether or
+    // not the write succeeds so the workload never waits on a half-open pipe.
+    workload.stdin.on("error", () => {});
+    try {
+      workload.stdin.end(message.stdinPayload);
+    } catch {
+      // The workload lifecycle reports itself over IPC; a broken payload pipe
+      // shows up there as its own typed outcome.
+    }
   }
 
   workload.once("spawn", () => {

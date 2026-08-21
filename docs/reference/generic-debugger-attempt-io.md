@@ -54,7 +54,9 @@ transcript descriptor and prevents further access. A future complete-only
 store must consume the handle before disposal and must not publish overflowed,
 partial, or invalid input as a complete attempt.
 
-The remaining execution work is to connect the two channels to a stable
-supervised debugger adapter running the [materialized command profile](generic-debugger-phase.md),
-and to combine process cleanup, control, and transcript facts in a typed
-attempt envelope.
+The [supervised adapter](generic-debugger-adapter.md) now connects the two
+channels to a real debugger launch: the adapter forwards the combined
+transcript and the private control descriptor through the established Node
+supervisor into this layer. The remaining execution work is to combine
+process cleanup, control, and transcript facts in a typed complete-only
+attempt envelope and durable artifacts.

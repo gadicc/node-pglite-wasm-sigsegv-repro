@@ -49,6 +49,7 @@ This index separates instructions for running the current tooling from the resul
 - [Understand the generic debugger phase manifest](reference/generic-debugger-phase.md): workload binding, GDB provenance, fixed capture profile, and the remaining execution boundary
 - [Understand the generic debugger control protocol](reference/generic-debugger-control.md): manifest-bound lifecycle records, strict sequencing, and separation from diagnostic output
 - [Understand bounded generic debugger attempt I/O](reference/generic-debugger-attempt-io.md): distinct channels, anonymous transcript retention, overflow evidence, and complete draining
+- [Understand the supervised generic debugger adapter](reference/generic-debugger-adapter.md): private launch package, last-moment provenance, and separate transcript/control routing under the Node supervisor
 - [Node/V8 source-history review](../research/node-v8-25.2.1-to-26.7.0-review.md): 5,693-commit source and provenance screen
 - [Node/V8 screened-commit audit](../research/node-v8-screened-commits.tsv): complete disposition table for the source-history review
 

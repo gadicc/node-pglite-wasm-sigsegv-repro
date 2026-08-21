@@ -113,6 +113,12 @@ switch (mode) {
   case "flood":
     flood(Number(args[0]));
     break;
+  case "stdin": {
+    const chunks = [];
+    for await (const chunk of process.stdin) chunks.push(chunk);
+    writeJson({ type: "stdin", text: Buffer.concat(chunks).toString("utf8") });
+    break;
+  }
   case "flood-hold":
     flood(Number(args[0]));
     hold();

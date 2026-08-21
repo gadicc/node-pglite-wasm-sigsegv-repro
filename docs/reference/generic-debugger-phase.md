@@ -62,15 +62,15 @@ provenance check.
 
 ## Keep this foundation distinct from evidence
 
-The manifest does not claim that a capture occurred. A complete generic phase
-still needs:
+The manifest does not claim that a capture occurred. The [supervised adapter](generic-debugger-adapter.md)
+now executes one attempt under the established Node supervisor. A complete
+generic phase still needs:
 
-1. a supervised GDB adapter that launches the materialized command profile and routes the [structured control protocol](generic-debugger-control.md) descriptor separately from the transcript into the [bounded attempt-I/O layer](generic-debugger-attempt-io.md);
-2. typed clean, captured, error, and operational outcomes;
-3. affinity and process-cleanup evidence;
-4. complete-only durable publication;
-5. schema-3 bundle inventory and lease integration; and
-6. read-only summary and public CLI support.
+1. typed clean, captured, error, and operational attempt envelopes;
+2. affinity and process-cleanup evidence;
+3. complete-only durable publication;
+4. schema-3 bundle inventory and lease integration; and
+5. read-only summary and public CLI support.
 
 Until those pieces exist, `capabilities.gdb` is a contract input rather than an
 advertised public phase. The historical `capture-fault.sh` and schema-2 GDB
