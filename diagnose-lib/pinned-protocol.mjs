@@ -81,6 +81,10 @@ const PINNED_CONCURRENT_PHASE_STATE_FILE_MAX_BYTES = 8 * 1024 * 1024;
 const PINNED_CONCURRENT_WAVE_STATE_FILE_MAX_BYTES = 64 * 1024 * 1024;
 const CONTROLLED_LOAD_PHASE_STATE_FILE_MAX_BYTES = 1024 * 1024;
 const CONTROLLED_LOAD_SESSION_STATE_FILE_MAX_BYTES = 256 * 1024 * 1024;
+const DEBUGGER_PHASE_STATE_FILE_MAX_BYTES = 1024 * 1024;
+const DEBUGGER_ATTEMPT_ENVELOPE_STATE_FILE_MAX_BYTES = 8 * 1024 * 1024;
+const DEBUGGER_ATTEMPT_TRANSCRIPT_STATE_FILE_MAX_BYTES = 64 * 1024 * 1024;
+const DEBUGGER_ATTEMPT_CONTROL_STATE_FILE_MAX_BYTES = 64 * 1024;
 const PROTOCOL_MARKER = Symbol("pinnedProtocolPlan");
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 
@@ -518,7 +522,7 @@ function fsyncDirectory(directory) {
 // The exact-CPU store reuses this proven no-clobber adapter in its own private
 // directory; legacy protocol readers still select only their own final names.
 const STATE_COMMIT_TEMP_RE =
-  /^\.(isolated-[0-9]{9}\.json|concurrent-[0-9]{9}-[a-z][a-z0-9_-]{0,63}\.json|exact-cpu-phase\.json|exact-cpu-attempt-[0-9]{9}\.json|baseline-phase\.json|baseline-wave-[0-9]{9}\.json|group-phase\.json|group-wave-[0-9]{9}\.json|pinned-concurrent-phase\.json|pinned-concurrent-wave-[0-9]{9}\.json|controlled-load-phase\.json|controlled-load-session\.json|fault-affinity-bundle\.json)\.([1-9][0-9]*)\.([a-f0-9]{16})\.(writing|ready)\.tmp$/;
+  /^\.(isolated-[0-9]{9}\.json|concurrent-[0-9]{9}-[a-z][a-z0-9_-]{0,63}\.json|exact-cpu-phase\.json|exact-cpu-attempt-[0-9]{9}\.json|baseline-phase\.json|baseline-wave-[0-9]{9}\.json|group-phase\.json|group-wave-[0-9]{9}\.json|pinned-concurrent-phase\.json|pinned-concurrent-wave-[0-9]{9}\.json|controlled-load-phase\.json|controlled-load-session\.json|debugger-phase\.json|debugger-attempt-[0-9]{9}-(?:envelope\.json|transcript|control)|fault-affinity-bundle\.json)\.([1-9][0-9]*)\.([a-f0-9]{16})\.(writing|ready)\.tmp$/;
 
 function processIsLive(pidText) {
   const pid = Number(pidText);
@@ -548,6 +552,7 @@ function recoverInterruptedStateCommits(directory) {
         !name.startsWith(".group-") &&
         !name.startsWith(".pinned-concurrent-") &&
         !name.startsWith(".controlled-load-") &&
+        !name.startsWith(".debugger-") &&
         !name.startsWith(".fault-affinity-bundle.json.")) continue;
     const match = name.match(STATE_COMMIT_TEMP_RE);
     if (match === null) continue;
@@ -582,6 +587,14 @@ function recoverInterruptedStateCommits(directory) {
                       ? CONTROLLED_LOAD_PHASE_STATE_FILE_MAX_BYTES
                       : finalName === "controlled-load-session.json"
                         ? CONTROLLED_LOAD_SESSION_STATE_FILE_MAX_BYTES
+                        : finalName === "debugger-phase.json"
+                          ? DEBUGGER_PHASE_STATE_FILE_MAX_BYTES
+                          : finalName.endsWith("-envelope.json")
+                            ? DEBUGGER_ATTEMPT_ENVELOPE_STATE_FILE_MAX_BYTES
+                            : finalName.endsWith("-transcript")
+                              ? DEBUGGER_ATTEMPT_TRANSCRIPT_STATE_FILE_MAX_BYTES
+                              : finalName.endsWith("-control")
+                                ? DEBUGGER_ATTEMPT_CONTROL_STATE_FILE_MAX_BYTES
                     : finalName === "fault-affinity-bundle.json"
                       ? SCHEMA3_BUNDLE_STATE_FILE_MAX_BYTES
                       : DEFAULT_STATE_FILE_MAX_BYTES;
@@ -679,6 +692,30 @@ function commitStateFile(directory, name, content) {
   }
 }
 
+function removeStateFile(directory, name) {
+  validateStateFileName(name);
+  const file = path.join(directory, name);
+  const uid = typeof process.getuid === "function" ? BigInt(process.getuid()) : null;
+  let stat;
+  try {
+    stat = lstatSync(file, { bigint: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw new PinnedProtocolStateError(`${name} could not be inspected for removal`);
+  }
+  if (!stat.isFile() || stat.nlink !== 1n ||
+      (uid !== null && stat.uid !== uid) || (stat.mode & 0o077n) !== 0n) {
+    throw new PinnedProtocolStateError(`${name} is not a safe private removable state file`);
+  }
+  try {
+    unlinkSync(file);
+    fsyncDirectory(directory);
+  } catch {
+    throw new PinnedProtocolStateError(`${name} could not be removed durably`);
+  }
+  return true;
+}
+
 export function createFileStateAdapter(stateDirectory) {
   const directory = validateAbsolutePath(stateDirectory, "state directory");
   validateStateDirectory(directory);
@@ -689,6 +726,7 @@ export function createFileStateAdapter(stateDirectory) {
     },
     read: (name, maxBytes) => readStableStateFile(directory, name, maxBytes),
     commit: (name, bytes) => commitStateFile(directory, name, bytes),
+    remove: (name) => removeStateFile(directory, name),
   });
 }
 

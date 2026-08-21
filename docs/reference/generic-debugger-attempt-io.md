@@ -57,6 +57,7 @@ partial, or invalid input as a complete attempt.
 The [supervised adapter](generic-debugger-adapter.md) now connects the two
 channels to a real debugger launch: the adapter forwards the combined
 transcript and the private control descriptor through the established Node
-supervisor into this layer. The remaining execution work is to combine
-process cleanup, control, and transcript facts in a typed complete-only
-attempt envelope and durable artifacts.
+supervisor into this layer, and the [complete-only attempt store](generic-debugger-attempt-envelopes.md)
+consumes the capture handle and disposes it after durable publication. The
+remaining execution work is schema-3 bundle integration, summaries, and a
+public command.

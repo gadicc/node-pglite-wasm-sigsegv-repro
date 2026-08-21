@@ -74,7 +74,9 @@ complete attempt.
 
 ## Remaining boundaries
 
-Typed complete-only debugger attempt envelopes, durable artifacts, a schema-3
-bundle variant, summaries, and a public command remain later steps. Until
-they exist, the supervised adapter is exercised only by synthetic tests with
-a harmless finite fake-debugger fixture; no test launches GDB.
+[Complete-only attempt envelopes](generic-debugger-attempt-envelopes.md) and
+their durable artifact store bind one successful attempt into a canonical
+record. Schema-3 bundle integration, read-only summaries, and a public
+command remain later steps. Until they exist, the supervised adapter is
+exercised only by synthetic tests with a harmless finite fake-debugger
+fixture; no test launches GDB.

@@ -35,3 +35,4 @@ behavior and compatibility boundaries, not current runtime capabilities.
 | [ADR 0027](0027-generic-debugger-control-protocol.md) | Accepted | Separate bounded machine-readable debugger lifecycle evidence from human-readable transcripts. |
 | [ADR 0028](0028-bounded-debugger-attempt-io.md) | Accepted | Retain distinct bounded transcript and control streams while draining complete debugger-attempt output. |
 | [ADR 0029](0029-supervised-debugger-adapter.md) | Accepted | Supervise debugger attempts through the established Node supervisor with a private stdin launch payload. |
+| [ADR 0030](0030-complete-only-debugger-attempt-envelopes.md) | Accepted | Publish complete-only debugger attempt envelopes with envelope-last durable artifact triples. |

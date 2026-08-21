@@ -69,7 +69,9 @@ kept non-inheritable from the inferior, and the [supervised adapter](generic-deb
 routes that descriptor separately from the combined transcript. Synthetic
 tests run the profile's gdb-free emission prelude under `python3` and validate
 the bytes with the real parser, and runner tests route a fake debugger's
-records through the full supervision stack. The remaining work is to combine
-adapter lifecycle, cleanup, control, and transcript facts into a complete-only
-attempt envelope. Until that exists, the control protocol is an internal
+records through the full supervision stack.
+[Complete-only attempt envelopes](generic-debugger-attempt-envelopes.md) now
+combine adapter lifecycle, cleanup, control, and transcript facts into one
+durable record. The remaining work is schema-3 bundle integration, summaries,
+and a public command. Until those exist, the control protocol is an internal
 contract exercised only by synthetic tests.

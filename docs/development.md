@@ -25,7 +25,7 @@ The suite covers:
 - Public exact-CPU CLI parsing, dry-run safety, fresh bundle creation, and resume
 - Public baseline, CPU-group, pinned-concurrent, and controlled-load CLI planning, fresh bundle creation, and complete-unit resume
 - Read-only schema-3 v1-v5 summaries with phase, context, leg, CPU, and typed-outcome counts
-- Generic debugger-phase manifest, materialized command-profile descriptor, structured control-protocol, bounded attempt-I/O validation, and supervised adapter routing without launching GDB
+- Generic debugger-phase manifest, materialized command-profile descriptor, structured control-protocol, bounded attempt-I/O validation, supervised adapter routing, and complete-only attempt envelopes without launching GDB
 - Internal shell-free attempt execution, deadlines, bounded output, and process-group cleanup
 - Managed auxiliary-workload readiness, discarded output, and bounded cancellation
 - Controlled-load worker-set readiness, boundary identity checks, peer cancellation, and stop evidence
@@ -193,7 +193,11 @@ delivery, HMAC-bound custom workloads through the real catalog resolution
 path, substituted private environment value rejection, adapter/lifecycle
 distinction, silent and garbage control rejection, nonzero and signaled
 debugger completions, and last-moment provenance refusal for a drifted
-target or debugger. No test starts GDB or a fault workload.
+target or debugger. Complete-only attempt envelopes and their durable
+artifact store are covered end to end: typed outcome classification,
+envelope tamper rejection, contiguous run prefixes, capture-cap completion,
+envelope-last triple publication, orphan recovery, and foreign or tampered
+artifact refusal. No test starts GDB or a fault workload.
 
 Custom commands should be documented as trusted local workloads, not sandboxed code. They must not daemonize or escape the supervised process group.
 

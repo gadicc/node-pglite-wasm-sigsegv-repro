@@ -72,8 +72,9 @@ function deepFreeze(value) {
 // The adapter receives a single workload launch capsule as its authority:
 // the exact public workload identity, the private environment values, and —
 // only for HMAC-bound workloads — the environment binding key, all inside the
-// private stdin payload. The adapter's own environment stays empty.
-function adapterWorkload(resolved, manifest) {
+// private stdin payload. The adapter's own environment stays empty. Exported
+// so the attempt envelope layer builds the identical adapter workload.
+export function debuggerAdapterWorkload(resolved, manifest) {
   return resolveWorkloadSpec({
     version: 1,
     id: "debugger-adapter",
@@ -118,7 +119,7 @@ export async function runDebuggerAttempt(
   const capsule = buildWorkloadLaunchCapsule(resolved, {
     environmentBindingKey: options.environmentBindingKey,
   });
-  const adapterResolved = adapterWorkload(resolved, manifest);
+  const adapterResolved = debuggerAdapterWorkload(resolved, manifest);
   const payload = canonicalProtocolJson({
     version: DEBUGGER_ADAPTER_PACKAGE_VERSION,
     capsule,
