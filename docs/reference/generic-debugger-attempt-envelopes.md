@@ -30,8 +30,12 @@ error, exactly as the control facts record it.
 
 The builder and parser share one rule: an envelope exists only when the
 adapter lifecycle is operationally successful, both I/O channels drained
-completely without overflow, and the control stream parsed. Partial,
-overflowed, invalid, or incompletely drained input throws
+completely without overflow, and the control stream parsed. A channel
+accepted as complete must reconcile exactly: no overflow flag, observed bytes
+equal to retained bytes and within the channel limit, and — for the control
+channel — observed and retained bytes and the observed digest exactly equal
+to the control binding. Partial, overflowed, invalid, or incompletely
+drained input throws
 `INCOMPLETE_DEBUGGER_ATTEMPT` at build time and fails parsing at read time,
 so no stored envelope can masquerade as complete evidence.
 

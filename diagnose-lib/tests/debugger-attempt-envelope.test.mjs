@@ -264,6 +264,69 @@ test("envelope parsing rejects tampering across every bound section", async () =
   }
 });
 
+test("complete channels reconcile observed, retained, limit, and control binding", async () => {
+  const files = fixture({ mode: "stopped" });
+  const { envelope, result } = await envelopeFor(files, 1);
+  const transcriptObserved = Number(envelope.io.transcript.observed.bytes);
+  const controlBindingBytes = envelope.control.binding.bytes;
+
+  const cases = [
+    ["transcript observed bytes incremented", (value) => {
+      value.io.transcript.observed.bytes = String(transcriptObserved + 1);
+    }],
+    ["transcript retained bytes reduced", (value) => {
+      value.io.transcript.retainedBytes -= 1;
+    }],
+    ["control observed bytes differ from its binding", (value) => {
+      value.io.control.observed.bytes = String(controlBindingBytes + 1);
+    }],
+    ["control retained bytes differ from its binding", (value) => {
+      value.io.control.retainedBytes = controlBindingBytes - 1;
+    }],
+    ["control observed digest differs from its binding", (value) => {
+      value.io.control.observed.sha256 = "0".repeat(64);
+    }],
+    ["complete channel with overflowed true", (value) => {
+      value.io.control.overflowed = true;
+    }],
+  ];
+  for (const [label, mutate] of cases) {
+    const tampered = clone(envelope);
+    mutate(tampered);
+    assert.throws(
+      () => parseDebuggerAttemptEnvelope(files.resolved, files.manifest, tampered),
+      DebuggerAttemptEnvelopeError,
+      label,
+    );
+  }
+
+  const buildCorruptions = [
+    (value) => {
+      value.io.evidence.control.observed.bytes = String(controlBindingBytes + 1);
+    },
+    (value) => {
+      value.io.evidence.transcript.overflowed = true;
+    },
+    (value) => {
+      value.io.evidence.transcript.observed.bytes = String(transcriptObserved + 1);
+    },
+  ];
+  for (const [index, mutate] of buildCorruptions.entries()) {
+    const corrupted = clone(result);
+    mutate(corrupted);
+    assert.throws(
+      () => buildDebuggerAttemptEnvelope(
+        files.resolved,
+        files.manifest,
+        context(1),
+        corrupted,
+      ),
+      DebuggerAttemptEnvelopeError,
+      `build case ${index}`,
+    );
+  }
+});
+
 test("progress tracks the contiguous run prefix and completion policy", async () => {
   const files = fixture({ mode: "stopped", maxRuns: 3, maxCaptures: 2 });
   const first = (await envelopeFor(files, 1)).envelope;

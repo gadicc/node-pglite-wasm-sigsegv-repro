@@ -174,6 +174,16 @@ function validateChannelEvidence(value, label) {
   requireCondition(typeof value.overflowed === "boolean", `${label}.overflowed is invalid`);
   requireCondition(BigInt(value.retainedBytes) <= BigInt(value.observed.bytes),
   `${label} retains more bytes than it observed`);
+  // A channel accepted as complete must reconcile exactly: no overflow, every
+  // observed byte retained, and nothing beyond the channel limit.
+  if (value.status === "complete") {
+    requireCondition(value.overflowed === false,
+      `${label} cannot be complete after overflow`);
+    requireCondition(BigInt(value.observed.bytes) === BigInt(value.retainedBytes),
+      `${label} must retain exactly the observed bytes when complete`);
+    requireCondition(BigInt(value.observed.bytes) <= BigInt(value.limitBytes),
+      `${label} exceeds its byte limit when complete`);
+  }
   return value;
 }
 
@@ -201,6 +211,17 @@ function validateIoEvidence(manifest, context, value) {
       (value.transcript.status === "complete" && value.control.status === "complete"),
   "debugger attempt I/O completeness does not reconcile");
   return value;
+}
+
+// The control channel must account for exactly the bytes the control binding
+// attests: observed and retained counts equal the binding's byte count, and
+// the observed digest is the binding digest.
+function reconcileControlChannelEvidence(ioEvidence, controlFacts) {
+  requireCondition(ioEvidence.control.observed.bytes ===
+    String(controlFacts.binding.bytes) &&
+    ioEvidence.control.retainedBytes === controlFacts.binding.bytes &&
+    ioEvidence.control.observed.sha256 === controlFacts.binding.sha256,
+  "debugger control channel evidence does not match its binding");
 }
 
 function validateControlFacts(manifest, value) {
@@ -333,6 +354,7 @@ export function buildDebuggerAttemptEnvelope(
     error: control.error,
     binding: control.binding,
   });
+  reconcileControlChannelEvidence(ioEvidence, controlFacts);
   requireCondition(controlFacts.terminal !== null || controlFacts.error !== null,
   "debugger attempt records neither a terminal event nor a typed error",
   "INCOMPLETE_DEBUGGER_ATTEMPT");
@@ -418,6 +440,7 @@ export function parseDebuggerAttemptEnvelope(resolved, manifestValue, value) {
     ioEvidence.control.overflowed === false,
   "debugger attempt I/O channels are not complete");
   const controlFacts = validateControlFacts(manifest, envelope.control);
+  reconcileControlChannelEvidence(ioEvidence, controlFacts);
   validateOutcome(manifest, controlFacts, envelope.outcome);
   return canonicalClone(envelope);
 }
