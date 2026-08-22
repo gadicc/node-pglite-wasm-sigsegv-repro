@@ -196,8 +196,50 @@ test("a version-6 summary inspects the debugger phase progress", () => {
   const text = renderSchema3BundleSummary(summary);
   assert.match(text, /manifest v6/);
   assert.match(text, /debugger: incomplete; 2\/4 runs; captured 1\/2/);
+});
 
-  const unbound = buildSchema3BundleSummary({ ...baseBundle(6), exactCpu: exactPhase([]) });
-  assert.equal(unbound.phases.debugger.status, "not-bound");
-  assert.match(renderSchema3BundleSummary(unbound), /debugger: not bound/);
+test("debugger summaries require the v6 phase and reconcile its progress", () => {
+  assert.throws(() => buildSchema3BundleSummary({
+    ...baseBundle(6),
+    exactCpu: exactPhase([]),
+  }), /missing its debugger phase/);
+
+  const debuggerBundle = (progress) => ({
+    ...baseBundle(6),
+    debugger: { progress },
+    exactCpu: exactPhase([]),
+  });
+  assert.throws(() => buildSchema3BundleSummary(debuggerBundle({
+    status: "incomplete",
+    complete: false,
+    committedRuns: 1,
+    maxRuns: 4,
+    capturedRuns: 2,
+    maxCaptures: 2,
+  })), /debugger progress is invalid/);
+  assert.throws(() => buildSchema3BundleSummary(debuggerBundle({
+    status: "incomplete",
+    complete: true,
+    committedRuns: 2,
+    maxRuns: 4,
+    capturedRuns: 1,
+    maxCaptures: 2,
+  })), /does not reconcile/);
+  assert.throws(() => buildSchema3BundleSummary(debuggerBundle({
+    status: "complete",
+    complete: true,
+    committedRuns: 2,
+    maxRuns: 4,
+    capturedRuns: 1,
+    maxCaptures: 2,
+  })), /does not reconcile/);
+
+  for (const version of [1, 2, 3, 4, 5]) {
+    const summary = buildSchema3BundleSummary({
+      ...baseBundle(version),
+      ...(version === 5 ? { controlledLoad: undefined } : {}),
+      exactCpu: exactPhase([]),
+    });
+    assert.equal(summary.phases.debugger.status, "not-bound", `v${version}`);
+  }
 });

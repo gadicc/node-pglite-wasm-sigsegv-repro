@@ -289,6 +289,12 @@ test("complete channels reconcile observed, retained, limit, and control binding
     ["complete channel with overflowed true", (value) => {
       value.io.control.overflowed = true;
     }],
+    ["io evidence version mutated", (value) => {
+      value.io.version = 2;
+    }],
+    ["control channel limit differs from the protocol bound", (value) => {
+      value.io.control.limitBytes = 1024;
+    }],
   ];
   for (const [label, mutate] of cases) {
     const tampered = clone(envelope);
@@ -309,6 +315,12 @@ test("complete channels reconcile observed, retained, limit, and control binding
     },
     (value) => {
       value.io.evidence.transcript.observed.bytes = String(transcriptObserved + 1);
+    },
+    (value) => {
+      value.io.evidence.version = 2;
+    },
+    (value) => {
+      value.io.evidence.control.limitBytes = 1024;
     },
   ];
   for (const [index, mutate] of buildCorruptions.entries()) {

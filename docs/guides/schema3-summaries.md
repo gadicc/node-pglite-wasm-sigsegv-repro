@@ -28,7 +28,7 @@ The text output includes:
 - outcome category and label counts;
 - per-context CPU-group and pinned-concurrent counts;
 - per-leg controlled-load counts;
-- per-run debugger capture counts (manifest v6); and
+- aggregate debugger run and capture progress (manifest v6); and
 - per-CPU exact counts.
 
 Only committed, already validated outcomes appear. An incomplete phase remains

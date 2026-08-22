@@ -43,7 +43,11 @@ so no stored envelope can masquerade as complete evidence.
 
 `diagnose-lib/debugger-attempt-store.mjs` keeps one private state directory
 per phase: the canonical manifest line, then per run a transcript part, a
-control part, and the canonical envelope line. Publication commits the
+control part, and the canonical envelope line. The harness never serializes
+target environment values or their binding authority into any artifact, but
+the transcript part retains workload and debugger output verbatim — it can
+contain values the workload itself prints, so treat retained transcripts as
+sensitive as the workload's own output. Publication commits the
 transcript, then the control, then the envelope through the no-clobber state
 adapter, so the envelope is the sole completion marker. A crash can only
 leave bounded orphan parts; they are never evidence and are cleaned only for

@@ -187,8 +187,16 @@ function debuggerSummary(phase) {
       !Number.isSafeInteger(value.committedRuns) || value.committedRuns < 0 ||
       !Number.isSafeInteger(value.maxRuns) || value.maxRuns < value.committedRuns ||
       !Number.isSafeInteger(value.capturedRuns) || value.capturedRuns < 0 ||
-      !Number.isSafeInteger(value.maxCaptures) || value.maxCaptures < value.capturedRuns) {
+      !Number.isSafeInteger(value.maxCaptures) || value.maxCaptures < value.capturedRuns ||
+      value.capturedRuns > value.committedRuns) {
     fail("debugger progress is invalid");
+  }
+  const complete = value.committedRuns === value.maxRuns ||
+    value.capturedRuns >= value.maxCaptures;
+  const status = value.committedRuns === 0 && !complete ? "empty"
+    : complete ? "complete" : "incomplete";
+  if (value.complete !== complete || value.status !== status) {
+    fail("debugger progress does not reconcile");
   }
   return {
     status: value.status,
@@ -208,6 +216,9 @@ export function buildSchema3BundleSummary(bundle) {
   const version = bundle.manifest.version;
   if (!Number.isSafeInteger(version) || version < 1 || version > 6) {
     fail("manifest version is unsupported");
+  }
+  if (version === 6 && bundle.debugger === undefined) {
+    fail("manifest version 6 bundle is missing its debugger phase");
   }
   const summary = {
     version: SCHEMA3_SUMMARY_VERSION,
@@ -229,7 +240,7 @@ export function buildSchema3BundleSummary(bundle) {
       groups: contextSummary(bundle.groups, "group"),
       pinnedConcurrent: contextSummary(bundle.pinnedConcurrent, "pinned"),
       controlledLoad: controlledLoadSummary(bundle.controlledLoad),
-      debugger: debuggerSummary(bundle.debugger),
+      debugger: version === 6 ? debuggerSummary(bundle.debugger) : notBound(),
       exactCpu: exactSummary(bundle.exactCpu),
     },
     interpretation: {

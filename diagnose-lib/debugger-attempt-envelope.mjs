@@ -13,12 +13,13 @@ import {
   buildAttemptEvidence,
   parseAttemptEvidence,
 } from "./attempt-evidence.mjs";
+import { DEBUGGER_ATTEMPT_IO_VERSION } from "./debugger-attempt-io.mjs";
 import {
   DEBUGGER_ATTEMPT_RUNNER_VERSION,
   debuggerAdapterWorkload,
 } from "./debugger-attempt-runner.mjs";
 import { buildDebuggerCommandProfile } from "./debugger-command-profile.mjs";
-import { DEBUGGER_CONTROL_VERSION } from "./debugger-control.mjs";
+import { DEBUGGER_CONTROL_MAX_BYTES, DEBUGGER_CONTROL_VERSION } from "./debugger-control.mjs";
 import {
   DEBUGGER_PHASE_MANIFEST_VERSION,
   debuggerPhaseManifestBinding,
@@ -190,8 +191,8 @@ function validateChannelEvidence(value, label) {
 function validateIoEvidence(manifest, context, value) {
   exactKeys(value, ["version", "context", "transcript", "control", "complete"],
     "debugger attempt I/O evidence");
-  canonicalInteger(value.version, "debugger attempt I/O evidence version", 1,
-    Number.MAX_SAFE_INTEGER);
+  requireCondition(value.version === DEBUGGER_ATTEMPT_IO_VERSION,
+    `debugger attempt I/O evidence version must be ${DEBUGGER_ATTEMPT_IO_VERSION}`);
   exactKeys(value.context, ["generation", "manifestSha256", "run", "nonce"],
     "debugger attempt I/O context");
   requireCondition(value.context.generation === manifest.generation &&
@@ -206,6 +207,8 @@ function validateIoEvidence(manifest, context, value) {
   "debugger attempt transcript evidence does not match the manifest profile");
   requireCondition(value.control.version === DEBUGGER_CONTROL_VERSION,
   "debugger attempt control evidence version is unsupported");
+  requireCondition(value.control.limitBytes === DEBUGGER_CONTROL_MAX_BYTES,
+  "debugger attempt control evidence limit does not match the control protocol bound");
   requireCondition(typeof value.complete === "boolean" &&
     value.complete ===
       (value.transcript.status === "complete" && value.control.status === "complete"),

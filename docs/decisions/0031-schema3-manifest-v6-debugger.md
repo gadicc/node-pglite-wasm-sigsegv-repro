@@ -36,9 +36,11 @@ phase completes at the manifest's run cap or capture cap, and initialization
 and complete-state rereads are idempotent.
 
 The environment binding key and private environment values pass only through
-process-local launch options and capsules. They never persist into the bundle
-manifest, the debugger manifest, envelopes, state artifacts, summaries,
-arguments, or logs.
+process-local launch options and capsules. The harness never serializes them
+into the bundle manifest, the debugger manifest, envelopes, summaries,
+arguments, or logs. Workload and debugger output is a different boundary: the
+transcript artifact retains it verbatim, and it can contain values the
+workload itself prints.
 
 The read-only schema-3 summary accepts version 6 and reports debugger run and
 capture progress. Public debugger command orchestration and debugger-specific
