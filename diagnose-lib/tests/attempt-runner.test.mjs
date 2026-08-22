@@ -242,6 +242,32 @@ test("a fast successful workload remains valid after its /proc entry is reaped",
   assert.equal(result.cleanup.groupDrained, true);
 });
 
+test("a fast successful workload remains valid inside its zombie reaping window", {
+  timeout: 5_000,
+}, async () => {
+  const files = launcher();
+  // Deterministically simulate the zombie window: every non-leader identity
+  // read sees the workload as a just-exited, not-yet-reaped group member.
+  const runner = createAttemptRunner({
+    readIdentity(pid) {
+      const identity = readLinuxProcessIdentity(pid);
+      if (identity !== null && identity.processGroupId !== identity.pid) {
+        return { ...identity, state: "Z", live: false };
+      }
+      return identity;
+    },
+  });
+  const result = track(await runner(workload(files, ["exit", "0", "zombie", ""]), {
+    stdoutExcerptBytes: 16,
+  }));
+
+  assert.equal(result.outcome.category, "pass", JSON.stringify(result.cleanup));
+  assert.equal(result.observation.exitCode, 0);
+  assert.equal(text(result.output.stdout), "zombie");
+  assert.equal(result.observation.cleanupComplete, true);
+  assert.equal(result.cleanup.failureReason, null);
+});
+
 test("natural signals remain direct signal evidence", { timeout: 5_000 }, async () => {
   const files = launcher();
   const result = track(await runWorkloadAttempt(workload(files, ["self-signal", "SIGUSR2"])));

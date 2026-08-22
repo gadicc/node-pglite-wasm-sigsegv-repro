@@ -907,8 +907,13 @@ function createRunner({
             return;
           }
           const actual = safeReadIdentity(message.pid);
+          // A same-group, same-session identity that is no longer live is the
+          // workload observed inside its zombie reaping window: a fast child
+          // can exit before this handler runs. Its terminal status still
+          // arrives through the supervisor's workload-exit message, so only a
+          // group or session mismatch is an identity error.
           if (actual !== null && (actual.processGroupId !== supervisor.pid ||
-              actual.sessionId !== supervisor.pid || !actual.live)) {
+              actual.sessionId !== supervisor.pid)) {
             chooseLaunchError("WORKLOAD_IDENTITY_ERROR");
             return;
           }
