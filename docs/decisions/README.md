@@ -36,3 +36,4 @@ behavior and compatibility boundaries, not current runtime capabilities.
 | [ADR 0028](0028-bounded-debugger-attempt-io.md) | Accepted | Retain distinct bounded transcript and control streams while draining complete debugger-attempt output. |
 | [ADR 0029](0029-supervised-debugger-adapter.md) | Accepted | Supervise debugger attempts through the established Node supervisor with a private stdin launch payload. |
 | [ADR 0030](0030-complete-only-debugger-attempt-envelopes.md) | Accepted | Publish complete-only debugger attempt envelopes with envelope-last durable artifact triples. |
+| [ADR 0031](0031-schema3-manifest-v6-debugger.md) | Accepted | Bind the debugger-focused exact-CPU variant in schema-3 manifest v6 under one lease. |

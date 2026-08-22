@@ -67,6 +67,16 @@ import {
   readControlledLoadPhaseStore,
 } from "./controlled-load-phase-store.mjs";
 import {
+  debuggerPhaseManifestBinding,
+  parseDebuggerPhaseManifest,
+} from "./debugger-phase.mjs";
+import {
+  commitDebuggerPhaseAttempt,
+  initializeDebuggerPhaseStore,
+  readDebuggerPhaseStore,
+  runNextDebuggerPhaseAttempt,
+} from "./debugger-attempt-store.mjs";
+import {
   PinnedProtocolStateError,
   canonicalProtocolJson,
   createFileStateAdapter,
@@ -83,6 +93,7 @@ export const SCHEMA3_BUNDLE_MANIFEST_V2_VERSION = 2;
 export const SCHEMA3_BUNDLE_MANIFEST_V3_VERSION = 3;
 export const SCHEMA3_BUNDLE_MANIFEST_V4_VERSION = 4;
 export const SCHEMA3_BUNDLE_MANIFEST_V5_VERSION = 5;
+export const SCHEMA3_BUNDLE_MANIFEST_V6_VERSION = 6;
 export const SCHEMA3_RUN_SCHEMA_VERSION = 3;
 export const SCHEMA3_BUNDLE_FILE = "fault-affinity-bundle.json";
 export const SCHEMA3_BUNDLE_FILE_MAX_BYTES = 8 * 1024 * 1024;
@@ -90,6 +101,7 @@ export const SCHEMA3_BASELINE_STATE_DIRECTORY = "state/baseline";
 export const SCHEMA3_GROUP_STATE_DIRECTORY = "state/groups";
 export const SCHEMA3_PINNED_CONCURRENT_STATE_DIRECTORY = "state/pinned-concurrent";
 export const SCHEMA3_CONTROLLED_LOAD_STATE_DIRECTORY = "state/controlled-load";
+export const SCHEMA3_DEBUGGER_STATE_DIRECTORY = "state/debugger";
 export const SCHEMA3_EXACT_CPU_STATE_DIRECTORY = "state/exact-cpu";
 
 const GENERATION_RE = /^[a-f0-9]{32}$/;
@@ -298,16 +310,35 @@ function parsePinnedConcurrentPhaseContext(resolved, value) {
   return manifest;
 }
 
+function parseDebuggerPhaseContext(resolved, value) {
+  exactKeys(value, [
+    "protocol",
+    "stateDirectory",
+    "manifestBinding",
+    "manifest",
+  ], "bundle debugger phase");
+  requireCondition(value.protocol === "gdb-capture-v1",
+    "bundle debugger protocol is unsupported");
+  requireCondition(value.stateDirectory === SCHEMA3_DEBUGGER_STATE_DIRECTORY,
+    "bundle debugger state directory is invalid");
+  const manifest = parseDebuggerPhaseManifest(resolved, value.manifest);
+  validateBinding(value.manifestBinding, debuggerPhaseManifestBinding(resolved, manifest),
+    "bundle debugger manifest binding");
+  return manifest;
+}
+
 function parseManifestContext(resolved, value, auxiliary) {
   plainObject(value, "schema-3 bundle manifest");
   requireCondition(value.version === SCHEMA3_BUNDLE_MANIFEST_VERSION ||
     value.version === SCHEMA3_BUNDLE_MANIFEST_V2_VERSION ||
     value.version === SCHEMA3_BUNDLE_MANIFEST_V3_VERSION ||
     value.version === SCHEMA3_BUNDLE_MANIFEST_V4_VERSION ||
-    value.version === SCHEMA3_BUNDLE_MANIFEST_V5_VERSION,
-  `schema-3 bundle manifest version must be ${SCHEMA3_BUNDLE_MANIFEST_VERSION} or ` +
-    `${SCHEMA3_BUNDLE_MANIFEST_V2_VERSION}, ${SCHEMA3_BUNDLE_MANIFEST_V3_VERSION}, or ` +
-    `${SCHEMA3_BUNDLE_MANIFEST_V4_VERSION}, or ${SCHEMA3_BUNDLE_MANIFEST_V5_VERSION}`);
+    value.version === SCHEMA3_BUNDLE_MANIFEST_V5_VERSION ||
+    value.version === SCHEMA3_BUNDLE_MANIFEST_V6_VERSION,
+  `schema-3 bundle manifest version must be ${SCHEMA3_BUNDLE_MANIFEST_VERSION}, ` +
+    `${SCHEMA3_BUNDLE_MANIFEST_V2_VERSION}, ${SCHEMA3_BUNDLE_MANIFEST_V3_VERSION}, ` +
+    `${SCHEMA3_BUNDLE_MANIFEST_V4_VERSION}, ${SCHEMA3_BUNDLE_MANIFEST_V5_VERSION}, or ` +
+    `${SCHEMA3_BUNDLE_MANIFEST_V6_VERSION}`);
   const hasBaseline = [
     SCHEMA3_BUNDLE_MANIFEST_V2_VERSION,
     SCHEMA3_BUNDLE_MANIFEST_V3_VERSION,
@@ -319,6 +350,7 @@ function parseManifestContext(resolved, value, auxiliary) {
   ].includes(value.version);
   const hasPinnedConcurrent = value.version === SCHEMA3_BUNDLE_MANIFEST_V4_VERSION;
   const hasControlledLoad = value.version === SCHEMA3_BUNDLE_MANIFEST_V5_VERSION;
+  const hasDebugger = value.version === SCHEMA3_BUNDLE_MANIFEST_V6_VERSION;
   exactKeys(value, [
     "version",
     "bundleFormatVersion",
@@ -332,6 +364,7 @@ function parseManifestContext(resolved, value, auxiliary) {
     ...(hasGroups ? ["groups"] : []),
     ...(hasPinnedConcurrent ? ["pinnedConcurrent"] : []),
     ...(hasControlledLoad ? ["controlledLoad"] : []),
+    ...(hasDebugger ? ["debugger"] : []),
     "exactCpu",
   ], "schema-3 bundle manifest");
   requireCondition(value.bundleFormatVersion === SCHEMA3_BUNDLE_FORMAT_VERSION,
@@ -359,6 +392,7 @@ function parseManifestContext(resolved, value, auxiliary) {
   const supported = new Set(hasPinnedConcurrent
     ? ["baseline", "groups", "isolated", "pinnedConcurrent"]
     : hasGroups ? ["baseline", "groups", "isolated"]
+    : hasDebugger ? ["isolated", "gdb"]
     : hasBaseline ? ["baseline", "isolated"] : ["isolated"]);
   validatePhaseControls(value.phaseControls, expectedPhaseControls(resolved, supported, {
     controlledLoad: hasControlledLoad,
@@ -372,6 +406,9 @@ function parseManifestContext(resolved, value, auxiliary) {
   const controlledLoadManifest = hasControlledLoad
     ? parseControlledLoadPhaseContext(resolved, auxiliary, value.controlledLoad)
     : null;
+  const debuggerManifest = hasDebugger
+    ? parseDebuggerPhaseContext(resolved, value.debugger)
+    : null;
   const exactCpuManifest = parseExactCpuPhaseContext(resolved, value.exactCpu);
   return {
     version: value.version,
@@ -379,6 +416,7 @@ function parseManifestContext(resolved, value, auxiliary) {
     groupManifest,
     pinnedConcurrentManifest,
     controlledLoadManifest,
+    debuggerManifest,
     exactCpuManifest,
   };
 }
@@ -577,6 +615,38 @@ export function buildSchema3BundleManifestV5(measured, auxiliary, options) {
   }, auxiliary);
 }
 
+export function buildSchema3BundleManifestV6(resolved, options) {
+  exactKeys(options, [
+    "bundleGeneration", "debuggerManifest", "exactCpuManifest",
+  ], "schema-3 bundle v6 options");
+  requireCondition(typeof options.bundleGeneration === "string" &&
+    GENERATION_RE.test(options.bundleGeneration),
+  "bundle generation must be exactly 32 lowercase hexadecimal characters");
+  const debuggerManifest = parseDebuggerPhaseManifest(resolved, options.debuggerManifest);
+  const exactCpuManifest = parseExactCpuPhaseManifest(resolved, options.exactCpuManifest);
+  return parseSchema3BundleManifest(resolved, {
+    version: SCHEMA3_BUNDLE_MANIFEST_V6_VERSION,
+    bundleFormatVersion: SCHEMA3_BUNDLE_FORMAT_VERSION,
+    runSchemaVersion: SCHEMA3_RUN_SCHEMA_VERSION,
+    bundleGeneration: options.bundleGeneration,
+    workload: resolvedWorkloadJson(resolved),
+    workloadBinding: workloadBinding(resolved),
+    phaseControls: expectedPhaseControls(resolved, new Set(["isolated", "gdb"])),
+    debugger: {
+      protocol: "gdb-capture-v1",
+      stateDirectory: SCHEMA3_DEBUGGER_STATE_DIRECTORY,
+      manifestBinding: debuggerPhaseManifestBinding(resolved, debuggerManifest),
+      manifest: debuggerManifest,
+    },
+    exactCpu: {
+      protocol: "isolated-exact-cpu-v1",
+      stateDirectory: SCHEMA3_EXACT_CPU_STATE_DIRECTORY,
+      manifestBinding: exactCpuPhaseManifestBinding(resolved, exactCpuManifest),
+      manifest: exactCpuManifest,
+    },
+  });
+}
+
 export function parseSchema3BundleManifest(resolved, value, auxiliary) {
   parseManifestContext(resolved, value, auxiliary);
   return canonicalClone(value);
@@ -652,6 +722,9 @@ async function listRoot(adapter) {
 }
 
 function expectedStateDirectories(manifest) {
+  if (manifest.version === SCHEMA3_BUNDLE_MANIFEST_V6_VERSION) {
+    return ["debugger", "exact-cpu"];
+  }
   if (manifest.version === SCHEMA3_BUNDLE_MANIFEST_V5_VERSION) {
     return ["controlled-load", "exact-cpu"];
   }
@@ -789,6 +862,20 @@ async function readBundleState(resolved, auxiliary, bundleDir) {
       canonicalProtocolJson(manifest.controlledLoad.manifest),
     "schema-3 controlled-load state belongs to a different phase manifest");
   }
+  let debuggerPhase;
+  if (manifest.version === SCHEMA3_BUNDLE_MANIFEST_V6_VERSION) {
+    const debuggerStateDir = validatePrivateDirectory(
+      path.join(stateRoot, "debugger"),
+      "schema-3 debugger state directory",
+    );
+    debuggerPhase = await readDebuggerPhaseStore({
+      resolved,
+      stateDir: debuggerStateDir,
+    });
+    requireCondition(canonicalProtocolJson(debuggerPhase.manifest) ===
+      canonicalProtocolJson(manifest.debugger.manifest),
+    "schema-3 debugger state belongs to a different phase manifest");
+  }
   const exactCpuStateDir = validatePrivateDirectory(path.join(stateRoot, "exact-cpu"),
     "schema-3 exact-CPU state directory");
   const exactCpu = await readExactCpuPhaseStore({ resolved, stateDir: exactCpuStateDir });
@@ -802,6 +889,7 @@ async function readBundleState(resolved, auxiliary, bundleDir) {
     ...(groups === undefined ? {} : { groups }),
     ...(pinnedConcurrent === undefined ? {} : { pinnedConcurrent }),
     ...(controlledLoad === undefined ? {} : { controlledLoad }),
+    ...(debuggerPhase === undefined ? {} : { debugger: debuggerPhase }),
     exactCpu,
   });
 }
@@ -893,6 +981,13 @@ export async function initializeSchema3Bundle({
         auxiliary,
         manifest: storedManifest.controlledLoad.manifest,
         stateDir: path.join(stateRoot, "controlled-load"),
+      });
+    }
+    if (storedManifest.version === SCHEMA3_BUNDLE_MANIFEST_V6_VERSION) {
+      await initializeDebuggerPhaseStore({
+        resolved,
+        manifest: storedManifest.debugger.manifest,
+        stateDir: path.join(stateRoot, "debugger"),
       });
     }
     const exactCpuStateDir = path.join(stateRoot, "exact-cpu");
@@ -1172,6 +1267,77 @@ export async function runOneSchema3ControlledLoadSession({
         envelope: result.envelope,
         stateDir: path.join(bundleDir, SCHEMA3_CONTROLLED_LOAD_STATE_DIRECTORY),
       });
+      bundle = await readBundleState(resolved, auxiliary, bundleDir);
+    }
+    assertBundleExecutionLeaseHeld(lease);
+    return deepFreeze({
+      result,
+      bundle,
+      lease: bundleExecutionLeaseEvidence(lease),
+    });
+  });
+}
+
+export async function runOneSchema3DebuggerAttempt({
+  resolved,
+  auxiliary,
+  bundleDir,
+  flockPath,
+  leaseWaitMs = 0,
+  environmentBindingKey,
+  attemptOptions,
+  runAttempt,
+}) {
+  const options = validateAttemptOptions(attemptOptions,
+    "schema-3 debugger attempt options");
+  requireCondition(environmentBindingKey === undefined ||
+    Buffer.isBuffer(environmentBindingKey),
+  "schema-3 environmentBindingKey must be a Buffer");
+  requireCondition(runAttempt === undefined || typeof runAttempt === "function",
+    "schema-3 runAttempt must be a function");
+  return withBundleExecutionLease({ bundleDir, flockPath, waitMs: leaseWaitMs }, async (lease) => {
+    let bundle = await readBundleState(resolved, auxiliary, bundleDir);
+    requireCondition(bundle.manifest.version === SCHEMA3_BUNDLE_MANIFEST_V6_VERSION &&
+      bundle.debugger !== undefined,
+    "schema-3 bundle manifest does not bind a debugger phase");
+    assertBundleExecutionLeaseHeld(lease);
+    if (bundle.debugger.progress.complete) {
+      return deepFreeze({
+        result: {
+          committed: false,
+          reason: "complete",
+          run: null,
+          outcome: null,
+          envelope: null,
+          attempt: null,
+        },
+        bundle,
+        lease: bundleExecutionLeaseEvidence(lease),
+      });
+    }
+    const result = await runNextDebuggerPhaseAttempt({
+      resolved,
+      manifest: bundle.manifest.debugger.manifest,
+      attempts: bundle.debugger.attempts,
+      ...(environmentBindingKey === undefined ? {} : { environmentBindingKey }),
+      ...(runAttempt === undefined ? {} : { runAttempt }),
+      attemptOptions: options,
+    });
+    assertBundleExecutionLeaseHeld(lease);
+    if (result.committed) {
+      try {
+        await commitDebuggerPhaseAttempt({
+          resolved,
+          manifest: bundle.manifest.debugger.manifest,
+          envelope: result.envelope,
+          io: result.attempt.io,
+          stateDir: path.join(bundleDir, SCHEMA3_DEBUGGER_STATE_DIRECTORY),
+        });
+      } finally {
+        // The commit path disposes the handle after a successful publication;
+        // a failed publication must never leak the process-local handle.
+        if (result.attempt.io.disposed === false) result.attempt.io.dispose();
+      }
       bundle = await readBundleState(resolved, auxiliary, bundleDir);
     }
     assertBundleExecutionLeaseHeld(lease);

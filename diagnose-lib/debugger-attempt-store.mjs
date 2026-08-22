@@ -5,20 +5,23 @@
 // envelope that binds both. Publication uses the proven no-clobber state
 // adapter, so a crash can only leave bounded orphan parts, which are never
 // evidence; the envelope is the sole completion marker for a run.
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 
 import { DEBUGGER_CONTROL_MAX_BYTES, parseDebuggerControlTranscript } from "./debugger-control.mjs";
 import {
+  DebuggerAttemptEnvelopeError,
+  buildDebuggerAttemptEnvelope,
   canonicalDebuggerAttemptEnvelopeLine,
   debuggerAttemptEnvelopeBinding,
   parseDebuggerAttemptEnvelope,
 } from "./debugger-attempt-envelope.mjs";
 import {
-  canonicalDebuggerPhaseManifestLine,
   debuggerPhaseManifestBinding,
+  canonicalDebuggerPhaseManifestLine,
   parseDebuggerPhaseManifest,
 } from "./debugger-phase.mjs";
+import { runDebuggerAttempt } from "./debugger-attempt-runner.mjs";
 import { canonicalProtocolJson, createFileStateAdapter } from "./pinned-protocol.mjs";
 
 export const DEBUGGER_ATTEMPT_STORE_VERSION = 1;
@@ -320,4 +323,82 @@ export async function commitDebuggerPhaseAttempt(options) {
     debuggerAttemptEnvelopeBinding(resolved, manifest, envelope).sha256,
   "debugger attempt committed envelope does not match the requested envelope");
   return committed;
+}
+
+// Choose and execute the next scheduled debugger run against the committed
+// prefix. The caller (the schema-3 lease owner) supplies the authoritative
+// attempt list and holds the exclusive bundle lease across the whole
+// transaction. A fresh per-attempt nonce is generated here. An incomplete
+// attempt returns a typed operational result with its process-local handle
+// disposed; it never advances the durable prefix and never publishes a
+// completion envelope.
+export async function runNextDebuggerPhaseAttempt({
+  resolved,
+  manifest: manifestValue,
+  attempts = [],
+  runAttempt = runDebuggerAttempt,
+  environmentBindingKey,
+  attemptOptions,
+} = {}) {
+  const manifest = parseDebuggerPhaseManifest(resolved, manifestValue);
+  requireCondition(runAttempt === undefined || typeof runAttempt === "function",
+    "debugger runAttempt must be a function");
+  const runner = runAttempt ?? runDebuggerAttempt;
+  requireCondition(attemptOptions === undefined ||
+    (attemptOptions !== null && typeof attemptOptions === "object" &&
+      !Array.isArray(attemptOptions) &&
+      Object.keys(attemptOptions).every((key) => key === "signal" ||
+        key === "stdoutExcerptBytes" || key === "stderrExcerptBytes")),
+  "debugger attempt options must contain only: signal, stdoutExcerptBytes, stderrExcerptBytes");
+  requireCondition(environmentBindingKey === undefined ||
+    Buffer.isBuffer(environmentBindingKey),
+  "debugger environmentBindingKey must be a Buffer");
+  const progress = assessDebuggerAttemptProgress(resolved, manifest, attempts);
+  if (progress.complete) {
+    return deepFreeze({
+      committed: false,
+      reason: "complete",
+      run: null,
+      outcome: null,
+      envelope: null,
+      attempt: null,
+    });
+  }
+
+  const context = {
+    run: progress.nextRun,
+    nonce: randomBytes(16).toString("hex"),
+  };
+  let attempt = null;
+  try {
+    attempt = await runner(resolved, manifest, context, {
+      ...attemptOptions,
+      ...(environmentBindingKey === undefined ? {} : { environmentBindingKey }),
+    });
+    const envelope = buildDebuggerAttemptEnvelope(resolved, manifest, context, attempt);
+    return deepFreeze({
+      committed: true,
+      reason: "committed",
+      run: context.run,
+      outcome: envelope.outcome,
+      envelope,
+      attempt,
+    });
+  } catch (error) {
+    if (attempt !== null && attempt.io !== null && attempt.io.disposed === false) {
+      attempt.io.dispose();
+    }
+    if (error instanceof DebuggerAttemptEnvelopeError &&
+        error.code === "INCOMPLETE_DEBUGGER_ATTEMPT") {
+      return deepFreeze({
+        committed: false,
+        reason: "operational-invalid",
+        run: context.run,
+        outcome: null,
+        envelope: null,
+        attempt,
+      });
+    }
+    throw error;
+  }
 }

@@ -58,7 +58,9 @@ fail closed.
 
 ## Remaining boundaries
 
-A schema-3 bundle variant with lease integration, read-only summaries, and a
-public command remain later steps. Until they exist, envelopes and stores are
+The [schema-3 manifest-v6 variant](../decisions/0031-schema3-manifest-v6-debugger.md)
+binds the debugger phase beside exact-CPU state and owns attempts under one
+lease. A public debugger command and user-facing debugger summaries remain
+Roadmap 6. Until they exist, envelopes and stores are
 exercised only by synthetic tests against the harmless fake-debugger fixture;
 no test launches GDB or a fault workload.

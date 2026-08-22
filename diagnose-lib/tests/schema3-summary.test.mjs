@@ -156,7 +156,7 @@ test("a version-4 summary groups baseline, topology, and pinned outcomes", () =>
 
 test("summaries reject unsupported manifests and invalid committed outcomes", () => {
   assert.throws(() => buildSchema3BundleSummary({
-    ...baseBundle(6),
+    ...baseBundle(7),
     exactCpu: exactPhase([]),
   }), /manifest version is unsupported/);
   assert.throws(() => buildSchema3BundleSummary({
@@ -166,4 +166,38 @@ test("summaries reject unsupported manifests and invalid committed outcomes", ()
       attempt: { evidence: { outcome: { validOutcome: false } } },
     }]),
   }), /invalid outcome evidence/);
+});
+
+test("a version-6 summary inspects the debugger phase progress", () => {
+  const bundle = {
+    ...baseBundle(6),
+    debugger: {
+      progress: {
+        status: "incomplete",
+        complete: false,
+        committedRuns: 2,
+        maxRuns: 4,
+        capturedRuns: 1,
+        maxCaptures: 2,
+      },
+    },
+    exactCpu: exactPhase([]),
+  };
+  const summary = buildSchema3BundleSummary(bundle);
+  assert.deepEqual(summary.phases.debugger, {
+    status: "incomplete",
+    complete: false,
+    committed: 2,
+    scheduled: 4,
+    captured: 1,
+    maxCaptures: 2,
+  });
+  assert.equal(summary.conditionWorkload, undefined);
+  const text = renderSchema3BundleSummary(summary);
+  assert.match(text, /manifest v6/);
+  assert.match(text, /debugger: incomplete; 2\/4 runs; captured 1\/2/);
+
+  const unbound = buildSchema3BundleSummary({ ...baseBundle(6), exactCpu: exactPhase([]) });
+  assert.equal(unbound.phases.debugger.status, "not-bound");
+  assert.match(renderSchema3BundleSummary(unbound), /debugger: not bound/);
 });

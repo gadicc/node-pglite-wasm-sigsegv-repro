@@ -179,13 +179,34 @@ function controlledLoadSummary(phase) {
   };
 }
 
+function debuggerSummary(phase) {
+  if (phase === undefined) return notBound();
+  const value = phase.progress;
+  if (value === null || typeof value !== "object" || Array.isArray(value) ||
+      typeof value.status !== "string" || typeof value.complete !== "boolean" ||
+      !Number.isSafeInteger(value.committedRuns) || value.committedRuns < 0 ||
+      !Number.isSafeInteger(value.maxRuns) || value.maxRuns < value.committedRuns ||
+      !Number.isSafeInteger(value.capturedRuns) || value.capturedRuns < 0 ||
+      !Number.isSafeInteger(value.maxCaptures) || value.maxCaptures < value.capturedRuns) {
+    fail("debugger progress is invalid");
+  }
+  return {
+    status: value.status,
+    complete: value.complete,
+    committed: value.committedRuns,
+    scheduled: value.maxRuns,
+    captured: value.capturedRuns,
+    maxCaptures: value.maxCaptures,
+  };
+}
+
 export function buildSchema3BundleSummary(bundle) {
   if (bundle === null || typeof bundle !== "object" || Array.isArray(bundle) ||
       bundle.manifest === null || typeof bundle.manifest !== "object") {
     fail("bundle is invalid");
   }
   const version = bundle.manifest.version;
-  if (!Number.isSafeInteger(version) || version < 1 || version > 5) {
+  if (!Number.isSafeInteger(version) || version < 1 || version > 6) {
     fail("manifest version is unsupported");
   }
   const summary = {
@@ -208,6 +229,7 @@ export function buildSchema3BundleSummary(bundle) {
       groups: contextSummary(bundle.groups, "group"),
       pinnedConcurrent: contextSummary(bundle.pinnedConcurrent, "pinned"),
       controlledLoad: controlledLoadSummary(bundle.controlledLoad),
+      debugger: debuggerSummary(bundle.debugger),
       exactCpu: exactSummary(bundle.exactCpu),
     },
     interpretation: {
@@ -241,6 +263,7 @@ export function renderSchema3BundleSummary(summary) {
       `risk ${summary.conditionWorkload.risk}; digest ${summary.conditionWorkload.digest}`);
   }
   const { baseline, groups, pinnedConcurrent, controlledLoad, exactCpu } = summary.phases;
+  const debuggerPhase = summary.phases.debugger;
   lines.push(`baseline: ${progressText(baseline, "waves")}` +
     `${baseline.outcomes === undefined ? "" : `; outcomes ${outcomesText(baseline.outcomes)}`}`);
   lines.push(`groups: ${progressText(groups, "waves")}` +
@@ -263,6 +286,9 @@ export function renderSchema3BundleSummary(summary) {
     lines.push(`  leg ${leg.leg} condition=${leg.condition} attempts=${leg.committedAttempts}; ` +
       `outcomes ${outcomesText(leg.outcomes)}`);
   }
+  lines.push(`debugger: ${progressText(debuggerPhase, "runs")}` +
+    `${debuggerPhase.status === "not-bound"
+      ? "" : `; captured ${debuggerPhase.captured}/${debuggerPhase.maxCaptures}`}`);
   lines.push(`exact-CPU: ${progressText(exactCpu, "attempts")}; ` +
     `outcomes ${outcomesText(exactCpu.outcomes)}`);
   for (const cpu of exactCpu.cpus) {

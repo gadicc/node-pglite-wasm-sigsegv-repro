@@ -25,7 +25,7 @@ The suite covers:
 - Public exact-CPU CLI parsing, dry-run safety, fresh bundle creation, and resume
 - Public baseline, CPU-group, pinned-concurrent, and controlled-load CLI planning, fresh bundle creation, and complete-unit resume
 - Read-only schema-3 v1-v5 summaries with phase, context, leg, CPU, and typed-outcome counts
-- Generic debugger-phase manifest, materialized command-profile descriptor, structured control-protocol, bounded attempt-I/O validation, supervised adapter routing, and complete-only attempt envelopes without launching GDB
+- Generic debugger-phase manifest, materialized command-profile descriptor, structured control-protocol, bounded attempt-I/O validation, supervised adapter routing, complete-only attempt envelopes, and schema-3 manifest-v6 ownership without launching GDB
 - Internal shell-free attempt execution, deadlines, bounded output, and process-group cleanup
 - Managed auxiliary-workload readiness, discarded output, and bounded cancellation
 - Controlled-load worker-set readiness, boundary identity checks, peer cancellation, and stop evidence
@@ -197,7 +197,13 @@ target or debugger. Complete-only attempt envelopes and their durable
 artifact store are covered end to end: typed outcome classification,
 envelope tamper rejection, contiguous run prefixes, capture-cap completion,
 envelope-last triple publication, orphan recovery, and foreign or tampered
-artifact refusal. No test starts GDB or a fault workload.
+artifact refusal. The schema-3 manifest-v6 variant is covered the same way:
+canonical round-trip and tamper rejection, exact state-directory ownership,
+lease-held clean and captured commits, run-cap and capture-cap completion,
+incomplete-attempt non-publication with fresh-nonce retry, orphan cleanup
+limited to the recommitted run, writer contention, interrupted-commit
+recovery, HMAC-bound custom workloads without private-value persistence, and
+sibling exact-CPU resume. No test starts GDB or a fault workload.
 
 Custom commands should be documented as trusted local workloads, not sandboxed code. They must not daemonize or escape the supervised process group.
 

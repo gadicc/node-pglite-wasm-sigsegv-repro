@@ -177,7 +177,7 @@ Future generic-workload schemas must extend these rules. Existing Node/PGlite bu
 ## Inspect schema-3 bundles without mutation
 
 Schema-3 bundles use their own manifest and phase-store formats rather than the
-legacy layout described above. Inspect versions 1 through 5 with the read-only
+legacy layout described above. Inspect versions 1 through 6 with the read-only
 public command:
 
 ```sh

@@ -109,8 +109,11 @@ export async function runDebuggerAttempt(
     "debugger attempt requires a resolved workload");
   requireCondition(options !== null && typeof options === "object" &&
     !Array.isArray(options) &&
-    Object.keys(options).every((key) => key === "signal" || key === "environmentBindingKey"),
-  "debugger attempt options must contain only: signal, environmentBindingKey");
+    Object.keys(options).every((key) => key === "signal" ||
+      key === "environmentBindingKey" || key === "stdoutExcerptBytes" ||
+      key === "stderrExcerptBytes"),
+  "debugger attempt options must contain only: signal, environmentBindingKey, " +
+    "stdoutExcerptBytes, stderrExcerptBytes");
   // Validate the manifest, context, and command profile before any process
   // exists; the adapter rebuilds the same descriptor authoritatively from the
   // launch capsule.
@@ -134,6 +137,12 @@ export async function runDebuggerAttempt(
   const adapter = await runWorkloadAttempt(adapterResolved, {
     signal: options.signal,
     stdinPayload: payload,
+    ...(options.stdoutExcerptBytes === undefined
+      ? {}
+      : { stdoutExcerptBytes: options.stdoutExcerptBytes }),
+    ...(options.stderrExcerptBytes === undefined
+      ? {}
+      : { stderrExcerptBytes: options.stderrExcerptBytes }),
     cpuAffinity: {
       cpu: manifest.schedule.cpu,
       tasksetPath: manifest.execution.tasksetPath,

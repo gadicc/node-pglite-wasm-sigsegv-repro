@@ -63,13 +63,14 @@ provenance check.
 ## Keep this foundation distinct from evidence
 
 The manifest does not claim that a capture occurred. The [supervised adapter](generic-debugger-adapter.md)
-executes one attempt under the established Node supervisor, and
+executes one attempt under the established Node supervisor,
 [complete-only attempt envelopes](generic-debugger-attempt-envelopes.md) bind
-typed outcomes, affinity and cleanup evidence, and durable artifact triples.
-A complete generic phase still needs:
+typed outcomes, affinity and cleanup evidence, and durable artifact triples,
+and the [schema-3 manifest-v6 variant](../decisions/0031-schema3-manifest-v6-debugger.md)
+binds the debugger phase beside exact-CPU state under one exclusive lease.
 
-1. schema-3 bundle inventory and lease integration; and
-2. read-only summary and public CLI support.
+The remaining boundary is read-only debugger summary detail and public CLI
+support (Roadmap 6).
 
 Until those pieces exist, `capabilities.gdb` is a contract input rather than an
 advertised public phase. The historical `capture-fault.sh` and schema-2 GDB

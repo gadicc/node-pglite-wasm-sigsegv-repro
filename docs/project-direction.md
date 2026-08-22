@@ -104,7 +104,10 @@ correlated baseline waves, version 3 binds overlapping CPU-group contexts and
 inherited masks, and version 4 binds a separate controller CPU plus one
 singleton-affinity child per active CPU. Version 5 is a separate controlled-load
 variant that binds measured and auxiliary workload identities, exact-CPU state,
-and one complete A1/B/A2 store.
+and one complete A1/B/A2 store. Version 6 is a separate debugger-focused
+exact-CPU variant that binds one isolated-plus-gdb workload, the exact-CPU
+phase, and the debugger phase with `state/exact-cpu` and `state/debugger`
+ownership; controlled-load composition is deferred to a later version.
 The owner holds one exclusive lease across selecting, running, and committing
 an exact attempt, complete baseline/group/pinned-concurrent wave, or complete
 controlled-load session and derives completion from durable publication. Its
@@ -122,7 +125,7 @@ schedule before bundle creation. The pinned command starts one short-lived
 bundle owner under each scheduled controller CPU. The controlled-load command
 binds separate measured and trusted custom condition workloads and publishes no
 partial session. Phase commands can then advance their matching prefixes in
-that same bundle. A read-only `summarize` command validates versions 1 through 5
+that same bundle. A read-only `summarize` command validates versions 1 through 6
 and renders committed outcomes by phase, context, leg, and CPU without changing
 the bundle. Trusted custom JSON workloads declare their own capabilities.
 
@@ -137,11 +140,11 @@ and 10 without requiring a physical checkout or repository-host rename.
 
 The controlled-load foundation and public command now compose the managed
 auxiliary lifecycle, verified worker sets, complete A1/B/A2 envelopes,
-complete-only store, and schema-3 manifest-v5 ownership. Debugger and frequency
-protocols still need workload-bound adapters where applicable. The debugger
-path now has an internal manifest that binds one workload, GDB executable,
-fixed capture profile, CPU, and bounded schedule without executing or changing
-schema-3. Historical Node
+complete-only store, and schema-3 manifest-v5 ownership. The debugger path now
+adds a bound phase manifest, a structured control protocol, bounded attempt
+I/O, a supervised adapter, complete-only attempt envelopes, and schema-3
+manifest-v6 ownership on top, without a public command yet. Frequency
+protocols still need workload-bound adapters where applicable. Historical Node
 A/B/A and Node-by-warmup modes remain multi-workload experiments outside the
 current schema.
 

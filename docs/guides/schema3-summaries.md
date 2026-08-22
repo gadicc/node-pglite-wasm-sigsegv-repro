@@ -1,7 +1,7 @@
 # Summarize a schema-3 bundle
 
 Use `fault-affinity summarize` to inspect committed evidence in any schema-3
-manifest version from 1 through 5. The command re-resolves the workload,
+manifest version from 1 through 6. The command re-resolves the workload,
 validates the complete bundle and every committed phase envelope, and writes a
 derived summary to standard output.
 
@@ -27,7 +27,8 @@ The text output includes:
 - committed and scheduled wave, session, or attempt counts;
 - outcome category and label counts;
 - per-context CPU-group and pinned-concurrent counts;
-- per-leg controlled-load counts; and
+- per-leg controlled-load counts;
+- per-run debugger capture counts (manifest v6); and
 - per-CPU exact counts.
 
 Only committed, already validated outcomes appear. An incomplete phase remains
@@ -62,7 +63,7 @@ node fault-affinity.mjs summarize \
 
 The condition definition is resolved only to validate the stored identity. No
 condition worker starts. `--condition-workload-file` is rejected for manifest
-versions 1 through 4.
+versions 1 through 4 and 6.
 
 ## Keep the interpretation narrow
 
